@@ -917,3 +917,105 @@ async fn uuidv7_entity_ids_preserve_temporal_ordering() {
     assert_eq!(generated, sorted, "uuid::Uuid::now_v7 must produce lex-monotonic ids in sequence");
 }
 
+
+// =====================================================================
+// 12. EXECUTION_PARAMS — SCD-2 + append-only per-run agent knob store
+// =====================================================================
+//
+// Every kernel mutation in §7-#5 must follow SCD-2 + append-only. The
+// execution_params table is the live test of that rule for a new substrate
+// table: every write to a (run_id, agent_id) tuple closes the prior current
+// row and opens a fresh one in one transaction. No in-place UPDATE, no DELETE.
+
+#[tokio::test]
+async fn execution_params_round_trip_returns_what_was_written() {
+    let (_dir, kernel, _sub) = bootstrap_tenant("ep_rt").await;
+    let payload = serde_json::json!({
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "max_tokens": 1024,
+        "model_ref": "entity:gemma_4_27b_it"
+    });
+
+    kernel.set_execution_params("run_abc", "agent_xyz", payload.clone()).await.unwrap();
+    let read_back = kernel.get_execution_params("run_abc", "agent_xyz").await.unwrap();
+    assert_eq!(read_back, Some(payload), "round-trip must return the same payload");
+}
+
+#[tokio::test]
+async fn execution_params_update_closes_prior_opens_new_scd2() {
+    // Operator updates knobs mid-run — must produce 2 rows in the ledger,
+    // exactly one is_current, the prior with valid_to set.
+    let (_dir, kernel, _sub) = bootstrap_tenant("ep_scd2").await;
+    kernel.set_execution_params("run_x", "agent_a",
+        serde_json::json!({"temperature": 0.5})).await.unwrap();
+    kernel.set_execution_params("run_x", "agent_a",
+        serde_json::json!({"temperature": 0.9})).await.unwrap();
+
+    #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
+    struct Row {
+        is_current: bool,
+        valid_to: serde_json::Value,
+        valid_from: serde_json::Value,
+        params_json: serde_json::Value,
+    }
+    let mut res = kernel.db.query(
+        "SELECT is_current, valid_to, valid_from, params_json FROM execution_params \
+         WHERE run_id = 'run_x' AND agent_id = 'agent_a' AND tenant_id = $session_tenant \
+         ORDER BY valid_from ASC"
+    ).await.unwrap();
+    let rows: Vec<Row> = res.take(0).unwrap();
+    assert_eq!(rows.len(), 2, "SCD-2 history must keep both versions; got {}", rows.len());
+
+    let current: Vec<&Row> = rows.iter().filter(|r| r.is_current).collect();
+    let closed: Vec<&Row> = rows.iter().filter(|r| !r.is_current).collect();
+    assert_eq!(current.len(), 1, "exactly one is_current per (run_id, agent_id)");
+    assert_eq!(closed.len(), 1, "the prior row must be closed");
+    assert!(current[0].valid_to.is_null(), "current row's valid_to must be NULL");
+    assert!(!closed[0].valid_to.is_null(), "closed row's valid_to must be set");
+
+    // The current row holds the latest value.
+    let current_temp = current[0].params_json.get("temperature").and_then(|v| v.as_f64()).unwrap();
+    assert!((current_temp - 0.9).abs() < f64::EPSILON, "current row must hold the newer payload");
+}
+
+#[tokio::test]
+async fn execution_params_distinct_agents_do_not_collide() {
+    // Two agents in the same run must have independent param histories.
+    let (_dir, kernel, _sub) = bootstrap_tenant("ep_iso").await;
+    kernel.set_execution_params("run_iso", "agent_a",
+        serde_json::json!({"temperature": 0.3})).await.unwrap();
+    kernel.set_execution_params("run_iso", "agent_b",
+        serde_json::json!({"temperature": 0.8})).await.unwrap();
+
+    let a = kernel.get_execution_params("run_iso", "agent_a").await.unwrap();
+    let b = kernel.get_execution_params("run_iso", "agent_b").await.unwrap();
+    assert_eq!(a.unwrap().get("temperature").and_then(|v| v.as_f64()), Some(0.3));
+    assert_eq!(b.unwrap().get("temperature").and_then(|v| v.as_f64()), Some(0.8));
+
+    // Updating agent_a's knobs must NOT touch agent_b's.
+    kernel.set_execution_params("run_iso", "agent_a",
+        serde_json::json!({"temperature": 0.1})).await.unwrap();
+    let a2 = kernel.get_execution_params("run_iso", "agent_a").await.unwrap();
+    let b2 = kernel.get_execution_params("run_iso", "agent_b").await.unwrap();
+    assert_eq!(a2.unwrap().get("temperature").and_then(|v| v.as_f64()), Some(0.1));
+    assert_eq!(b2.unwrap().get("temperature").and_then(|v| v.as_f64()), Some(0.8));
+}
+
+#[tokio::test]
+async fn execution_params_get_returns_none_when_not_set() {
+    let (_dir, kernel, _sub) = bootstrap_tenant("ep_missing").await;
+    let res = kernel.get_execution_params("never_set_run", "never_set_agent").await.unwrap();
+    assert!(res.is_none(), "missing row must return None, not an error");
+}
+
+#[tokio::test]
+async fn execution_params_set_emits_telemetry() {
+    let (_dir, kernel, _sub) = bootstrap_tenant("ep_tele").await;
+    let before = count_events(&kernel, "execution_params_set").await;
+    kernel.set_execution_params("run_tele", "agent_one",
+        serde_json::json!({"temperature": 0.5})).await.unwrap();
+    let after = count_events(&kernel, "execution_params_set").await;
+    assert_eq!(after, before + 1, "each set must emit exactly one execution_params_set event");
+}
