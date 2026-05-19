@@ -115,6 +115,59 @@ The dumb division of labor:
 
 If you find yourself adding a `depends_on` field to `schedule`, a `kind` field that duplicates `attr_capability`, a `metadata` field that duplicates entity attrs, or any other column that re-encodes information already in the entity graph — **stop**. That's the wrong layer. The schedule row holds an entity id. Everything else is on the entity.
 
+### 9. Intelligence Lives in Gemma, Not in the Schema
+
+When you're tempted to add a field that encodes a *decision*, a *policy*, a *ranking*, a *score*, or a *priority* — **STOP**. That's not a schema concern. That's an inference concern. The local model (`gemma-3-4b-it` today, swappable via Roadmap #4) is the OS's brain and is woven through every runtime decision. Hardcoding policy into substrate columns is exactly the failure mode `ARCHITECTURE.md` §0c-1 ("always intelligent") was written to prevent.
+
+The substrate is a **dumb-but-honest record of facts**:
+
+- `entity` — what exists
+- `relation` — how things connect
+- `state_ledger` — what changed when (SCD-2 typed attributes)
+- `telemetry_stream` — what happened
+- `schedule` — what is queued
+- `execution_params` — what knobs are currently set
+
+Decisions that operate *over* those facts are **not schema features**. They are the model's job:
+
+| You might want to encode... | Where it actually belongs |
+| --- | --- |
+| `priority: int` on schedule | Gemma reads schedule + state + telemetry, decides what runs next |
+| `retry_policy: object` on schedule | Gemma reads failure history, decides retry / skip / escalate |
+| `depends_on: array` on schedule | Already expressed as edges in the entity graph; agent walks it |
+| `kind: enum` that branches runtime behavior | Read `attr_capability` off the target entity |
+| `confidence: float` / `score: float` on any work row | Recorded as `attr_score` via `state_ledger`; Gemma assigns it |
+| Ranking / sort order / sequencing logic | Gemma sorts at query time given current substrate state |
+| Param-tuning rules (temp / top_p heuristics) | `ParamTunerBlade` reads outcomes, proposes new `execution_params` |
+| "Which agent should pick this up?" | Gemma reads entity + capability + agent availability, decides |
+
+#### The correct pattern
+
+1. Substrate stores **facts** (dumb, append-only, SCD-2).
+2. A blade calls Gemma with the relevant context (`compile_context`, telemetry slices, schedule queries).
+3. Gemma proposes a **decision** — written back to the substrate as a `node_proposal` entity + `attr_*` state via `state_ledger`. Full audit trail.
+4. Meta-Harness scores the proposal (fuel-metered wasm harness).
+5. The operator (or auto-promote rules per capability) accepts.
+6. Accepted decisions are acted on by the relevant blade.
+
+This is the same loop the existing `ProposerBlade` runs for structural-edge proposals — generalize the pattern, don't reinvent it.
+
+#### Anti-patterns (banned without explicit operator approval)
+
+- ❌ Adding a column to "encode the rule" instead of asking Gemma the question
+- ❌ Hardcoding a heuristic in Rust (`if attempt > 3 then …`) when it should be a model-proposed knob
+- ❌ Static threshold constants for retries, scores, priorities, timeouts that "feel right"
+- ❌ Treating intelligence as an optional add-on layered on top of the OS — **it is the OS**
+
+#### Self-check before any column or constant
+
+> *"Is this a fact about what happened, or is this a judgment about what should happen?"*
+
+- Fact → substrate column is fine (subject to §7 schema-immutability gate).
+- Judgment → it's a Gemma decision, recorded as a proposal, scored by the Harness. Do not put it in the schema.
+
+The bar: every non-trivial policy decision the OS makes should be **traceable back to a model call**, not to a hardcoded Rust constant or schema default. *"Always intelligent"* is enforced here.
+
 ### Execution Loop Enforcement
 For every single action you take, you must silently ask yourself: *"Am I guessing? Am I rushing? Did I read the documentation?"* If the answer to any of these is yes, you are violating this protocol.
 </instructions>
