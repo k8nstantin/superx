@@ -1019,3 +1019,115 @@ async fn execution_params_set_emits_telemetry() {
     let after = count_events(&kernel, "execution_params_set").await;
     assert_eq!(after, before + 1, "each set must emit exactly one execution_params_set event");
 }
+
+// =====================================================================
+// 13. SCHEDULE — SCD-2 + append-only work-item ledger
+// =====================================================================
+//
+// Every status transition (waiting → scheduled → running → completed/failed,
+// plus awaiting_human for HITL) creates a new schedule row; the prior row is
+// closed with valid_to. No in-place UPDATE, no DELETE. Reconstructable in
+// strict temporal order by SELECT ... ORDER BY valid_from ASC.
+
+fn now_utc() -> chrono::DateTime<chrono::Utc> { chrono::Utc::now() }
+
+#[tokio::test]
+async fn schedule_enqueue_returns_a_uuidv7_record_id() {
+    let (_dir, kernel, _sub) = bootstrap_tenant("sched_id").await;
+    let sid = kernel.enqueue_schedule_item(
+        "run_a", "ingest", "entity:abc",
+        now_utc(), vec![], serde_json::json!({}),
+    ).await.unwrap();
+    assert!(sid.starts_with("schedule:"), "id must be a `schedule:<uuid>` record id, got {sid}");
+    let payload = kernel.get_schedule_item(&sid).await.unwrap().expect("just-enqueued row must be readable");
+    assert_eq!(payload.get("run_id").and_then(|v| v.as_str()), Some("run_a"));
+    assert_eq!(payload.get("kind").and_then(|v| v.as_str()), Some("ingest"));
+    assert_eq!(payload.get("status").and_then(|v| v.as_str()), Some("waiting"));
+    assert_eq!(payload.get("attempt").and_then(serde_json::Value::as_i64), Some(0));
+    assert_eq!(payload.get("is_current").and_then(serde_json::Value::as_bool), Some(true));
+}
+
+#[tokio::test]
+async fn schedule_transition_closes_prior_opens_new_scd2() {
+    let (_dir, kernel, _sub) = bootstrap_tenant("sched_scd2").await;
+    let sid = kernel.enqueue_schedule_item(
+        "run_x", "compile", "entity:tgt",
+        now_utc(), vec![], serde_json::json!({"note": "first"}),
+    ).await.unwrap();
+    let _sid2 = kernel.transition_schedule_status(&sid, "scheduled").await.unwrap();
+    let _sid3 = kernel.transition_schedule_status(&_sid2, "running").await.unwrap();
+
+    #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
+    struct Row {
+        status: String,
+        is_current: bool,
+        valid_to: serde_json::Value,
+        valid_from: serde_json::Value,
+    }
+    let mut res = kernel.db.query(
+        "SELECT status, is_current, valid_to, valid_from FROM schedule \
+         WHERE run_id = 'run_x' AND tenant_id = $session_tenant \
+         ORDER BY valid_from ASC"
+    ).await.unwrap();
+    let rows: Vec<Row> = res.take(0).unwrap();
+    assert_eq!(rows.len(), 3, "SCD-2 ledger must preserve all 3 versions, got {}", rows.len());
+
+    let current: Vec<&Row> = rows.iter().filter(|r| r.is_current).collect();
+    let closed: Vec<&Row> = rows.iter().filter(|r| !r.is_current).collect();
+    assert_eq!(current.len(), 1, "exactly one is_current row per schedule chain");
+    assert_eq!(closed.len(), 2, "the two prior rows must be closed");
+    assert!(current[0].valid_to.is_null(), "current row's valid_to must be NULL");
+    for c in &closed {
+        assert!(!c.valid_to.is_null(), "closed row's valid_to must be set");
+    }
+    assert_eq!(current[0].status, "running", "current row carries the latest status");
+    assert_eq!(closed[0].status, "waiting", "first closed row preserved its original status");
+    assert_eq!(closed[1].status, "scheduled", "second closed row preserved its prior status");
+}
+
+#[tokio::test]
+async fn schedule_transition_preserves_payload_fields() {
+    let (_dir, kernel, _sub) = bootstrap_tenant("sched_payload").await;
+    let due = now_utc();
+    let sid = kernel.enqueue_schedule_item(
+        "run_p", "design", "entity:prod",
+        due, vec!["schedule:dep_one".into()], serde_json::json!({"priority": 7, "memo": "carry-me"}),
+    ).await.unwrap();
+    let sid2 = kernel.transition_schedule_status(&sid, "scheduled").await.unwrap();
+
+    let after = kernel.get_schedule_item(&sid2).await.unwrap().expect("post-transition row must be readable");
+    assert_eq!(after.get("run_id").and_then(|v| v.as_str()), Some("run_p"));
+    assert_eq!(after.get("kind").and_then(|v| v.as_str()), Some("design"));
+    assert_eq!(after.get("target_entity").and_then(|v| v.as_str()), Some("entity:prod"));
+    assert_eq!(after.get("status").and_then(|v| v.as_str()), Some("scheduled"));
+    let deps = after.get("depends_on").and_then(|v| v.as_array()).expect("depends_on must round-trip");
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].as_str(), Some("schedule:dep_one"));
+    assert_eq!(after.get("metadata").and_then(|m| m.get("priority")).and_then(serde_json::Value::as_i64), Some(7));
+    assert_eq!(after.get("metadata").and_then(|m| m.get("memo")).and_then(|v| v.as_str()), Some("carry-me"));
+}
+
+#[tokio::test]
+async fn schedule_get_returns_none_when_id_unknown() {
+    let (_dir, kernel, _sub) = bootstrap_tenant("sched_miss").await;
+    let fake = format!("schedule:{}", uuid::Uuid::now_v7());
+    let res = kernel.get_schedule_item(&fake).await.unwrap();
+    assert!(res.is_none(), "unknown schedule id must return None, not an error");
+}
+
+#[tokio::test]
+async fn schedule_emits_enqueued_and_transitioned_telemetry() {
+    let (_dir, kernel, _sub) = bootstrap_tenant("sched_tele").await;
+    let enq_before = count_events(&kernel, "schedule_enqueued").await;
+    let tx_before  = count_events(&kernel, "schedule_transitioned").await;
+
+    let sid = kernel.enqueue_schedule_item(
+        "run_t", "ingest", "entity:x",
+        now_utc(), vec![], serde_json::json!({}),
+    ).await.unwrap();
+    let _sid2 = kernel.transition_schedule_status(&sid, "scheduled").await.unwrap();
+
+    assert_eq!(count_events(&kernel, "schedule_enqueued").await,    enq_before + 1, "one enqueue → one schedule_enqueued event");
+    assert_eq!(count_events(&kernel, "schedule_transitioned").await, tx_before  + 1, "one transition → one schedule_transitioned event");
+}

@@ -23,6 +23,7 @@ thiserror = "1.0"
 tracing = "0.1"
 jsonschema = "0.17"
 uuid = { version = "1.0", features = ["v7"] }
+chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.8"
 candle-core = "0.8"
 candle-transformers = "0.8"

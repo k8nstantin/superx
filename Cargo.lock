@@ -5519,6 +5519,7 @@ dependencies = [
 name = "superx-cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "serde",
  "serde_json",
@@ -5620,6 +5621,7 @@ dependencies = [
 name = "superx-kernel"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "jsonschema",
  "serde",
  "serde_json",
