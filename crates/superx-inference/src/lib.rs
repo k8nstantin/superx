@@ -14,6 +14,10 @@ use tokenizers::Tokenizer;
 use std::path::Path;
 use thiserror::Error;
 
+/// All error types surfaced by `InferenceEngine`. Distinguishes load-time
+/// failures (model file or tokenizer missing / malformed) from run-time
+/// failures (tokenisation, forward-pass, sampling). `Candle` and `Io` variants
+/// preserve the underlying error so callers can introspect for retry policy.
 #[derive(Error, Debug)]
 pub enum InferenceError {
     /// Failure during the inference/generation phase.

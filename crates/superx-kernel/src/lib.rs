@@ -22,6 +22,21 @@ const MAX_ID_LENGTH: usize = 128;
 /// it here propagates everywhere — there is no magic-string duplication.
 pub const DEFAULT_TENANT: &str = "sa_dogfood";
 
+/// All error types surfaced by `Kernel` operations. Each variant maps to a
+/// specific failure class so callers can branch on intent rather than
+/// stringly-typed reasons:
+///
+/// - `Database` — underlying `SurrealDB` / `RocksDB` failure (network,
+///   transaction, storage).
+/// - `Init` — substrate startup failure (path creation, schema apply).
+/// - `Validation` — typed write rejected by JSON-Schema or by a missing
+///   referenced entity / type.
+/// - `Integrity` — substrate invariant violation discovered at read time
+///   (e.g. missing substrate entity during promotion).
+/// - `SafetyViolation` — NASA Power-of-10 bound exceeded (DFS limit, node
+///   limit) or a tenant-coercion attempt.
+/// - `CycleDetected` — attempted to create an acyclic edge that would close
+///   a cycle.
 #[derive(Debug, thiserror::Error)]
 pub enum KernelError {
     #[error("Database error: {0}")]
@@ -44,11 +59,23 @@ impl From<surrealdb::Error> for KernelError {
     }
 }
 
-/// `Kernel`: The Safety-Critical 5-Table Substrate
+/// The safety-critical 5-table substrate plus durable execution cursor —
+/// the load-bearing primitive every other crate in the workspace depends on.
+///
+/// Holds the live `SurrealDB` handle and the namespace + database it's bound
+/// to. Constructed via `Kernel::init`, which creates the parent directory,
+/// opens `RocksDB`, applies the `SCHEMAFULL` substrate schema (idempotent),
+/// and seeds the metamodel.
+///
+/// Cloning is cheap — `Surreal<Db>` is internally `Arc`-shared. Pass the
+/// kernel around freely; do not store references to its fields independently.
 #[derive(Clone)]
 pub struct Kernel {
+    /// Live `SurrealDB` connection bound to the substrate's namespace + database.
     pub db: Surreal<Db>,
+    /// The `SurrealDB` namespace this kernel is bound to (set at `init` time).
     pub ns: String,
+    /// The `SurrealDB` database name this kernel is bound to (set at `init` time).
     pub db_name: String,
 }
 
@@ -78,6 +105,11 @@ struct StateResult {
     value_json: Option<serde_json::Value>
 }
 
+/// Read-side projection of a `execution_cursor` row, returned by
+/// `Kernel::get_execution_cursor`. `last_processed` is the cursor token a
+/// resumer can hand back to the source (e.g. the last filesystem path
+/// ingested, or the last offset processed); `metadata` is an opaque JSON
+/// envelope the producer chose to attach.
 #[derive(Deserialize, Serialize, Debug)]
 pub struct CursorResult {
     pub last_processed: Option<String>,

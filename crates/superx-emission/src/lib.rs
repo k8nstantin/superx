@@ -16,6 +16,19 @@ use std::time::Duration;
 use surrealdb::Notification;
 use reqwest::Client;
 
+/// One row of the unified telemetry firehose, as it travels from
+/// `telemetry_stream` to a downstream sink (`KafkaSink` / `ApiSink`).
+///
+/// Field semantics mirror the `telemetry_stream` schema defined in
+/// `superx-kernel::apply_substrate_schema`:
+/// - `id` — the row's `Thing` record id (native `Id::Uuid`); preserves
+///   the temporal ordering of when the event was logged.
+/// - `timestamp` — ISO-8601 wall-clock time the row was written.
+/// - `tenant_id` — the tenant that produced the event; sinks may filter on this.
+/// - `lifecycle_event` — typed event name (`state_supersede`, `edge_create`,
+///   `agent_discovered`, `system_pulse`, …).
+/// - `run_id` — optional correlation id linking the event to a workflow run.
+/// - `payload` — typed structured payload specific to `lifecycle_event`.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TelemetryRow {
     pub id: surrealdb::sql::Thing,
@@ -26,6 +39,9 @@ pub struct TelemetryRow {
     pub payload: serde_json::Value,
 }
 
+/// Kafka egress sink. Wraps an `rdkafka` `FutureProducer` configured for a
+/// single bootstrap-broker list and a single topic. Use one `KafkaSink` per
+/// destination topic; sinks are cheap (a tokio-friendly producer handle).
 pub struct KafkaSink {
     producer: FutureProducer,
     topic: String,
@@ -65,6 +81,14 @@ impl KafkaSink {
     }
 }
 
+/// HTTP egress sink — POSTs each `TelemetryRow` as JSON to a configured URL.
+/// Bearer-token authentication is optional. Failure modes:
+/// - Non-2xx response → `Err` returned (silent failure would defeat the audit
+///   trail invariant).
+/// - Network error → `Err` returned.
+///
+/// One `ApiSink` corresponds to one downstream endpoint; create multiple sinks
+/// for fan-out.
 pub struct ApiSink {
     url: String,
     auth_token: Option<String>,
@@ -101,6 +125,12 @@ impl ApiSink {
     }
 }
 
+/// Long-lived background task that bridges the substrate's `telemetry_stream`
+/// (via `SurrealDB` `LIVE SELECT`) to one or more downstream sinks. Spawned
+/// by `superx-cli` for the lifetime of a command and by `superx-mcp` for the
+/// lifetime of the server process. Runs in the kernel's root context so it
+/// can observe cross-tenant telemetry for an instance; per-event tenant
+/// filtering is up to the sinks.
 pub struct TelemetrySubscriber<'a> {
     kernel: &'a Kernel,
 }
