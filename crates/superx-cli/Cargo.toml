@@ -24,5 +24,6 @@ tempfile.workspace = true
 
 [dev-dependencies]
 superx-mcp = { path = "../superx-mcp" }
+chrono.workspace = true
 wat = "1"
 wiremock = "0.6"
