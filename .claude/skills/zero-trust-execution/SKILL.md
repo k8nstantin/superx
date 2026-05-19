@@ -36,9 +36,52 @@ You MUST halt execution and ask the user for direction under any of the followin
 - Code is not clean until it passes `cargo clippy --all-targets --all-features -- -D warnings`.
 - You are strictly forbidden from claiming a task is "completed" or updating `ARCHITECTURE.md` until the entire workspace compiles, passes tests, and is warning-free.
 
-### 6. Branch + PR Workflow (Mandatory)
+### 6. Branch + PR Workflow (Mandatory) — Trunk-Based Development
+
+SuperX adopts **Trunk-Based Development** (TBD) — the methodology Google uses at scale across a 35,000-developer monorepo — as its binding source-control strategy. The principles below are TBD's, applied to SuperX:
+
+- **Single trunk: `main`.** All work integrates into `main`. There are no long-running release branches, no `develop` branches, no Gitflow. Releases are tagged from `main`.
+- **Always-releasable trunk.** *"The codebase is always releasable on demand."* Every commit on `main` must pass Mandate-5 gates (`cargo test --workspace` + `cargo clippy --all-targets --all-features -- -D warnings`). The MVP baseline is working; every subsequent feature lands on top of a working baseline.
+- **Integration cadence ≤ 24 hours.** *"All team members commit to trunk at least once every 24 hours."* Branches do not survive overnight. If a change can't land in a day, decompose it.
+- **Feature flags hide unfinished work.** Incomplete features land behind a config flag (a substrate `attr_config` parameter — `deployment_mode`, `classifier_enabled`, etc.) so partial code on `main` doesn't break releases.
+- **Branch by abstraction for extended changes.** When refactoring a load-bearing primitive, ship the abstraction first (no behavior change), then migrate consumers behind it, then remove the old code — three small PRs, each green at the gate. Never one giant rewrite branch.
+
+
 - **All work happens on a branch.** Never commit directly to `main`. Create a topic branch named after the change (`feat/<thing>`, `fix/<thing>`, `chore/<thing>`, `docs/<thing>`).
 - **Every change ships as a pull request.** Open a PR against `main` with a clear description, linked issues, and a summary of what the diff does and how it was verified (Mandate 5 gates).
+- **One logical step per PR — small diffs are the default.** Operator's standing direction: *"smaller diffs, clearer history, easier to roll back one piece. We used to lose a lot of items on merge — we need very short-lived branches."* Do not batch unrelated changes. If two changes can be reasoned about independently, ship them as two PRs.
+- **Branches are very short-lived.** Open → push → PR → merge → delete should typically complete in minutes, not hours. Never leave a branch open overnight. If a change is too large to land in one short-lived branch, decompose it into smaller logical steps first.
+- **Sequential, never parallel.** At any moment there should be exactly one open branch + one open PR. Wait for merge before starting the next change. Parallel branches are how items get lost on merge.
+- **Each branch is atomic — all-or-nothing.** Operator's standing direction: *"each branch should be all or nothing — this way the baseline is working — first viable product, then we add modular features."* A branch either lands fully working (Mandate-5 gates green, feature operational end-to-end) OR it does not land at all. Partial features behind feature flags are acceptable; broken features on `main` are not. `main` must always be a working SuperX — first the MVP, then MVP + feature₁, then MVP + feature₁ + feature₂, etc. Anyone cloning `main` at any commit gets a runnable system.
+
+#### Pre-flight checklist before opening any branch
+
+Run through these silently before `git checkout -b`:
+
+1. **Is the change self-contained?** If touching it pulls in 5 other changes, decompose first.
+2. **Will the gates pass at the end?** If you can't see a clean path to `cargo test --workspace` + `cargo clippy --all-targets --all-features -- -D warnings` green, decompose first.
+3. **Does the diff fit in one mental model?** A reviewer should hold the whole PR in their head without scrolling tabs.
+4. **Is there a feature flag if the change is incomplete?** Half-features land *behind* an `attr_config` parameter that defaults to off until the rest ships.
+5. **What does the PR description say?** Write it before the code — if you can't describe the change clearly in 2-3 sentences, it's not focused enough.
+
+#### Anti-patterns (banned)
+
+- ❌ **Mega-branch.** "Let me just add execution_params, RunnerBlade, schedule table, and the classifier blade in one PR." No — that's four PRs, sequenced.
+- ❌ **Speculative branch.** Opening a branch "to explore" with no clear acceptance criteria. Either you know what landing looks like or you don't open the branch.
+- ❌ **Long-lived feature branch.** Anything that exists past one calendar day is a long-lived branch; rebase against trunk, split into landable chunks, or abandon.
+- ❌ **Force-merge through red gates.** A failing test isn't "we'll fix it later." It's a blocker. The Mandate-5 gate is non-negotiable.
+- ❌ **Side-quest mid-branch.** Found a typo in another crate while implementing a feature? That's a separate PR. Finish the current one first.
+- ❌ **Direct `git push main`.** Banned by the workflow; verified by repo settings (require-PR enforcement).
+
+#### Worked example — branch-by-abstraction for a load-bearing change
+
+Refactoring the kernel's `set_session_auth` from session-var assertion to real `db.signin(Record)` is a load-bearing change. Trunk-Based Development handles it as three sequential PRs, each green at the gate:
+
+1. **PR 1** — Add a `KernelAuthBackend` trait + a `SessionVarBackend` impl that wraps today's behavior. No call-site changes; both implementations coexist. Gate green.
+2. **PR 2** — Add `RecordSigninBackend` impl. Behind a feature flag `attr_config.auth_backend = "session_var" | "record_signin"`. Default unchanged. Gate green.
+3. **PR 3** — Flip the default + remove `SessionVarBackend`. Tests prove the new path. Gate green.
+
+Never one branch that rewrites the kernel auth model. Three small ones, each landing a working SuperX.
 - **Once a PR is merged, delete the branch.** Both locally (`git branch -d <branch>`) and on origin (`git push origin --delete <branch>` or rely on GitHub's auto-delete-on-merge setting). No long-lived branches.
 - **Never force-push to `main`.** Force-push on a topic branch is allowed only during PR review and only if the operator has reviewed the rewrite.
 - **No commits to `main` from local clones.** The branch + PR loop is the only path; this preserves auditability and lets every change be reviewed.
