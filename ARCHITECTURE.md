@@ -170,6 +170,47 @@ The substrate-first posture lets us pick up these capabilities *without retrofit
 
 This is the durable moat. **Modularity from line zero is the only way to compete with incumbents who started years earlier.** SuperX is the only Rust agentic OS where every operational concern (auth, dispatch, model selection, telemetry, prompt template, data source) is a row in the same table family, not a code path.
 
+### 0e. Go-to-market wedge — the execution corollary of the moat
+
+The architectural moat (§0c-extensibility) is *what* makes SuperX defensible. The go-to-market wedge is *how* SuperX gets adopted long enough for the moat to compound. **Architecture without distribution is academia.** This section is binding on product, marketing, and engineering priority discussions — not just on code.
+
+#### Three sequencing rules
+
+1. **Pick one deployment mode and dominate it first — collector mode.**
+   Three deployment modes (collector / designer / full) is an architectural strength but a positioning *liability*. "We can be three things" reads as "we are nothing specific." The wedge: **be the absolute best telemetry collector for MCP agents** before claiming anything else. Every MCP user already runs Claude Desktop / Claude Code / Cursor / Continue / Cody. Drop SuperX on their machine; it captures fine-grained telemetry for every agent with zero config; the firehose lights up immediately. They never had this. We charge zero. They tell their team. **That is the wedge.**
+
+   - Don't lead the README with "intelligent agentic OS that designs and builds products."
+   - Lead with "drop-in agent activity capture for everything MCP. One binary. No config. Free."
+   - Designer + Runner are the *upsell*, not the pitch.
+
+2. **The MCP server is the wedge into every agent-using developer's workflow.**
+   `superx-mcp` is already an MCP server. The 2025-11-25 spec adds `resources`, `prompts`, `sampling`, `elicitation`, `roots` — we're behind on surface area but designed to add them as match arms (§0c-extensibility). **Get the MCP surface to feature-complete + 1 (something the field doesn't have) before broadcasting.** That "something" is structured agent telemetry exposed as MCP resources — no other MCP server does this. Once `superx-mcp` is *strictly better than the alternatives*, every MCP user is a potential install.
+
+3. **Kernel is durable IP; everything above is commodity.**
+   The 5-table metamodel + SCD-2-everywhere + capability-governor + model-as-entity combination is the defensible piece. The CLI surface is copyable in a sprint. The MCP wrapper is copyable in a week. The substrate is *months* to replicate even if someone copies the visible spec — and the substrate-vs-glue distinction shapes every blade we'll ever ship. **Lean into the kernel as the IP; commodify everything above it.** Open-source the kernel design publicly; let the CLI / MCP / blades remain in our repo but accept that they will be cloned. Defend the substrate; concede the surface.
+
+#### What this means in practice — DOs and DON'Ts
+
+| ✅ DO | ❌ DON'T |
+|---|---|
+| Optimize the README headline for collector-mode value: *"Drop-in fine-grained telemetry for every MCP agent on your machine, with a local model running RAG for free."* | Lead with "intelligent agentic OS that designs and builds products" — that's v3.0 positioning fronting a v1.0 binary. |
+| Make `superx-cli stats` and `superx-cli list-agents` look impressive on day one — these are the wedge demos. | Spend MVP energy on Designer/Runner polish that competes with LangGraph/AutoGen on their turf. |
+| Treat every MCP user as a potential SuperX install. Build for them. | Build for "the agentic OS market" — that market doesn't exist yet; ride the MCP wave instead. |
+| Open-source the substrate design (this doc); accept the CLI / MCP surface will be copied. | Try to hide architectural choices; the moat is in execution velocity, not secrecy. |
+| Ship `cargo dist` binaries for macOS Apple Silicon + Intel + Linux x86_64 day one. Friction-free install is non-negotiable for a collector. | Require operators to `cargo build`. That kills the wedge. |
+| Brag about "we have a local model integrated" only in the second paragraph, after the telemetry firehose demo wins them. | Position the model as the differentiator first — Ollama is winning that comparison on convenience. |
+
+#### Window math
+
+The agentic-OS field is < 2 years old. MCP spec just shipped 2025-11-25. Letta is 0.x. AutoGen rewrote itself for 0.4 last year. Rules aren't settled.
+
+- **Today**: SuperX behind on features, ahead on substrate design, no users.
+- **12 months**: SuperX shipped MVP collector + intelligence blades, has 100-1000 users running it, has compounding feature velocity advantage.
+- **18 months**: Anthropic / Microsoft / Google can copy the substrate idea but they don't (large orgs move slowly on architecture rewrites). Letta / AutoGen could; they're more agile but their existing codebases fight them.
+- **24 months**: Either we have the user-velocity moat OR the architectural-moat thesis was wrong and an incumbent caught up. Bet is real.
+
+The wedge has to land in months 0-12. After that we're on equal footing with whichever incumbent reorganizes fastest. **Use the window.**
+
 ### 0d. MVP scope — what "first viable product" means
 
 The MVP is the **collector deployment mode** with the foundations of intelligent classification:
@@ -428,72 +469,112 @@ The full agentic-OS pillar. Adds Designer + Runner; turns SuperX from collector+
 
 ---
 
-## 10. First Viable Product (v1.0) — explicit spec
+## 10. First Viable Product (v1.0) and the Blade Roadmap
 
-This section is the contract for what "shipped" means for the MVP. **Every feature listed below must be implemented, fully tested, and have a green Mandate-5 gate before v1.0 is tagged.** Anything not in this section is deferred to a later release.
+### 10.1 What v1.0 *is*, in one sentence
 
-### 10.1 In-scope features (v1.0)
+> **Drop-in fine-grained telemetry capture for every MCP agent on the host machine, with a local model running RAG over ingested data for free, driven entirely from a CLI.**
 
-| # | Feature | Acceptance criteria |
+That's the product. Everything below is *how* we ship that, blade by blade.
+
+### 10.2 The seven v1.0 capabilities (and nothing else)
+
+| # | Capability | What the operator sees |
 |---|---|---|
-| **F1** | **Auto-discover all detectable MCP agents on the host** during `bootstrap` | Probes succeed without operator action for: Claude Desktop (macOS/Windows/Linux), Claude Code, Cursor, Continue, Cody. Each discovered agent gets `node_agent` + `agent_discovered` telemetry. Test injection via `SUPERX_*_CONFIG` env vars. |
-| **F2** | **Fine-grained telemetry capture from instant-zero** | Every kernel mutation (`supersede_state`, `create_structural_edge`, `checkpoint_execution`, `compile_context`, `pulse`) emits a typed `telemetry_stream` row. Bootstrap alone emits ≥ 16 events. All events tenant-isolated. Reconstructable history by `valid_from` order. |
-| **F3** | **Telemetry egress** to Kafka and HTTP API sinks | Both sinks accept structured `TelemetryRow` payloads. HTTP supports optional bearer-auth. Backpressure-tolerant. (OTLP deferred to post-MVP.) |
-| **F4** | **CLI parity across all kernel verbs** | `bootstrap`, `graphify`, `compile`, `propose`, `evaluate`, `promote`, `identify`, `list-agents`, `list-tools`, `demo`, `stats`, plus new for MVP: `install-model`, `prompts {add|list|show|supersede}`, `models {list|set-default}`. Every verb sets session auth, validates inputs, emits its own typed telemetry. |
-| **F5** | **A model is always loaded** | Default = Gemma 4 (smallest reasonable Q4_K_M GGUF). Discovered via `--model-path` → `SUPERX_MODEL_PATH` env → substrate `node_hardened_model.attr_config.local_path` → `./models/<uid>.gguf`. Fallback to remote model if configured. Boot warns (does not fail) if no model is available; intelligence blades degrade gracefully. |
-| **F6** | **Multi-provider model abstraction via Rig.rs** | `ChatModel` trait covers local Candle + remote Anthropic + remote OpenAI. Per-task model selection lives in `execution_params`, not CLI flags. |
-| **F7** | **Continuous classification of ingested entities** | `ContinuousClassifierBlade` subscribes to `telemetry_stream`; classifies new `node_code` / `node_artifact` entities asynchronously; writes `node_classification` rows. Operator-tunable via `attr_config.classifier_enabled` and `classifier_vocabulary`. |
-| **F8** | **Continuous summarization of long content** | `SummarizerBlade` writes `attr_summary` SCD-2 rows on entities whose `attr_desc` exceeds the configured token threshold. `CompilerBlade` consumes summaries when present. |
-| **F9** | **Insight harvesting from telemetry** | `InsightHarvesterBlade` runs windowed analysis; emits `node_insight` rows when anomaly heuristics (configurable) fire. Operator views via `superx-cli insights --tenant <t>`. |
-| **F10** | **Capability-scored model routing** | `ModelRouterBlade` consults `attr_capability_score` per registered model; picks the cheapest one above the per-task threshold; escalates per `attr_config.escalation_rules`. Choice is recorded in `execution_params`. |
-| **F11** | **Operator-authored custom prompts** | Prompts are `node_artifact` entities. `superx-cli prompts add <name> --body <text>` writes one. Blades read prompts by name via `Kernel::load_prompt`. Supersession follows SCD-2 (full audit chain). |
-| **F12** | **`execution_params` SCD-2 table** | Holds per-run knobs (temperature, top_p, top_k, max_tokens, turns, branch, retry_policy, model_ref, …). Append-only, time-travel-queryable. Knob updates close prior row + open new. |
-| **F13** | **`execution_cursor` SCD-2 conversion** | Resume-points stop using in-place `UPSERT`; switch to close-and-create per §7-#5. Full cursor history is recoverable. |
-| **F14** | **HITL primitives (foundation, not full)** | New `attr_approval` type. Any blade-proposed substrate mutation (`node_proposed_edge`, `node_param_proposal`, `node_critique`) can be gated behind an `awaiting_human` status with `attr_config.hitl.required = true`. Approval requires an `edge_approves` from an operator agent. Default thresholds favour autonomous flow; operators tune up if desired. |
-| **F15** | **Models directory convention** | `./models/` (gitignored) is the workspace-default location. `superx-cli install-model gemma-4-27b-it-q4_k_m` downloads via `hf-hub`, registers the `node_hardened_model` entity, runs the baseline benchmark via Meta-Harness, writes the `attr_capability_score`. |
-| **F16** | **Three deployment modes selectable via attr_config** | `collector` (telemetry + classifier only), `designer` (+ Compiler + Designer-stub), `full` (all blades). Default = `full`. Background-task spawn is conditional on the mode. |
-| **F17** | **Doc-complete pub surface** | Every pub item on every crate carries a `///` rustdoc comment including `# Errors` / `# Panics` where applicable. The full code-comment pass from issue #3 is landed. |
+| **C1** | **Auto-onboarding** | `superx-cli bootstrap --tenant demo` discovers every MCP agent on the system (Claude Desktop, Claude Code, Cursor, Continue, Cody) with no further config. **The local model classifies each discovered agent at discovery time** and emits a welcome `node_insight` summarising what it found and suggesting next steps. |
+| **C2** | **Fine-grained telemetry firehose** | Every kernel mutation produces a typed `telemetry_stream` row. `superx-cli stats` shows the live feed. Optional Kafka / HTTP egress. |
+| **C3** | **Local model integrated, always present, actively used** | A GGUF model loads on boot from `./models/`. `superx-cli install-model gemma-4-…` fetches one if absent. The model is a `node_hardened_model` entity. **Touches bootstrap, classification, summarization, insight, RAG, and the `ask` verb — not a passive dependency.** |
+| **C4** | **RAG over any ingested source** | `superx-cli graphify --path <dir>` ingests + classifies + summarizes. `superx-cli compile --root <id>` returns a tier-filtered, summary-enriched context window the model has already pre-processed. |
+| **C5** | **Continuous local intelligence** | Four background blades (Classifier, Summarizer, Insighter, Router) running 24/7, subscribed to `telemetry_stream`, producing classifications / summaries / insights without operator action. All four are model-driven. |
+| **C6** | **Natural-language OS interface** ⭐ | `superx-cli ask "<question>"` — the model translates English to substrate queries, executes them, and returns an answer with citations. Example: `superx-cli ask "what agents have been most active in the last hour"` → reads telemetry, summarises, cites the source events. **This is what makes SuperX an *intelligent* agentic OS, not a fancy logger.** |
+| **C7** | **Everything is a parameter** | No hardcoded values. Models, prompts, thresholds, sink targets, classifier vocabulary, HITL gates — all `attr_config` rows. `superx-cli prompts add/list/show/supersede`, `superx-cli config set/get`. |
 
-### 10.2 Out-of-scope for v1.0 (deferred to v1.x or later)
+If a behavior isn't covered by C1-C7, it's not v1.0. Designer, Runner, schedule table, federation, chat UI — all v1.x or later.
 
-- `DesignerBlade` (Phase F)
-- `RunnerBlade` and `schedule` table (Phase F)
-- `EdgeProposerBlade`, `ParamTunerBlade` continuous variants (Phase F)
-- `node_data_source_*` connectors for MySQL / Postgres / Iceberg (Phase F)
-- Full MCP 2025-11-25 surface — only `tools` is exposed at v1.0 (Phase F)
-- OTLP egress (Phase G)
-- Automerge CRDT integration + Chat UI (Phase G)
-- Real service-account auth — `db.set(session_tenant, ...)` is still the model at v1.0 (Phase H)
-- Wasm Component Model for tool blades (Phase H)
+### 10.2.1 How the model is woven into v1.0 — every touchpoint
 
-### 10.3 v1.0 test matrix
+The model is not a passive "loaded" dependency. It is actively used at six distinct points in v1.0, each with a clear contract and graceful degradation if the model is unavailable:
 
-Every feature above maps to test files. All tests run under Mandate-5 gates. Numbers below are minimum targets — more is fine.
+| Touchpoint | What the model produces | Fallback if no model loaded |
+|---|---|---|
+| **At bootstrap, per discovered agent** | A `node_classification` row labelling the agent (`{role: "filesystem-server", trust: "user", expected_tools: [...]}` ) | Agent registered as `unclassified`; classifier blade picks it up later if model becomes available |
+| **At bootstrap, post-discovery** | A `node_insight` welcome row: "I found 3 MCP agents, 2 of which are filesystem tools. You have a Rust project at /Users/…/SuperX — would you like to graphify it for RAG?" | Bootstrap completes silently; operator sees census telemetry only |
+| **At ingest** (`graphify`) | Per-file `node_classification` (test / config / production-logic / dead-code) + `attr_summary` rows for long content | Files ingested with raw `attr_desc` only; classification rows missing |
+| **At telemetry windows** (continuous) | `node_insight` rows when anomaly heuristics fire — but with the model's narrative explanation attached | Insights still fire from heuristic rules; the narrative field is empty |
+| **At `compile_context`** (RAG) | Tier-filtered context, *with summaries inlined* where they exist | Raw `attr_desc` text without summaries; larger context window consumed |
+| **At `ask` verb** | English → substrate query plan → execute → natural-language answer with cited entity ids | `ask` fails fast with "no model loaded; use `superx-cli install-model gemma-…` first" |
 
-| Layer | Coverage |
-|---|---|
-| **Unit (per-crate, in `crates/<c>/src/lib.rs#tests`)** | ≥ 1 test per public function. Verifies the API contract, not internals. |
-| **Integration (cross-crate, in `crates/superx-cli/tests/`)** | New file `mvp_release.rs`: drives `bootstrap → discover agents → classify ingested fixture → summarize → emit insight → telemetry capture → stats CLI returns all events`. End-to-end, one tenant. |
-| **Capability** (existing `core_capabilities.rs`) | Already at 36 tests; expand to ≥ 50 covering each new MVP feature (F7-F11 each get ≥ 2 tests). |
-| **MCP dispatch** | Existing 4 tests in `core_capabilities.rs` cover the policy layer. Extend with one test per new tool surfaced. |
-| **Telemetry egress** | Already covered by `apisink_*` (wiremock). Add Kafka emission test using a `wiremock`-equivalent (or `rdkafka` mock producer). |
-| **Smoke (`cargo run` driven)** | New shell script `scripts/mvp_smoke.sh` that runs the full operator flow: `bootstrap → install-model → list-agents → list-tools → graphify → stats`. Asserts exit codes + expected telemetry events. |
-| **Mandate-5 gates** | `cargo test --workspace` 100% pass; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean. CI-enforced before any merge to `main`. |
+**Graceful degradation is non-negotiable.** If the model file is missing, SuperX still boots, still captures telemetry, still ingests data — every blade logs a clear warning and idles. The operator can install a model anytime and the blades wake up. This is what "intelligent OS" requires: the *OS* part must work even when the *intelligent* part is offline. The Router blade encodes this explicitly: tasks that require a model and have no fallback fail with a specific error code the operator can act on.
 
-### 10.4 Release checklist for v1.0
+### 10.3 The blade roster — every feature = exactly one blade
 
-1. ☐ All 17 features F1-F17 implemented + tested
-2. ☐ All MVP roadmap issues closed
+This is the modular contract. **A "feature" is a blade with a config schema, a subscription, an output type, and a parameter set.** Adding a feature post-v1.0 means adding a row to this table and implementing it. The substrate doesn't change.
+
+#### Blades shipping in v1.0
+
+| Blade | Lives in | Subscribes to | Writes | Parameters (on `attr_config`) | Mode |
+|---|---|---|---|---|---|
+| **`TelemetrySubscriber`** | `superx-emission` | `LIVE SELECT telemetry_stream` | Kafka + HTTP egress | `emission_enabled`, `data_scope`, `kafka_brokers`, `kafka_topic`, `emission_api` | All |
+| **`HeartbeatPulse`** | `superx-mcp` (bin) | `tokio::interval(60s)` | `system_pulse` telemetry rows | `pulse_interval_secs` | All |
+| **`BootstrapBlade`** | `superx-bootstrap` | (one-shot on `bootstrap` CLI) | substrate seed + `agent_discovered` events + model-classified agent labels + welcome `node_insight` (when model is loaded) | `bootstrap_default_admins`, `mcp_client_probe_set`, `bootstrap_model_classify_enabled`, `bootstrap_welcome_prompt_uid` | All |
+| **`AskBlade`** ⏳ | `superx-runtime::ask` | (called by CLI `ask` verb) | Natural-language answer + citation entity ids | `ask_planning_prompt_uid`, `ask_max_context_tokens`, `ask_default_model` | All |
+| **`ContinuousClassifierBlade`** ⏳ | `superx-runtime::classifier` | `state_supersede` on `node_code` / `node_artifact` | `node_classification` + `edge_classifies` | `classifier_enabled`, `classifier_vocabulary`, `classifier_threshold` | Collector, Designer, Full |
+| **`SummarizerBlade`** ⏳ | `superx-runtime::summarizer` | `state_supersede` on `attr_desc` rows > token threshold | `attr_summary` SCD-2 rows | `summarize_threshold_tokens`, `summarize_max_output_tokens` | Collector, Designer, Full |
+| **`InsightHarvesterBlade`** ⏳ | `superx-runtime::insighter` | Windowed scan of telemetry | `node_insight` + `edge_observes` to source events | `insight_window_secs`, `insight_anomaly_thresholds` | Collector, Designer, Full |
+| **`ModelRouterBlade`** ⏳ | `superx-runtime::router` | Every model-using dispatch | `execution_params` row recording the choice | `routing_escalation_rules`, `routing_default_thresholds` | All |
+| **`CapabilityGovernor`** | `superx-agent` | (called inline on every MCP dispatch) | (no writes, returns Result) | `capability_audit_enabled` | All |
+| **`MetaHarness`** | `superx-harness` | (called by `MetaHarness::evaluate/promote`) | `attr_score`, `edge_promotes` | `metaharness_fuel_limit`, `metaharness_default_threshold` | All |
+| **`CompilerBlade`** | `superx-compiler` | (called by CLI `compile` + Proposer + Runner) | XML context output | `compile_max_depth`, `compile_max_nodes`, `compile_default_tiers` | All |
+| **`UniversalIngestor`** | `superx-ingest` | (called by CLI `graphify`) | new entities + `edge_owns` + `attr_desc` | `max_ingestion_entries`, `ingest_exclude_patterns` | Collector, Designer, Full |
+
+⏳ = not yet implemented, ships in v1.0.
+
+Every blade above is independently testable, independently togglable, independently parametrizable. No blade reaches into another blade's internals. Adding a blade is a Cargo file + a module file + a registration call in the host binary.
+
+#### Blades shipping post-v1.0 (the visible horizon)
+
+Each row in this table is one future release. Operators see exactly what each release adds.
+
+| Release | New blades | Capability gained |
+|---|---|---|
+| **v1.1** | `EdgeProposerBlade` (background) — Phase F start | Continuous structural-edge proposal; Meta-Harness gates promotion. Plus refinement of v1.0 blades based on usage data. |
+| **v1.2** | `ParamTunerBlade` | Self-tuning `execution_params` based on schedule outcomes. Substrate gets better at running itself. |
+| **v2.0** | `ScheduleBlade` (the `schedule` table) + `RunnerBlade` | First autonomous execution. Schedule items get consumed by background workers; tasks run without operator triggering. **Crosses from "intelligent collector" to "autonomous OS."** |
+| **v2.1** | `DesignerBlade` | Operator describes a product in English; Designer produces a cascading DAG; Runner executes it. |
+| **v2.2** | `DataSourceConnectorBlade` (SQL / Iceberg / RAG / remote-model subtypes) | Connectors for MySQL, Postgres, Iceberg, S3, Confluence, etc. The "compiled data sources" pillar. |
+| **v2.3** | `OtelSink` + GenAI semantic conventions | Datadog / Honeycomb / Grafana plug-and-play observability. |
+| **v3.0** | `SupersetSink` + `MothershipModelRouter` | Federated analytics: local SuperX nodes phone home to a central Superset for org-wide telemetry; complex queries escalate to a central mothership model. |
+| **v3.1** | `EchartsToolBlade` | Dynamic chart generation: the model produces eCharts JSON configs; a new tool serves them. |
+| **v3.2** | `CrdtDagEditingBlade` (Automerge-rs) + `ChatUiBlade` | Collaborative DAG authoring; chat UI is a downstream consumer of the substrate via MCP. |
+| **v4.0** | `WasmComponentBlade` | Tool blades are wasm components with capability-typed imports. Long-term safety story. |
+
+Every release is **strictly additive**. No release breaks an earlier release's API contract. SCD-2 + entity-of-everything means migrations are substrate writes, not schema changes.
+
+### 10.4 v1.0 implementation phases (the work breakdown)
+
+| Phase | Work | Issues | Acceptance |
+|---|---|---|---|
+| **A** — Tech-debt baseline | Backfill doc comments → diligent read-through → detailed comment pass. | #1, #2, #3 | All pub items documented. Zero `unwrap()` outside known-safe sites. |
+| **B** — Substrate foundations | `execution_params` SCD-2 table + `execution_cursor` SCD-2 conversion + prompt-template entity helper + `attr_summary` + `attr_capability_score` types. | #5 (subset), #6 (subset), #14, new | New verbs + types pass per-feature tests. |
+| **C** — Model plug-and-play | Rig.rs adoption + `./models/` convention + `superx-cli install-model` + `ModelRouterBlade` scaffold. | #16, #24, #27 (new) | One local + one remote `CompletionModel` implementation in tree, both selectable via `execution_params`. |
+| **D** — Continuous intelligence blades + Ask | New crate `superx-runtime` with Classifier / Summarizer / Insighter / Router fully wired, **plus `AskBlade` and the `superx-cli ask` verb**. Model-aware bootstrap (classify discovered agents + emit welcome insight). | #20 (revised), #21, #22, #23 (new), Ask | Each blade independently togglable; integration test proves end-to-end firehose lights up; `ask` returns a sensible answer with citations on a fixture-bootstrapped substrate. |
+| **E** — Onboarding completeness + release polish | Extend bootstrap probes to Claude Code / Cursor / Continue / Cody. `superx-cli prompts` subcommand. MVP integration test suite. `cargo dist` release pipeline. Tag v1.0.0. | #28 (new), #29 (new) | Operator can `cargo install` (or download binary) and have the full collector+RAG+Ask running in < 5 minutes. |
+
+Each phase ends with a green Mandate-5 gate. No phase starts before the previous phase's gate passes.
+
+### 10.5 v1.0 release checklist
+
+1. ☐ Capabilities C1-C6 all implemented + smoke-tested end-to-end
+2. ☐ All v1.0 blades from §10.3 implemented + per-blade tests
 3. ☐ `cargo test --workspace`: 100% pass
 4. ☐ `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean
-5. ☐ MVP smoke script `scripts/mvp_smoke.sh` passes locally on macOS + Linux
-6. ☐ `ARCHITECTURE.md` updated with "v1.0 shipped" status block
-7. ☐ `README.md` updated with v1.0 quickstart
-8. ☐ Release notes drafted under `RELEASES.md`
-9. ☐ `cargo dist` releases binaries for macOS (Apple Silicon + Intel) + Linux x86_64
-10. ☐ GitHub release tagged `v1.0.0` with binaries attached
-11. ☐ Architecture issue updated with v1.0 surface
-12. ☐ Demo video (or asciinema cast) of `bootstrap → install-model → graphify → stats` for the README
+5. ☐ `scripts/mvp_smoke.sh` passes locally on macOS + Linux
+6. ☐ Every pub item has a `///` rustdoc comment
+7. ☐ `README.md` updated with v1.0 quickstart matching §10.1's one-sentence positioning
+8. ☐ `RELEASES.md` v1.0 release notes drafted
+9. ☐ `cargo dist` builds binaries for macOS (Apple Silicon + Intel) + Linux x86_64
+10. ☐ GitHub release tagged `v1.0.0` with binaries attached + 30-second asciinema cast
+11. ☐ Pinned ARCHITECTURE issue updated with "v1.0 shipped — see §10.3 blade roster" surface
 
 ### 9. Operator Quickstart
 
