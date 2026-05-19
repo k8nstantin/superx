@@ -251,6 +251,19 @@ impl Kernel {
 
             DEFINE INDEX IF NOT EXISTS cursor_lookup ON execution_cursor FIELDS run_id, tenant_id;
 
+            DEFINE TABLE execution_params SCHEMAFULL
+                PERMISSIONS FOR select, create, update, delete WHERE tenant_id = $session_tenant OR $session_role = 'admin';
+            DEFINE FIELD run_id      ON execution_params TYPE string;
+            DEFINE FIELD tenant_id   ON execution_params TYPE string DEFAULT '00000000-0000-0000-0000-000000000000';
+            DEFINE FIELD agent_id    ON execution_params TYPE string;
+            DEFINE FIELD params_json ON execution_params FLEXIBLE TYPE object;
+            DEFINE FIELD is_current  ON execution_params TYPE bool DEFAULT true;
+            DEFINE FIELD valid_from  ON execution_params TYPE datetime DEFAULT time::now();
+            DEFINE FIELD valid_to    ON execution_params TYPE option<datetime>;
+
+            DEFINE INDEX IF NOT EXISTS exec_params_current ON execution_params FIELDS run_id, agent_id, is_current;
+            DEFINE INDEX IF NOT EXISTS exec_params_run     ON execution_params FIELDS run_id, is_current;
+
             DEFINE TABLE telemetry_stream SCHEMALESS CHANGEFEED 1d
                 PERMISSIONS FOR select, create, update, delete WHERE tenant_id = $session_tenant OR $session_role = 'admin';
             DEFINE FIELD timestamp        ON telemetry_stream TYPE datetime DEFAULT time::now();
@@ -700,13 +713,115 @@ impl Kernel {
     /// Returns `KernelError::Database` if query fails.
     pub async fn get_execution_cursor(&self, run_id: &str) -> Result<Option<CursorResult>, KernelError> {
         assert!(!run_id.is_empty(), "Run ID mandatory");
-        
+
         let query = "SELECT last_processed, metadata FROM execution_cursor WHERE run_id = $run_id AND tenant_id = $session_tenant LIMIT 1";
         let mut res = self.db.query(query)
             .bind(("run_id", run_id.to_string())).await?;
-        
+
         let cursor = res.take::<Vec<CursorResult>>(0)?.pop();
         Ok(cursor)
+    }
+
+    /// `set_execution_params`: SCD-2 write of per-run agent execution knobs
+    /// (`temperature`, `top_p`, `top_k`, `max_tokens`, `turns`, `branch`,
+    /// `retry_policy`, `model_ref`, …). Closes any prior `is_current` row for the same
+    /// `(run_id, agent_id)` tuple within the calling session's tenant, then
+    /// inserts a fresh `is_current` row — one atomic transaction. The full
+    /// history is recoverable by `SELECT … ORDER BY valid_from ASC`.
+    ///
+    /// `params` is an opaque JSON object: the kernel does not enforce a
+    /// schema on its contents (blades enforce their own knob shape).
+    ///
+    /// Emits an `execution_params_set` telemetry event.
+    ///
+    /// # Panics
+    /// Panics if `run_id` or `agent_id` are empty.
+    ///
+    /// # Errors
+    /// Returns `KernelError::SafetyViolation` if no session is established;
+    /// `KernelError::Database` if the transaction fails.
+    pub async fn set_execution_params(
+        &self,
+        run_id: &str,
+        agent_id: &str,
+        params: serde_json::Value,
+    ) -> Result<(), KernelError> {
+        assert!(!run_id.is_empty(), "run_id mandatory");
+        assert!(!agent_id.is_empty(), "agent_id mandatory");
+
+        // Pre-condition: caller is in a session. We don't pass tenant explicitly;
+        // it flows through `$session_tenant`. This call is here to surface the
+        // 'no session' case as a clean SafetyViolation rather than a SurrealDB
+        // permission error.
+        let _session_tenant = self.get_session_tenant().await?;
+
+        let row_id = Thing::from((
+            "execution_params",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(::uuid::Uuid::now_v7())),
+        ));
+
+        let query = r"
+            BEGIN TRANSACTION;
+                UPDATE execution_params SET is_current = false, valid_to = time::now()
+                WHERE run_id = $rid AND agent_id = $aid AND is_current = true AND tenant_id = $session_tenant;
+
+                CREATE execution_params CONTENT {
+                    id: $id,
+                    run_id: $rid,
+                    tenant_id: $session_tenant,
+                    agent_id: $aid,
+                    params_json: $params,
+                    is_current: true,
+                    valid_from: time::now()
+                };
+            COMMIT TRANSACTION;
+        ";
+
+        self.db.query(query)
+            .bind(("id", row_id))
+            .bind(("rid", run_id.to_string()))
+            .bind(("aid", agent_id.to_string()))
+            .bind(("params", params)).await?.check()?;
+
+        let _ = self.log_telemetry(
+            serde_json::json!({"run_id": run_id, "agent_id": agent_id}),
+            "execution_params_set",
+            Some(run_id.to_string())
+        ).await;
+
+        Ok(())
+    }
+
+    /// `get_execution_params`: read the current execution-params payload for a
+    /// `(run_id, agent_id)` tuple within the calling session's tenant. Returns
+    /// `Ok(None)` when no row exists; `Ok(Some(params_json))` when it does.
+    ///
+    /// # Panics
+    /// Panics if `run_id` or `agent_id` are empty.
+    ///
+    /// # Errors
+    /// Returns `KernelError::Database` if the query fails.
+    pub async fn get_execution_params(
+        &self,
+        run_id: &str,
+        agent_id: &str,
+    ) -> Result<Option<serde_json::Value>, KernelError> {
+        #[derive(serde::Deserialize)]
+        struct Row { params_json: serde_json::Value }
+
+        assert!(!run_id.is_empty(), "run_id mandatory");
+        assert!(!agent_id.is_empty(), "agent_id mandatory");
+
+        let query = "SELECT params_json FROM execution_params \
+            WHERE run_id = $rid AND agent_id = $aid AND is_current = true \
+            AND tenant_id = $session_tenant LIMIT 1";
+
+        let mut res = self.db.query(query)
+            .bind(("rid", run_id.to_string()))
+            .bind(("aid", agent_id.to_string())).await?;
+
+        let row = res.take::<Vec<Row>>(0)?.pop();
+        Ok(row.map(|r| r.params_json))
     }
 }
 
