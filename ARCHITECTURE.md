@@ -135,6 +135,44 @@ When models are local (the default expectation — SuperX is "best local model, 
 
 Remote-model entities (Claude, GPT-5, Gemini) carry their endpoint URL + auth-token-ref in `attr_config`; no local file required.
 
+### 0c-2. The execution pipeline — design → compile → schedule → run (Terraform-style)
+
+Borrowed wholesale from Terraform's `plan`/`apply` pattern: **nothing executes that hasn't been compiled.** The substrate has four execution-layer phases, each with a distinct blade, each calling the local model when judgment is required. This binds *how* work flows from intent to outcome — and prevents the wrong-layer mistakes called out in §8 and §9 of the operating skill (`zero-trust-execution`).
+
+1. **Design** — operator intent (text + constraints) → DAG of substrate entities. `DesignerBlade` (#3) calls the local model to plan: which `node_product`, which `node_component`s, which `node_task`s, which `node_data_source*` (`_sql` / `_iceberg` / `_postgres` / `_rag` / `_remote_model`), which `node_hardened_model`s, which `node_agent`s, which prompt entities — all linked by `edge_owns` / `edge_implements` / dep edges. Output: an *uncompiled* DAG with `attr_compile_status = 'uncompiled'` on the root.
+
+2. **Compile** (the Terraform-`plan` analog) — `CompilerBlade` (#30) walks the uncompiled DAG and validates **every connection** before anything queues:
+   - **Topology checks** via `petgraph`/`daggy`: `is_cyclic_directed` (no impossible cycles), `toposort` (execution order), single-root + reachability of every node from the root.
+   - **Substrate checks**: every referenced entity exists; every `node_data_source_sql` is reachable (`sqlx::query!("SELECT 1")`); every `node_rag_source` corpus is queryable; every `node_hardened_model` has its weights resolvable per §0c-1 path-discovery order; every `node_agent` has the capability edges its assigned task requires.
+   - **Template checks**: every prompt entity resolves all `{variable}` references against upstream task outputs (via `minijinja` or `tera`).
+   - **Semantic checks via the local model** (through Rig.rs once #16 lands): does the prompt match what the upstream RAG actually covers? Are there missing intermediate steps? Does the assigned agent's capability match the task's intent? Each model call records its rationale text.
+   
+   Output: every entity in the DAG gets `attr_compile_status` written via `state_ledger` (`'compiled'` or `'failed'`) plus an `attr_compile_report` envelope (resolved refs, estimated fuel cost, telemetry budget, failure list). **Uncompiled DAGs cannot enter the schedule.** Idempotent and re-runnable: SCD-2 history of `attr_compile_status` shows the moment a previously-valid DAG became invalid (e.g., upstream data-source schema drift, RAG corpus rotation, model capability-score change).
+
+3. **Schedule** — `SchedulerBlade` (#31) is the local-model layer **over** a dumb queue. Continuous loop: reads compiled DAGs (`attr_compile_status='compiled'`), current `schedule` rows, telemetry windows (latency / failure / success patterns), agent load, `execution_params` history. Proposes scheduling decisions via `node_proposal` rows scored by the Meta-Harness — which compiled DAG enqueues next with what `execution_params`, which failed items retry vs. abandon vs. escalate to HITL, which DAG successors are newly ready, which param defaults to tune for a given task kind. Every model call emits a `scheduler_*` telemetry event with rationale text. **The `schedule` table itself stays dumb** — every judgment lives in proposals with full audit trail, per §9 of the operating skill.
+
+4. **Run** (the Terraform-`apply` analog) — `RunnerBlade` (#2) is the pure mechanical executor. **No model calls, no scheduling decisions** — those live in `SchedulerBlade`. Pops a due schedule row; refuses unless `target_entity.attr_compile_status='compiled'`; walks the compiled DAG via `petgraph::toposort`, parallel up to `attr_config.max_concurrent` (Terraform's pattern); reads each node's prompts/instructions/capability/agent/execution_params; dispatches via `CapabilityGovernor` + the appropriate tool blade; writes results back as superseded state; emits typed telemetry per step; transitions the schedule row.
+
+**Binding invariants:**
+- Schedule rows reference **compiled-DAG entity roots** (or sub-DAG nodes). The runner refuses uncompiled targets.
+- Compile is **idempotent**: re-compiling the same DAG with unchanged upstream produces the same report.
+- Every model call (Designer, Compiler, Scheduler) emits typed telemetry with rationale text. **No silent intelligence** — the model is woven through every decision and every decision is auditable.
+- Recompile on upstream change. When a data source's schema drifts or a model's capability scores change, dependent compiled DAGs get re-compiled and their SCD-2 `attr_compile_status` chain shows the transition.
+
+**Library leverage** (per the §8 library philosophy "reuse first, build second"):
+- **`petgraph`** + **`daggy`** for in-memory DAG operations (toposort, cycle check, parallel walk order). The Rust standard; ubiquitous, mature.
+- **`Rig.rs`** (roadmap #16) for every local-model call inside Designer / Compiler / Scheduler.
+- **`minijinja`** or **`tera`** for prompt-template variable binding during Compile (decide at impl time).
+- **`jsonschema`** (already a workspace dep) for entity-attr schema validation during Compile.
+- **`sqlx`** for `node_data_source_sql` reachability probes during Compile.
+- Reference implementations to *study* but **not adopt wholesale**: [`dagrs`](https://github.com/dagrs-dev/dagrs), [`erio-workflow`](https://crates.io/crates/erio-workflow), [`oxigdal-workflow`](https://lib.rs/crates/oxigdal-workflow), `Flow-Like`, `sayiir`. Generic workflow engines don't fit our substrate-driven + telemetry-everywhere + Governor-gated constraints; we borrow patterns (parallelism, checkpointing, conditional nodes), build bespoke.
+
+**The boundary rules** (from the operating skill, restated here because they're load-bearing for this pipeline):
+- Don't queue uncompiled DAGs. The Compile step is non-negotiable.
+- Don't put intelligence in the queue (§9 skill). All Scheduler judgment lives in proposals.
+- Don't put queue logic in the entities (§8 skill). The DAG is design; the queue is execution.
+- Designer designs, Compiler validates, Scheduler decides, Runner executes. Four blades, four jobs.
+
 ### 0c-extensibility. The extensibility moat — our durable competitive advantage
 
 SuperX's competitive position rests on **two structural advantages**, not on tactical feature counts:
@@ -347,10 +385,10 @@ Each is scoped against the §0 vision. Marked **[NEW]** if the crate/file does n
 
 | # | Primitive | Crate | Type | Description |
 |---|---|---|---|---|
-| 1 | `schedule` table | `superx-kernel` | [EXTEND] | A new SCHEMAFULL table next to `execution_cursor`, holding pending work items: `{run_id, tenant_id, kind, target_entity, due_at, status, attempt, depends_on, metadata, is_current, valid_from, valid_to}`. Indexed by `(due_at, is_current)` and `(run_id, is_current)`. **SCD-2 + append-only** per §7 invariant 5: every status transition (`waiting → scheduled → running → completed/failed`) creates a new row; prior row gets `valid_to`. |
+| 1 | `schedule` table | `superx-kernel` | [EXTEND] | A new SCHEMAFULL table next to `execution_cursor`, holding pending work items: `{run_id, tenant_id, kind, target_entity, due_at, status, attempt, depends_on, metadata, is_current, valid_from, valid_to}`. Indexed by `(due_at, is_current)` and `(run_id, is_current)`. **SCD-2 + append-only** per §7 invariant 5: every status transition (`waiting → scheduled → running → completed/failed`) creates a new row; prior row gets `valid_to`. **Per §0c-2**, `target_entity` references the root (or sub-root) of a **compiled product DAG** (`attr_compile_status='compiled'`); `RunnerBlade` refuses uncompiled targets. The table itself stays dumb — all scheduling judgment lives in `SchedulerBlade` (#31) proposals, never in schema columns (§9 of the operating skill). |
 | 1b | `execution_params` table | `superx-kernel` | [EXTEND] | A new SCHEMAFULL table holding per-run agent knobs: `{run_id, tenant_id, agent_id, params_json, is_current, valid_from, valid_to}`. `params_json` carries the full set: `{temperature, top_p, top_k, max_tokens, turns, branch, retry_policy, model_ref, …}`. **SCD-2 + append-only**: changing any knob closes the prior row and writes a new one. The Runner reads the current row at dispatch time. |
-| 2 | `RunnerBlade` | `superx-runner` | [NEW] | Background loop spawned by `superx-cli` and `superx-mcp`. Polls the `schedule` table for due-and-ready items (deps satisfied), reads `execution_params` for the run, sets session auth, dispatches via `CapabilityGovernor` + the appropriate tool blade, writes results back as superseded state, and transitions the schedule row's status. All transitions log `schedule_*` telemetry events. |
-| 3 | `DesignerBlade` | `superx-designer` | [NEW] | Consumes a product-intent payload (text + constraints) and the substrate's catalogue of compiled `node_data_source` / `node_component` / `node_hardened_model` entities. Produces the full cascading DAG (`node_product → component* → task*`) with `edge_owns` and `edge_implements` edges, then enqueues the leaf tasks into the `schedule` table. Uses local Candle inference (or a configured remote model) for the planning step. |
+| 2 | `RunnerBlade` (Terraform-`apply` analog) | `superx-runner` | [NEW] | Background loop spawned by `superx-cli` and `superx-mcp`. **Pure mechanical executor** — no local-model calls, no scheduling decisions (those live in `SchedulerBlade` #31). Pops a due schedule row, **refuses unless `target_entity.attr_compile_status='compiled'`** (per §0c-2), walks the compiled DAG via `petgraph::toposort` with parallel execution up to `attr_config.max_concurrent` (Terraform's pattern), reads `execution_params` for the run, sets session auth, reads each DAG node's prompts/instructions/capability/agent attrs via `state_ledger`, dispatches via `CapabilityGovernor` + the appropriate tool blade, writes results back as superseded state, transitions the schedule row. Every step emits typed `schedule_*` / `runner_*` telemetry — no silent failures, no untracked retries. |
+| 3 | `DesignerBlade` (intent → uncompiled DAG) | `superx-designer` | [NEW] | Consumes a product-intent payload (text + constraints) and the substrate's catalogue of `node_data_source*` / `node_component` / `node_hardened_model` / `node_agent` entities. Produces the full cascading DAG (`node_product → component* → task*`) with `edge_owns` / `edge_implements` / dep edges. Marks the root with `attr_compile_status='uncompiled'` via `state_ledger`. **Does not touch the schedule** — per §0c-2, uncompiled DAGs flow through `CompilerBlade` (#30) and `SchedulerBlade` (#31) before any schedule row is created. Uses the local model (via Rig.rs once #16 lands) for the planning step; every model call emits typed telemetry with rationale text. |
 | 4 | `node_data_source` + connector traits | `superx-kernel` + `superx-ingest` | [EXTEND] | New `node_data_source` (and subtypes `node_data_source_sql`, `node_data_source_iceberg`, `node_data_source_rag`, `node_data_source_remote_model`) in the metamodel. `superx-ingest` gains connector blades that probe and compile each source into the substrate (schema fingerprint, table list, vector chunks, model card). |
 | 5 | Vector embedding pipeline | `superx-ingest` + `superx-inference` + `superx-kernel` schema | [EXTEND] | Define `attr_embedding` type with a vector field; add SurrealDB `DEFINE INDEX … MTREE DIMENSION …` for cosine search. `UniversalIngestor` chunks text via configurable strategy, calls `superx-inference` for embeddings, stores on the chunk entity. Activates `edge_semantic` via similarity queries inside `CompilerBlade`. |
 | 6 | Prompts as substrate entities | `superx-compiler` + `superx-proposer` | [EXTEND] | Move every hardcoded prompt string to a `node_artifact` with `attr_desc` payload. Blades read their prompt template via `Kernel::compile_context` at the start of every run. The Meta-Harness can supersede prompt entities the same way it promotes code proposals. |
@@ -377,6 +415,8 @@ Each is scoped against the §0 vision. Marked **[NEW]** if the crate/file does n
 | 27 | Models directory convention + `superx-cli install-model` | `superx-cli` + filesystem | [NEW, MVP] | Workspace-relative `./models/` (gitignored) holds local GGUFs. Discovery order: `--model-path` flag → `SUPERX_MODEL_PATH` env → `node_hardened_model.attr_config.local_path` → `./models/<uid>.gguf`. `superx-cli install-model gemma-4-27b-it` downloads + registers + benchmarks the model entity. |
 | 28 | Custom prompt entities + operator authoring CLI | `superx-cli` + `superx-kernel` | [EXTEND of #6] | `superx-cli prompts add <name> --body <text>` writes a `node_artifact` of type `prompt_template`. Blades look up their prompt by name; operators can supersede prompts at any time (SCD-2 audit chain). The Meta-Harness can A/B-test prompt versions the same way it scores code proposals. |
 | 29 | Auto-onboard all MCP clients on the system | `superx-bootstrap` | [EXTEND, MVP] | Bootstrap currently probes Claude Desktop config + Claude Desktop logs. Extend the probe set to: Claude Code config, Cursor MCP config, Continue/Cody/other-MCP-client configs. Each discovered agent gets a `node_agent` row + `agent_discovered` telemetry. The bar: drop SuperX on a machine, run `bootstrap`, every agent gets onboarded automatically. |
+| 30 | `CompilerBlade` (DAG validation, Terraform-`plan` analog) | `superx-planner` | [NEW] | Walks an uncompiled product DAG (root: `node_product` with `attr_compile_status='uncompiled'`) and validates **every connection** before anything queues. Topology via `petgraph`/`daggy`: `is_cyclic_directed` (no impossible cycles), `toposort` (execution order), single-root + reachability. Substrate: every referenced entity exists; every `node_data_source_sql` reachable via `sqlx::query!("SELECT 1")`; every `node_rag_source` corpus queryable; every `node_hardened_model` weights resolvable; every `node_agent` has the capability edges its task requires. Templates: every prompt entity resolves all `{variable}` refs against upstream task outputs (`minijinja`/`tera`). Local-model checks via Rig.rs: semantic sanity ("does this prompt match this RAG?"), missing-step detection, agent/intent alignment, rationale recorded. Writes `attr_compile_status='compiled'` + `attr_compile_report` (resolved refs, fuel cost estimate, telemetry budget, failure list) on every DAG entity via `state_ledger`. **Uncompiled DAGs cannot enter the schedule.** Idempotent + re-runnable; SCD-2 history shows the moment a previously-valid DAG became invalid (upstream drift). Requires two new metamodel types (`attr_compile_status`, `attr_compile_report`) — gated by §7 of the operating skill (operator approval per change). |
+| 31 | `SchedulerBlade` (Gemma over the dumb queue) | `superx-scheduler` | [NEW] | The local-model intelligence layer above the `schedule` table. Continuous background loop: reads compiled DAGs (`attr_compile_status='compiled'`), current `schedule` rows, telemetry windows, agent load, `execution_params` history. Proposes scheduling decisions via `node_proposal` rows scored by the Meta-Harness — which compiled DAG enqueues next + with what `execution_params`, which failed items retry-with-new-knobs / abandon / escalate-to-HITL, which DAG successors are newly ready (graph-walk via `petgraph` from the just-completed entity), which param defaults to tune per `task_kind` (subsumes the `ParamTunerBlade` #26 pattern). Every model call emits a typed `scheduler_*` telemetry event with rationale text. Accepted proposals (auto-promote per capability or HITL approval) become schedule mutations `RunnerBlade` (#2) executes mechanically. **The `schedule` table itself stays dumb** — all judgment lives in proposals, full audit trail per §9 of the operating skill. Generalises the on-demand `ProposerBlade` pattern that already exists for structural edges. |
 
 ### Implementation roadmap — MVP first, then expand
 
@@ -431,17 +471,19 @@ The user-mandated build order: **first viable product**, then layer on. The MVP 
 
 #### Post-MVP — Phase F: autonomous orchestration
 
-The full agentic-OS pillar. Adds Designer + Runner; turns SuperX from collector+RAG into a system that *builds products on its own*.
+The full agentic-OS pillar. Adds the **design → compile → schedule → run** pipeline of §0c-2 (Terraform-style); turns SuperX from collector+RAG into a system that *builds products on its own*. Ordered so each blade lands on a working baseline.
 
-| Roadmap # | Item |
-|---|---|
-| #1 | `schedule` table (SCD-2) |
-| #2 | `RunnerBlade` |
-| #3 | `DesignerBlade` |
-| #25 | `EdgeProposerBlade` (background continuous variant) |
-| #26 | `ParamTunerBlade` (self-tuning) |
-| #4 | `node_data_source` connectors (SQL / Iceberg / RAG / remote-model) |
-| #15 | Full MCP 2025-11-25 surface (`resources` / `prompts` / `sampling` / `elicitation`) |
+| Roadmap # | Item | Why it lands in this order |
+|---|---|---|
+| #1 | `schedule` table (SCD-2) — already merged | Dumb queue, no judgment, ready for consumers. |
+| #1b | `execution_params` table (SCD-2) — already merged | Per-run knobs, ready for consumers. |
+| #4 | `node_data_source` connectors (SQL / Iceberg / Postgres / RAG / remote-model) | Compiler needs to probe these during validation. |
+| #3 | `DesignerBlade` (intent → uncompiled DAG) | Produces what Compiler validates. |
+| #30 | `CompilerBlade` (Terraform-`plan` analog) | Gates entry into the schedule. |
+| #31 | `SchedulerBlade` (local-model intelligence over the dumb queue) | Decides what runs when; subsumes #26 once it ships. |
+| #2 | `RunnerBlade` (Terraform-`apply` analog; pure mechanical executor) | Pops compiled schedule rows, walks the DAG, dispatches. |
+| #25 | `EdgeProposerBlade` (background continuous variant) | Enriches the substrate graph for future Designer runs. |
+| #15 | Full MCP 2025-11-25 surface (`resources` / `prompts` / `sampling` / `elicitation`) | Exposes the pipeline to external clients. |
 
 #### Post-MVP — Phase G: enterprise observability + collaboration
 
@@ -524,7 +566,7 @@ This is the modular contract. **A "feature" is a blade with a config schema, a s
 | **`ModelRouterBlade`** ⏳ | `superx-runtime::router` | Every model-using dispatch | `execution_params` row recording the choice | `routing_escalation_rules`, `routing_default_thresholds` | All |
 | **`CapabilityGovernor`** | `superx-agent` | (called inline on every MCP dispatch) | (no writes, returns Result) | `capability_audit_enabled` | All |
 | **`MetaHarness`** | `superx-harness` | (called by `MetaHarness::evaluate/promote`) | `attr_score`, `edge_promotes` | `metaharness_fuel_limit`, `metaharness_default_threshold` | All |
-| **`CompilerBlade`** | `superx-compiler` | (called by CLI `compile` + Proposer + Runner) | XML context output | `compile_max_depth`, `compile_max_nodes`, `compile_default_tiers` | All |
+| **`ContextCompilerBlade`** (a.k.a. `CompilerBlade` in `superx-compiler` today; the rename lands when the DAG `CompilerBlade` #30 ships, to avoid the name collision) | `superx-compiler` | (called by CLI `compile` + Proposer + Runner) | XML **context** output (entity DAG → agent-ready XML) | `compile_max_depth`, `compile_max_nodes`, `compile_default_tiers` | All |
 | **`UniversalIngestor`** | `superx-ingest` | (called by CLI `graphify`) | new entities + `edge_owns` + `attr_desc` | `max_ingestion_entries`, `ingest_exclude_patterns` | Collector, Designer, Full |
 
 ⏳ = not yet implemented, ships in v1.0.
@@ -539,8 +581,8 @@ Each row in this table is one future release. Operators see exactly what each re
 |---|---|---|
 | **v1.1** | `EdgeProposerBlade` (background) — Phase F start | Continuous structural-edge proposal; Meta-Harness gates promotion. Plus refinement of v1.0 blades based on usage data. |
 | **v1.2** | `ParamTunerBlade` | Self-tuning `execution_params` based on schedule outcomes. Substrate gets better at running itself. |
-| **v2.0** | `ScheduleBlade` (the `schedule` table) + `RunnerBlade` | First autonomous execution. Schedule items get consumed by background workers; tasks run without operator triggering. **Crosses from "intelligent collector" to "autonomous OS."** |
-| **v2.1** | `DesignerBlade` | Operator describes a product in English; Designer produces a cascading DAG; Runner executes it. |
+| **v2.0** | `RunnerBlade` (Terraform-`apply` analog; pure mechanical executor) | First autonomous execution. Schedule items get consumed by background workers; tasks run without operator triggering. **Crosses from "intelligent collector" to "autonomous OS."** |
+| **v2.1** | `DesignerBlade` + `CompilerBlade` (DAG, Terraform-`plan`) + `SchedulerBlade` (Gemma over the queue) | The full §0c-2 pipeline: operator describes a product in English → Designer emits an uncompiled DAG → Compiler validates every connection (`petgraph`/`daggy` + Rig-driven semantic checks) → Scheduler decides what enqueues + with what knobs → Runner executes. Subsumes the standalone `ParamTunerBlade` (now a SchedulerBlade proposal kind). |
 | **v2.2** | `DataSourceConnectorBlade` (SQL / Iceberg / RAG / remote-model subtypes) | Connectors for MySQL, Postgres, Iceberg, S3, Confluence, etc. The "compiled data sources" pillar. |
 | **v2.3** | `OtelSink` + GenAI semantic conventions | Datadog / Honeycomb / Grafana plug-and-play observability. |
 | **v3.0** | `SupersetSink` + `MothershipModelRouter` | Federated analytics: local SuperX nodes phone home to a central Superset for org-wide telemetry; complex queries escalate to a central mothership model. |
