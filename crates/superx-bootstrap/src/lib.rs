@@ -1,8 +1,44 @@
-/*
- * SuperX Bootstrap Blade - Revision 42.14 (Hardened)
- * 
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- */
+//! # superx-bootstrap — first-run provisioning + agent discovery
+//!
+//! Implements the **auto-onboarding pillar** (`ARCHITECTURE.md` §0d MVP
+//! capability C1). The `run` method is what the operator-facing
+//! `superx-cli bootstrap --tenant <t>` invokes; it provisions the substrate
+//! entity, configures default safety bounds, seeds canonical admin agents and
+//! tools, probes the local environment for MCP clients (Claude Desktop config
+//! and logs), and emits a `bootstrap_census` summary so consumers can prove
+//! the scan ran.
+//!
+//! ## Entry point
+//!
+//! [`BootstrapBlade::run`] — idempotent. The substrate entity id is a
+//! `UUIDv5(DNS-NS, tenant_id)` so re-running for the same tenant is a no-op.
+//!
+//! ## Telemetry contract
+//!
+//! Bootstrap emits at minimum these typed events:
+//!
+//! - `agent_seeded` × N — one per canonical admin agent (today: 2)
+//! - `agent_discovered` × M — one per `mcpServers` entry found across
+//!   probed Claude Desktop configs (cross-platform: macOS, Windows, Linux)
+//! - `agent_activity_observed` × K — one per `mcp-server-*.log` found in
+//!   the Claude Desktop logs directory (live-agent signal)
+//! - `bootstrap_census` — final summary with counts
+//! - `system_bootstrap` — overall lifecycle event
+//!
+//! ## Design notes
+//!
+//! - **Verification step at the end.** Bootstrap counts the telemetry rows
+//!   it just produced and fails loudly if the firehose did not capture them.
+//!   This is the early-warning that the substrate's telemetry pipe broke.
+//! - **Env-var overrides for testing.** `SUPERX_CLAUDE_CONFIG` and
+//!   `SUPERX_CLAUDE_LOGS` redirect the probes to fixture paths so
+//!   integration tests can be hermetic on developer machines.
+//! - **Cross-platform probes** — macOS `~/Library/Application Support/Claude/`,
+//!   Windows `%APPDATA%\Claude\`, Linux `~/.config/Claude/` (best-effort;
+//!   Anthropic does not officially document the Linux path).
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]
@@ -82,12 +118,14 @@ impl<'a> BootstrapBlade<'a> {
             Some(run_id.clone())
         ).await?;
 
-        // 6. VERIFICATION: Confirm stats are being captured at the finest grain
-        tracing::info!("Verifying telemetry flow (Run ID: {run_id})...");
+        // 6. Verify the telemetry firehose actually captured our writes — this
+        //    is the early-warning that the substrate's `telemetry_stream` pipe
+        //    broke. If we just provisioned a tenant but no events landed, the
+        //    operator needs to know immediately, not at first usage.
         let verify_query = "SELECT count() FROM telemetry_stream WHERE run_id = $rid GROUP ALL";
         let mut verify_res = self.kernel.db.query(verify_query)
             .bind(("rid", run_id.clone())).await?;
-        
+
         let counts: Vec<CountRes> = verify_res.take(0)?;
         if counts.is_empty() || counts[0].count == 0 {
             let mut all_res = self.kernel.db.query("SELECT count() FROM telemetry_stream GROUP ALL").await?;
@@ -96,7 +134,7 @@ impl<'a> BootstrapBlade<'a> {
             return Err(KernelError::SafetyViolation(format!("Telemetry failed to capture bootstrap event. Total events in table: {total}")));
         }
 
-        tracing::info!("Bootstrap verified. System healthy.");
+        tracing::info!("Bootstrap healthy (run_id={run_id}, substrate_id={substrate_id})");
         Ok(substrate_id)
     }
 

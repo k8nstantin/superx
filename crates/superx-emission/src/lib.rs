@@ -1,8 +1,38 @@
-/*
- * SuperX Emission Router - Revision 42.14 (Hardened)
- * 
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- */
+//! # superx-emission — substrate-to-outside telemetry routing
+//!
+//! Implements the **fine-grained telemetry collection pillar**
+//! (`ARCHITECTURE.md` §0a Pillar 1) on the *egress* side. The `telemetry_stream`
+//! table captures every kernel mutation; this crate forwards those rows to
+//! downstream sinks (Kafka, HTTP, future OTLP) so an operator can see the
+//! firehose from outside the `SuperX` process.
+//!
+//! ## Entry points
+//!
+//! - [`TelemetryRow`] — the on-wire shape every sink receives. Mirrors the
+//!   `telemetry_stream` schema field-for-field.
+//! - [`KafkaSink`] — `rdkafka` `FutureProducer` wrapper.
+//! - [`ApiSink`] — `reqwest` HTTP POST with optional bearer auth. Non-2xx is
+//!   surfaced as `Err` so silent failures don't defeat the audit-trail
+//!   invariant.
+//! - [`TelemetrySubscriber::run_loop`] — long-lived background task that
+//!   bridges `SurrealDB` `LIVE SELECT` to the configured sinks.
+//!
+//! ## Design notes
+//!
+//! - **Sinks are independent.** Configure 0, 1, or both — the subscriber
+//!   fan-outs to whichever are present. Future `OtelSink` slots in next to
+//!   them per Roadmap #7.
+//! - **The subscriber runs in root context.** It cannot use
+//!   `Kernel::get_parameter` (which needs a session); instead it reads
+//!   `attr_config` directly with the tenant id bound as a `SurrealQL`
+//!   parameter. This is the documented exception to the "all writes go
+//!   through kernel verbs" rule (Roadmap #13).
+//! - **Sink failures log but don't kill the loop.** An emit error on one
+//!   sink logs at ERROR and the loop continues — losing a row is better
+//!   than losing the firehose.
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]

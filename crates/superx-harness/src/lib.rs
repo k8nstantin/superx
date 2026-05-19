@@ -1,8 +1,37 @@
-/*
- * SuperX Meta-Harness - Revision 42.14 (Hardened)
- * 
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- */
+//! # superx-harness — wasmtime fuel-metered Meta-Harness
+//!
+//! Implements the **verifiable proposal-scoring** primitive
+//! (`ARCHITECTURE.md` §0c Cognitive Governance). Proposals (code, prompts,
+//! model versions) are scored by running an operator-supplied wasm module
+//! inside a wasmtime sandbox with strict fuel metering. A fuel-exhausted
+//! module traps as `KernelError::SafetyViolation` — the proposal is rejected
+//! rather than allowed to consume unbounded compute.
+//!
+//! ## Entry points
+//!
+//! - [`MetaHarness::evaluate`] — load wasm, set fuel budget (10 000 units
+//!   today; will be a parameter in Roadmap #1b), call the `run_test`
+//!   export, divide the returned `i32` by 100 to derive a `[0.0..1.0]`
+//!   score, persist the score as `attr_score` on the proposal entity.
+//! - [`MetaHarness::promote`] — read the current `attr_score`; if it clears
+//!   the threshold, link the proposal to the tenant's substrate entity via
+//!   `edge_promotes`. This is the substrate-side promotion step that turns
+//!   "candidate" into "adopted."
+//!
+//! ## Design notes
+//!
+//! - **Fuel budget is hardcoded at 10 000.** Roadmap #1b moves this to
+//!   `execution_params` so per-task tuning is a substrate write.
+//! - **Wasm guest exports `run_test() -> i32` and that's it.** The harness
+//!   does not provide host functions today; the wasm is pure-compute. When
+//!   Roadmap #20 (Component Model) lands, the harness will offer
+//!   capability-typed host imports the wasm can declare it needs.
+//! - **Promote resolves the substrate dynamically** via a `SurrealQL` query on
+//!   `state_ledger` rather than a hardcoded literal — promotions follow the
+//!   tenant's current substrate entity, no matter how it was provisioned.
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]

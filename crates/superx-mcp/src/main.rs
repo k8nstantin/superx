@@ -1,12 +1,20 @@
-/*
- * SuperX MCP Server (binary entry point) — Revision 42.14
- *
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- *
- * Thin wrapper: open the kernel, spawn the observability + heartbeat
- * background tasks, hand the `McpServer` to rmcp over stdio. All tool-dispatch
- * policy lives in `superx_mcp::dispatch_tool` (see `src/lib.rs`).
- */
+//! # superx-mcp — binary entry point
+//!
+//! Thin process wrapper that opens the substrate, spawns the two long-lived
+//! background tasks (telemetry subscriber + minute-cadence heartbeat pulse),
+//! then hands the [`McpServer`] to `rmcp` over stdio.
+//!
+//! All MCP tool-dispatch policy lives in [`superx_mcp::dispatch_tool`] (see
+//! `src/lib.rs`) so the policy is unit-testable without standing up a real
+//! rmcp transport. This file is *only* runtime concerns:
+//!
+//! - environment-variable configuration (`SUPERX_DB_PATH`, `SUPERX_NS`,
+//!   `SUPERX_DB_NAME`, `SUPERX_TENANT`, `SUPERX_KAFKA_*`, `SUPERX_EMISSION_API`)
+//! - tracing init with `RUST_LOG` honored via `EnvFilter`
+//! - background-task lifecycle with error logging (no silent failures)
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]

@@ -1,8 +1,65 @@
-/*
- * SuperX Kernel - Revision 42.14 (NASA Hardened)
- * 
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- */
+//! # superx-kernel — the safety-critical 5-table substrate
+//!
+//! The load-bearing primitive every other crate in the workspace depends on.
+//! Implements `ARCHITECTURE.md` §1 (the 5-table substrate + execution cursor)
+//! and enforces every §2 / §7 invariant at the storage layer.
+//!
+//! ## Tables (defined in [`Kernel::apply_substrate_schema`])
+//!
+//! - **`type_definition`** — metamodel. Every concept (entity types, edge
+//!   types, attribute types) is a row.
+//! - **`entity`** — the persistent *who* (substrate, agents, sessions, code
+//!   files, products, tools, models, …). Tenant-scoped via PERMISSIONS +
+//!   explicit `tenant_id = $session_tenant` predicates on every read.
+//! - **`relation`** — directed graph (`in → out`). Acyclic edges are
+//!   cycle-checked at write time via bounded DFS.
+//! - **`state_ledger`** — SCD-2 content. Every typed write produces a new
+//!   row and closes the prior `is_current` row in the same transaction.
+//! - **`telemetry_stream`** — CHANGEFEED-enabled firehose. Every kernel
+//!   mutation logs one typed event.
+//! - **`execution_cursor`** — durable workflow checkpoints (planned
+//!   conversion to SCD-2 per Roadmap #14).
+//!
+//! ## Invariants enforced by this crate
+//!
+//! 1. **Physical multi-tenancy.** Session vars `$session_tenant` /
+//!    `$session_role` are bound at session start; every PERMISSIONS clause
+//!    and every kernel read predicates on them. The
+//!    [`Kernel::supersede_state`] and [`Kernel::create_structural_edge`]
+//!    paths additionally check that the *target* entity's tenant matches
+//!    the calling session — anti-coercion guard.
+//! 2. **Temporal identity.** Every substrate row is keyed by a native
+//!    `Id::Uuid(UUIDv7)` — lex-sortable by time, no MD5 shortcuts.
+//! 3. **SCD-2 atomicity.** [`Kernel::supersede_state`] uses a `SurrealQL`
+//!    `BEGIN TRANSACTION` to close the prior `is_current` row and create
+//!    the new one in one round-trip.
+//! 4. **NASA Power of 10.** DFS, traversal depth, ingestion count are all
+//!    parameter-bounded (read via [`Kernel::get_parameter`] with sensible
+//!    defaults). No unbounded loop is permitted.
+//! 5. **JSON-Schema validation at the write boundary.** If a
+//!    `type_definition` carries a `sch_json` schema, every state write
+//!    against that type is validated before insertion.
+//!
+//! ## Entry points
+//!
+//! - [`Kernel::init`] — create kernel + apply schema + seed metamodel.
+//! - [`Kernel::set_session_auth`] — bind `$session_tenant` / `$session_role`.
+//! - [`Kernel::supersede_state`] — SCD-2 typed write with anti-coercion +
+//!   JSON-Schema validation + automatic `state_supersede` telemetry.
+//! - [`Kernel::create_structural_edge`] — graph edge with cycle detection
+//!   for acyclic edge types.
+//! - [`Kernel::compile_context`] — recursive tier-filtered traversal
+//!   producing context XML; bounded by `max_context_nodes` +
+//!   `max_traversal_depth`.
+//! - [`Kernel::log_telemetry`] — typed firehose insertion.
+//! - [`Kernel::checkpoint_execution`] / [`Kernel::get_execution_cursor`] —
+//!   durable resume points.
+//! - [`Kernel::parse_id`] — canonical `Thing` parser; rejects malformed
+//!   inputs at the boundary.
+//! - [`DEFAULT_TENANT`] — single source of truth for the default tenant id.
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]

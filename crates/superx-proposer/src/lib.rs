@@ -1,8 +1,31 @@
-/*
- * SuperX Agentic Proposer - Revision 42.14 (Hardened)
- * 
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- */
+//! # superx-proposer — LLM-driven structural-edge proposer
+//!
+//! On-demand variant of the edge-proposer pattern. Given two entity ids, calls
+//! the local inference engine to decide whether the relation is `edge_owns`,
+//! `edge_implements`, or `edge_semantic`, and writes a `node_proposal` row
+//! that the Meta-Harness can later score and (if accepted) promote.
+//!
+//! The future background variant `EdgeProposerBlade` (Roadmap #25 in
+//! `ARCHITECTURE.md` §8) will subscribe to `telemetry_stream` and propose
+//! edges continuously without needing an operator to trigger them.
+//!
+//! ## Entry point
+//!
+//! [`ProposerBlade::propose_relation`] — analyses two nodes via inference,
+//! creates a `node_proposal` entity, links it to both participants, and emits
+//! a `relation_proposed` telemetry event.
+//!
+//! ## Design notes
+//!
+//! - **Allowed edge-type list is hardcoded** in `propose_relation` today; a
+//!   future commit will derive it from a metamodel query so adding a new
+//!   edge type is a substrate write, not a code change (audit finding M6).
+//! - **Inference failure surfaces as `KernelError::Validation`** — not
+//!   `SafetyViolation`. The safety-violation taxonomy is reserved for
+//!   NASA-rule-bounded-loop violations and tenant-coercion attempts.
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]

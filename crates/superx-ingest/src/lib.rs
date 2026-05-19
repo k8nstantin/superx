@@ -1,8 +1,38 @@
-/*
- * SuperX Universal Ingestor - Revision 42.14 (Hardened)
- * 
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- */
+//! # superx-ingest — universal data-source ingestion
+//!
+//! Implements the **"data sources are compiled entities"** principle
+//! (`ARCHITECTURE.md` §0c Principle #4). Every source — filesystem directory,
+//! JSON payload, future SQL / Iceberg / RAG / remote-model connectors — is
+//! reduced to a single trait, [`IngestionSource`], that produces a root
+//! entity id and chained substrate state.
+//!
+//! ## Entry points
+//!
+//! - [`IngestionSource`] — the trait every connector implements.
+//! - [`FileSource`] — walks a local directory; one `node_code_root` plus a
+//!   `node_code` per file, linked by `edge_owns`. NASA-Rule-2-bounded by
+//!   `max_ingestion_entries`.
+//! - [`JsonSource`] — single-shot ingestion of a structured payload into a
+//!   `node_source_external`.
+//! - [`UniversalIngestor`] — thin orchestrator that calls
+//!   `IngestionSource::ingest` on the boxed source.
+//!
+//! ## Design notes
+//!
+//! - **Bounded iteration.** The walkdir loop trips the
+//!   `max_ingestion_entries` assertion before processing the (N+1)th entry —
+//!   no unbounded ingestion is possible, per NASA Power-of-10 Rule 2.
+//! - **`target/` and `.git/` paths are skipped** so a `graphify .` on a Rust
+//!   project doesn't ingest its own build artifacts or git history.
+//! - **Per-entry checkpoint.** Each file processed writes an
+//!   `execution_cursor` row so a crashed ingest can resume from where it
+//!   left off.
+//!
+//! Future connectors land here as new `IngestionSource` impls (Roadmap #4 in
+//! `ARCHITECTURE.md` §8).
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]

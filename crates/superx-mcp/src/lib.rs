@@ -1,12 +1,43 @@
-/*
- * SuperX MCP Server (library surface) — Revision 42.14
- *
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- *
- * The MCP dispatch policy is extracted here so it can be exercised directly in
- * integration tests without standing up a full rmcp transport / RequestContext.
- * `McpServer::call_tool` is the thinnest possible delegate to `dispatch_tool`.
- */
+//! # superx-mcp — library surface
+//!
+//! The MCP server's policy is extracted here so it can be exercised directly
+//! in integration tests without standing up a full `rmcp` transport or a
+//! synthetic `RequestContext`. [`McpServer::call_tool`] is the thinnest
+//! possible delegate to [`dispatch_tool`]; the binary entry point
+//! (`src/main.rs`) is purely runtime concerns (kernel init, background
+//! tasks, transport).
+//!
+//! ## Entry points
+//!
+//! - [`McpServer`] — the `rmcp::ServerHandler` impl.
+//! - [`dispatch_tool`] — pure policy. Takes kernel + name + arguments,
+//!   returns `Result<CallToolResult, McpError>`. Callable from tests.
+//! - [`list_tools_payload`] — the published tool descriptors. Tests
+//!   inspect them without touching the transport.
+//!
+//! ## Tools exposed today
+//!
+//! - `identify` — agent handshake; returns a session uid.
+//! - `graphify` — capability-gated ingestion (requires `tool_ingest`).
+//! - `compile` — capability-gated context distillation (requires
+//!   `tool_compile`).
+//!
+//! ## Design notes
+//!
+//! - **Every tool dispatch sets session auth from the request's `tenant`
+//!   argument** (falling back to `DEFAULT_TENANT`). Tenant isolation is
+//!   the operator's responsibility; the server doesn't second-guess.
+//! - **Tools that perform work go through `CapabilityGovernor::check_capability`
+//!   before executing.** Refusal is an early-return `McpError::internal_error`.
+//! - **No state is held in `McpServer` beyond the kernel handle.**
+//!   Concurrent calls are safe — `Surreal<Db>` is `Arc`-shared internally.
+//!
+//! The next MCP-spec items (`resources`, `prompts`, `sampling`, `elicitation`,
+//! `roots` per the 2025-11-25 spec) land here as new `dispatch_*` functions,
+//! per Roadmap #15.
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]
