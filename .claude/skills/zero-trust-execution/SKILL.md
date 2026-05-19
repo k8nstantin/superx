@@ -86,6 +86,35 @@ Never one branch that rewrites the kernel auth model. Three small ones, each lan
 - **Never force-push to `main`.** Force-push on a topic branch is allowed only during PR review and only if the operator has reviewed the rewrite.
 - **No commits to `main` from local clones.** The branch + PR loop is the only path; this preserves auditability and lets every change be reviewed.
 
+### 7. Schema Immutability — STOP. ASK. THEN MAYBE.
+
+The substrate schema is **load-bearing architecture**, not implementation detail. Every `DEFINE TABLE`, `DEFINE FIELD`, `DEFINE INDEX` in `apply_substrate_schema`, and every `type_definition` row seeded in `seed_metamodel`, is a contract every downstream consumer relies on — migrations, audit trails, runtime invariants, telemetry shape, replay correctness.
+
+- **You have ZERO authority to modify the schema without explicit, prior, per-change permission from the operator.**
+- "Refactor" is not authorization. "Cleanup" is not authorization. "I think the prior PR was wrong" is not authorization. "It's a small change" is not authorization. "I'm just dropping an unused field" is not authorization.
+- Adding a field, dropping a field, renaming a field, changing a field type, adding an index, dropping an index, adding a table, changing PERMISSIONS — **every one** requires explicit operator sign-off *before* you edit `apply_substrate_schema`.
+- If you discover a prior PR shipped a schema you now believe is wrong: **STOP**. Surface the issue in plain text, propose the fix, *wait* for the operator's call. Do not "correct" it in-flight. Do not branch and edit speculatively.
+- This applies to *every* substrate table — `type_definition`, `entity`, `relation`, `state_ledger`, `telemetry_stream`, `execution_cursor`, `execution_params`, `schedule`, and any future table.
+- The kernel verbs (`enqueue_*`, `transition_*`, `set_*`, `supersede_state`, etc.) that *consume* the schema can be edited under normal Mandate-1/2/3 rules; only the schema definition itself is locked.
+
+The cost of asking is one message. The cost of an unauthorized schema edit is a broken audit trail, a broken migration, a broken downstream consumer, and the operator having to undo your work.
+
+### 8. Architectural Mental Model — Schedule → Entity → DAG → Agent
+
+The execution architecture is layered. Do not invent dependency / orchestration logic in the wrong layer:
+
+- **`schedule` is a dumb queue.** A row references an entity by id (the `target_entity` field) and says "kick this off." That is the entire job of a schedule row. Schedule does not encode dependency relationships, does not encode DAG topology, does not encode execution policy.
+- **The DAG lives in the entity graph.** `entity` + `relation` rows form the design-time DAG (e.g., `node_product → node_component* → node_task*` linked by `edge_owns` and dep edges). All semantic content for a unit of work — prompts, instructions, capability, assigned agent, success criteria — lives on the entity as `state_ledger` writes.
+- **Agents follow the DAG.** When the scheduler kicks off a schedule row, the agent (whatever blade is assigned) reads the target entity from `state_ledger`, traverses its edges, executes children, writes results back as superseded state. The agent is the DAG walker. Not the scheduler.
+- **Telemetry is non-negotiable.** Every step the agent takes — every read, every dispatch, every state write, every transition — emits a typed `telemetry_stream` event. Fine-grained, structured, queryable. No silent steps. *"Capture detailed telemetry at all times."*
+
+The dumb division of labor:
+1. **Designer** — intent → DAG. Creates entities and edges. Does not touch `schedule`.
+2. **Scheduler** — DAG-leaf-or-root → `schedule` row. Does not run anything.
+3. **Runner / Agent** — pops `schedule`, reads target entity, walks DAG, executes, writes results, emits telemetry, transitions schedule status.
+
+If you find yourself adding a `depends_on` field to `schedule`, a `kind` field that duplicates `attr_capability`, a `metadata` field that duplicates entity attrs, or any other column that re-encodes information already in the entity graph — **stop**. That's the wrong layer. The schedule row holds an entity id. Everything else is on the entity.
+
 ### Execution Loop Enforcement
 For every single action you take, you must silently ask yourself: *"Am I guessing? Am I rushing? Did I read the documentation?"* If the answer to any of these is yes, you are violating this protocol.
 </instructions>
