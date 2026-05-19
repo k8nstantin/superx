@@ -1,9 +1,9 @@
-# AuraOS — State Sync Protocol (CRDT to SCD-2)
+# SuperX — State Sync Protocol (CRDT to SCD-2)
 
 The dual-state Hot (CRDT) / Cold (SCD-2) architecture requires explicit mechanisms to prevent data corruption, handle partial Epochs, and ensure op-log persistence.
 
 ## 1. Single-Node Commitment
-AuraOS v1 commits to a **Single-Node CRDT** architecture for the primary kernel loop. Cross-node clustered CRDT sync (multi-master) is explicitly deferred to v2 to guarantee state consistency during initial adoption.
+SuperX v1 commits to a **Single-Node CRDT** architecture for the primary kernel loop. Cross-node clustered CRDT sync (multi-master) is explicitly deferred to v2 to guarantee state consistency during initial adoption.
 
 ## 2. Loro Op-Log Persistence
 The SCD-2 `supersede()` transaction stores the materialized *snapshot* of the entity. However, cross-process collaboration requires the CRDT history to survive a crash.

@@ -1,4 +1,4 @@
-# AuraOS — Architect's Review #2 (Follow-up after revisions)
+# SuperX — Architect's Review #2 (Follow-up after revisions)
 
 **Reviewing:** `01-architecture.md`, `02-state-and-persistence.md`,
 `03-execution-and-mcp.md`, `04-graphify-ingestion.md`,
@@ -20,7 +20,7 @@ with `01-architecture.md`. Five gaps remain.
 | **Critical #3 — No MCP / protocol story** | **Fixed** | `01-architecture.md` §C: "MCP Bridge … native `rmcp` server over Unix Domain Sockets or gRPC." MCP is now the integration ABI. |
 | **Critical #4 — No multi-tenancy** | **Fixed** | `02-state-and-persistence.md`: `tenant_id` mandatory on every row; `fn::current_at` now takes `$tenant`; rehydration filters by tenant. |
 | **Critical #5 — LLM in primary security path** | **Fixed** | `01-architecture.md` §3.2: "Deterministic Security Check … (No slow LLM in the authorization path)." Capability manifests are pre-compiled. |
-| **Critical #6 — Auto-deploy of agent-written code** | **Fixed** | `05-meta-harness.md` §2.3: "AuraOS strictly avoids the supply-chain attack surface … Only upon explicit human approval is the `supersede()` transaction fired." |
+| **Critical #6 — Auto-deploy of agent-written code** | **Fixed** | `05-meta-harness.md` §2.3: "SuperX strictly avoids the supply-chain attack surface … Only upon explicit human approval is the `supersede()` transaction fired." |
 | **G1 — No structured prompt discipline** | **Acknowledged** | `05-meta-harness.md` §1: "System Instructions: The base prompt (using strict XML/tagged prompt discipline)." But not yet defined (see new issue N3). |
 | **G2 — Sparse system-agent roster** | **Expanded** | `01-architecture.md` §E: Proposer, Evaluator, Classifier, Summarizer, Redactor — 5 named. |
 | **G4 — Emission pipeline thin** | **Partially fixed** | Redactor in pipeline before Kafka publish. Full outbox engineering still missing — see G4-remaining below. |
@@ -44,7 +44,7 @@ This directly contradicts the architecture overview:
 
 | `01-architecture.md` says | `03-execution-and-mcp.md` says |
 |---|---|
-| "**The MCP Bridge** *(Replaces the legacy FUSE VFS.)* A native rmcp server exposed over Unix Domain Sockets or gRPC." | "Using the `fuser` crate, the AuraOS Rust kernel implements a FUSE (Filesystem in Userspace) driver. It mounts the abstract, in-memory CRDT graph as a physical volume on the host machine (e.g., `/var/run/auraos/vfs/`)." |
+| "**The MCP Bridge** *(Replaces the legacy FUSE VFS.)* A native rmcp server exposed over Unix Domain Sockets or gRPC." | "Using the `fuser` crate, the SuperX Rust kernel implements a FUSE (Filesystem in Userspace) driver. It mounts the abstract, in-memory CRDT graph as a physical volume on the host machine (e.g., `/var/run/superx/vfs/`)." |
 | "Docker heavy-lifters … interact with the OS via the **MCP Bridge** or Virtio-FS, completely isolated from host paths." | "Docker containers cannot access the Rust kernel's shared memory. They must interact with the Living Graph through the **VFS bridge**." |
 
 This is a **showstopper inconsistency.** A contributor reading both
@@ -61,13 +61,13 @@ incompatible.
      channels; speed AND ecosystem compat).
    - Section 3: Docker runtime — drop the VFS-as-bridge language;
      specify "Docker containers connect to the kernel via rmcp over
-     Unix Domain Sockets (`/var/run/auraos/mcp.sock`) bind-mounted into
+     Unix Domain Sockets (`/var/run/superx/mcp.sock`) bind-mounted into
      the container."
    - Section 4: External tooling (IDEs, third-party agents) — connect
      via the same rmcp endpoint over UDS or gRPC.
    - **Optional Section 5:** "VFS Projection (Inspection Only)" —
      keep FUSE as a *read-mostly debug projection* for `ls
-     /AuraOS/graph/...` exploration. Document the platform caveats
+     /SuperX/graph/...` exploration. Document the platform caveats
      (macFUSE deprecation, Windows-no-FUSE, Docker `--privileged`
      requirement). Make it clearly opt-in, not the bridge.
 
@@ -96,7 +96,7 @@ problem). It does not address several real ones:
 | Sub-problem | Status after revision | What's missing |
 |---|---|---|
 | Loro operation log persistence across crashes | Crash-discards-RAM is acceptable for single-node single-writer; but for **cross-process collaboration** (human in IDE + agent in Wasm both editing) the CRDT op log is *the state*. Cold-wins on crash means concurrent edits that hadn't yet flushed are silently dropped. | Document this trade-off explicitly. If cross-process CRDT collaboration is a feature (the `02` doc claims it is), the op log MUST be persisted incrementally (snapshot every N ops to SurrealKV) so loro can re-converge on restart. Otherwise mark CRDT collaboration as "single-process, in-memory only" — a different feature. |
-| Multi-node CRDT sync | Not addressed | If AuraOS scales to multiple nodes, how do their loro stores converge? A sync protocol (gossip? NATS? hub-and-spoke?) is needed. Or commit to single-node v1 explicitly. |
+| Multi-node CRDT sync | Not addressed | If SuperX scales to multiple nodes, how do their loro stores converge? A sync protocol (gossip? NATS? hub-and-spoke?) is needed. Or commit to single-node v1 explicitly. |
 | Partial Epoch failure | Not addressed | The Epoch sync is a multi-table SurrealDB transaction. If one table's supersede fails mid-transaction, the kernel must either roll the whole Epoch back or mark the entity diverged. Today's spec is silent. |
 | Time-travel within an Epoch | Not addressed | `fn::current_at($t)` returns SCD-2 state. But between Epoch flushes, the CRDT in RAM has newer state. A query for "as of right now" gives the LAST-EPOCH state, not actual current. Tradeoff: explain, accept, or define a `fn::current_now()` that reads CRDT. |
 | Epoch trigger heuristics | Mentioned ("file save, turn completion, 5-second debounce") but not formalized | Define the trigger taxonomy as a config table (parameterized, not hard-coded) — what events trigger an Epoch, with what priority, with what max-Epoch-size cap. |
@@ -177,7 +177,7 @@ Kafka publishes." Still missing:
 - **Cursor persistence** (how is the high-water-mark stored across kernel restarts? — SurrealKV key suggested)
 - **At-least-once + idempotent consume** (log_uid as dedup key)
 - **Backpressure / drop-to-disk** when Kafka is down — what disk path? what cap?
-- **Topic naming convention** (suggest: `auraos.activity.<event_family>.<tenant>`)
+- **Topic naming convention** (suggest: `superx.activity.<event_family>.<tenant>`)
 - **Schema evolution** (Variant/JSON for payload; Avro / Protobuf consideration)
 - **Multi-sink fan-out** (Vector.dev sidecar pattern when shipping to Iceberg + Datadog + Loki at once)
 
@@ -303,4 +303,4 @@ to close all gaps. After that, you're ready to scaffold Cargo and
 start writing code on a foundation that won't bite you in Phase 4.
 
 The bones remain good. The revisions are real progress. Three more
-focused doc-passes and AuraOS is production-design-ready.
+focused doc-passes and SuperX is production-design-ready.

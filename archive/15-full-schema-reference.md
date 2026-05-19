@@ -1,9 +1,9 @@
-# AuraOS — Master Schema Reference (Revision 24: Validated Vaults)
+# SuperX — Master Schema Reference (Revision 24: Validated Vaults)
 
-This is the final, production-hardened blueprint for the AuraOS Atomic Kernel. It adopts the "Everything is a Parameter" philosophy while ensuring physical isolation between declarative state, encrypted secrets, causal sync, and analytics.
+This is the final, production-hardened blueprint for the SuperX Atomic Kernel. It adopts the "Everything is a Parameter" philosophy while ensuring physical isolation between declarative state, encrypted secrets, causal sync, and analytics.
 
 ## The Physical Isolation Invariant
-To prevent system-wide I/O lockup and secure credentials, AuraOS physically isolates four distinct data flows:
+To prevent system-wide I/O lockup and secure credentials, SuperX physically isolates four distinct data flows:
 1. **Declarative State**: (Graph & State Ledger) The rules and current reality of the OS.
 2. **Encrypted Vaults**: (Vault Ledger) KMS-backed, proactively tested credentials.
 3. **Causal Sync**: (CRDT Ledger) High-speed binary deltas for recovery.

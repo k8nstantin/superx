@@ -1,8 +1,8 @@
-# AuraOS Physical Execution Roadmap: The Orchestrated Swarm v3.0
+# SuperX Physical Execution Roadmap: The Orchestrated Swarm v3.0
 
-This document defines the final engineering sequence for implementing **AuraOS v40.1**.
+This document defines the final engineering sequence for implementing **SuperX v40.1**.
 
-*See also: [AuraOS Master Blueprint v40.1](./AuraOS-Master-Blueprint-v40.1-Self-Configuring-Swarm.md)*
+*See also: [SuperX Master Blueprint v40.1](./SuperX-Master-Blueprint-v40.1-Self-Configuring-Swarm.md)*
 
 ---
 
@@ -35,7 +35,7 @@ This document defines the final engineering sequence for implementing **AuraOS v
 ### Phase 3: The Orchestrated Swarm (Current) [NEXT]
 **Goal:** Build the "System 2" reasoning and execution layer.
 1.  **Knowledge Distillation:** Update the Semantic Compiler to use local Gemma for pre-compressing DAG state into Task Artifacts.
-2.  **MCP/A2A Bridge:** Build the `auraos-mcp` server. Expose `node_agent_card` for peer discovery.
+2.  **MCP/A2A Bridge:** Build the `superx-mcp` server. Expose `node_agent_card` for peer discovery.
 3.  **Cyclic Reasoning:** Implement `thread_id` and recursive looping in the `execution_state` table.
 4.  **Meta-Harness:** Integrate `wasmtime` to execute autonomous test nodes and feed results back to agents.
 
@@ -62,6 +62,6 @@ This document defines the final engineering sequence for implementing **AuraOS v
 
 ## 4. Immediate Tasks
 
-1.  **Finalize `auraos-mcp` implementation with `rmcp 1.7` stable types.**
+1.  **Finalize `superx-mcp` implementation with `rmcp 1.7` stable types.**
 2.  **Implement 'Knowledge Distillation' logic in the Semantic Compiler.**
-3.  **Initialize the `auraos-harness` Wasm sandbox.**
+3.  **Initialize the `superx-harness` Wasm sandbox.**

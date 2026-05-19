@@ -1,23 +1,23 @@
-# AuraOS Master Blueprint v32.0: The Structural Swarm Kernel
+# SuperX Master Blueprint v32.0: The Structural Swarm Kernel
 
 **Classification:** Confirmed Final Architectural Design  
 **Paradigm:** Documentation-Driven / Structural DAG as Source of Truth / Decentralized  
 **Core Engine:** Semantic Compiler + Telemetry/Execution Host + Federation Router  
 
 ## The Airtight Schema Mandate (Zero Bypasses)
-AuraOS enforces data integrity exclusively at the database layer using native SurrealDB constraints.
+SuperX enforces data integrity exclusively at the database layer using native SurrealDB constraints.
 1. **No Triggers:** Business logic is never hidden in database triggers. 
 2. **No Application Bypasses:** The Rust kernel MUST NOT contain code that attempts to disable, suppress, or work around `SCHEMAFULL`, `REFERENCES`, or `NOT NULL` constraints.
 3. **Database as Enforcer:** If an agent attempts to write data that violates the metamodel, the database rejects the transaction.
 4. **Structural Supremacy:** The Structural DAG is the absolute source of truth for product definition and execution boundaries.
 
-*See also: [AuraOS Physical Execution Roadmap](./AuraOS-Physical-Execution-Roadmap-The-Iron-Foundation.md)*
+*See also: [SuperX Physical Execution Roadmap](./SuperX-Physical-Execution-Roadmap-The-Iron-Foundation.md)*
 
 ---
 
 ## 1. Executive Philosophy: "The Database is the OS"
 
-AuraOS discards the traditional "application" model. Instead, the OS treats **Language as the Source Code**, the **Graph as the Compiler**, and **Agents as the CPU**.
+SuperX discards the traditional "application" model. Instead, the OS treats **Language as the Source Code**, the **Graph as the Compiler**, and **Agents as the CPU**.
 
 *   **Zero Hardcoding:** No concept exists as a table. All domain knowledge is stored as data in a universal metamodel.
 *   **Documentation-Driven:** Execution is a byproduct of high-fidelity semantic descriptions. Agents execute by traversing a Directed Acyclic Graph (DAG) of versioned text.
@@ -28,16 +28,16 @@ AuraOS discards the traditional "application" model. Instead, the OS treats **La
 
 ## 2. P2P Federation Protocols (The Swarm)
 
-AuraOS instances are designed to discover each other, establish trust, and share execution graphs (Product DAGs). This is governed entirely by the database layer.
+SuperX instances are designed to discover each other, establish trust, and share execution graphs (Product DAGs). This is governed entirely by the database layer.
 
 ### A. Autonomous Node Discovery (mDNS & Gossip)
-AuraOS instances do not rely on central servers to find each other. Discovery is handled at the network edge.
+SuperX instances do not rely on central servers to find each other. Discovery is handled at the network edge.
 * **Local Swarm (mDNS / ZeroConf):** On a local network, the Rust kernel runs an mDNS responder. It broadcasts its `tenant_uid` and active gRPC port.
 * **Global Swarm (Gossip Protocol):** For distributed VMs, you provide a "Seed Node." The kernel uses a Gossip protocol to exchange known peer lists. 
 * **The Result:** Discovered nodes are written to the local `entity` table (Type: `node_peer`). 
 
 ### B. The Initialization Handshake (mTLS & Ed25519)
-AuraOS operates on a strict Zero-Trust model. 
+SuperX operates on a strict Zero-Trust model. 
 1. **Identity Generation:** On first boot, the OS generates an Ed25519 keypair. The public key is the node's true identity.
 2. **The Connection Request:** Node A attempts to open a raw TCP connection to Node B.
 3. **mTLS Negotiation:** They perform a Mutual TLS (mTLS) handshake.
@@ -54,7 +54,7 @@ When a trusted peer sends a shared Product Design (a serialized JSON export), it
 
 ## 3. Swarm Collaboration Mechanics (P2P Workflows)
 
-AuraOS enables three primary collaborative workflows:
+SuperX enables three primary collaborative workflows:
 
 ### A. Real-Time Co-Authoring (Causal Sync)
 *   **Mechanic:** The local OS monitors its **`crdt_sync_ledger`**. When a local edit creates a Loro delta, the OS kernel signs it and broadcasts it to trusted peers.
@@ -72,7 +72,7 @@ One node can act as the "Source of Truth" for a specific data source without sha
 
 ## 4. Context Portability (The Portable Design Bundle)
 
-AuraOS enables the **"Design Locally, Execute Globally"** workflow.
+SuperX enables the **"Design Locally, Execute Globally"** workflow.
 
 ### A. Modular Sub-Graph Export (The Deep Bundle)
 The OS kernel can generate a **Deep Graph Bundle** starting from **ANY arbitrary entity** (e.g., a top-level Product or a single Component). 
@@ -156,7 +156,7 @@ The Kernel logs every thought and tool call to the `telemetry_stream`. If a fail
 
 ## 4. Collaborative Core: Human-in-the-Loop (HITL)
 
-AuraOS is a social environment for humans and agents.
+SuperX is a social environment for humans and agents.
 
 *   **Non-Blocking Interception:** Users can type "Hey, consider this" while an agent is running. This signal is injected into the `telemetry_stream` and pushed to the agent's live context.
 *   **Communication Threads:** Chat history is stored in the `state_ledger` (Type: `communication_thread`). It is a first-class citizen of the graph, meaning the Semantic Compiler can "bake" previous chat decisions into the next compiled prompt.
@@ -174,4 +174,4 @@ AuraOS is a social environment for humans and agents.
 ---
 
 **End of Document**  
-*AuraOS v21.0: Design Finalized.*
+*SuperX v21.0: Design Finalized.*

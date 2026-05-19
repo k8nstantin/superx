@@ -1,8 +1,8 @@
-# AuraOS — System Architecture & Data Flow
+# SuperX — System Architecture & Data Flow
 
 ## 1. System Overview
 
-AuraOS is a documentation-driven, everything-is-a-parameter Agentic OS. It transforms the traditionally messy world of agents into a **Semantic Compiler** and a **Telemetry/Execution Engine**. 
+SuperX is a documentation-driven, everything-is-a-parameter Agentic OS. It transforms the traditionally messy world of agents into a **Semantic Compiler** and a **Telemetry/Execution Engine**. 
 
 The OS operates on a **5-Table Hardened Atomic Kernel** (Metamodel, Entity, Relation, State Ledger, and CRDT Sync). Every rule, permission, and instruction is a queryable graph node, enabling mathematical auditability and infinite runtime extensibility.
 

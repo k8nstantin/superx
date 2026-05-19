@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_path = PathBuf::from("./db/superx.db");
     let kernel = Arc::new(Kernel::init(&db_path, "superx", "prod").await?);
-    let tenant = std::env::var("SUPERX_TENANT").unwrap_or_else(|_| "sa_dogfood".to_string());
+    let tenant = std::env::var("SUPERX_TENANT").unwrap_or_else(|_| superx_kernel::DEFAULT_TENANT.to_string());
 
     // 1. Observability pipe (LIVE SELECT → Kafka/API sinks if configured)
     let k_sub = kernel.clone();

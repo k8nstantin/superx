@@ -1,6 +1,6 @@
-# AuraOS — Full Library Inventory
+# SuperX — Full Library Inventory
 
-AuraOS leverages specific, state-of-the-art libraries to avoid reinventing the wheel while maintaining extreme performance.
+SuperX leverages specific, state-of-the-art libraries to avoid reinventing the wheel while maintaining extreme performance.
 
 ## Rust Stack (The Kernel)
 *   **`wasmtime` / `wasmtime-wasi`:** The core execution engine. Unmatched security and speed.
@@ -19,4 +19,4 @@ AuraOS leverages specific, state-of-the-art libraries to avoid reinventing the w
 *   **`vite`:** Build tooling and dev server.
 *   **`xyflow` (React Flow):** The spatial canvas. Purpose-built for node-edge editing, infinitely superior to basic chart libraries like ECharts for topological exploration.
 *   **`tailwind` + `shadcn/ui`:** Component design system for deterministic, clean UI.
-*   **`tanstack-query`:** Async state management for interacting with the AuraOS MCP bridge over WebSockets.
+*   **`tanstack-query`:** Async state management for interacting with the SuperX MCP bridge over WebSockets.
