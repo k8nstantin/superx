@@ -135,6 +135,41 @@ When models are local (the default expectation — SuperX is "best local model, 
 
 Remote-model entities (Claude, GPT-5, Gemini) carry their endpoint URL + auth-token-ref in `attr_config`; no local file required.
 
+### 0c-extensibility. The extensibility moat — our durable competitive advantage
+
+SuperX's competitive position rests on **two structural advantages**, not on tactical feature counts:
+
+1. **The model is integrated into the OS, not bolted on.** Competitors (OpenFANG, Letta, etc.) are bigger, older, and shipping. But they were *not designed* to make a model a first-class entity inside their substrate. Their model integration is glue code around a Python SDK call. To retrofit "the model is part of the OS" they have to redesign their kernel. Until they do, they're calling an LLM; we *are* an intelligent OS.
+2. **Modular from line zero.** The 5-table metamodel, capability-graph governor, model-as-entity, prompt-as-entity, params-as-SCD-2 patterns mean every future capability lands as a *substrate write*, not a schema migration. Competitors need a release cycle to add a new model provider; we need an `INSERT INTO entity`.
+
+These two compound. The moat is not "we have better design" (subjective). The moat is **"adding the Nth feature to SuperX costs less than adding the Nth feature to anything else."** Today that means we ship MVP behind them. In a year it means we ship `N+1` features per quarter while they ship `N`. In two years we're ahead by feature-velocity squared.
+
+#### What this means for design decisions, *every* one
+
+- **Adding a new model provider** = `node_hardened_model` row + an impl of `CompletionModel`. No new crate unless behavior warrants it.
+- **Adding a new tool** = `node_tool` row + an `edge_has_capability` grant. The Governor and Router handle dispatch with no special-casing.
+- **Adding a new data source connector** = `node_data_source` subtype in the metamodel + a new module in `superx-ingest`. No core kernel change.
+- **Adding a new telemetry sink** = a struct implementing the existing `Sink` shape (Kafka/HTTP today, OTLP/Superset/eCharts tomorrow). Composable in the `TelemetrySubscriber::run_loop`.
+- **Adding a new analysis blade** = a new module in `superx-runtime` subscribing to `telemetry_stream`. No kernel change.
+- **Adding a new prompt strategy** = a `node_artifact` row of type `prompt_template`. No code change.
+
+If a feature *cannot* land this way, the kernel is missing a primitive and we add the primitive first.
+
+#### Future integration vectors we're designed to absorb without redesign
+
+The substrate-first posture lets us pick up these capabilities *without retrofitting*:
+
+| Future capability | How it lands in SuperX | Why this is hard for competitors |
+|---|---|---|
+| **Federated analytics** — local SuperX nodes phone home to a central Apache Superset for org-wide telemetry | A new `SupersetSink` in `superx-emission` next to `KafkaSink`/`ApiSink`. The "federation" is configuration on `attr_config.emission_targets`. | They have to design a federation layer; we already have multi-sink emission. |
+| **Mothership model** — local SuperX nodes route complex queries to a central org-level model | New `node_hardened_model` entity whose `attr_config` points to a private endpoint; the ModelRouterBlade escalates per existing rules. | They don't have a router pattern; every escalation requires app-layer wiring. |
+| **Dynamic chart generation** (Apache eCharts) | A new tool (`tool_chart`) + `node_chart` entity carrying the eCharts JSON config; the model produces the config from data via prompt template. | They'd add a hardcoded chart-builder; we add a row. |
+| **CRDT-collaborative DAG editing** (Automerge / leiden-rs) | `node_dag_revision` entity + Automerge patches stored as `attr_patch` SCD-2 rows | No retrofit story; we already have SCD-2 + UUIDv7 + entity-of-everything. |
+| **Custom org capabilities** (any vertical: legal/medical/finance compliance gates) | `edge_has_capability` to a custom tool + a custom prompt entity | They need policy code paths; we need rows. |
+| **New MCP spec revisions** (resources, sampling, elicitation, roots — already in spec 2025-11-25) | Add handlers to `superx-mcp::dispatch_tool` | They have to upgrade their MCP wrapper; ours is one match arm per surface. |
+
+This is the durable moat. **Modularity from line zero is the only way to compete with incumbents who started years earlier.** SuperX is the only Rust agentic OS where every operational concern (auth, dispatch, model selection, telemetry, prompt template, data source) is a row in the same table family, not a code path.
+
 ### 0d. MVP scope — what "first viable product" means
 
 The MVP is the **collector deployment mode** with the foundations of intelligent classification:
