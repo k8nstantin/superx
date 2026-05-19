@@ -127,11 +127,18 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    // Honour RUST_LOG (e.g. `RUST_LOG=info,superx_inference=debug` to see prompts).
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let cli = Cli::parse();
 
-    let db_path = PathBuf::from("./db/superx.db");
-    let kernel = Arc::new(Kernel::init(&db_path, "superx", "prod").await?);
+    let db_path = PathBuf::from(
+        std::env::var("SUPERX_DB_PATH").unwrap_or_else(|_| "./db/superx.db".to_string()),
+    );
+    let ns = std::env::var("SUPERX_NS").unwrap_or_else(|_| "superx".to_string());
+    let db_name = std::env::var("SUPERX_DB_NAME").unwrap_or_else(|_| "main".to_string());
+    let kernel = Arc::new(Kernel::init(&db_path, &ns, &db_name).await?);
 
     // Activate Observability Pipe (Background - Runs as Root to avoid session clash)
     let k_sub = kernel.clone();

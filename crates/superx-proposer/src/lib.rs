@@ -51,13 +51,17 @@ impl<'a> ProposerBlade<'a> {
         // 2. Local Inference: Ask agent to decide relation type
         let mut engine = self.inference.lock().await;
         let prompt = format!(
-            "Analyze these two components and decide if Component A owns, implements, or is semanticly related to Component B.\n\n\
+            "Analyze these two components and decide if Component A owns, implements, or is semantically related to Component B.\n\n\
             Component A:\n{from_xml}\n\n\
             Component B:\n{to_xml}\n\n\
             Respond with ONLY one of: [edge_owns, edge_implements, edge_semantic]"
         );
 
-        let proposal_type = engine.predict(&prompt, 10).map_err(|e| KernelError::SafetyViolation(e.to_string()))?;
+        // Inference failures are *validation* failures (the model failed to produce
+        // a usable answer), not NASA-rule-bounded-loop safety violations. Conflating
+        // them dilutes the safety-violation taxonomy used by Mandate-1 alerting.
+        let proposal_type = engine.predict(&prompt, 10)
+            .map_err(|e| KernelError::Validation(format!("inference failed: {e}")))?;
         let sanitized_type = proposal_type.trim().to_lowercase();
         
         // Default to semantic if response is malformed

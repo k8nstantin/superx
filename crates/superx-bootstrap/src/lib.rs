@@ -50,7 +50,10 @@ impl<'a> BootstrapBlade<'a> {
         let substrate_id = format!("entity:{substrate_uuid}");
         let substrate_thing = Thing::from(("entity".to_string(), substrate_uuid));
 
-        self.kernel.db.query("UPSERT $id SET tenant_id = $t, role = 'admin', type = type_definition:node_substrate")
+        // The substrate is a `node_substrate`, not a `node_agent` — it does not
+        // carry a role. The PERMISSIONS clauses gate reads/writes via
+        // `$session_role`, not via this entity's own role field.
+        self.kernel.db.query("UPSERT $id SET tenant_id = $t, type = type_definition:node_substrate")
             .bind(("id", substrate_thing))
             .bind(("t", tenant_id.to_string())).await?.check()?;
 
