@@ -24,11 +24,19 @@ use superx_compiler::CompilerBlade;
 use superx_ingest::{FileSource, UniversalIngestor};
 use superx_kernel::Kernel;
 
+/// The `rmcp::ServerHandler` implementation that exposes the `SuperX` MCP
+/// surface over stdio (or any `rmcp` transport). Holds a shared `Kernel`
+/// handle so it can serve concurrent requests without lock contention; the
+/// dispatch policy itself lives in `dispatch_tool` so it can be unit-tested
+/// without standing up a real `RequestContext`.
 pub struct McpServer {
     pub kernel: Arc<Kernel>,
 }
 
 impl McpServer {
+    /// Construct a new `McpServer` over an existing `Kernel`. Caller is
+    /// responsible for keeping the `Arc<Kernel>` alive for the lifetime of
+    /// the server.
     #[must_use]
     pub fn new(kernel: Arc<Kernel>) -> Self {
         Self { kernel }
