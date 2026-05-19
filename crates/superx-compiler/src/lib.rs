@@ -1,8 +1,26 @@
-/*
- * SuperX Compiler Blade - Revision 42.14 (Hardened)
- * 
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- */
+//! # superx-compiler — context distillation blade
+//!
+//! Implements the **RAG / daggify pillar** (`ARCHITECTURE.md` §0a) by combining
+//! structural traversal (`Kernel::compile_context`) with optional LLM-driven
+//! distillation. Returns a context XML window that downstream agents read.
+//!
+//! ## Entry point
+//!
+//! [`CompilerBlade::compile`] — durable, tier-aware context distillation with
+//! optional model post-processing. Records compilation checkpoints to the
+//! `execution_cursor` for resumability.
+//!
+//! ## Design notes
+//!
+//! - **Model is optional.** Without an `InferenceEngine`, the blade returns
+//!   the raw substrate-traversal XML. With one, it adds a distilled summary
+//!   layer on top. Graceful degradation per the §0c-1 "always intelligent"
+//!   principle: `SuperX` still works without a model loaded.
+//! - **Prompts are hardcoded today** (roadmap #6 will move them to
+//!   `node_artifact` entities so they're operator-customisable).
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]

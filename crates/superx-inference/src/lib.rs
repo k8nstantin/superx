@@ -1,8 +1,33 @@
-/*
- * SuperX Local Inference Engine - Revision 42.0 (Hardened)
- * 
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- */
+//! # superx-inference — local GGUF inference engine
+//!
+//! Implements the **local-model pillar** (`ARCHITECTURE.md` §0c-1) using
+//! Candle + a quantized-llama model loader. A model is loaded from a GGUF file
+//! on disk along with its tokenizer; the engine then runs forward-pass
+//! generation token-by-token with logits sampling.
+//!
+//! ## Entry points
+//!
+//! - [`InferenceEngine::new`] — construct from a model GGUF path and a
+//!   tokenizer JSON path.
+//! - [`InferenceEngine::predict`] — synchronous text generation. Logs the
+//!   prompt *length* + a short preview at INFO; full prompt at DEBUG only
+//!   (privacy + log-volume — operator opts in via `RUST_LOG=debug`).
+//!
+//! ## Design notes
+//!
+//! - **Today**: Single in-process Candle engine. The roadmap (#16 Rig.rs
+//!   adoption) will wrap this behind a multi-provider `CompletionModel`
+//!   trait so local Candle, remote `Anthropic`, remote `OpenAI` etc. are
+//!   selectable per-task via `execution_params`.
+//! - **Sampling params are hardcoded** in `predict` (seed = c, temp = 0.7,
+//!   `top_p` = 0.9). Roadmap #1b (`execution_params` SCD-2 table) makes them
+//!   per-run parameters.
+//! - **EOS detection** uses a hardcoded token id (`2`). Different model
+//!   families have different EOS — Roadmap follow-up will read it from the
+//!   tokenizer config at engine construction time.
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]
@@ -100,6 +125,10 @@ impl InferenceEngine {
 
         for i in 0..safe_max {
             assert!(i < MAX_PREDICT_TOKENS, "Safety violation: MAX_PREDICT_TOKENS exceeded");
+            // Standard KV-cache pattern: iteration 0 (prefill) feeds the entire
+            // prompt; subsequent iterations feed only the single newly-sampled
+            // token. The model's `start_pos` argument tells it where in the
+            // cache to append, so we never re-process the prompt.
             let context_size = if i > 0 { 1 } else { tokens_ids.len() };
             let start_pos = tokens_ids.len().saturating_sub(context_size);
             let input = Tensor::new(&tokens_ids[start_pos..], &self.device)?.unsqueeze(0)?;

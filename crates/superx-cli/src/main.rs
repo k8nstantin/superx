@@ -1,8 +1,43 @@
-/*
- * SuperX CLI - Revision 42.14 (NASA Hardened)
- * 
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- */
+//! # superx-cli — the operator-facing CLI
+//!
+//! Implements **MVP capability C4** (`ARCHITECTURE.md` §0d): CLI parity across
+//! every substrate verb. Drives the same kernel APIs as the MCP server but
+//! through human-facing subcommands.
+//!
+//! ## Subcommands (v1.0)
+//!
+//! | Verb | Purpose |
+//! | --- | --- |
+//! | `bootstrap` | First-run provisioning + agent discovery |
+//! | `graphify` | Walk a directory, ingest into the substrate as a DAG |
+//! | `compile` | Distill context for an entity (tier-aware, optionally LLM-distilled) |
+//! | `propose` | Run the proposer blade to suggest a structural edge |
+//! | `evaluate` | Score a proposal via the Meta-Harness wasm sandbox |
+//! | `promote` | Link a passing proposal to the tenant's substrate |
+//! | `identify` | Agent handshake; returns a session uid |
+//! | `list-agents` | Enumerate registered agents for the tenant |
+//! | `list-tools` | Enumerate registered tools for the tenant |
+//! | `demo` | One-shot bootstrap → ingest → propose → promote |
+//! | `stats` | Stream recent telemetry events |
+//!
+//! ## Telemetry-pipe lifetime
+//!
+//! Every command spawns a [`TelemetrySubscriber`] task at startup so any
+//! telemetry the command produces flows to the configured Kafka / HTTP sinks
+//! for the duration of the run. The MCP server (`superx-mcp` binary) does
+//! the same — the difference is lifetime (command vs. server process).
+//!
+//! ## Environment variables
+//!
+//! - `SUPERX_DB_PATH` — substrate file path (default `./db/superx.db`)
+//! - `SUPERX_NS` — `SurrealDB` namespace (default `superx`)
+//! - `SUPERX_DB_NAME` — `SurrealDB` database name (default `main`)
+//! - `SUPERX_KAFKA_BROKERS`, `SUPERX_KAFKA_TOPIC` — Kafka egress
+//! - `SUPERX_EMISSION_API` — HTTP egress URL
+//! - `RUST_LOG` — tracing filter (e.g. `info,superx_inference=debug`)
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]

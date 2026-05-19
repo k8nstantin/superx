@@ -1,8 +1,34 @@
-/*
- * SuperX Agent Governance - Revision 42.11 (Hardened)
- * 
- * Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>
- */
+//! # superx-agent — Capability Governor
+//!
+//! Implements the **graph-derived security policy** primitive
+//! (`ARCHITECTURE.md` §0c Cognitive Governance). Agents are entities; their
+//! ability to invoke a tool is determined by whether an `edge_has_capability`
+//! relation exists between the agent entity and the tool entity *within the
+//! current session tenant*.
+//!
+//! ## Entry points
+//!
+//! - [`CapabilityGovernor::handshake`] — authenticates an agent and opens a
+//!   `node_session` entity linked to it via `edge_participates_in`. Returns
+//!   the session uid the agent can later present.
+//! - [`CapabilityGovernor::check_capability`] — predicate: does this agent
+//!   hold capability for this tool? Returns `Ok(())` or a `SafetyViolation`
+//!   with explicit ALLOW / DENY tracing on each decision.
+//!
+//! ## Design notes
+//!
+//! - **Identity coercion is rejected.** `handshake` refuses if the agent
+//!   already exists in a different tenant — operators cannot accidentally
+//!   re-tenant a registered agent.
+//! - **Record IDs flow as `Thing`, never as `<string>id` round-trips.** The
+//!   `EscapeRidKey` escaping rule (see `surrealdb-core/src/sql/escape.rs`)
+//!   double-escapes hyphen-bearing UUIDs on round-trip; using `Thing` end-to-end
+//!   avoids this entirely. The existence query uses `count()` instead of
+//!   selecting the matched row's id to avoid deserialising a `Thing` enum
+//!   into a `serde_json::Value` (which fails).
+//!
+//! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
+//! Licensed under the Apache License, Version 2.0.
 
 #![deny(warnings)]
 #![deny(clippy::pedantic)]
