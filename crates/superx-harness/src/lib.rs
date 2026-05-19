@@ -34,6 +34,7 @@ impl<'a> MetaHarness<'a> {
     /// # Errors
     /// Returns `KernelError::SafetyViolation` if fuel is exhausted.
     pub async fn evaluate(&self, proposal_id: &str, harness_wasm: &[u8]) -> Result<f64, KernelError> {
+        tracing::info!("evaluating proposal {proposal_id} (wasm {} bytes)", harness_wasm.len());
         let mut config = Config::new();
         config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(|e| KernelError::Integrity(e.to_string()))?;
@@ -76,7 +77,7 @@ impl<'a> MetaHarness<'a> {
             .bind(("id", target_thing.clone())).await?;
         
         let all_records: Vec<serde_json::Value> = res.take(0)?;
-        tracing::info!("DEBUG: Raw score records for {proposal_id}: {all_records:?}");
+        tracing::debug!("raw attr_score rows for {proposal_id}: {all_records:?}");
 
         let mut score = 0.0;
         for rec in all_records {

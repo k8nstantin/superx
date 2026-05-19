@@ -33,7 +33,8 @@ impl<'a> CapabilityGovernor<'a> {
     /// Returns `KernelError` if the agent or session records cannot be created.
     pub async fn handshake(&self, agent_uid: &str) -> Result<String, KernelError> {
         assert!(!agent_uid.is_empty(), "Agent identity mandatory");
-        
+        tracing::info!("governor handshake: agent_uid={agent_uid}");
+
         // 1. Resolve Session Tenant (Physical Isolation)
         let mut t_res = self.kernel.db.query("RETURN $session_tenant").await?;
         let session_tenant: String = t_res.take::<Option<String>>(0)?
@@ -91,6 +92,8 @@ impl<'a> CapabilityGovernor<'a> {
         #[derive(serde::Deserialize)]
         struct CountRow { count: u64 }
 
+        tracing::info!("capability check: agent_id={agent_id} tool_uid={tool_uid}");
+
         let agent_thing = Kernel::parse_id(agent_id)?;
         let tool_thing = Kernel::parse_id(&format!("entity:{tool_uid}"))?;
 
@@ -104,8 +107,10 @@ impl<'a> CapabilityGovernor<'a> {
 
         let count = res.take::<Vec<CountRow>>(0)?.pop().map_or(0, |r| r.count);
         if count == 0 {
+            tracing::info!("capability DENY: agent_id={agent_id} tool_uid={tool_uid}");
             return Err(KernelError::SafetyViolation(format!("Agent {agent_id} lacks capability for {tool_uid}")));
         }
+        tracing::info!("capability ALLOW: agent_id={agent_id} tool_uid={tool_uid}");
 
         Ok(())
     }

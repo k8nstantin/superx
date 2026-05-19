@@ -46,14 +46,24 @@ const MAX_PREDICT_TOKENS: usize = 4096;
 impl InferenceEngine {
     /// Creates a new `InferenceEngine` from local GGUF and tokenizer files.
     ///
-    /// # Panics
-    /// Panics if the model or tokenizer paths do not exist.
-    ///
     /// # Errors
-    /// Returns `InferenceError::Load` if the tokenizer or model cannot be read.
+    /// Returns `InferenceError::Load` if either path does not exist, the
+    /// tokenizer cannot be parsed, or the GGUF model cannot be read.
     pub fn new(model_path: &Path, tokenizer_path: &Path) -> Result<Self, InferenceError> {
-        assert!(model_path.exists(), "Model path mandatory");
-        assert!(tokenizer_path.exists(), "Tokenizer path mandatory");
+        // Operator-facing API: a wrong --model-path / --tokenizer-path flag must
+        // surface as a clean Err the CLI can print and exit on, not a panic.
+        if !model_path.exists() {
+            return Err(InferenceError::Load(format!(
+                "model path does not exist: {}",
+                model_path.display()
+            )));
+        }
+        if !tokenizer_path.exists() {
+            return Err(InferenceError::Load(format!(
+                "tokenizer path does not exist: {}",
+                tokenizer_path.display()
+            )));
+        }
 
         let device = Device::Cpu;
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| InferenceError::Load(e.to_string()))?;
@@ -76,7 +86,12 @@ impl InferenceEngine {
         assert!(!prompt.is_empty(), "Prompt must not be empty");
         let safe_max = if max_tokens > MAX_PREDICT_TOKENS { MAX_PREDICT_TOKENS } else { max_tokens };
 
-        tracing::info!("Running local GGUF inference for prompt: {prompt}");
+        // Log length + a short prefix at INFO. Full prompts can contain user-confidential
+        // payloads and reach megabytes when the compiler blade fans-in a whole project DAG;
+        // emit the full text only when the operator opts in via `RUST_LOG=debug`.
+        let prompt_preview: String = prompt.chars().take(80).collect();
+        tracing::info!("GGUF inference: {} chars (preview: {prompt_preview:?})", prompt.len());
+        tracing::debug!("full inference prompt: {prompt}");
         
         let tokens = self.tokenizer.encode(prompt, true).map_err(|e| InferenceError::Failure(e.to_string()))?;
         let mut tokens_ids = tokens.get_ids().to_vec();
