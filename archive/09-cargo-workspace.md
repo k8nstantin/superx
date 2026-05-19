@@ -1,18 +1,18 @@
-# AuraOS — Cargo Workspace Topology
+# SuperX — Cargo Workspace Topology
 
-The AuraOS source is organized as a strict Cargo virtual workspace to enforce decoupling between the kernel, the bridge, and the execution environments.
+The SuperX source is organized as a strict Cargo virtual workspace to enforce decoupling between the kernel, the bridge, and the execution environments.
 
 ```text
-/auraos
+/superx
 ├── Cargo.toml                  # Workspace root
 ├── crates/
-│   ├── auraos-kernel/          # Core OS loop, Loro CRDT management, SurrealDB sync
-│   ├── auraos-mcp/             # rmcp server, Unix Domain Socket handling
-│   ├── auraos-wasm/            # wasmtime host, WASI capability manifesting
-│   ├── auraos-docker/          # OCI container management, UDS bind-mounting
-│   ├── auraos-extractors/      # Wasm swarm, notify-debouncer, tree-sitter wrappers
-│   ├── auraos-system-agents/   # Proposer, Evaluator, Classifier (candle inference)
-│   └── auraos-telemetry/       # Outbox, rdkafka publisher, Redactor logic
+│   ├── superx-kernel/          # Core OS loop, Loro CRDT management, SurrealDB sync
+│   ├── superx-mcp/             # rmcp server, Unix Domain Socket handling
+│   ├── superx-wasm/            # wasmtime host, WASI capability manifesting
+│   ├── superx-docker/          # OCI container management, UDS bind-mounting
+│   ├── superx-extractors/      # Wasm swarm, notify-debouncer, tree-sitter wrappers
+│   ├── superx-system-agents/   # Proposer, Evaluator, Classifier (candle inference)
+│   └── superx-telemetry/       # Outbox, rdkafka publisher, Redactor logic
 └── tools/
     └── meta-harness-cli/       # CLI for human-in-the-loop promotion approvals
 ```

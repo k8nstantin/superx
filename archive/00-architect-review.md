@@ -1,4 +1,4 @@
-# AuraOS — Applications Architect's Review
+# SuperX — Applications Architect's Review
 
 **Reviewing:** `01-architecture.md`, `02-state-and-persistence.md`,
 `03-execution-and-vfs.md`, `04-graphify-ingestion.md`,
@@ -6,7 +6,7 @@
 
 **Reviewer's stance:** experienced applications architect. Goal is to
 surface gaps + risks honestly while acknowledging the bold ideas that
-work. Where AuraOS does something better than what I'd otherwise
+work. Where SuperX does something better than what I'd otherwise
 recommend, I say so.
 
 ---
@@ -78,7 +78,7 @@ problem in the system.
 | Multiple CRDT changes batched faster than SurrealDB can absorb | Not specified | Backpressure: how does the hot path know SCD-2 is behind? Bounded queue? Drop oldest? Block? |
 | Crash during a `supersede()` transaction after CRDT applied but before commit | Not specified | Rehydration finds prior state; CRDT history (loro op log) must be persisted independently so loro can re-converge after recovery |
 | **Loro's operation log itself is state.** Loro maintains operation IDs, peer IDs, vector clocks. If you persist only the materialized snapshot to SCD-2, you lose merge capability after restart. | Not addressed | Persist BOTH the snapshot (in SCD-2) AND the loro op log (in a separate SurrealKV store or as `string_value` rows on the entity). On rehydrate, replay op log. |
-| Two peers connected to two AuraOS nodes both edit the same entity | Hand-waved as "CRDTs solve it" | True only if both nodes have a connected loro session; cross-node CRDT requires a sync protocol (NATS? gossip? hub-spoke?) not in the doc |
+| Two peers connected to two SuperX nodes both edit the same entity | Hand-waved as "CRDTs solve it" | True only if both nodes have a connected loro session; cross-node CRDT requires a sync protocol (NATS? gossip? hub-spoke?) not in the doc |
 | Time-travel queries — does `fn::current_at($t)` give the CRDT state at $t, or the SCD-2 state? | Not addressed | They diverge: CRDT may have applied mutations not yet in SCD-2. Need to define which is canonical for which query |
 
 **Recommendation:**
@@ -104,7 +104,7 @@ FUSE differ by 10–100x. Tools that use `mmap`, `O_DIRECT`, locking,
 xattrs may fail outright.
 
 **Recommendation:**
-- **Demote FUSE from "the universal bridge" to "an optional inspection projection."** Useful for `ls /AuraOS/graph/concepts/auth` exploration in a terminal, debug, demos.
+- **Demote FUSE from "the universal bridge" to "an optional inspection projection."** Useful for `ls /SuperX/graph/concepts/auth` exploration in a terminal, debug, demos.
 - **Primary IPC for tools should be MCP** (rmcp), which works cross-platform, is the agent-ecosystem standard, and doesn't require admin install.
 - **Docker container integration:** rmcp via stdio or SSE, not FUSE mount.
 - **Wasm tool integration:** shared memory + host functions, not FUSE.
@@ -308,23 +308,23 @@ prompts? Without the stack, the frontend is undecided.
 
 ## Recommendations: a converged path forward
 
-If AuraOS continues as its own product, here are the concrete moves to
-make it production-ready. If AuraOS and SuperX merge (or you pick the
+If SuperX continues as its own product, here are the concrete moves to
+make it production-ready. If SuperX and SuperX merge (or you pick the
 best of both), the same recommendations apply.
 
-### Adopt from AuraOS into your unified design
+### Adopt from SuperX into your unified design
 1. **Wasm extractor swarm with shared memory** for code graph — keep the < 10ms latency claim.
 2. **xyflow** as the React graph canvas (replace ECharts graph series).
 3. **CRDT support as an opt-in collaboration layer** — but persisted properly (snapshot + op log) and only for entities with concurrent-edit needs.
 4. **Continuous indexing as a kernel-internal primitive**, not as an offline batch.
 
-### Drop or re-scope from AuraOS
+### Drop or re-scope from SuperX
 1. **FUSE as primary IPC** — demote to optional inspection projection.
 2. **"OS writes its own code without human intervention"** — gate production promotion behind explicit approval.
 3. **Wasm-as-the-only-fast-path** — Wasm for trusted internal tools, MCP for everyone else's tools.
 4. **Semantic Warden as primary gate** — defense-in-depth only.
 
-### Add to AuraOS
+### Add to SuperX
 1. **MCP / rmcp protocol surface** for agent tool calling.
 2. **`tenant` field on every table** — multi-tenant from day 0.
 3. **`secret` table** with encrypted ciphertext + KMS backends.
@@ -357,14 +357,14 @@ best of both), the same recommendations apply.
 
 ---
 
-## Honest comparison: AuraOS vs SuperX (the doc set I just helped design)
+## Honest comparison: SuperX vs SuperX (the doc set I just helped design)
 
-| Dimension | AuraOS spec | SuperX spec | Better |
+| Dimension | SuperX spec | SuperX spec | Better |
 |---|---|---|---|
 | SCD-2 universal invariant | Yes | Yes | Tie |
 | UUIDv7 everywhere | Implicit | Explicit | SuperX |
-| Storage strategy | Hot CRDT + cold SCD-2 | Cold SCD-2 only (Loro deferred to v2) | AuraOS if dual-state correctness is proven; SuperX if it isn't |
-| Code graph | Continuous Wasm extractors in-kernel | graphify-rs via MCP bridge | AuraOS (lower latency, tighter integration) |
+| Storage strategy | Hot CRDT + cold SCD-2 | Cold SCD-2 only (Loro deferred to v2) | SuperX if dual-state correctness is proven; SuperX if it isn't |
+| Code graph | Continuous Wasm extractors in-kernel | graphify-rs via MCP bridge | SuperX (lower latency, tighter integration) |
 | Tool ABI | Wasm WASI + Docker via VFS | MCP / rmcp | SuperX (ecosystem compat) |
 | Multi-tenancy | Not addressed | First-class from day 0 | SuperX |
 | Secrets management | Not addressed | `secret` table + KMS | SuperX |
@@ -374,25 +374,25 @@ best of both), the same recommendations apply.
 | Interactive (human) capture | Not addressed | `interactive.*` event taxonomy | SuperX |
 | Emission pipeline | One paragraph | Full outbox + sink trait + cursor + backpressure spec | SuperX |
 | Library inventory | Partial | Complete (Rust + React) | SuperX |
-| Graph canvas (React) | xyflow | ECharts graph series | AuraOS |
+| Graph canvas (React) | xyflow | ECharts graph series | SuperX |
 | Capability check | LLM-fuzzy primary | Deterministic primary + LLM anomaly-watcher | SuperX |
 | Self-improvement loop | Auto-deploy | Approval-gated in prod | SuperX |
 | Differentiation pitch | Hot/cold + Wasm + VFS + self-modifying | Time-traveled data + insert-only + MCP-driver + central analytics | Both strong, different bets |
 
-**My architect's verdict:** AuraOS has 4 great ideas that SuperX should
+**My architect's verdict:** SuperX has 4 great ideas that SuperX should
 adopt (Wasm extractors with shared memory; xyflow canvas; loro CRDT for
 opt-in collaboration; continuous in-kernel indexing). SuperX has ~10
-specifications AuraOS is missing (MCP, tenants, secrets, prompt
+specifications SuperX is missing (MCP, tenants, secrets, prompt
 discipline, full system-agent roster, hardware tiers, interactive
 capture, emission engineering, library inventory, failure-mode matrix).
 
-The right move: **merge them.** Take AuraOS's hot-path innovations
+The right move: **merge them.** Take SuperX's hot-path innovations
 into SuperX's foundation. Result: an agentic OS with both the
 sub-10ms code-graph reactivity AND the production-readiness of a
 properly tenant-isolated, secret-managed, capability-gated, MCP-fluent
 system.
 
-If they remain separate products, AuraOS as currently specified is a
+If they remain separate products, SuperX as currently specified is a
 research demo waiting to bite production users on (a) state-sync
 divergence under load, (b) FUSE on macOS, (c) LLM-in-the-security-loop
 incidents, and (d) the absence of multi-tenancy + secrets. Each is
@@ -419,7 +419,7 @@ fixable; none is fixed by the docs as they stand.
    - `12-react-stack.md` (with xyflow as the headline)
 4. **Promote the Wasm extractor swarm** as the headline differentiator
    — it's genuinely novel and worth fronting.
-5. **Re-pitch:** "AuraOS — the agentic OS that indexes your code in
+5. **Re-pitch:** "SuperX — the agentic OS that indexes your code in
    under 10 milliseconds, time-travels every state change forever, and
    lets agents + humans collaborate on the same living graph." Drop
    "OS writes its own code without human intervention" — replace with

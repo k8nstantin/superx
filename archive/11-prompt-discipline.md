@@ -1,6 +1,6 @@
-# AuraOS — Strict XML Prompt Discipline
+# SuperX — Strict XML Prompt Discipline
 
-Free-form text prompts introduce non-determinism, rendering the Meta-Harness Evaluator useless. AuraOS enforces a strict XML/tagged prompt discipline for all system and external agents.
+Free-form text prompts introduce non-determinism, rendering the Meta-Harness Evaluator useless. SuperX enforces a strict XML/tagged prompt discipline for all system and external agents.
 
 ## 1. The Tag Vocabulary
 All LLM outputs must conform to a defined schema. If an agent outputs raw text outside these tags, the OS considers it a fault and truncates the turn.

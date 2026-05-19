@@ -1,6 +1,6 @@
-# AuraOS — State Management & Persistence (SCD-2 + CRDTs)
+# SuperX — State Management & Persistence (SCD-2 + CRDTs)
 
-AuraOS solves the tension between the need for microsecond execution speeds and the absolute requirement for immutable, time-traveled data retention. It achieves this via an Epoch-Synced dual-state architecture.
+SuperX solves the tension between the need for microsecond execution speeds and the absolute requirement for immutable, time-traveled data retention. It achieves this via an Epoch-Synced dual-state architecture.
 
 ## 1. The Hot Path: CRDTs and Concurrent Maps
 
@@ -42,7 +42,7 @@ To prevent database bloat and catastrophic Write Amplification, we do **not** sy
 
 ## 3. Crash Recovery: The Rehydration Loop
 
-Because the execution graph lives in volatile RAM, AuraOS must perfectly recover state upon crash or restart.
+Because the execution graph lives in volatile RAM, SuperX must perfectly recover state upon crash or restart.
 
 1.  **Boot Phase:** The Rust kernel process starts. RAM is empty.
 2.  **The Rehydration Query:** The kernel queries SurrealDB for the "active" slice of reality:

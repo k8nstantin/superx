@@ -1,8 +1,8 @@
-# AuraOS — The Meta-Harness Evolution Loop
+# SuperX — The Meta-Harness Evolution Loop
 
-An Agentic OS must improve itself. AuraOS treats the "Harness" (the configuration, capability manifest, prompts, and tools of an agent) as a versioned program. The OS runs a continuous Propose -> Evaluate -> Promote loop.
+An Agentic OS must improve itself. SuperX treats the "Harness" (the configuration, capability manifest, prompts, and tools of an agent) as a versioned program. The OS runs a continuous Propose -> Evaluate -> Promote loop.
 
-Because AuraOS mandates strict SCD-2 persistence, the Meta-Harness has access to a mathematically perfect, time-traveled audit log of every failure and success.
+Because SuperX mandates strict SCD-2 persistence, the Meta-Harness has access to a mathematically perfect, time-traveled audit log of every failure and success.
 
 ## 1. The Anatomy of a Harness
 
@@ -29,7 +29,7 @@ When an agent fails a task:
 3.  It spawns isolated, temporary Wasm instances with the *proposed* Harness and runs them against the evaluation set, recording scores.
 
 ### Step 3: The Human-in-the-Loop Promotion Gate
-AuraOS strictly avoids the "supply-chain attack surface" of automatically deploying agent-written code to production.
+SuperX strictly avoids the "supply-chain attack surface" of automatically deploying agent-written code to production.
 
 1.  If the Evaluator determines the proposal shows a statistically significant improvement, it flags the Harness as `Ready for Review`.
 2.  **Human Approval:** A human developer is notified via the React `xyflow` UI or an MCP notification. The developer reviews the proposed Wasm tool source code and the evaluation traces.
@@ -39,4 +39,4 @@ AuraOS strictly avoids the "supply-chain attack surface" of automatically deploy
 
 Without strict SCD-2, the Meta-Harness is blind.
 *   If a file was overwritten during a failed run, the Proposer couldn't see the exact code that confused the agent.
-*   Because AuraOS saves *everything* securely to SurrealDB (and emits cleansed data to Kafka), the Proposer has a perfect, time-aligned "filesystem" of history to learn from.
+*   Because SuperX saves *everything* securely to SurrealDB (and emits cleansed data to Kafka), the Proposer has a perfect, time-aligned "filesystem" of history to learn from.

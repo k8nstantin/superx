@@ -1,9 +1,9 @@
-# AuraOS — Emission Engineering
+# SuperX — Emission Engineering
 
-AuraOS is designed for enterprise environments where every action must be auditable, analyzable, and secure.
+SuperX is designed for enterprise environments where every action must be auditable, analyzable, and secure.
 
 ## 1. The Outbox Pattern
-Directly writing to Kafka from the hot path introduces network latency and reliability risks. AuraOS uses the **Outbox Pattern**.
+Directly writing to Kafka from the hot path introduces network latency and reliability risks. SuperX uses the **Outbox Pattern**.
 *   All state changes and agent logs are written to the local SurrealDB `execution_log` table in the same transaction as the SCD-2 state change.
 *   A background `tokio` task (The Emitter) independently tails this table.
 
@@ -18,6 +18,6 @@ Directly writing to Kafka from the hot path introduces network latency and relia
 
 ## 4. Multi-Sink & Topics
 Events are strictly routed by topic:
-*   `auraos.telemetry.mutations`: Structural CRDT changes (for data-warehouse replication).
-*   `auraos.telemetry.agent_traces`: `<thought>` and `<action>` logs for offline ML training.
-*   `auraos.telemetry.security`: Capability violations and access denials.
+*   `superx.telemetry.mutations`: Structural CRDT changes (for data-warehouse replication).
+*   `superx.telemetry.agent_traces`: `<thought>` and `<action>` logs for offline ML training.
+*   `superx.telemetry.security`: Capability violations and access denials.

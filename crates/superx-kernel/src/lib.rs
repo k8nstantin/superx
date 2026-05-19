@@ -17,6 +17,11 @@ use jsonschema::JSONSchema;
 
 const MAX_ID_LENGTH: usize = 128;
 
+/// Single source of truth for the default tenant identifier used by every
+/// `SuperX` surface (CLI flags, MCP fallback, integration tests). Renaming
+/// it here propagates everywhere — there is no magic-string duplication.
+pub const DEFAULT_TENANT: &str = "sa_dogfood";
+
 #[derive(Debug, thiserror::Error)]
 pub enum KernelError {
     #[error("Database error: {0}")]

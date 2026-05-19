@@ -1,4 +1,4 @@
-# AuraOS Master Blueprint v41.1: The Atomic Reset (Hardened)
+# SuperX Master Blueprint v41.1: The Atomic Reset (Hardened)
 
 **Classification:** Definitive Immutable Architecture (Revision 41.1)  
 **Paradigm:** Documentation-Driven / Tight Substrate / Functional Rigor  
@@ -31,8 +31,8 @@
 
 ## 3. Directory Layout (Mandatory)
 ```text
-/AuraOS
-├── auraos (The Rust Manager)
+/SuperX
+├── superx (The Rust Manager)
 ├── /ui (Static UI assets)
 ├── /db (RocksDB files)
 ├── /models (GGUF brains)
@@ -50,4 +50,4 @@
 
 ---
 **End of Document**  
-*AuraOS v41.1: Reset Complete. Moving to Hardened Construction.*
+*SuperX v41.1: Reset Complete. Moving to Hardened Construction.*

@@ -67,7 +67,11 @@ impl IngestionSource for FileSource {
             let path_str = path.to_string_lossy();
             if path_str.contains("target/") || path_str.contains(".git/") { continue; }
 
-            let parent = path.parent().unwrap();
+            // `WalkDir` never yields the filesystem root, so `path.parent()` is
+            // always Some — but we don't rely on that implicit invariant: if it
+            // ever returns None we fall back to the ingestion root rather than
+            // panicking inside an async traversal.
+            let parent = path.parent().unwrap_or(root_path);
             let parent_uid = path_to_id.get(parent).cloned().unwrap_or(root_uid.clone());
 
             let node_uid = uuid::Uuid::now_v7().to_string();

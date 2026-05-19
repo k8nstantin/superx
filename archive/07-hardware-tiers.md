@@ -1,6 +1,6 @@
-# AuraOS — Hardware Tiers & Degradation Strategy
+# SuperX — Hardware Tiers & Degradation Strategy
 
-AuraOS adapts its System Agent roster and LLM requirements based on available hardware, gracefully degrading capabilities from T0 down to T5.
+SuperX adapts its System Agent roster and LLM requirements based on available hardware, gracefully degrading capabilities from T0 down to T5.
 
 | Tier | Hardware Profile | Roster Deployment | Primary LLM Strategy | Degradation Impact |
 | :--- | :--- | :--- | :--- | :--- |

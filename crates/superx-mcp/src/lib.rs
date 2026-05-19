@@ -36,7 +36,8 @@ impl McpServer {
 }
 
 /// Default tenant fallback used when an MCP request does not carry one.
-pub const DEFAULT_TENANT: &str = "sa_dogfood";
+/// Re-exported from `superx-kernel` so there's exactly one source of truth.
+pub use superx_kernel::DEFAULT_TENANT;
 
 /// Dispatch an MCP tool call. Pure policy: takes the kernel + the parsed request
 /// pieces, returns the same `Result<CallToolResult, McpError>` the rmcp handler

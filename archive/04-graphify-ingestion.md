@@ -1,10 +1,10 @@
-# AuraOS — Graphify & Continuous Ingestion
+# SuperX — Graphify & Continuous Ingestion
 
-To an Agentic OS, code is not text; code is a highly structured, relational graph. AuraOS integrates Graphify's principles (AST extraction, symbol resolution) as a sub-10ms, living system primitive. This is a core differentiator over periodic batch-indexing.
+To an Agentic OS, code is not text; code is a highly structured, relational graph. SuperX integrates Graphify's principles (AST extraction, symbol resolution) as a sub-10ms, living system primitive. This is a core differentiator over periodic batch-indexing.
 
 ## 1. The Continuous Wasm Extractor Swarm
 
-AuraOS does not run batch jobs. The graph breathes with the codebase.
+SuperX does not run batch jobs. The graph breathes with the codebase.
 
 ### The `notify` Loop
 The Rust kernel runs a background task utilizing the `notify` crate, deeply hooking into macOS `FSEvents` or Linux `inotify`. It monitors the workspace for any file saves.

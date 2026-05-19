@@ -1,6 +1,6 @@
-# AuraOS — Resource Quotas & Tenancy Budgets
+# SuperX — Resource Quotas & Tenancy Budgets
 
-To prevent "runaway agents" from bankrupting organizations or DOSing the kernel, AuraOS implements strict, multi-tenant resource accounting.
+To prevent "runaway agents" from bankrupting organizations or DOSing the kernel, SuperX implements strict, multi-tenant resource accounting.
 
 ## 1. The `resource_account`
 Every `tenant_id` in SurrealDB maps to a `resource_account`. This account holds budgets for:
@@ -10,7 +10,7 @@ Every `tenant_id` in SurrealDB maps to a `resource_account`. This account holds 
 
 ## 2. Enforcement at the Tool-Call Boundary
 Quotas are not checked "after the fact."
-*   **Wasmtime Fuel:** AuraOS utilizes `wasmtime`'s native fuel metering. If an agent enters an infinite loop, it runs out of fuel and traps instantly.
+*   **Wasmtime Fuel:** SuperX utilizes `wasmtime`'s native fuel metering. If an agent enters an infinite loop, it runs out of fuel and traps instantly.
 *   **MCP Interception:** Every MCP request (`rmcp`) is intercepted by a Quota Middleware. If the tenant's token budget is exhausted, the RPC call returns a `429 Too Many Requests` equivalent, forcing the agent to `<yield>`.
 
 ## 3. Dynamic Adjustments

@@ -1,6 +1,6 @@
-# AuraOS — Interactive Activity Capture
+# SuperX — Interactive Activity Capture
 
-AuraOS captures human intent just as rigorously as agent intent. Developer actions in the IDE or React Canvas are logged as first-class semantic events, creating training data for future agents.
+SuperX captures human intent just as rigorously as agent intent. Developer actions in the IDE or React Canvas are logged as first-class semantic events, creating training data for future agents.
 
 ## 1. The `interactive.*` Event Taxonomy
 Every UI action in `xyflow` or the MCP IDE plugin emits a structured event to the Living Graph:

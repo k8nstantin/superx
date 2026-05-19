@@ -1,6 +1,6 @@
-# AuraOS — Failure Mode Matrix
+# SuperX — Failure Mode Matrix
 
-AuraOS guarantees deterministic recovery across its subsystems.
+SuperX guarantees deterministic recovery across its subsystems.
 
 | Subsystem | Failure Event | Detection Mechanism | Recovery Behavior |
 | :--- | :--- | :--- | :--- |

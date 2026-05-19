@@ -1,4 +1,4 @@
-# AuraOS Master Blueprint v37.0: The Unified Modular Binary
+# SuperX Master Blueprint v37.0: The Unified Modular Binary
 
 **Classification:** Final Immutable Architecture (Revision 37.0)  
 **Paradigm:** Documentation-Driven / Unified DAG Supremacy / Persistent Execution  
@@ -36,7 +36,7 @@ All intelligence is stored in a single, un-partitioned graph utilizing the embed
 
 ## 3. Distribution Model: The Unified Modular Binary (UMB)
 
-AuraOS is distributed as a single, "Gig Fat Fuck Executable" that encapsulates the entire intelligence stack. While the codebase is modular (Rust crates), the final distribution statically links all providers to ensure zero external dependencies.
+SuperX is distributed as a single, "Gig Fat Fuck Executable" that encapsulates the entire intelligence stack. While the codebase is modular (Rust crates), the final distribution statically links all providers to ensure zero external dependencies.
 
 *   **Statically Linked Kernel:** Embedded **RocksDB** and **SurrealDB**.
 *   **Statically Linked Ingestors:** **Tree-sitter** grammars for all major languages.
@@ -77,9 +77,9 @@ AuraOS is distributed as a single, "Gig Fat Fuck Executable" that encapsulates t
 ---
 
 ## 5. Persistence-First Swarm Topologies
-*   **Durability Over RAM:** AuraOS prioritizes persistent RocksDB writes over volatile memory caches. Intelligence survives reboots natively.
+*   **Durability Over RAM:** SuperX prioritizes persistent RocksDB writes over volatile memory caches. Intelligence survives reboots natively.
 *   **P2P Sharing:** Sub-graph exports with re-encrypted credentials for decentralized swarm collaboration.
 
 ---
 **End of Document**  
-*AuraOS v37.0: Unified Modular Binary Locked. Architecture Finalized.*
+*SuperX v37.0: Unified Modular Binary Locked. Architecture Finalized.*

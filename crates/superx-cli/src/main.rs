@@ -12,7 +12,7 @@ use superx_compiler::CompilerBlade;
 use superx_harness::MetaHarness;
 use superx_proposer::ProposerBlade;
 use superx_bootstrap::BootstrapBlade;
-use superx_kernel::Kernel;
+use superx_kernel::{Kernel, DEFAULT_TENANT};
 use superx_emission::{TelemetrySubscriber, ApiSink, KafkaSink};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -40,7 +40,7 @@ enum Commands {
     Graphify {
         #[arg(short, long)]
         path: PathBuf,
-        #[arg(short, long, default_value = "sa_dogfood")]
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
         tenant: String,
         #[arg(short, long)]
         run_id: Option<String>,
@@ -49,7 +49,7 @@ enum Commands {
     Compile {
         #[arg(short, long)]
         root: String,
-        #[arg(short, long, default_value = "sa_dogfood")]
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
         tenant: String,
         #[arg(short, long)]
         model: Option<PathBuf>,
@@ -64,7 +64,7 @@ enum Commands {
         proposal: String,
         #[arg(short, long)]
         harness: PathBuf,
-        #[arg(short, long, default_value = "sa_dogfood")]
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
         tenant: String,
     },
     /// Promote a proposal node if it passes threshold
@@ -73,7 +73,7 @@ enum Commands {
         proposal: String,
         #[arg(short, long, default_value = "0.8")]
         threshold: f64,
-        #[arg(short, long, default_value = "sa_dogfood")]
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
         tenant: String,
     },
     /// Propose a relation between two nodes using an agent
@@ -82,7 +82,7 @@ enum Commands {
         from: String,
         #[arg(short, long)]
         to: String,
-        #[arg(short, long, default_value = "sa_dogfood")]
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
         tenant: String,
         #[arg(short, long)]
         model: PathBuf,
@@ -91,12 +91,12 @@ enum Commands {
     },
     /// Bootstrap the substrate for a tenant
     Bootstrap {
-        #[arg(short, long, default_value = "sa_dogfood")]
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
         tenant: String,
     },
     /// View the latest telemetry stats
     Stats {
-        #[arg(short, long, default_value = "sa_dogfood")]
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
         tenant: String,
         #[arg(short, long, default_value = "10")]
         limit: usize,
@@ -105,17 +105,17 @@ enum Commands {
     Identify {
         #[arg(short, long)]
         agent_uid: String,
-        #[arg(short, long, default_value = "sa_dogfood")]
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
         tenant: String,
     },
     /// List all agents registered in the substrate for the tenant
     ListAgents {
-        #[arg(short, long, default_value = "sa_dogfood")]
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
         tenant: String,
     },
     /// List all tools registered in the substrate (capability-gated targets)
     ListTools {
-        #[arg(short, long, default_value = "sa_dogfood")]
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
         tenant: String,
     },
     /// One-shot end-to-end demo: bootstrap -> ingest fixture -> propose -> promote
