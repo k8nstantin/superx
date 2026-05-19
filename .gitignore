@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# RocksDB substrate (local dev state, never committed)
+/db
+**/db/superx.db
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local model weights (large, not in version control)
+*.gguf
+*.safetensors
+*.bin
+
+# Local environment overrides
+.env
+.env.local
+
+# Tempfiles from tests
+tmp/
+.tmp*/
+
+# Claude Code worktree / session state
+.claude/sessions/

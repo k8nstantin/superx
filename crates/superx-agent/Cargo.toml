@@ -1,0 +1,14 @@
+[package]
+name = "superx-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+superx-kernel = { path = "../superx-kernel" }
+surrealdb.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+async-trait.workspace = true

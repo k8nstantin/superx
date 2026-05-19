@@ -1,0 +1,15 @@
+[package]
+name = "superx-ingest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+superx-kernel = { path = "../superx-kernel" }
+surrealdb.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+walkdir = "2.5"
+uuid.workspace = true
