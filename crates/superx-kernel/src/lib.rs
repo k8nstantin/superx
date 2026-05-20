@@ -779,11 +779,15 @@ impl Kernel {
         let _ = substrate_thing;
 
         // 5. Telemetry on every typed write.
-        let _ = self.log_telemetry(
-            serde_json::json!({"target": target_id, "type": type_uid}),
-            "state_supersede",
-            run_id
-        ).await;
+        // run_id (caller-provided correlation token) stays in the payload;
+        // the typed run FK is None until node_run entities are modelled.
+        let mut payload_obj = serde_json::json!({"target": target_id, "type": type_uid});
+        if let Some(ref r) = run_id {
+            if let Some(o) = payload_obj.as_object_mut() {
+                o.insert("run_id".into(), serde_json::Value::String(r.clone()));
+            }
+        }
+        let _ = self.log_telemetry(payload_obj, "state_supersede", None).await;
 
         Ok(())
     }
@@ -884,11 +888,11 @@ impl Kernel {
         tiers: Option<Vec<String>>
     ) -> Result<String, KernelError> {
         assert!(!root_id.is_empty(), "Root ID mandatory");
-        
+
         let _ = self.log_telemetry(
-            serde_json::json!({"root": root_id, "tiers": tiers}),
+            serde_json::json!({"root": root_id, "tiers": tiers, "run_id": run_id}),
             "context_compile",
-            Some(run_id.to_string())
+            None
         ).await;
 
         let root_thing = Self::parse_id(root_id)?;
@@ -942,30 +946,60 @@ impl Kernel {
         Ok(xml)
     }
 
-    /// `log_telemetry`: Non-critical telemetry logging.
+    /// `log_telemetry`: append a typed event to the firehose.
+    ///
+    /// Schema-aligned to v2:
+    /// - `valid_from` is set by the schema default; the kernel does not write
+    ///   a separate `timestamp`.
+    /// - `tenant: record<entity>` resolved from the session's substrate-entity
+    ///   id; the engine `ASSERT $value.type.uid = 'node_substrate'` catches
+    ///   any FK pointing at a non-substrate row.
+    /// - `run: Option<record<entity>>` resolved by the caller; when provided
+    ///   the engine `ASSERT $value.type.uid = 'node_run'` catches FKs that
+    ///   point at the wrong entity type.
+    /// - Pure INSERT — no UPDATE, no `is_current`, no `valid_to`. Under the
+    ///   superx service account the engine would refuse UPDATE anyway.
     ///
     /// # Panics
     /// Panics if `event` is empty.
     ///
     /// # Errors
-    /// Returns `KernelError::Database` if insertion fails.
-    pub async fn log_telemetry(&self, payload: serde_json::Value, event: &str, run_id: Option<String>) -> Result<(), KernelError> {
+    /// Returns `KernelError::Database` if insertion fails (engine refusal is
+    /// the signal that a caller is passing the wrong FK type — fix the caller,
+    /// never the user identity).
+    pub async fn log_telemetry(
+        &self,
+        payload: serde_json::Value,
+        event: &str,
+        run: Option<Thing>,
+    ) -> Result<(), KernelError> {
         assert!(!event.is_empty(), "Event name mandatory");
         tracing::info!("Logging Telemetry: Event={}, Payload={}", event, payload);
 
-        // Telemetry rows likewise carry native UUIDv7 ids so the firehose preserves
-        // the wall-clock ordering its consumers rely on.
         let log_record_id = Thing::from((
             "telemetry_stream",
             surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(::uuid::Uuid::now_v7())),
         ));
-        
-        let query = "INSERT INTO telemetry_stream { id: $id, lifecycle_event: $e, payload: $p, run_id: $r, tenant_id: $session_tenant, timestamp: time::now() }";
-        self.db.query(query)
+
+        // tenant FK: substrate-entity Thing resolved from session.
+        let session_tenant_str = self.get_session_tenant().await?;
+        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
+
+        self.db.query(
+            "INSERT INTO telemetry_stream { \
+                id: $id, \
+                lifecycle_event: $e, \
+                payload: $p, \
+                run: $r, \
+                tenant: $t \
+            }"
+        )
             .bind(("id", log_record_id))
             .bind(("p", payload))
             .bind(("e", event.to_string()))
-            .bind(("r", run_id)).await?.check()?;
+            .bind(("r", run))
+            .bind(("t", tenant_thing))
+            .await?.check()?;
         Ok(())
     }
 
@@ -1006,7 +1040,7 @@ impl Kernel {
         let _ = self.log_telemetry(
             serde_json::json!({"type": cursor_type, "last": last_processed}),
             "execution_checkpoint",
-            Some(run_id.to_string())
+            None
         ).await;
 
         Ok(())
@@ -1094,7 +1128,7 @@ impl Kernel {
         let _ = self.log_telemetry(
             serde_json::json!({"run_id": run_id, "agent_id": agent_id}),
             "execution_params_set",
-            Some(run_id.to_string())
+            None
         ).await;
 
         Ok(())
@@ -1198,7 +1232,7 @@ impl Kernel {
         let _ = self.log_telemetry(
             serde_json::json!({"schedule_id": row_id_str, "run_id": run_id, "kind": kind, "target": target_entity}),
             "schedule_enqueued",
-            Some(run_id.to_string())
+            None
         ).await;
 
         Ok(row_id_str)
@@ -1309,9 +1343,10 @@ impl Kernel {
                 "new_schedule_id": new_row_id_str,
                 "prior_status": prior_status,
                 "new_status": new_status,
+                "run_id": current.run_id,
             }),
             "schedule_transitioned",
-            Some(current.run_id)
+            None
         ).await;
 
         Ok(new_row_id_str)
