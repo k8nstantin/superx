@@ -256,6 +256,16 @@ The substrate enforces this from its side: `PERMISSIONS FOR update NONE; FOR del
 
 **Root account boundary:** root is reserved for the operator. The operator uses root only to apply schema changes that they have explicitly designed (per §11 schema-first workflow) and explicitly authorised. The model is forbidden from invoking root under any circumstance. If a verb or test or migration needs root, **STOP and ask the operator** to run it.
 
+**Never use root to bypass engine refusals.** If the substrate refuses an operation — an `UPDATE` blocked by `FOR update NONE`, a `record<entity>` insert rejected by an `ASSERT` clause, a SCHEMAFULL field-type violation, a missing required field, a tenant-coercion attempt refused by `PERMISSIONS` — the answer is **fix the code so it stops issuing the rejected operation**. The answer is **never** to authenticate as root and re-run the operation. Engine refusals are the §12 debugging surface working as designed; bypassing them under root reintroduces every class of bug the constraints were put there to catch.
+
+Anti-patterns (banned outright):
+- ❌ "I'll just signin as root for this one query to get past the constraint."
+- ❌ "I'll use root in tests because the service account doesn't have permission."
+- ❌ "Let me set `SUPERX_USE_ROOT=true` for this migration."
+- ❌ Any pattern that switches the kernel's connection back to root after init.
+
+The model's connection is `superx` and stays `superx`. Engine refusals propagate as `KernelError::Database` errors and the model must respond by changing the code that issued the rejected operation — not by changing the user issuing it.
+
 **Credentials in this skill, not in source code:** the password lives here so the model can authenticate; it does not live as a hardcoded literal in business logic. Production hardening (PASSHASH-based provisioning, vaulted secrets, per-tenant accounts) is roadmap, but the contract — *the model uses `superx`, never root* — is binding from this commit forward.
 
 ### Execution Loop Enforcement
