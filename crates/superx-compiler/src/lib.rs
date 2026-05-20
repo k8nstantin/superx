@@ -69,12 +69,20 @@ impl<'a> CompilerBlade<'a> {
 
         tracing::info!("Starting durable compilation for {root_id} (Run ID: {run_id})");
 
+        // Cursor subject = the root entity being compiled. Cursor chain tracks
+        // compile_context progress for this subject; run_id is recorded in
+        // metadata for cross-referencing telemetry.
+        let root_thing = superx_kernel::Kernel::parse_id(root_id)?;
+
         // 1. Initial Checkpoint
-        self.kernel.checkpoint_execution(
-            run_id,
-            "compilation",
+        self.kernel.write_cursor(
+            root_thing.clone(),
+            "compile_context",
             None,
-            Some(serde_json::json!(CompilationMetadata { total_nodes: 0, current_node_index: 0 }))
+            Some(serde_json::json!({
+                "run_id": run_id,
+                "metadata": CompilationMetadata { total_nodes: 0, current_node_index: 0 }
+            }))
         ).await?;
 
         // 2. Structural Traversal (Tier-aware)
@@ -97,11 +105,11 @@ impl<'a> CompilerBlade<'a> {
         };
 
         // 4. Final Checkpoint
-        self.kernel.checkpoint_execution(
-            run_id,
-            "compilation",
+        self.kernel.write_cursor(
+            root_thing,
+            "compile_context",
             Some("DONE".to_string()),
-            None
+            Some(serde_json::json!({"run_id": run_id})),
         ).await?;
 
         Ok(final_output)
