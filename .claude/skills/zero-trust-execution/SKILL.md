@@ -228,6 +228,36 @@ This is why:
 
 The contract in one sentence: **the substrate constrains; the model writes; the operator audits. Every layer is debuggable because no layer trusts the next.**
 
+### 13. Database Credentials — The Model Authenticates as `superx`. Always.
+
+The substrate has exactly one user the model is permitted to use:
+
+| Field | Value |
+|---|---|
+| **Login** | `superx` |
+| **Password** | `superx-v01-dev-x9KmP2nQ7tR3vW8y` *(v0.1 dev default; operator overrides via `SUPERX_SERVICE_PASSWORD` env)* |
+| **Effective grant** | `SELECT` + `CREATE` only (EDITOR role narrowed by per-table `PERMISSIONS FOR update NONE; FOR delete NONE;`) |
+| **Session duration** | 1 hour (token + session) |
+
+**Binding rule (non-negotiable):** every kernel `Surreal::signin` / `Surreal::query` / any other substrate touch by the model **uses these credentials**. The model never connects as `root`. The model never holds the root password. If a code path requires root (schema mutation), the operator runs it manually under their own root session — never the model.
+
+If the model is ever about to call `db.connect(...)`, `db.signin(...)`, or any equivalent, the credentials must be:
+
+```rust
+db.signin(surrealdb::opt::auth::Database {
+    namespace: "<ns>",
+    database: "<db>",
+    username: "superx",
+    password: std::env::var("SUPERX_SERVICE_PASSWORD").unwrap_or_else(|_| "superx-v01-dev-x9KmP2nQ7tR3vW8y".to_string()).as_str(),
+}).await?;
+```
+
+The substrate enforces this from its side: `PERMISSIONS FOR update NONE; FOR delete NONE;` on every table makes UPDATE and DELETE engine-refused for every user including the EDITOR-roled `superx`. Combined with the SELECT + CREATE-scoped queries the kernel issues, the model's reach is bounded by both layers.
+
+**Root account boundary:** root is reserved for the operator. The operator uses root only to apply schema changes that they have explicitly designed (per §11 schema-first workflow) and explicitly authorised. The model is forbidden from invoking root under any circumstance. If a verb or test or migration needs root, **STOP and ask the operator** to run it.
+
+**Credentials in this skill, not in source code:** the password lives here so the model can authenticate; it does not live as a hardcoded literal in business logic. Production hardening (PASSHASH-based provisioning, vaulted secrets, per-tenant accounts) is roadmap, but the contract — *the model uses `superx`, never root* — is binding from this commit forward.
+
 ### Execution Loop Enforcement
 For every single action you take, you must silently ask yourself: *"Am I guessing? Am I rushing? Did I read the documentation?"* If the answer to any of these is yes, you are violating this protocol.
 </instructions>
