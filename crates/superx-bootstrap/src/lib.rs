@@ -93,16 +93,40 @@ impl<'a> BootstrapBlade<'a> {
 
         // 2. Provision Substrate Entity (Deterministic UUIDv5 from Tenant)
         let ns_uuid = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").expect("Valid DNS NS");
-        let substrate_uuid = Uuid::new_v5(&ns_uuid, tenant_id.as_bytes()).to_string();
+        let substrate_uuid = Uuid::new_v5(&ns_uuid, tenant_id.as_bytes());
+        let substrate_thing = Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(substrate_uuid)),
+        ));
         let substrate_id = format!("entity:{substrate_uuid}");
-        let substrate_thing = Thing::from(("entity".to_string(), substrate_uuid));
 
-        // The substrate is a `node_substrate`, not a `node_agent` — it does not
-        // carry a role. The PERMISSIONS clauses gate reads/writes via
-        // `$session_role`, not via this entity's own role field.
-        self.kernel.db.query("UPSERT $id SET tenant_id = $t, type = type_definition:node_substrate")
-            .bind(("id", substrate_thing))
-            .bind(("t", tenant_id.to_string())).await?.check()?;
+        // Under v2: typed FK type=$node_substrate, tenant points at the
+        // substrate itself (self-reference is how the substrate entity
+        // satisfies its own `tenant.type.uid = 'node_substrate'` ASSERT).
+        // Idempotent SELECT-then-CREATE — UPSERT is forbidden under the
+        // superx service account (PERMISSIONS FOR update NONE).
+        let node_substrate = self.kernel.type_thing("node_substrate")?;
+        let mut sel = self.kernel.db
+            .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
+            .bind(("id", substrate_thing.clone()))
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct IdRow { #[allow(dead_code)] id: Thing }
+        let exists = sel.take::<Vec<IdRow>>(0)?.pop().is_some();
+        if !exists {
+            self.kernel.db.query(
+                "CREATE entity CONTENT { \
+                    id: $id, \
+                    type: $type, \
+                    tenant: $tenant_self, \
+                    role: 'admin' \
+                }"
+            )
+                .bind(("id", substrate_thing.clone()))
+                .bind(("type", node_substrate))
+                .bind(("tenant_self", substrate_thing.clone()))
+                .await?.check()?;
+        }
 
 
         // 3. Configure Substrate Parameters (Fine-grained state)
@@ -129,11 +153,13 @@ impl<'a> BootstrapBlade<'a> {
             None
         ).await?;
 
-        // 6. Verify the telemetry firehose actually captured our writes — this
-        //    is the early-warning that the substrate's `telemetry_stream` pipe
-        //    broke. If we just provisioned a tenant but no events landed, the
-        //    operator needs to know immediately, not at first usage.
-        let verify_query = "SELECT count() FROM telemetry_stream WHERE run_id = $rid GROUP ALL";
+        // 6. Verify the telemetry firehose actually captured our writes —
+        //    early-warning that the substrate's `telemetry_stream` pipe
+        //    broke. Under v2 the typed `run` FK isn't populated yet
+        //    (node_run entities aren't modelled), so we filter on the
+        //    `run_id` field that the caller embedded in the payload JSON.
+        let verify_query = "SELECT count() FROM telemetry_stream \
+            WHERE payload.run_id = $rid GROUP ALL";
         let mut verify_res = self.kernel.db.query(verify_query)
             .bind(("rid", run_id.clone())).await?;
 
@@ -164,7 +190,7 @@ impl<'a> BootstrapBlade<'a> {
         let sys_ns = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").expect("Valid DNS NS UUID");
 
         let admin_agents = self.seed_admin_agents(tenant_id, run_id, substrate_id, &sys_ns).await?;
-        self.seed_standard_tools(tenant_id, &admin_agents).await?;
+        self.seed_standard_tools(tenant_id, substrate_id, &admin_agents).await?;
         let discovered_count = self.probe_mcp_client_configs(tenant_id, run_id, substrate_id, &sys_ns).await?;
         let activity_count = self.probe_claude_desktop_logs(run_id).await?;
 
@@ -190,14 +216,39 @@ impl<'a> BootstrapBlade<'a> {
         substrate_id: &str,
         sys_ns: &Uuid,
     ) -> Result<Vec<(String, String)>, KernelError> {
+        let node_agent = self.kernel.type_thing("node_agent")?;
+        let substrate_thing = superx_kernel::Kernel::parse_id(substrate_id)?;
+
         let mut admin_agents: Vec<(String, String)> = Vec::new();
         for name in ["system_controller", "gemini_cli"] {
-            let uid = Uuid::new_v5(sys_ns, format!("{tenant_id}:{name}").as_bytes()).to_string();
+            let uid = Uuid::new_v5(sys_ns, format!("{tenant_id}:{name}").as_bytes());
+            let agent_thing = Thing::from((
+                "entity",
+                surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(uid)),
+            ));
             let id_literal = format!("entity:{uid}");
-            self.kernel.db.query("UPSERT $id SET tenant_id = $t, role = $r, type = type_definition:node_agent")
-                .bind(("id", Thing::from(("entity".to_string(), uid.clone()))))
-                .bind(("t", tenant_id.to_string()))
-                .bind(("r", "admin".to_string())).await?.check()?;
+
+            // Idempotent SELECT-then-CREATE under superx (no UPSERT).
+            let mut sel = self.kernel.db
+                .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
+                .bind(("id", agent_thing.clone()))
+                .await?;
+            #[derive(serde::Deserialize)]
+            struct IdRow { #[allow(dead_code)] id: Thing }
+            if sel.take::<Vec<IdRow>>(0)?.pop().is_none() {
+                self.kernel.db.query(
+                    "CREATE entity CONTENT { \
+                        id: $id, \
+                        type: $type, \
+                        tenant: $tenant, \
+                        role: 'admin' \
+                    }"
+                )
+                    .bind(("id", agent_thing.clone()))
+                    .bind(("type", node_agent.clone()))
+                    .bind(("tenant", substrate_thing.clone()))
+                    .await?.check()?;
+            }
             self.kernel.create_structural_edge(substrate_id, &id_literal, "edge_owns").await?;
             let desc = if name == "system_controller" {
                 "SuperX Core System Controller"
@@ -216,20 +267,60 @@ impl<'a> BootstrapBlade<'a> {
     }
 
     /// Seed the five canonical tools and grant each admin agent capability to all of them.
+    /// Tool entities use deterministic UUIDv5 ids derived from `(tenant, tool_uid)` so
+    /// re-bootstraps reuse the same row idempotently.
     async fn seed_standard_tools(
         &self,
         tenant_id: &str,
+        substrate_id: &str,
         admin_agents: &[(String, String)],
     ) -> Result<(), KernelError> {
+        let node_tool = self.kernel.type_thing("node_tool")?;
+        let substrate_thing = superx_kernel::Kernel::parse_id(substrate_id)?;
+        let ns_uuid = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").expect("Valid DNS NS");
+
         let tools = ["tool_ingest", "tool_compile", "tool_propose", "tool_evaluate", "tool_promote"];
         for tool in tools {
-            let tool_id = format!("entity:{tool}");
-            let tool_thing = Thing::from(("entity".to_string(), tool.to_string()));
-            self.kernel.db.query("UPSERT $id SET tenant_id = $t, role = 'user', type = type_definition:node_tool")
-                .bind(("id", tool_thing))
-                .bind(("t", tenant_id.to_string())).await?.check()?;
+            let tool_uuid = Uuid::new_v5(&ns_uuid, format!("{tenant_id}:{tool}").as_bytes());
+            let tool_thing = Thing::from((
+                "entity",
+                surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(tool_uuid)),
+            ));
+            let tool_id_literal = format!("entity:{tool_uuid}");
+
+            let mut sel = self.kernel.db
+                .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
+                .bind(("id", tool_thing.clone()))
+                .await?;
+            #[derive(serde::Deserialize)]
+            struct IdRow { #[allow(dead_code)] id: Thing }
+            if sel.take::<Vec<IdRow>>(0)?.pop().is_none() {
+                self.kernel.db.query(
+                    "CREATE entity CONTENT { \
+                        id: $id, \
+                        type: $type, \
+                        tenant: $tenant, \
+                        role: 'user' \
+                    }"
+                )
+                    .bind(("id", tool_thing))
+                    .bind(("type", node_tool.clone()))
+                    .bind(("tenant", substrate_thing.clone()))
+                    .await?.check()?;
+            }
+
+            // Tag the tool entity with its canonical uid for identification —
+            // the operational pattern was `entity:<tool_uid>` literal; now it's
+            // `entity:<uuidv7>` + an attr_desc carrying the uid.
+            self.kernel.supersede_state(
+                &tool_id_literal,
+                "attr_desc",
+                json!({"text": tool}),
+                None,
+            ).await?;
+
             for (_, agent_id) in admin_agents {
-                self.kernel.create_structural_edge(agent_id, &tool_id, "edge_has_capability").await?;
+                self.kernel.create_structural_edge(agent_id, &tool_id_literal, "edge_has_capability").await?;
             }
         }
         Ok(())
@@ -253,6 +344,9 @@ impl<'a> BootstrapBlade<'a> {
         substrate_id: &str,
         sys_ns: &Uuid,
     ) -> Result<u64, KernelError> {
+        let node_agent = self.kernel.type_thing("node_agent")?;
+        let substrate_thing = superx_kernel::Kernel::parse_id(substrate_id)?;
+
         let mut discovered_count: u64 = 0;
         for (cfg_path, source) in mcp_client_config_candidates() {
             if !cfg_path.exists() {
@@ -261,13 +355,33 @@ impl<'a> BootstrapBlade<'a> {
             tracing::info!("Probing {source} config at {}", cfg_path.display());
             let Some(servers) = read_mcp_servers(&cfg_path) else { continue };
             for (name, server_cfg) in servers {
-                let agent_uuid = Uuid::new_v5(sys_ns, format!("{tenant_id}:{name}").as_bytes()).to_string();
+                let agent_uuid = Uuid::new_v5(sys_ns, format!("{tenant_id}:{name}").as_bytes());
+                let agent_thing = Thing::from((
+                    "entity",
+                    surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(agent_uuid)),
+                ));
                 let agent_record_id = format!("entity:{agent_uuid}");
 
-                self.kernel.db.query("UPSERT $id SET tenant_id = $t, role = $r, type = type_definition:node_agent")
-                    .bind(("id", Thing::from(("entity".to_string(), agent_uuid.clone()))))
-                    .bind(("t", tenant_id.to_string()))
-                    .bind(("r", "user".to_string())).await?.check()?;
+                let mut sel = self.kernel.db
+                    .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
+                    .bind(("id", agent_thing.clone()))
+                    .await?;
+                #[derive(serde::Deserialize)]
+                struct IdRow { #[allow(dead_code)] id: Thing }
+                if sel.take::<Vec<IdRow>>(0)?.pop().is_none() {
+                    self.kernel.db.query(
+                        "CREATE entity CONTENT { \
+                            id: $id, \
+                            type: $type, \
+                            tenant: $tenant, \
+                            role: 'user' \
+                        }"
+                    )
+                        .bind(("id", agent_thing))
+                        .bind(("type", node_agent.clone()))
+                        .bind(("tenant", substrate_thing.clone()))
+                        .await?.check()?;
+                }
                 self.kernel.create_structural_edge(substrate_id, &agent_record_id, "edge_owns").await?;
 
                 let command = server_cfg.get("command").and_then(|v| v.as_str()).unwrap_or("");
