@@ -68,7 +68,9 @@ use surrealdb::engine::local::{Db, RocksDb};
 use surrealdb::sql::Thing;
 use surrealdb::Surreal;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::fmt::Write as _;
 use jsonschema::JSONSchema;
 
@@ -134,6 +136,13 @@ pub struct Kernel {
     pub ns: String,
     /// The `SurrealDB` database name this kernel is bound to (set at `init` time).
     pub db_name: String,
+    /// Cache of `type_definition` row ids keyed by their stable `uid` (e.g.,
+    /// `"node_substrate"`, `"edge_owns"`). Populated once at the end of
+    /// [`Kernel::init`] from the seeded metamodel rows. Every verb that
+    /// references a metamodel type by name resolves it through this cache via
+    /// [`Kernel::type_thing`] — there is no named-id pattern (`type_definition:node_substrate`)
+    /// in the substrate any more; ids are UUIDv7 and lookups go through the cache.
+    type_cache: Arc<OnceLock<HashMap<String, Thing>>>,
 }
 
 #[derive(Deserialize)] 
@@ -191,10 +200,18 @@ impl Kernel {
         let db = Surreal::new::<RocksDb>(path).await?;
         db.use_ns(ns).use_db(db_name).await?;
 
-        let kernel = Self { db, ns: ns.to_string(), db_name: db_name.to_string() };
+        let kernel = Self {
+            db,
+            ns: ns.to_string(),
+            db_name: db_name.to_string(),
+            type_cache: Arc::new(OnceLock::new()),
+        };
         kernel.apply_substrate_schema().await?;
-        kernel.seed_metamodel().await?;
-        
+        let cache = kernel.seed_metamodel().await?;
+        kernel.type_cache
+            .set(cache)
+            .map_err(|_| KernelError::Init("type_cache already initialised".to_string()))?;
+
         assert!(kernel.db.health().await.is_ok(), "Substrate health check failed after init");
         Ok(kernel)
     }
@@ -448,52 +465,122 @@ impl Kernel {
         Ok(())
     }
 
-    async fn seed_metamodel(&self) -> Result<(), KernelError> {
-        let types = vec![
+    /// `seed_metamodel`: idempotently seeds the canonical `type_definition`
+    /// rows under the v2 schema (UUIDv7 ids + `uid` field).
+    ///
+    /// For each canonical type:
+    /// - SELECT existing row by `uid` (idempotent on re-bootstrap);
+    /// - if not found, CREATE with a fresh UUIDv7 id + the `uid` field;
+    /// - record the row's `Thing` in the returned cache.
+    ///
+    /// The returned `HashMap<uid, Thing>` is installed on `Kernel::type_cache`
+    /// at the end of [`Kernel::init`]. Every other kernel verb resolves
+    /// metamodel types via [`Kernel::type_thing`] so the substrate never
+    /// stores or queries by a named-string id ever again.
+    ///
+    /// Runs at init time under root context (schema apply + seed precede
+    /// any service-account `signin`).
+    ///
+    /// # Errors
+    /// Returns `KernelError::Database` if a SELECT or CREATE fails.
+    async fn seed_metamodel(&self) -> Result<HashMap<String, Thing>, KernelError> {
+        // Canonical metamodel: (uid, category, is_acyclic, sch_json, memory_tier)
+        let types: Vec<(&str, &str, bool, Option<&str>, &str)> = vec![
             // Core substrate identities
             ("node_substrate", "node", false, None, "core"),
-            ("node_agent", "node", false, None, "core"),
-            ("node_session", "node", false, None, "working"),
-            ("node_capability", "node", false, None, "core"),
-            ("node_tool", "node", false, None, "core"),
+            ("node_agent",     "node", false, None, "core"),
+            ("node_session",   "node", false, None, "working"),
+            ("node_capability","node", false, None, "core"),
+            ("node_tool",      "node", false, None, "core"),
             ("node_component", "node", false, None, "core"),
             ("node_hardened_model", "node", false, None, "working"),
+            // Execution-tier identities (new in v2 — typed FK targets)
+            ("node_run",       "node", false, None, "core"),
+            ("node_source",    "node", false, None, "core"),
             // Domain identities (ingested artifacts and cognitive products)
-            ("node_prod", "node", false, None, "working"),
-            ("node_code", "node", false, None, "working"),
-            ("node_code_root", "node", false, None, "working"),
-            ("node_artifact", "node", false, None, "working"),
-            ("node_proposal", "node", false, None, "working"),
-            ("node_harness", "node", false, None, "core"),
-            ("node_source_external", "node", false, None, "archival"),
-            ("node_rag_source", "node", false, None, "archival"),
-            // Attribute types (SCD-2 ledger payload shapes)
-            ("attr_desc", "attribute", false, Some("{\"type\":\"object\",\"required\":[\"text\"],\"properties\":{\"text\":{\"type\":\"string\",\"minLength\":1}}}"), "working"),
+            ("node_prod",          "node", false, None, "working"),
+            ("node_code",          "node", false, None, "working"),
+            ("node_code_root",     "node", false, None, "working"),
+            ("node_artifact",      "node", false, None, "working"),
+            ("node_proposal",      "node", false, None, "working"),
+            ("node_harness",       "node", false, None, "core"),
+            ("node_source_external","node", false, None, "archival"),
+            ("node_rag_source",    "node", false, None, "archival"),
+            // Attribute types (typed payloads on state_ledger writes)
+            ("attr_desc",   "attribute", false, Some("{\"type\":\"object\",\"required\":[\"text\"],\"properties\":{\"text\":{\"type\":\"string\",\"minLength\":1}}}"), "working"),
             ("attr_config", "attribute", false, None, "core"),
-            ("attr_score", "attribute", false, Some("{\"type\":\"object\",\"required\":[\"score\"],\"properties\":{\"score\":{\"type\":\"number\"}}}"), "working"),
+            ("attr_score",  "attribute", false, Some("{\"type\":\"object\",\"required\":[\"score\"],\"properties\":{\"score\":{\"type\":\"number\"}}}"), "working"),
             // Edge types (graph topology)
-            ("edge_owns", "edge", true, None, "working"),
-            ("edge_compiled_from", "edge", true, None, "working"),
-            ("edge_distilled_from", "edge", true, None, "working"),
-            ("edge_evaluates", "edge", false, None, "working"),
-            ("edge_promotes", "edge", true, None, "working"),
-            ("edge_implements", "edge", true, None, "core"),
-            ("edge_has_capability", "edge", false, None, "core"),
+            ("edge_owns",            "edge", true,  None, "working"),
+            ("edge_compiled_from",   "edge", true,  None, "working"),
+            ("edge_distilled_from",  "edge", true,  None, "working"),
+            ("edge_evaluates",       "edge", false, None, "working"),
+            ("edge_promotes",        "edge", true,  None, "working"),
+            ("edge_implements",      "edge", true,  None, "core"),
+            ("edge_has_capability",  "edge", false, None, "core"),
             ("edge_participates_in", "edge", false, None, "working"),
-            ("edge_semantic", "edge", false, None, "recall"),
+            ("edge_semantic",        "edge", false, None, "recall"),
         ];
 
+        let mut cache: HashMap<String, Thing> = HashMap::with_capacity(types.len());
+
         for (uid, cat, acyclic, sch, tier) in types {
-            let id = Thing::from(("type_definition".to_string(), uid.to_string()));
-            let _ = self.db.query("UPSERT $id SET category = $cat, is_acyclic = $acyc, sch_json = $sch, memory_tier = $tier")
-                .bind(("id", id))
-                .bind(("cat", cat.to_string()))
-                .bind(("acyc", acyclic))
-                .bind(("sch", sch.map(std::string::ToString::to_string)))
-                .bind(("tier", tier.to_string()))
-                .await?.check()?;
+            // 1. Look up existing row by uid (idempotent across re-bootstraps).
+            let mut select_res = self.db
+                .query("SELECT id FROM type_definition WHERE uid = $uid LIMIT 1")
+                .bind(("uid", uid.to_string()))
+                .await?;
+            let existing: Option<IdResult> = select_res.take::<Vec<IdResult>>(0)?.pop();
+
+            let id_thing = if let Some(row) = existing {
+                // Already seeded — reuse the existing Thing.
+                row.id
+            } else {
+                // Fresh seed: generate a UUIDv7 id and CREATE the row.
+                let new_uuid = ::uuid::Uuid::now_v7();
+                let new_id = Thing::from((
+                    "type_definition",
+                    surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(new_uuid)),
+                ));
+                self.db
+                    .query("CREATE type_definition CONTENT { id: $id, uid: $uid, category: $cat, is_acyclic: $acyc, sch_json: $sch, memory_tier: $tier }")
+                    .bind(("id", new_id.clone()))
+                    .bind(("uid", uid.to_string()))
+                    .bind(("cat", cat.to_string()))
+                    .bind(("acyc", acyclic))
+                    .bind(("sch", sch.map(std::string::ToString::to_string)))
+                    .bind(("tier", tier.to_string()))
+                    .await?
+                    .check()?;
+                new_id
+            };
+
+            cache.insert(uid.to_string(), id_thing);
         }
-        Ok(())
+
+        Ok(cache)
+    }
+
+    /// `type_thing`: resolve a canonical metamodel `uid` (e.g. `"node_substrate"`,
+    /// `"edge_owns"`, `"attr_desc"`) to its `Thing` reference in the substrate.
+    ///
+    /// This is the single chokepoint replacing the legacy
+    /// `Thing::from(("type_definition", "node_substrate"))` pattern. Under the
+    /// v2 schema, `type_definition` ids are UUIDv7; the human-readable name
+    /// lives in the `uid` column. Every kernel verb and every caller crate
+    /// resolves the FK target through this cache, never by name-id literal.
+    ///
+    /// # Errors
+    /// Returns `KernelError::Integrity` if the cache is uninitialised (only
+    /// possible if `type_thing` is called before `Kernel::init` completes) or
+    /// if the requested `uid` was not seeded.
+    pub fn type_thing(&self, uid: &str) -> Result<Thing, KernelError> {
+        let cache = self.type_cache.get().ok_or_else(|| {
+            KernelError::Integrity("type_cache not yet initialised — called before Kernel::init completed".to_string())
+        })?;
+        cache.get(uid).cloned().ok_or_else(|| {
+            KernelError::Integrity(format!("type_definition uid '{uid}' not in cache — missing from seed_metamodel?"))
+        })
     }
 
     /// `set_session_auth`: Set the `SurrealDB` session context using custom variables.
