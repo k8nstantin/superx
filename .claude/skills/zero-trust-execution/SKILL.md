@@ -168,6 +168,61 @@ This is the same loop the existing `ProposerBlade` runs for structural-edge prop
 
 The bar: every non-trivial policy decision the OS makes should be **traceable back to a model call**, not to a hardcoded Rust constant or schema default. *"Always intelligent"* is enforced here.
 
+### 10. Database Account Separation — Operator Owns the Schema, Model Uses a Service Account
+
+The substrate database (SurrealDB on RocksDB) has two account boundaries. They are non-negotiable.
+
+**A. The operator owns the schema and the database root account.**
+- All schema mutations — every `DEFINE TABLE`, `DEFINE FIELD`, `DEFINE INDEX`, `DEFINE ACCESS`, `DEFINE ANALYZER`, `REMOVE TABLE`, every change to `apply_substrate_schema` or `seed_metamodel` — happen via the operator's root account.
+- The root account is operator-only. The model does not hold root credentials.
+- The model invokes anything that requires root **only when** the operator and the model are designing the schema change together AND the operator has explicitly instructed the model to apply that specific change.
+
+**B. The model uses a service account with minimal privileges required for the work at hand.**
+- All application reads and writes — `SELECT`, `CREATE`, `UPDATE`, `DELETE` on existing rows — happen via a service account scoped to the substrate's existing tables.
+- The service account has **no schema-write permission**. It cannot `DEFINE`, `REMOVE`, `ALTER`, or `UPSERT` any schema entity.
+- Per-tenant + per-role `PERMISSIONS` clauses on each table apply on top of the service-account scope — defense in depth.
+
+This separation is what makes the substrate safe to develop against. The model cannot accidentally (or via misunderstanding) drift the schema while writing application code. Every schema change is operator-witnessed. Every application bug surfaces as a substrate constraint violation rather than silent corruption.
+
+### 11. Schema-First, Code-After — Binding Workflow
+
+Every new table, new field, new index, new constraint, new entity type, new metamodel row is **designed in `SUPERX_SCHEMA.md` first, with the operator, before any kernel verb or caller is touched.** The order is non-negotiable:
+
+1. **Design.** Operator and model collaborate on the schema change. Model proposes; operator approves. `SUPERX_SCHEMA.md` is updated *first* and becomes the source of truth for the change.
+2. **Operator applies the schema.** The operator (root account) applies the `DEFINE` statements to the live substrate. The model never does this.
+3. **Code follows the schema.** The model implements kernel verbs, callers, tests against the now-locked schema using its service account.
+
+Schema designs in `SUPERX_SCHEMA.md` must include:
+
+- Field list with explicit `type`
+- All FK references typed as `record<table>` (not opaque strings); the cross-reference graph showing where each FK points and any `ASSERT type = …` constraint
+- The SCD-2 triad (`is_current` / `valid_from` / `valid_to`) — every table, no exceptions
+- The UUIDv7 row-id contract (explicit, kernel-set, never auto-generated)
+- Migration plan from the previous shape if the table already exists in the substrate
+
+If the operator authorises the model to apply a schema change in a given session, the authorisation is **scoped to that specific change only**. It does not extend to adjacent schema work, refactors, "cleanups," or "while-I'm-here" improvements. Subsequent changes require fresh per-change authorisation.
+
+### 12. Entity Constraints Are the Debugging Surface
+
+The substrate's typed FK graph (`record<table>` references plus `ASSERT $value.type = type_definition:<uid>` constraints plus per-tenant `PERMISSIONS` clauses) is not merely normalisation hygiene — it is the OS's **primary debugging lattice**.
+
+When the application has a bug, the substrate refuses the write at the engine layer and surfaces a typed error. Specifically:
+
+- A wrong-type pointer (e.g. a schedule item pointing at a `node_agent` instead of a `node_task`) is rejected at insert time by the `ASSERT` clause on the FK field.
+- A tenant-coercion attempt (writing into another tenant's namespace) is refused by the `tenant = $session_tenant` PERMISSIONS clause.
+- A referential-integrity violation (FK pointing at a non-existent row) surfaces as a substrate error, not a silent half-write.
+- A schema-shape violation (writing the wrong field type, or missing a required field) is refused by SCHEMAFULL.
+
+Every such refusal emits a typed telemetry event the operator can inspect. Bugs surface as substrate-level constraint violations within milliseconds of the offending kernel call, *before* they propagate to downstream systems or get silently absorbed.
+
+This is why:
+
+- The schema must be designed thoroughly, with every FK typed and constrained.
+- The model must use a minimum-privilege service account so it cannot escape the constraint lattice.
+- Schema-first / code-after is binding — application code that pre-dates the schema designs cannot rely on constraints that don't exist yet.
+
+The contract in one sentence: **the substrate constrains; the model writes; the operator audits. Every layer is debuggable because no layer trusts the next.**
+
 ### Execution Loop Enforcement
 For every single action you take, you must silently ask yourself: *"Am I guessing? Am I rushing? Did I read the documentation?"* If the answer to any of these is yes, you are violating this protocol.
 </instructions>
