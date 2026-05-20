@@ -200,100 +200,246 @@ impl Kernel {
     }
 
     async fn apply_substrate_schema(&self) -> Result<(), KernelError> {
+        // Service-account password from operator-set env. Falls back to a dev
+        // default with a loud warning so first-bootstrap on a dev machine
+        // still works without ceremony; in any deployment scenario the
+        // operator sets SUPERX_SERVICE_PASSWORD before init.
+        let service_password = std::env::var("SUPERX_SERVICE_PASSWORD")
+            .unwrap_or_else(|_| {
+                tracing::warn!("SUPERX_SERVICE_PASSWORD not set; using dev default. Set this env var before any non-dev deployment.");
+                "superx-dev-password".to_string()
+            });
+
+        // v2 schema — append-only, insert-only, fully cross-referenceable.
+        // Every table has one temporal field (`valid_from`) — no `is_current`,
+        // no `valid_to`. "Current" is `ORDER BY valid_from DESC LIMIT 1` against
+        // the chain key. PERMISSIONS clauses refuse UPDATE/DELETE engine-side
+        // so the model's EDITOR-roled service_account can only SELECT + CREATE.
         let surql = r"
+            -- ====================================================================
+            -- type_definition — metamodel root
+            -- ====================================================================
             DEFINE TABLE type_definition SCHEMAFULL
-                PERMISSIONS FOR select, create, update, delete WHERE $session_role = 'admin';
-            DEFINE FIELD category         ON type_definition TYPE string;
-            DEFINE FIELD is_acyclic      ON type_definition TYPE bool DEFAULT false;
-            DEFINE FIELD sch_json        ON type_definition TYPE option<string>; 
-            DEFINE FIELD memory_tier      ON type_definition TYPE string DEFAULT 'working' ASSERT $value INSIDE ['core', 'working', 'archival', 'recall'];
+                PERMISSIONS
+                    FOR select WHERE $session_role IN ['admin', 'user']
+                    FOR create WHERE $session_role = 'admin'
+                    FOR update NONE
+                    FOR delete NONE;
 
+            DEFINE FIELD id           ON type_definition TYPE uuid;
+            DEFINE FIELD uid          ON type_definition TYPE string;
+            DEFINE FIELD category     ON type_definition TYPE string;
+            DEFINE FIELD is_acyclic   ON type_definition TYPE bool DEFAULT false;
+            DEFINE FIELD sch_json     ON type_definition TYPE option<string>;
+            DEFINE FIELD memory_tier  ON type_definition TYPE string DEFAULT 'working'
+                ASSERT $value INSIDE ['core', 'working', 'archival', 'recall'];
+            DEFINE FIELD valid_from   ON type_definition TYPE datetime DEFAULT time::now();
+
+            DEFINE INDEX IF NOT EXISTS type_def_uid      ON type_definition FIELDS uid UNIQUE;
+            DEFINE INDEX IF NOT EXISTS type_def_category ON type_definition FIELDS category;
+
+            -- ====================================================================
+            -- entity — substrate identities
+            -- ====================================================================
             DEFINE TABLE entity SCHEMAFULL
-                PERMISSIONS FOR select, create, update, delete WHERE tenant_id = $session_tenant OR $session_role = 'admin';
-            DEFINE FIELD type             ON entity TYPE record<type_definition>;
-            DEFINE FIELD tenant_id        ON entity TYPE string DEFAULT '00000000-0000-0000-0000-000000000000';
-            DEFINE FIELD role             ON entity TYPE string DEFAULT 'user' ASSERT $value INSIDE ['user', 'admin'];
-            DEFINE FIELD is_deleted       ON entity TYPE bool DEFAULT false;
+                PERMISSIONS
+                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR update NONE
+                    FOR delete NONE;
 
-            DEFINE ACCESS tenant_access ON DATABASE TYPE RECORD
-                SIGNIN ( SELECT * FROM entity WHERE tenant_id = $tenant AND role = $role LIMIT 1 );
+            DEFINE FIELD id           ON entity TYPE uuid;
+            DEFINE FIELD type         ON entity TYPE record<type_definition>
+                ASSERT $value.category = 'node';
+            DEFINE FIELD tenant       ON entity TYPE record<entity>
+                ASSERT $value.type.uid = 'node_substrate';
+            DEFINE FIELD role         ON entity TYPE string DEFAULT 'user'
+                ASSERT $value INSIDE ['user', 'admin'];
+            DEFINE FIELD valid_from   ON entity TYPE datetime DEFAULT time::now();
 
+            DEFINE INDEX IF NOT EXISTS entity_tenant ON entity FIELDS tenant;
+            DEFINE INDEX IF NOT EXISTS entity_type   ON entity FIELDS type;
+
+            -- ====================================================================
+            -- relation — directed graph edges
+            -- ====================================================================
             DEFINE TABLE relation SCHEMAFULL
-                PERMISSIONS FOR select, create, update, delete WHERE tenant_id = $session_tenant OR $session_role = 'admin';
-            DEFINE FIELD in               ON relation TYPE record<entity>;
-            DEFINE FIELD out              ON relation TYPE record<entity>;
-            DEFINE FIELD type             ON relation TYPE record<type_definition>;
-            DEFINE FIELD tenant_id        ON relation TYPE string DEFAULT '00000000-0000-0000-0000-000000000000';
-            DEFINE FIELD is_acyclic       ON relation TYPE bool DEFAULT false;
+                PERMISSIONS
+                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR update NONE
+                    FOR delete NONE;
 
-            DEFINE INDEX rel_source       ON relation FIELDS in, tenant_id, is_acyclic;
-            DEFINE INDEX rel_dest         ON relation FIELDS out, tenant_id, is_acyclic;
+            DEFINE FIELD id           ON relation TYPE uuid;
+            DEFINE FIELD in           ON relation TYPE record<entity>;
+            DEFINE FIELD out          ON relation TYPE record<entity>;
+            DEFINE FIELD type         ON relation TYPE record<type_definition>
+                ASSERT $value.category = 'edge';
+            DEFINE FIELD tenant       ON relation TYPE record<entity>
+                ASSERT $value.type.uid = 'node_substrate';
+            DEFINE FIELD is_acyclic   ON relation TYPE bool DEFAULT false;
+            DEFINE FIELD valid_from   ON relation TYPE datetime DEFAULT time::now();
 
+            DEFINE INDEX IF NOT EXISTS rel_source ON relation FIELDS in, tenant, is_acyclic;
+            DEFINE INDEX IF NOT EXISTS rel_dest   ON relation FIELDS out, tenant, is_acyclic;
+
+            -- ====================================================================
+            -- state_ledger — append-only typed attribute writes
+            -- ====================================================================
             DEFINE TABLE state_ledger SCHEMALESS
-                PERMISSIONS FOR select, create, update, delete WHERE tenant_id = $session_tenant OR $session_role = 'admin';
-            DEFINE FIELD target           ON state_ledger TYPE record<entity>;
-            DEFINE FIELD type             ON state_ledger TYPE record<type_definition>;
-            DEFINE FIELD tenant_id        ON state_ledger TYPE string DEFAULT '00000000-0000-0000-0000-000000000000';
-            DEFINE FIELD is_current       ON state_ledger TYPE bool DEFAULT true;
-            DEFINE FIELD valid_from       ON state_ledger TYPE datetime DEFAULT time::now();
-            DEFINE FIELD valid_to         ON state_ledger TYPE option<datetime>;
+                PERMISSIONS
+                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR update NONE
+                    FOR delete NONE;
 
-            DEFINE INDEX IF NOT EXISTS state_current ON state_ledger FIELDS target, type, is_current;
+            DEFINE FIELD id           ON state_ledger TYPE uuid;
+            DEFINE FIELD target       ON state_ledger TYPE record<entity>;
+            DEFINE FIELD type         ON state_ledger TYPE record<type_definition>
+                ASSERT $value.category = 'attribute';
+            DEFINE FIELD tenant       ON state_ledger TYPE record<entity>
+                ASSERT $value.type.uid = 'node_substrate';
+            DEFINE FIELD valid_from   ON state_ledger TYPE datetime DEFAULT time::now();
 
-            DEFINE TABLE execution_cursor SCHEMAFULL
-                PERMISSIONS FOR select, create, update, delete WHERE tenant_id = $session_tenant OR $session_role = 'admin';
-            DEFINE FIELD run_id           ON execution_cursor TYPE string;
-            DEFINE FIELD tenant_id        ON execution_cursor TYPE string;
-            DEFINE FIELD cursor_type      ON execution_cursor TYPE string;
-            DEFINE FIELD last_processed   ON execution_cursor TYPE option<string>;
-            DEFINE FIELD metadata         ON execution_cursor TYPE option<object>;
-            DEFINE FIELD updated_at       ON execution_cursor TYPE datetime DEFAULT time::now();
+            DEFINE INDEX IF NOT EXISTS state_chain ON state_ledger FIELDS target, type, valid_from;
 
-            DEFINE INDEX IF NOT EXISTS cursor_lookup ON execution_cursor FIELDS run_id, tenant_id;
+            -- ====================================================================
+            -- cursor_type — categorises every cursor kind
+            -- ====================================================================
+            DEFINE TABLE cursor_type SCHEMAFULL
+                PERMISSIONS
+                    FOR select WHERE $session_role IN ['admin', 'user']
+                    FOR create WHERE $session_role = 'admin'
+                    FOR update NONE
+                    FOR delete NONE;
 
+            DEFINE FIELD id           ON cursor_type TYPE uuid;
+            DEFINE FIELD uid          ON cursor_type TYPE string;
+            DEFINE FIELD category     ON cursor_type TYPE string
+                ASSERT $value INSIDE ['workload', 'telemetry'];
+            DEFINE FIELD description  ON cursor_type TYPE string;
+            DEFINE FIELD sch_json     ON cursor_type TYPE option<string>;
+            DEFINE FIELD valid_from   ON cursor_type TYPE datetime DEFAULT time::now();
+
+            DEFINE INDEX IF NOT EXISTS cursor_type_uid      ON cursor_type FIELDS uid UNIQUE;
+            DEFINE INDEX IF NOT EXISTS cursor_type_category ON cursor_type FIELDS category;
+
+            -- ====================================================================
+            -- cursor — unified workload + telemetry cursor (renamed from execution_cursor)
+            -- ====================================================================
+            DEFINE TABLE cursor SCHEMAFULL
+                PERMISSIONS
+                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR update NONE
+                    FOR delete NONE;
+
+            DEFINE FIELD id             ON cursor TYPE uuid;
+            DEFINE FIELD subject        ON cursor TYPE record<entity>;
+            DEFINE FIELD tenant         ON cursor TYPE record<entity>
+                ASSERT $value.type.uid = 'node_substrate';
+            DEFINE FIELD cursor_type    ON cursor TYPE record<cursor_type>;
+            DEFINE FIELD last_processed ON cursor TYPE option<string>;
+            DEFINE FIELD metadata       ON cursor TYPE option<object>;
+            DEFINE FIELD valid_from     ON cursor TYPE datetime DEFAULT time::now();
+
+            DEFINE INDEX IF NOT EXISTS cursor_chain ON cursor FIELDS subject, cursor_type, valid_from;
+
+            -- ====================================================================
+            -- execution_params — per-run agent execution knobs (append-only)
+            -- ====================================================================
             DEFINE TABLE execution_params SCHEMAFULL
-                PERMISSIONS FOR select, create, update, delete WHERE tenant_id = $session_tenant OR $session_role = 'admin';
-            DEFINE FIELD run_id      ON execution_params TYPE string;
-            DEFINE FIELD tenant_id   ON execution_params TYPE string DEFAULT '00000000-0000-0000-0000-000000000000';
-            DEFINE FIELD agent_id    ON execution_params TYPE string;
-            DEFINE FIELD params_json ON execution_params FLEXIBLE TYPE object;
-            DEFINE FIELD is_current  ON execution_params TYPE bool DEFAULT true;
-            DEFINE FIELD valid_from  ON execution_params TYPE datetime DEFAULT time::now();
-            DEFINE FIELD valid_to    ON execution_params TYPE option<datetime>;
+                PERMISSIONS
+                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR update NONE
+                    FOR delete NONE;
 
-            DEFINE INDEX IF NOT EXISTS exec_params_current ON execution_params FIELDS run_id, agent_id, is_current;
-            DEFINE INDEX IF NOT EXISTS exec_params_run     ON execution_params FIELDS run_id, is_current;
+            DEFINE FIELD id           ON execution_params TYPE uuid;
+            DEFINE FIELD run          ON execution_params TYPE record<entity>
+                ASSERT $value.type.uid = 'node_run';
+            DEFINE FIELD tenant       ON execution_params TYPE record<entity>
+                ASSERT $value.type.uid = 'node_substrate';
+            DEFINE FIELD agent        ON execution_params TYPE record<entity>
+                ASSERT $value.type.uid = 'node_agent';
+            DEFINE FIELD params_json  ON execution_params FLEXIBLE TYPE object;
+            DEFINE FIELD valid_from   ON execution_params TYPE datetime DEFAULT time::now();
 
+            DEFINE INDEX IF NOT EXISTS exec_params_chain ON execution_params FIELDS run, agent, valid_from;
+            DEFINE INDEX IF NOT EXISTS exec_params_run   ON execution_params FIELDS run, valid_from;
+
+            -- ====================================================================
+            -- schedule — dumb work queue (append-only)
+            -- ====================================================================
             DEFINE TABLE schedule SCHEMAFULL
-                PERMISSIONS FOR select, create, update, delete WHERE tenant_id = $session_tenant OR $session_role = 'admin';
-            DEFINE FIELD run_id        ON schedule TYPE string;
-            DEFINE FIELD tenant_id     ON schedule TYPE string DEFAULT '00000000-0000-0000-0000-000000000000';
-            DEFINE FIELD kind          ON schedule TYPE string;
-            DEFINE FIELD target_entity ON schedule TYPE string;
-            DEFINE FIELD due_at        ON schedule TYPE datetime DEFAULT time::now();
-            DEFINE FIELD status        ON schedule TYPE string DEFAULT 'waiting';
-            DEFINE FIELD attempt       ON schedule TYPE int DEFAULT 0;
-            DEFINE FIELD depends_on    ON schedule TYPE array<string> DEFAULT [];
-            DEFINE FIELD metadata      ON schedule FLEXIBLE TYPE object DEFAULT {};
-            DEFINE FIELD is_current    ON schedule TYPE bool DEFAULT true;
-            DEFINE FIELD valid_from    ON schedule TYPE datetime DEFAULT time::now();
-            DEFINE FIELD valid_to      ON schedule TYPE option<datetime>;
+                PERMISSIONS
+                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR update NONE
+                    FOR delete NONE;
 
-            DEFINE INDEX IF NOT EXISTS sched_due_current ON schedule FIELDS due_at, is_current;
-            DEFINE INDEX IF NOT EXISTS sched_run_current ON schedule FIELDS run_id, is_current;
+            DEFINE FIELD id           ON schedule TYPE uuid;
+            DEFINE FIELD run          ON schedule TYPE record<entity>
+                ASSERT $value.type.uid = 'node_run';
+            DEFINE FIELD tenant       ON schedule TYPE record<entity>
+                ASSERT $value.type.uid = 'node_substrate';
+            DEFINE FIELD kind         ON schedule TYPE string;
+            DEFINE FIELD target       ON schedule TYPE record<entity>;
+            DEFINE FIELD due_at       ON schedule TYPE datetime DEFAULT time::now();
+            DEFINE FIELD status       ON schedule TYPE string DEFAULT 'waiting'
+                ASSERT $value INSIDE ['waiting', 'scheduled', 'running', 'completed', 'failed', 'awaiting_human'];
+            DEFINE FIELD attempt      ON schedule TYPE int DEFAULT 0
+                ASSERT $value >= 0;
+            DEFINE FIELD depends_on   ON schedule TYPE array<record<schedule>> DEFAULT [];
+            DEFINE FIELD metadata     ON schedule FLEXIBLE TYPE object DEFAULT {};
+            DEFINE FIELD valid_from   ON schedule TYPE datetime DEFAULT time::now();
 
+            DEFINE INDEX IF NOT EXISTS sched_due_recent ON schedule FIELDS due_at, valid_from;
+            DEFINE INDEX IF NOT EXISTS sched_run_recent ON schedule FIELDS run, valid_from;
+
+            -- ====================================================================
+            -- telemetry_stream — event firehose (CHANGEFEED 1d)
+            -- ====================================================================
             DEFINE TABLE telemetry_stream SCHEMALESS CHANGEFEED 1d
-                PERMISSIONS FOR select, create, update, delete WHERE tenant_id = $session_tenant OR $session_role = 'admin';
-            DEFINE FIELD timestamp        ON telemetry_stream TYPE datetime DEFAULT time::now();
+                PERMISSIONS
+                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR update NONE
+                    FOR delete NONE;
+
+            DEFINE FIELD id               ON telemetry_stream TYPE uuid;
             DEFINE FIELD lifecycle_event  ON telemetry_stream TYPE string;
             DEFINE FIELD payload          ON telemetry_stream TYPE any;
-            DEFINE FIELD run_id           ON telemetry_stream TYPE option<string>;
-            DEFINE FIELD tenant_id        ON telemetry_stream TYPE string DEFAULT '00000000-0000-0000-0000-000000000000';
+            DEFINE FIELD run              ON telemetry_stream TYPE option<record<entity>>
+                ASSERT $value = NONE OR $value.type.uid = 'node_run';
+            DEFINE FIELD tenant           ON telemetry_stream TYPE record<entity>
+                ASSERT $value.type.uid = 'node_substrate';
+            DEFINE FIELD valid_from       ON telemetry_stream TYPE datetime DEFAULT time::now();
 
-            DEFINE INDEX IF NOT EXISTS tele_run ON telemetry_stream FIELDS run_id;
+            DEFINE INDEX IF NOT EXISTS tele_run   ON telemetry_stream FIELDS run, valid_from;
+            DEFINE INDEX IF NOT EXISTS tele_event ON telemetry_stream FIELDS lifecycle_event, valid_from;
+
+            -- ====================================================================
+            -- Tenant-based record auth (existing — kept for roadmap #8)
+            -- ====================================================================
+            DEFINE ACCESS IF NOT EXISTS tenant_access ON DATABASE TYPE RECORD
+                SIGNIN ( SELECT * FROM entity WHERE tenant.id = $tenant AND role = $role LIMIT 1 );
+
+            -- ====================================================================
+            -- Service account (model's runtime user — EDITOR role narrowed by
+            -- per-table PERMISSIONS FOR update NONE; FOR delete NONE; above)
+            -- Effective grant: SELECT + CREATE only.
+            -- ====================================================================
+            DEFINE USER IF NOT EXISTS service_account ON DATABASE
+                PASSWORD $superx_service_password
+                ROLES EDITOR
+                DURATION FOR SESSION 1h, FOR TOKEN 1h;
         ";
-        // Ignore AlreadyExists errors for idempotency
-        let _ = self.db.query(surql).await;
+        // Apply schema. AlreadyExists errors are tolerated for idempotency on
+        // re-bootstrap; other errors propagate.
+        let _ = self.db.query(surql)
+            .bind(("superx_service_password", service_password))
+            .await;
         Ok(())
     }
 
