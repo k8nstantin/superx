@@ -268,6 +268,65 @@ The model's connection is `superx` and stays `superx`. Engine refusals propagate
 
 **Credentials in this skill, not in source code:** the password lives here so the model can authenticate; it does not live as a hardcoded literal in business logic. Production hardening (PASSHASH-based provisioning, vaulted secrets, per-tenant accounts) is roadmap, but the contract — *the model uses `superx`, never root* — is binding from this commit forward.
 
+### 14. No Data-Type Conversions — Types Flow End-to-End
+
+**Binding rule (non-negotiable):** data types travel from the schema to the
+Rust callsite **unchanged**. A `record<entity>` is a `Thing` everywhere. A
+`uuid` is a `Uuid` everywhere. A `datetime` is a `DateTime<Utc>` everywhere.
+Strings only appear at the literal text-payload boundary (`attr_desc.text`,
+prompt bodies, log lines, error messages). Anywhere else, **a conversion is a bug**.
+
+This rule is the partner to §10–§13: the substrate enforces typed FKs with
+`ASSERT $value.type.uid = '…'`; the Rust side must hand back the same type the
+substrate handed out. Casting that type away — to compare, to log, to
+"simplify the bind" — defeats the very ASSERTs that make tenant coercion
+impossible. Engine refusals (`Found type 'X' for field 'Y' but expected 'Z'`)
+become the §12 debugging surface; **casting around the refusal is bypassing it**.
+
+The correct pattern (typed Rust ↔ typed substrate):
+
+```rust
+// ✅ Deserialize the FK as the same type the engine stores.
+#[derive(serde::Deserialize)]
+struct TenantRow { tenant: Option<Thing> }
+
+let mut r = self.db
+    .query("SELECT tenant FROM $target LIMIT 1")
+    .bind(("target", target_thing.clone()))
+    .await?;
+let target_tenant = r.take::<Vec<TenantRow>>(0)?.pop()
+    .ok_or(/* … */)?.tenant;
+
+if target_tenant.as_ref() != Some(&session_tenant_thing) {
+    return Err(KernelError::SafetyViolation(/* … */));
+}
+```
+
+Anti-patterns (banned outright):
+- ❌ `SELECT <string>tenant.id AS tenant_id FROM …` — converting a `record<entity>` to its
+  string form in SurrealQL because the Rust side declared `tenant_id: String`.
+- ❌ `parse_id(&format!("entity:{uuid_string}"))` scattered at every call site —
+  the session-tenant `Thing` should be returned once by an accessor, not
+  rebuilt by every verb from its string form.
+- ❌ `let s = thing.to_string(); /* compare strings */` — losing the typed
+  comparison the engine already provides.
+- ❌ "Just `String` it for the test and we'll fix later" — the test that
+  passes on String diverges from the schema the engine actually enforces.
+
+**Engine refusal of a type mismatch is the signal to fix the Rust side.** If
+the engine reports `expected 'uuid', got 'string'`, the answer is to change
+the Rust struct to `Uuid` (or `Thing`), not to add a `<string>` cast in the
+SurrealQL. If a `tenant_id: String` field somewhere doesn't match a
+`record<entity>` FK, the field is wrong — rename and retype, do not coerce.
+
+**Schema-PERMISSIONS string round-trips are a schema-change candidate, not a
+loophole.** If a PERMISSIONS clause uses `tenant.id = $session_tenant` and
+the session var is a `string`, the model is forced into one centralised
+conversion. That centralised conversion is the **only** acceptable
+appearance of the pattern, and it must be flagged as schema technical debt
+(operator-approval territory under §7 / §11) — not scattered to every
+callsite as a convenience.
+
 ### Execution Loop Enforcement
 For every single action you take, you must silently ask yourself: *"Am I guessing? Am I rushing? Did I read the documentation?"* If the answer to any of these is yes, you are violating this protocol.
 </instructions>

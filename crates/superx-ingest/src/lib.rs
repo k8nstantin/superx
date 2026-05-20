@@ -73,9 +73,8 @@ impl IngestionSource for FileSource {
         // replacing the legacy `type_definition:<name>` named-id literals).
         let node_code_root = kernel.type_thing("node_code_root")?;
         let node_code = kernel.type_thing("node_code")?;
-        // Tenant FK: substrate entity Thing built from the session's tenant uuid.
-        let session_tenant_str = kernel.session_tenant().await?;
-        let tenant_thing = Kernel::parse_id(&format!("entity:{session_tenant_str}"))?;
+        // Tenant FK: substrate entity Thing read directly from the session.
+        let tenant_thing = kernel.session_tenant_thing().await?;
 
         // Root entity for the ingestion (subject of the cursor chain).
         let root_uuid = uuid::Uuid::now_v7();
@@ -186,8 +185,7 @@ impl IngestionSource for JsonSource {
     /// Returns `KernelError` if substrate interaction fails.
     async fn ingest(&self, kernel: &Kernel, run_id: &str) -> Result<String, KernelError> {
         let node_source_external = kernel.type_thing("node_source_external")?;
-        let session_tenant_str = kernel.session_tenant().await?;
-        let tenant_thing = Kernel::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = kernel.session_tenant_thing().await?;
 
         let json_uuid = uuid::Uuid::now_v7();
         let json_thing = Thing::from((

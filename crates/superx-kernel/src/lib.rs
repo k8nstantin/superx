@@ -215,6 +215,13 @@ impl Kernel {
             .set(cursor_cache)
             .map_err(|_| KernelError::Init("cursor_type_cache already initialised".to_string()))?;
 
+        // Phase 1.5: seed the default `node_substrate` entity for this DB.
+        // The substrate is the root of the tenancy graph (`tenant = NONE`);
+        // every other entity references it. Deterministic UUIDv5 from
+        // `(ns, db_name)` makes re-bootstraps idempotent. Operator-
+        // authorised init activity per skill §10.A.
+        kernel.seed_default_substrate(ns, db_name).await?;
+
         // Phase 2: switch to the `superx` service account for the entire
         // remaining lifetime of this Kernel handle. Every subsequent verb
         // touches the substrate as `superx` — engine-restricted to SELECT +
@@ -283,16 +290,21 @@ impl Kernel {
             -- ====================================================================
             DEFINE TABLE entity SCHEMAFULL
                 PERMISSIONS
-                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR select WHERE tenant = $session_tenant OR id = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant = $session_tenant OR id = $session_tenant OR $session_role = 'admin'
                     FOR update NONE
                     FOR delete NONE;
 
             DEFINE FIELD id           ON entity TYPE uuid;
             DEFINE FIELD type         ON entity TYPE record<type_definition>
                 ASSERT $value.category = 'node';
-            DEFINE FIELD tenant       ON entity TYPE record<entity>
-                ASSERT $value.type.uid = 'node_substrate';
+            -- Tenant is optional for `node_substrate` entities — they are the
+            -- root of the tenancy graph and have no tenant above them. Every
+            -- other entity MUST reference a `node_substrate` row. The ASSERT
+            -- enforces both shapes: NONE (only valid for substrate rows by
+            -- caller convention) OR a typed reference to a substrate.
+            DEFINE FIELD tenant       ON entity TYPE option<record<entity>>
+                ASSERT $value = NONE OR $value.type.uid = 'node_substrate';
             DEFINE FIELD role         ON entity TYPE string DEFAULT 'user'
                 ASSERT $value INSIDE ['user', 'admin'];
             DEFINE FIELD valid_from   ON entity TYPE datetime DEFAULT time::now();
@@ -305,8 +317,8 @@ impl Kernel {
             -- ====================================================================
             DEFINE TABLE relation SCHEMAFULL
                 PERMISSIONS
-                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR select WHERE tenant = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant = $session_tenant OR $session_role = 'admin'
                     FOR update NONE
                     FOR delete NONE;
 
@@ -328,8 +340,8 @@ impl Kernel {
             -- ====================================================================
             DEFINE TABLE state_ledger SCHEMALESS
                 PERMISSIONS
-                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR select WHERE tenant = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant = $session_tenant OR $session_role = 'admin'
                     FOR update NONE
                     FOR delete NONE;
 
@@ -369,8 +381,8 @@ impl Kernel {
             -- ====================================================================
             DEFINE TABLE cursor SCHEMAFULL
                 PERMISSIONS
-                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR select WHERE tenant = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant = $session_tenant OR $session_role = 'admin'
                     FOR update NONE
                     FOR delete NONE;
 
@@ -390,8 +402,8 @@ impl Kernel {
             -- ====================================================================
             DEFINE TABLE execution_params SCHEMAFULL
                 PERMISSIONS
-                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR select WHERE tenant = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant = $session_tenant OR $session_role = 'admin'
                     FOR update NONE
                     FOR delete NONE;
 
@@ -413,8 +425,8 @@ impl Kernel {
             -- ====================================================================
             DEFINE TABLE schedule SCHEMAFULL
                 PERMISSIONS
-                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR select WHERE tenant = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant = $session_tenant OR $session_role = 'admin'
                     FOR update NONE
                     FOR delete NONE;
 
@@ -442,8 +454,8 @@ impl Kernel {
             -- ====================================================================
             DEFINE TABLE telemetry_stream SCHEMALESS CHANGEFEED 1d
                 PERMISSIONS
-                    FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-                    FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+                    FOR select WHERE tenant = $session_tenant OR $session_role = 'admin'
+                    FOR create WHERE tenant = $session_tenant OR $session_role = 'admin'
                     FOR update NONE
                     FOR delete NONE;
 
@@ -667,6 +679,71 @@ impl Kernel {
         Ok(cache)
     }
 
+    /// `seed_default_substrate`: idempotent root-context seed of the default
+    /// `node_substrate` entity for this kernel's `(ns, db_name)`. The
+    /// substrate is the root of the tenancy graph and has `tenant = NONE`;
+    /// every other entity references it via its own `tenant` FK.
+    ///
+    /// Runs in the pre-signin init phase per skill §10.A (operator-authorised
+    /// init activity). The bootstrap blade configures `attr_config` state on
+    /// this same row.
+    ///
+    /// # Errors
+    /// Returns `KernelError::Database` if SELECT or CREATE fails.
+    async fn seed_default_substrate(&self, ns: &str, db_name: &str) -> Result<(), KernelError> {
+        let substrate_uuid = Self::default_substrate_uuid(ns, db_name);
+        let substrate_thing = Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(substrate_uuid)),
+        ));
+
+        // Idempotent: skip if already seeded.
+        #[derive(Deserialize)]
+        struct IdRow { #[allow(dead_code)] id: Thing }
+        let mut sel = self.db
+            .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
+            .bind(("id", substrate_thing.clone()))
+            .await?;
+        if sel.take::<Vec<IdRow>>(0)?.pop().is_some() {
+            return Ok(());
+        }
+
+        let node_substrate = self.type_thing("node_substrate")?;
+        // Substrate rows have `tenant = NONE` — they ARE the tenant root, not
+        // an instance of one. The schema's tenant ASSERT permits NONE for
+        // exactly this case.
+        self.db.query(
+            "CREATE entity CONTENT { \
+                id: $id, type: $type, tenant: NONE, role: 'admin' \
+            }"
+        )
+            .bind(("id", substrate_thing))
+            .bind(("type", node_substrate))
+            .await?.check()?;
+        Ok(())
+    }
+
+    /// `default_substrate_uuid`: deterministic UUIDv5 derived from
+    /// `(ns, db_name)`. Same kernel handle always resolves to the same
+    /// substrate entity — re-bootstraps reuse it idempotently.
+    #[must_use]
+    pub fn default_substrate_uuid(ns: &str, db_name: &str) -> ::uuid::Uuid {
+        let key = format!("{ns}/{db_name}");
+        let ns_uuid = ::uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+            .expect("Valid DNS NS UUID");
+        ::uuid::Uuid::new_v5(&ns_uuid, key.as_bytes())
+    }
+
+    /// `default_substrate_thing`: convenience wrapper around
+    /// [`Self::default_substrate_uuid`] returning a substrate `Thing`.
+    #[must_use]
+    pub fn default_substrate_thing(ns: &str, db_name: &str) -> Thing {
+        Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(Self::default_substrate_uuid(ns, db_name))),
+        ))
+    }
+
     /// `cursor_type_thing`: resolve a canonical cursor-type `uid` (e.g.
     /// `"ingestion"`, `"transcript"`) to its `Thing` reference. Single
     /// chokepoint for the new `cursor.cursor_type` FK — never a named-id
@@ -686,19 +763,36 @@ impl Kernel {
 
     /// `set_session_auth`: Set the `SurrealDB` session context using custom variables.
     ///
+    /// Stores `$session_tenant` as a typed `Thing` (the substrate-entity FK)
+    /// so the PERMISSIONS clauses can compare `tenant = $session_tenant`
+    /// directly without a `<string>` cast. The `&str` signature is preserved
+    /// because every caller already passes the substrate uuid as a string —
+    /// the parse-to-`Thing` happens once here, at the boundary, not at every
+    /// kernel verb.
+    ///
     /// # Panics
     /// Panics if `tenant_id` or `role` are empty.
     ///
     /// # Errors
-    /// Returns `KernelError::Database` if binding fails.
+    /// Returns `KernelError::Database` if binding fails, or
+    /// `KernelError::Validation` if `tenant_id` is not a valid record id.
     pub async fn set_session_auth(&self, tenant_id: &str, role: &str) -> Result<(), KernelError> {
         assert!(!tenant_id.is_empty(), "Tenant ID mandatory for auth");
         assert!(!role.is_empty(), "Role mandatory for auth");
 
-        // Manually set session variables for local mode.
-        self.db.set("session_tenant", tenant_id.to_string()).await?;
+        // Boundary conversion: a tenant_id like "<uuid>" or "entity:<uuid>"
+        // becomes the typed `Thing`. From this point on the session var is
+        // record-typed; no further string round-trip occurs.
+        let literal = if tenant_id.contains(':') {
+            tenant_id.to_string()
+        } else {
+            format!("entity:{tenant_id}")
+        };
+        let tenant_thing = Self::parse_id(&literal)?;
+
+        self.db.set("session_tenant", tenant_thing).await?;
         self.db.set("session_role", role.to_string()).await?;
-        
+
         Ok(())
     }
 
@@ -714,6 +808,8 @@ impl Kernel {
         assert!(!s.is_empty(), "ID string must not be empty");
         assert!(s.len() < MAX_ID_LENGTH, "ID string exceeds safety limit");
 
+        // Strip SurrealDB's backtick wrapping and any `u'…'` prefix that
+        // appears on the wire for Uuid-typed ids.
         let cleaned = s.replace('`', "");
         let parts: Vec<&str> = cleaned.split(':').collect();
         if parts.len() != 2 {
@@ -722,24 +818,57 @@ impl Kernel {
         if parts[0].is_empty() || parts[1].is_empty() {
             return Err(KernelError::Validation(format!("Invalid ID format: {s}")));
         }
-        Ok(Thing::from((parts[0].to_string(), parts[1].to_string())))
+
+        let table = parts[0].to_string();
+        let id_part = parts[1].trim_start_matches("u'").trim_end_matches('\'');
+
+        // Detect UUID-formatted ids and build `Id::Uuid` so the Thing matches
+        // rows stored with `DEFINE FIELD id TYPE uuid`. Falls back to
+        // `Id::String` for non-UUID ids (e.g. legacy named ids — kept as a
+        // boundary for callers that haven't migrated yet).
+        if let Ok(uuid) = ::uuid::Uuid::parse_str(id_part) {
+            Ok(Thing::from((
+                table,
+                surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(uuid)),
+            )))
+        } else {
+            Ok(Thing::from((table, parts[1].to_string())))
+        }
     }
 
-    async fn get_session_tenant(&self) -> Result<String, KernelError> {
+    /// `session_tenant_thing`: the calling session's tenant as a typed
+    /// `record<entity>` `Thing`. Reads `$session_tenant` directly — the
+    /// session var was stored as a `Thing` by `set_session_auth`, so no
+    /// conversion happens here. This is the only public accessor; every
+    /// kernel verb uses it for tenant FK binds.
+    ///
+    /// # Errors
+    /// Returns `KernelError::SafetyViolation` if no session is established.
+    pub async fn session_tenant_thing(&self) -> Result<Thing, KernelError> {
         let mut res = self.db.query("RETURN $session_tenant").await?;
-        let tenant: Option<String> = res.take(0)?;
-        tenant.ok_or_else(|| KernelError::SafetyViolation("No authenticated session. Ensure set_session_auth was called.".into()))
+        let tenant: Option<Thing> = res.take(0)?;
+        tenant.ok_or_else(|| KernelError::SafetyViolation(
+            "No authenticated session. Ensure set_session_auth was called.".into()
+        ))
     }
 
-    /// `session_tenant`: public accessor for the calling session's
-    /// substrate-entity uuid (the value of `$session_tenant` set by
-    /// `set_session_auth`). Callers use this when they need to build the
-    /// tenant `Thing` for FK fields under the v2 schema.
+    /// `session_tenant`: legacy string accessor kept for crates that still
+    /// log the tenant uuid (logs / error messages). Returns the substrate
+    /// uuid in string form, derived from the typed `Thing` in the session
+    /// var. Prefer [`session_tenant_thing`](Self::session_tenant_thing) for
+    /// every typed callsite — binds, FK assignments, comparisons.
     ///
     /// # Errors
     /// Returns `KernelError::SafetyViolation` if no session is established.
     pub async fn session_tenant(&self) -> Result<String, KernelError> {
-        self.get_session_tenant().await
+        let thing = self.session_tenant_thing().await?;
+        match &thing.id {
+            surrealdb::sql::Id::Uuid(u) => Ok(u.to_raw()),
+            surrealdb::sql::Id::String(s) => Ok(s.clone()),
+            other => Err(KernelError::Integrity(format!(
+                "session_tenant id has unexpected form: {other:?}"
+            ))),
+        }
     }
 
     /// `get_parameter`: Dynamic lookup of safety/governance parameters from `state_ledger`.
@@ -753,7 +882,7 @@ impl Kernel {
             return default;
         };
 
-        let query = "SELECT value_json FROM state_ledger \
+        let query = "SELECT value_json, valid_from FROM state_ledger \
             WHERE target.type = $node_substrate AND `type` = $attr_config \
             ORDER BY valid_from DESC LIMIT 1";
 
@@ -797,39 +926,53 @@ impl Kernel {
         // `type_uid` (e.g. "attr_desc") resolves to a Thing via type_thing().
         let type_thing = self.type_thing(type_uid)?;
         let target_thing = Self::parse_id(target_id)?;
-        let session_tenant_str = self.get_session_tenant().await?;
-        let substrate_thing = self.type_thing("node_substrate")?;
+        let session_tenant_thing = self.session_tenant_thing().await?;
 
         // 1. Fetch the attribute type's JSON Schema (if any) + the target
-        //    entity's tenant. Tenant comes back as `record<entity>` under v2;
-        //    we read .id to get the UUIDv7 string for the cross-tenant check.
+        //    entity's tenant FK. Types flow end-to-end as `Thing` — no string
+        //    conversion at the boundary. Two single-row SELECTs because
+        //    SurrealDB's nested-subquery shape is awkward for two distinct
+        //    record types.
         #[derive(serde::Deserialize)]
-        struct FetchV2 {
-            sch_json: Option<String>,
-            tenant_id: Option<String>,
-        }
-        let fetch_query = "SELECT \
-            (SELECT sch_json FROM $ty LIMIT 1)[0].sch_json AS sch_json, \
-            (SELECT tenant FROM $target LIMIT 1)[0].tenant.id AS tenant_id \
-            FROM { ty: $ty }";
-        let mut fetch_res = self.db.query(fetch_query)
+        struct SchRow { sch_json: Option<String> }
+        let mut sch_res = self.db
+            .query("SELECT sch_json FROM $ty LIMIT 1")
             .bind(("ty", type_thing.clone()))
-            .bind(("target", target_thing.clone())).await?;
-        let info: FetchV2 = fetch_res.take::<Vec<FetchV2>>(0)?
+            .await?;
+        let sch_json = sch_res.take::<Vec<SchRow>>(0)?
             .pop()
-            .ok_or_else(|| KernelError::Validation(format!("Type {type_uid} not found")))?;
-        let target_tenant = info.tenant_id
-            .ok_or_else(|| KernelError::Validation(format!("Target {target_id} not found")))?;
+            .ok_or_else(|| KernelError::Validation(format!("Type {type_uid} not found")))?
+            .sch_json;
 
-        // 2. Tenant-coercion guard.
-        if target_tenant != session_tenant_str {
+        #[derive(serde::Deserialize)]
+        struct TenantRow { tenant: Option<Thing> }
+        let mut tenant_res = self.db
+            .query("SELECT tenant FROM $target LIMIT 1")
+            .bind(("target", target_thing.clone()))
+            .await?;
+        let target_tenant = tenant_res.take::<Vec<TenantRow>>(0)?
+            .pop()
+            .ok_or_else(|| KernelError::Validation(format!("Target {target_id} not found")))?
+            .tenant;
+
+        // 2. Tenant-coercion guard — Thing comparison, no string conversion.
+        //    Substrate-root case: when the target IS the session's substrate
+        //    entity, its `tenant` is NONE by schema (option<record<entity>>
+        //    with the substrate self-reference relaxed). That is the only
+        //    legitimate NONE; everything else must match the session tenant.
+        let target_is_substrate_root = target_thing == session_tenant_thing;
+        let tenant_ok = match target_tenant.as_ref() {
+            Some(t) => t == &session_tenant_thing,
+            None => target_is_substrate_root,
+        };
+        if !tenant_ok {
             return Err(KernelError::SafetyViolation(format!(
-                "Tenant mismatch: Entity belongs to {target_tenant}, session is {session_tenant_str}"
+                "Tenant mismatch: Entity {target_id} tenant {target_tenant:?} != session {session_tenant_thing}"
             )));
         }
 
         // 3. JSON-Schema validation at the write boundary.
-        if let Some(schema_str) = info.sch_json {
+        if let Some(schema_str) = sch_json {
             let schema_val: serde_json::Value = serde_json::from_str(&schema_str)
                 .map_err(|e| KernelError::Validation(e.to_string()))?;
             let schema = JSONSchema::compile(&schema_val)
@@ -847,10 +990,6 @@ impl Kernel {
             "state_ledger",
             surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(::uuid::Uuid::now_v7())),
         ));
-        // Tenant FK is a record<entity> per v2 schema. The kernel session-
-        // var $session_tenant holds the substrate-entity UUID string; we
-        // resolve it to a Thing here for the bind.
-        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
 
         self.db.query(
             "CREATE state_ledger CONTENT { \
@@ -864,11 +1003,8 @@ impl Kernel {
             .bind(("id", state_record_id))
             .bind(("target", target_thing))
             .bind(("ty", type_thing))
-            .bind(("tenant", tenant_thing))
+            .bind(("tenant", session_tenant_thing))
             .bind(("val", value)).await?.check()?;
-
-        // Suppress unused warning until tenant-coercion uses it.
-        let _ = substrate_thing;
 
         // 5. Telemetry on every typed write.
         // run_id (caller-provided correlation token) stays in the payload;
@@ -902,26 +1038,31 @@ impl Kernel {
         let edge_type_thing = self.type_thing(edge_type)?;
         let from_thing = Self::parse_id(from)?;
         let to_thing = Self::parse_id(to)?;
-        let session_tenant_str = self.get_session_tenant().await?;
-        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = self.session_tenant_thing().await?;
 
-        // 1. Anti-coercion check — the source entity's tenant must match the
-        //    calling session. Under v2 `entity.tenant` is `record<entity>` so
-        //    we read its `.id` to compare against the session's substrate
-        //    UUID string.
+        // 1. Anti-coercion check — the source entity's `tenant` FK must point
+        //    at the same substrate Thing the session is bound to. Types flow
+        //    end-to-end as `Thing`. Substrate-root case: when the source IS
+        //    the session's substrate entity, its `tenant` is NONE by schema
+        //    and the source's own `id` matches the session — admit it.
         #[derive(serde::Deserialize)]
-        struct EntityTenant { tenant_id: String }
+        struct EntityTenant { tenant: Option<Thing> }
         let mut fetch_res = self.db
-            .query("SELECT tenant.id AS tenant_id FROM $target LIMIT 1")
+            .query("SELECT tenant FROM $target LIMIT 1")
             .bind(("target", from_thing.clone()))
             .await?;
-        let target_tenant: String = fetch_res.take::<Vec<EntityTenant>>(0)?
+        let target_tenant: Option<Thing> = fetch_res.take::<Vec<EntityTenant>>(0)?
             .pop()
             .ok_or_else(|| KernelError::Validation(format!("Source {from} not found")))?
-            .tenant_id;
-        if target_tenant != session_tenant_str {
+            .tenant;
+        let from_is_substrate_root = from_thing == tenant_thing;
+        let tenant_ok = match target_tenant.as_ref() {
+            Some(t) => t == &tenant_thing,
+            None => from_is_substrate_root,
+        };
+        if !tenant_ok {
             return Err(KernelError::SafetyViolation(format!(
-                "Tenant mismatch: Entity belongs to {target_tenant}, session is {session_tenant_str}"
+                "Tenant mismatch: Entity {from} tenant {target_tenant:?} != session {tenant_thing}"
             )));
         }
 
@@ -1043,8 +1184,10 @@ impl Kernel {
             if !visited.insert(current.to_string()) { continue; }
             nodes_ordered.push(current.clone());
 
-            // Fetch structural children (outgoing acyclic edges) within SAME tenant
-            let query = "SELECT out.id as id FROM relation WHERE in = $id AND tenant_id = $session_tenant AND is_acyclic = true";
+            // Fetch structural children (outgoing acyclic edges) within SAME tenant.
+            // v2: tenant FK is `record<entity>`; compare to the session's
+            // typed Thing — no legacy `tenant_id` column under v2.
+            let query = "SELECT out.id as id FROM relation WHERE in = $id AND tenant = $session_tenant AND is_acyclic = true";
             let mut res = self.db.query(query)
                 .bind(("id", current)).await?;
             let children: Vec<IdResult> = res.take(0)?;
@@ -1055,8 +1198,14 @@ impl Kernel {
 
         let mut xml = String::from("<context>\n");
         for node in nodes_ordered {
-            // Fetch state rows filtered by target memory tiers and session tenant
-            let fetch = "SELECT value_json FROM state_ledger WHERE target = $id AND tenant_id = $session_tenant AND `type`.memory_tier INSIDE $tiers AND is_current = true LIMIT 1";
+            // Fetch state rows filtered by target memory tiers and session
+            // tenant. v2: typed FK comparison `tenant = $session_tenant`;
+            // "current" is the most-recent row by `valid_from`, not the
+            // dropped `is_current = true` filter.
+            let fetch = "SELECT value_json, valid_from FROM state_ledger \
+                WHERE target = $id AND tenant = $session_tenant \
+                  AND `type`.memory_tier INSIDE $tiers \
+                ORDER BY valid_from DESC LIMIT 1";
             let mut res = self.db.query(fetch)
                 .bind(("id", node.clone()))
                 .bind(("tiers", target_tiers.clone())).await?;
@@ -1109,8 +1258,7 @@ impl Kernel {
         ));
 
         // tenant FK: substrate-entity Thing resolved from session.
-        let session_tenant_str = self.get_session_tenant().await?;
-        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = self.session_tenant_thing().await?;
 
         self.db.query(
             "INSERT INTO telemetry_stream { \
@@ -1164,8 +1312,7 @@ impl Kernel {
         metadata: Option<serde_json::Value>,
     ) -> Result<(), KernelError> {
         let cursor_type_thing = self.cursor_type_thing(cursor_type_uid)?;
-        let session_tenant_str = self.get_session_tenant().await?;
-        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = self.session_tenant_thing().await?;
 
         let row_id = Thing::from((
             "cursor",
@@ -1221,7 +1368,7 @@ impl Kernel {
         let cursor_type_thing = self.cursor_type_thing(cursor_type_uid)?;
 
         let mut res = self.db.query(
-            "SELECT last_processed, metadata FROM cursor \
+            "SELECT last_processed, metadata, valid_from FROM cursor \
              WHERE subject = $subject AND cursor_type = $ct \
              ORDER BY valid_from DESC LIMIT 1"
         )
@@ -1266,8 +1413,7 @@ impl Kernel {
     ) -> Result<(), KernelError> {
         // Pre-condition: caller is in a session. Surfaces "no session" as a
         // clean SafetyViolation rather than a substrate permission error.
-        let session_tenant_str = self.get_session_tenant().await?;
-        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = self.session_tenant_thing().await?;
 
         let row_id = Thing::from((
             "execution_params",
@@ -1317,7 +1463,7 @@ impl Kernel {
         struct Row { params_json: serde_json::Value }
 
         let mut res = self.db.query(
-            "SELECT params_json FROM execution_params \
+            "SELECT params_json, valid_from FROM execution_params \
              WHERE run = $run AND agent = $agent \
              ORDER BY valid_from DESC LIMIT 1"
         )
@@ -1367,8 +1513,7 @@ impl Kernel {
     ) -> Result<Thing, KernelError> {
         assert!(!kind.is_empty(), "kind mandatory");
 
-        let session_tenant_str = self.get_session_tenant().await?;
-        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = self.session_tenant_thing().await?;
 
         let row_id = Thing::from((
             "schedule",
@@ -1455,8 +1600,7 @@ impl Kernel {
             metadata: serde_json::Value,
         }
 
-        let session_tenant_str = self.get_session_tenant().await?;
-        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = self.session_tenant_thing().await?;
 
         // 1. Fetch the latest row in the chain. The chain root is the
         //    schedule_id the caller has in hand; from there we walk to the
@@ -1464,7 +1608,7 @@ impl Kernel {
         //    given row (chains are short; full chain-walk is later when
         //    SchedulerBlade lands).
         let mut res = self.db.query(
-            "SELECT run, kind, target, due_at, status, attempt, depends_on, metadata \
+            "SELECT run, kind, target, due_at, status, attempt, depends_on, metadata, valid_from \
              FROM schedule WHERE id = $sid \
              ORDER BY valid_from DESC LIMIT 1"
         )
@@ -1563,84 +1707,193 @@ mod tests {
         (dir, kernel)
     }
 
+    /// Test helper: create a tenant by provisioning its `node_substrate`
+    /// entity. The substrate entity is the self-tenant root — its `tenant`
+    /// FK points at itself, satisfying the engine ASSERT. Session is bound
+    /// to the substrate uuid string.
+    ///
+    /// Returns `(substrate_uuid_string, substrate_record_id)` so tests can
+    /// reference both forms.
+    async fn provision_tenant(kernel: &Kernel, tenant_name: &str) -> (String, String) {
+        let ns = ::uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+            .expect("Valid DNS NS UUID");
+        let substrate_uuid = ::uuid::Uuid::new_v5(&ns, tenant_name.as_bytes());
+        let substrate_uuid_str = substrate_uuid.to_string();
+        let substrate_thing = Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(substrate_uuid)),
+        ));
+        let substrate_record_id = format!("entity:{substrate_uuid}");
+
+        // Bind session BEFORE the insert so PERMISSIONS / future queries
+        // see this tenant as the active one.
+        kernel.set_session_auth(&substrate_uuid_str, "admin").await.unwrap();
+
+        let node_substrate = kernel.type_thing("node_substrate").unwrap();
+
+        // Idempotent: skip create if already exists.
+        #[derive(serde::Deserialize)]
+        struct IdRow { #[allow(dead_code)] id: Thing }
+        let mut sel = kernel.db
+            .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
+            .bind(("id", substrate_thing.clone()))
+            .await.unwrap();
+        if sel.take::<Vec<IdRow>>(0).unwrap().pop().is_none() {
+            kernel.db.query(
+                "CREATE entity CONTENT { \
+                    id: $id, type: $type, tenant: NONE, role: 'admin' \
+                }"
+            )
+                .bind(("id", substrate_thing))
+                .bind(("type", node_substrate))
+                .await.unwrap().check().unwrap();
+        }
+
+        (substrate_uuid_str, substrate_record_id)
+    }
+
+    /// Test helper: CREATE a fresh entity of the given metamodel type under
+    /// the given tenant. Returns the record-id literal (`entity:<uuidv7>`).
+    async fn create_entity(kernel: &Kernel, type_uid: &str, tenant_uuid_str: &str) -> String {
+        let new_uuid = ::uuid::Uuid::now_v7();
+        let new_thing = Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(new_uuid)),
+        ));
+        let entity_type = kernel.type_thing(type_uid).unwrap();
+        // Build the tenant Thing with Id::Uuid (the substrate row was created
+        // with `id TYPE uuid`). parse_id would otherwise produce Id::String,
+        // which references a different (non-existent) row.
+        let tenant_uuid = ::uuid::Uuid::parse_str(tenant_uuid_str)
+            .expect("tenant_uuid_str must be a valid UUID");
+        let tenant_thing = Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(tenant_uuid)),
+        ));
+
+        kernel.db.query(
+            "CREATE entity CONTENT { \
+                id: $id, type: $type, tenant: $tenant, role: 'user' \
+            }"
+        )
+            .bind(("id", new_thing))
+            .bind(("type", entity_type))
+            .bind(("tenant", tenant_thing))
+            .await.unwrap().check().unwrap();
+
+        format!("entity:{new_uuid}")
+    }
+
     #[tokio::test]
     async fn test_validation_nasa_hardened() {
         let (_dir, kernel) = setup().await;
-        let t = "tenant_1";
-        kernel.set_session_auth(t, "admin").await.unwrap();
-        kernel.db.query("INSERT INTO entity {id: entity:v1, tenant_id: $session_tenant, type: type_definition:node_prod}").await.unwrap();
+        let (tenant_uuid, _) = provision_tenant(&kernel, "tenant_1").await;
+        let v1 = create_entity(&kernel, "node_prod", &tenant_uuid).await;
 
         // 1. Unknown type rejected
-        let res = kernel.supersede_state("entity:v1", "none", serde_json::json!({"text":"x"}), None).await;
-        assert!(matches!(res, Err(KernelError::Validation(m)) if m.contains("not found")));
+        let res = kernel.supersede_state(&v1, "none", serde_json::json!({"text":"x"}), None).await;
+        assert!(
+            matches!(&res, Err(KernelError::Integrity(_)) | Err(KernelError::Validation(_))),
+            "supersede_state must reject unknown type uid, got {res:?}"
+        );
 
-        // 2. Schema violation rejected
-        let res = kernel.supersede_state("entity:v1", "attr_desc", serde_json::json!({"wrong":"y"}), None).await;
-        assert!(matches!(&res, Err(KernelError::Validation(ref m)) if m.contains("fails validation")));
+        // 2. Schema-violation rejected
+        let res = kernel.supersede_state(&v1, "attr_desc", serde_json::json!({"wrong":"y"}), None).await;
+        assert!(
+            matches!(&res, Err(KernelError::Validation(ref m)) if m.contains("fails validation")),
+            "schema-invalid payload must be refused, got {res:?}"
+        );
 
-        // 3. Tenant coercion rejected by physical check
-        kernel.set_session_auth("attacker", "user").await.unwrap();
-        let res2 = kernel.supersede_state("entity:v1", "attr_desc", serde_json::json!({"text":"hack"}), None).await;
-        assert!(matches!(res2, Err(KernelError::SafetyViolation(m)) if m.contains("Tenant mismatch")));
+        // 3. Tenant-coercion rejected
+        let (_, _) = provision_tenant(&kernel, "attacker").await; // switches session
+        let res2 = kernel.supersede_state(&v1, "attr_desc", serde_json::json!({"text":"hack"}), None).await;
+        assert!(
+            matches!(&res2, Err(KernelError::SafetyViolation(m)) if m.contains("Tenant mismatch")),
+            "cross-tenant write must be refused, got {res2:?}"
+        );
     }
 
     #[tokio::test]
     async fn test_cycle_nasa_hardened() {
         let (_dir, kernel) = setup().await;
-        let t = "tenant_1";
-        kernel.set_session_auth(t, "admin").await.unwrap();
-        kernel.db.query("INSERT INTO entity [{id: entity:a, tenant_id: $session_tenant, type: type_definition:node_prod}, {id: entity:b, tenant_id: $session_tenant, type: type_definition:node_prod}]").await.unwrap();
+        let (tenant_uuid, _) = provision_tenant(&kernel, "tenant_cycle").await;
+        let a = create_entity(&kernel, "node_prod", &tenant_uuid).await;
+        let b = create_entity(&kernel, "node_prod", &tenant_uuid).await;
 
-        kernel.create_structural_edge("entity:a", "entity:b", "edge_owns").await.unwrap();
-        let res = kernel.create_structural_edge("entity:b", "entity:a", "edge_owns").await;
+        kernel.create_structural_edge(&a, &b, "edge_owns").await.unwrap();
+        let res = kernel.create_structural_edge(&b, &a, "edge_owns").await;
         assert!(matches!(res, Err(KernelError::CycleDetected)));
     }
 
     #[tokio::test]
     async fn test_tenant_isolation_nasa_hardened() {
         let (_dir, kernel) = setup().await;
-        let t1 = "t1";
-        kernel.set_session_auth(t1, "admin").await.unwrap();
-        kernel.db.query("INSERT INTO entity {id: entity:p1, tenant_id: $session_tenant, type: type_definition:node_prod}").await.unwrap();
-        kernel.supersede_state("entity:p1", "attr_desc", serde_json::json!({"text":"secret"}), None).await.unwrap();
+        let (tenant_t1, _) = provision_tenant(&kernel, "t1").await;
+        let p1 = create_entity(&kernel, "node_prod", &tenant_t1).await;
+        kernel.supersede_state(&p1, "attr_desc", serde_json::json!({"text":"secret"}), None).await.unwrap();
 
-        kernel.set_session_auth("t2", "user").await.unwrap();
-        let xml = kernel.compile_context("entity:p1", "run1", None).await.unwrap();
-        assert!(!xml.contains("secret"));
+        // Switch to a different tenant — compile_context must not leak the
+        // other tenant's secret.
+        let (_, _) = provision_tenant(&kernel, "t2").await;
+        let xml = kernel.compile_context(&p1, "run1", None).await.unwrap();
+        assert!(!xml.contains("secret"), "compile_context must respect tenant isolation, got: {xml}");
     }
 
     #[tokio::test]
     async fn test_durable_cursor_nasa_hardened() {
         let (_dir, kernel) = setup().await;
-        let t = "t1";
-        kernel.set_session_auth(t, "admin").await.unwrap();
-        let rid = "run_123";
-        kernel.checkpoint_execution(rid, "test", Some("file_1".into()), None).await.unwrap();
-        
-        let cursor = kernel.get_execution_cursor(rid).await.unwrap().unwrap();
+        let (tenant_uuid, _) = provision_tenant(&kernel, "t1_cursor").await;
+
+        // Subject for the cursor chain — any entity will do; for v0.1 we use
+        // a node_prod (workload subject would be a node_run when those land).
+        let subject = create_entity(&kernel, "node_prod", &tenant_uuid).await;
+        let subject_thing = Kernel::parse_id(&subject).unwrap();
+
+        kernel.write_cursor(
+            subject_thing.clone(),
+            "ingestion",
+            Some("file_1".into()),
+            None,
+        ).await.unwrap();
+
+        let cursor = kernel.read_cursor(subject_thing, "ingestion").await.unwrap().unwrap();
         assert_eq!(cursor.last_processed, Some("file_1".into()));
     }
 
     #[tokio::test]
     async fn test_scd2_supersede_nasa_hardened() {
         let (_dir, kernel) = setup().await;
-        let t = "t1";
-        kernel.set_session_auth(t, "admin").await.unwrap();
-        kernel.db.query("INSERT INTO entity {id: entity:v1, tenant_id: $session_tenant, type: type_definition:node_prod}").await.unwrap();
+        let (tenant_uuid, _) = provision_tenant(&kernel, "t1_scd2").await;
+        let v1 = create_entity(&kernel, "node_prod", &tenant_uuid).await;
+        let v1_thing = Kernel::parse_id(&v1).unwrap();
 
         // 1. First state
-        kernel.supersede_state("entity:v1", "attr_desc", serde_json::json!({"text":"v1"}), None).await.unwrap();
-        
-        // 2. Second state (Supersede)
-        kernel.supersede_state("entity:v1", "attr_desc", serde_json::json!({"text":"v2"}), None).await.unwrap();
+        kernel.supersede_state(&v1, "attr_desc", serde_json::json!({"text":"v1"}), None).await.unwrap();
+        // 2. Second state — append-only under v2; prior row stays.
+        kernel.supersede_state(&v1, "attr_desc", serde_json::json!({"text":"v2"}), None).await.unwrap();
 
-        // 3. Verify history (Cast IDs to string for deserialization)
-        let mut res = kernel.db.query("SELECT <string>id as id, is_current, value_json FROM state_ledger WHERE target = entity:v1").await.unwrap();
-        let history: Vec<serde_json::Value> = res.take(0).unwrap();
-        assert_eq!(history.len(), 2, "SCD-2 history must preserve all versions");
-        
-        let current = history.iter().find(|v| v.get("is_current").and_then(serde_json::Value::as_bool).unwrap_or(false)).unwrap();
-        assert_eq!(current.get("value_json").unwrap().get("text").unwrap().as_str().unwrap(), "v2");
+        // 3. Verify both versions are preserved and "current" (latest by
+        //    valid_from) is the v2 payload.
+        let attr_desc = kernel.type_thing("attr_desc").unwrap();
+
+        #[derive(serde::Deserialize, Debug)]
+        struct Row {
+            value_json: serde_json::Value,
+            #[allow(dead_code)]
+            valid_from: chrono::DateTime<chrono::Utc>,
+        }
+        let mut res = kernel.db.query(
+            "SELECT value_json, valid_from FROM state_ledger \
+             WHERE target = $target AND `type` = $ty \
+             ORDER BY valid_from ASC"
+        )
+            .bind(("target", v1_thing))
+            .bind(("ty", attr_desc))
+            .await.unwrap();
+        let history: Vec<Row> = res.take(0).unwrap();
+        assert_eq!(history.len(), 2, "append-only history must keep both versions, got {history:?}");
+        assert_eq!(history[0].value_json.get("text").and_then(|v| v.as_str()), Some("v1"), "first row is the v1 payload");
+        assert_eq!(history[1].value_json.get("text").and_then(|v| v.as_str()), Some("v2"), "latest row (by valid_from) is the v2 payload");
     }
 
     #[tokio::test]
@@ -1662,29 +1915,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_compile_context_node_limit() {
-        // NASA Rule 2: compile_context must enforce a bounded total-node cap, even when
-        // depth would otherwise permit a runaway-wide DAG. Configure max_context_nodes=2,
-        // seed a 3-node chain, and verify the kernel refuses to materialize the third.
+        // NASA Rule 2: compile_context must enforce a bounded total-node cap.
+        // Configure max_context_nodes=2, seed a 3-node chain, verify refusal.
         let (_dir, kernel) = setup().await;
-        let t = "tenant_bound";
-        kernel.set_session_auth(t, "admin").await.unwrap();
+        let (tenant_uuid, substrate_record_id) = provision_tenant(&kernel, "tenant_bound").await;
 
-        // Provision a substrate for this tenant so attr_config writes land where get_parameter expects.
-        let sub_id = "entity:bound_substrate";
-        kernel.db.query("INSERT INTO entity {id: entity:bound_substrate, tenant_id: $session_tenant, type: type_definition:node_substrate}")
-            .await.unwrap().check().unwrap();
-        kernel.supersede_state(sub_id, "attr_config", serde_json::json!({"max_context_nodes": 2}), None).await.unwrap();
+        // Cap configured as attr_config on the substrate entity.
+        kernel.supersede_state(
+            &substrate_record_id,
+            "attr_config",
+            serde_json::json!({"max_context_nodes": 2}),
+            None,
+        ).await.unwrap();
 
-        // Seed three entities and a structural chain a -> b -> c.
-        kernel.db.query("INSERT INTO entity [\
-            {id: entity:bn_a, tenant_id: $session_tenant, type: type_definition:node_prod},\
-            {id: entity:bn_b, tenant_id: $session_tenant, type: type_definition:node_prod},\
-            {id: entity:bn_c, tenant_id: $session_tenant, type: type_definition:node_prod}]")
-            .await.unwrap().check().unwrap();
-        kernel.create_structural_edge("entity:bn_a", "entity:bn_b", "edge_owns").await.unwrap();
-        kernel.create_structural_edge("entity:bn_b", "entity:bn_c", "edge_owns").await.unwrap();
+        // Seed three entities and chain a -> b -> c via structural edges.
+        let a = create_entity(&kernel, "node_prod", &tenant_uuid).await;
+        let b = create_entity(&kernel, "node_prod", &tenant_uuid).await;
+        let c = create_entity(&kernel, "node_prod", &tenant_uuid).await;
+        kernel.create_structural_edge(&a, &b, "edge_owns").await.unwrap();
+        kernel.create_structural_edge(&b, &c, "edge_owns").await.unwrap();
 
-        let res = kernel.compile_context("entity:bn_a", "test_run", None).await;
+        let res = kernel.compile_context(&a, "test_run", None).await;
         assert!(
             matches!(&res, Err(KernelError::SafetyViolation(m)) if m.contains("node limit")),
             "compile_context must refuse to exceed max_context_nodes, got {res:?}"

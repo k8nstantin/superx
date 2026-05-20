@@ -120,8 +120,7 @@ impl<'a> ProposerBlade<'a> {
         //    Id::Uuid(UUIDv7), no UPSERT. Engine refuses anything else
         //    under the superx service account.
         let node_proposal = self.kernel.type_thing("node_proposal")?;
-        let session_tenant_str = self.kernel.session_tenant().await?;
-        let tenant_thing = Kernel::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = self.kernel.session_tenant_thing().await?;
 
         let proposal_uuid = uuid::Uuid::now_v7();
         let proposal_thing = surrealdb::sql::Thing::from((
