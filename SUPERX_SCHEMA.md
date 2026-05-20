@@ -20,12 +20,18 @@ The substrate has two accounts. The operator owns root; the model uses a service
 -- Used only by the operator, only to apply schema changes.
 -- Not represented here as a DEFINE USER — it is the engine's root.
 
--- Model: service account with EDITOR role, narrowed by per-table PERMISSIONS.
-DEFINE USER IF NOT EXISTS service_account ON DATABASE
-    PASSWORD $SUPERX_SERVICE_PASSWORD
+-- Model: service account named `superx`.
+-- EDITOR role at user level, narrowed by per-table PERMISSIONS so the
+-- effective grant is SELECT + CREATE only (no UPDATE, no DELETE).
+DEFINE USER IF NOT EXISTS superx ON DATABASE
+    PASSWORD $superx_service_password
     ROLES EDITOR
     DURATION FOR SESSION 1h, FOR TOKEN 1h;
 ```
+
+**Credentials** (also recorded in `.claude/skills/zero-trust-execution/SKILL.md §13`):
+- Login: `superx`
+- Password: `superx-v01-dev-x9KmP2nQ7tR3vW8y` (v0.1 dev default; operator overrides via `SUPERX_SERVICE_PASSWORD` env)
 
 Per [SurrealDB's `DEFINE USER` docs](https://surrealdb.com/docs/surrealql/statements/define/user), only the built-in `OWNER` / `EDITOR` / `VIEWER` roles are available at the user level. To enforce **SELECT + CREATE only** at the substrate, every table additionally carries:
 

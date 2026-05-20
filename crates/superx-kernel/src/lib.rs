@@ -200,15 +200,13 @@ impl Kernel {
     }
 
     async fn apply_substrate_schema(&self) -> Result<(), KernelError> {
-        // Service-account password from operator-set env. Falls back to a dev
-        // default with a loud warning so first-bootstrap on a dev machine
-        // still works without ceremony; in any deployment scenario the
-        // operator sets SUPERX_SERVICE_PASSWORD before init.
+        // Service-account password for the `superx` user.
+        // The operator may override via SUPERX_SERVICE_PASSWORD env; otherwise
+        // we use the dev default that is also recorded in the skill so the
+        // model knows what credentials to authenticate with.
+        // CONTRACT: see .claude/skills/zero-trust-execution/SKILL.md §13.
         let service_password = std::env::var("SUPERX_SERVICE_PASSWORD")
-            .unwrap_or_else(|_| {
-                tracing::warn!("SUPERX_SERVICE_PASSWORD not set; using dev default. Set this env var before any non-dev deployment.");
-                "superx-dev-password".to_string()
-            });
+            .unwrap_or_else(|_| "superx-v01-dev-x9KmP2nQ7tR3vW8y".to_string());
 
         // v2 schema — append-only, insert-only, fully cross-referenceable.
         // Every table has one temporal field (`valid_from`) — no `is_current`,
@@ -426,11 +424,18 @@ impl Kernel {
                 SIGNIN ( SELECT * FROM entity WHERE tenant.id = $tenant AND role = $role LIMIT 1 );
 
             -- ====================================================================
-            -- Service account (model's runtime user — EDITOR role narrowed by
-            -- per-table PERMISSIONS FOR update NONE; FOR delete NONE; above)
-            -- Effective grant: SELECT + CREATE only.
+            -- Service account (the model's runtime user)
+            -- Login: `superx`
+            -- EDITOR role at the user level, narrowed by per-table PERMISSIONS
+            -- (`FOR update NONE; FOR delete NONE;` on every table above) so
+            -- the effective grant is SELECT + CREATE only — no UPDATE, no
+            -- DELETE, no schema mutation.
+            -- Credentials are documented in
+            --   .claude/skills/zero-trust-execution/SKILL.md §13
+            -- The operator may override the password via the
+            -- SUPERX_SERVICE_PASSWORD environment variable.
             -- ====================================================================
-            DEFINE USER IF NOT EXISTS service_account ON DATABASE
+            DEFINE USER IF NOT EXISTS superx ON DATABASE
                 PASSWORD $superx_service_password
                 ROLES EDITOR
                 DURATION FOR SESSION 1h, FOR TOKEN 1h;
