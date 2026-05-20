@@ -5660,6 +5660,7 @@ dependencies = [
  "serde_json",
  "superx-inference",
  "superx-kernel",
+ "surrealdb",
  "tokio",
  "tracing",
  "uuid",
