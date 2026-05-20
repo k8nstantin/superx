@@ -155,11 +155,6 @@ struct IdResult {
     id: Thing 
 }
 
-#[derive(Deserialize)] 
-struct TenantResult { 
-    tenant_id: String 
-}
-
 #[derive(Deserialize)]
 struct StateResult {
     value_json: Option<serde_json::Value>
@@ -803,29 +798,49 @@ impl Kernel {
         assert!(!from.is_empty(), "Source ID mandatory");
         assert!(!to.is_empty(), "Target ID mandatory");
 
-        let session_tenant = self.get_session_tenant().await?;
-        let type_thing = Thing::from(("type_definition".to_string(), edge_type.to_string()));
+        // Resolve metamodel + identity Things once. type_thing fails fast if
+        // edge_type is not a seeded metamodel uid — the substrate would have
+        // refused via the relation.type ASSERT clause otherwise, but failing
+        // here gives a clearer error message.
+        let edge_type_thing = self.type_thing(edge_type)?;
         let from_thing = Self::parse_id(from)?;
         let to_thing = Self::parse_id(to)?;
+        let session_tenant_str = self.get_session_tenant().await?;
+        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
 
-        // 1. Coercion check for source
-        let mut fetch_res = self.db.query("SELECT tenant_id FROM $target LIMIT 1").bind(("target", from_thing.clone())).await?;
-        let target_tenant: String = fetch_res.take::<Vec<TenantResult>>(0)?
+        // 1. Anti-coercion check — the source entity's tenant must match the
+        //    calling session. Under v2 `entity.tenant` is `record<entity>` so
+        //    we read its `.id` to compare against the session's substrate
+        //    UUID string.
+        #[derive(serde::Deserialize)]
+        struct EntityTenant { tenant_id: String }
+        let mut fetch_res = self.db
+            .query("SELECT tenant.id AS tenant_id FROM $target LIMIT 1")
+            .bind(("target", from_thing.clone()))
+            .await?;
+        let target_tenant: String = fetch_res.take::<Vec<EntityTenant>>(0)?
             .pop()
             .ok_or_else(|| KernelError::Validation(format!("Source {from} not found")))?
             .tenant_id;
-
-        if target_tenant != session_tenant {
-            return Err(KernelError::SafetyViolation(format!("Tenant mismatch: Entity belongs to {target_tenant}, session is {session_tenant}")));
+        if target_tenant != session_tenant_str {
+            return Err(KernelError::SafetyViolation(format!(
+                "Tenant mismatch: Entity belongs to {target_tenant}, session is {session_tenant_str}"
+            )));
         }
 
-        let mut type_res = self.db.query("SELECT is_acyclic FROM $id").bind(("id", type_thing.clone())).await?;
-        let is_acyclic = type_res.take::<Vec<AcyclicCheck>>(0)?.pop().is_some_and(|c| c.is_acyclic);
+        // 2. is_acyclic flag from the metamodel row.
+        let mut type_res = self.db
+            .query("SELECT is_acyclic FROM $id")
+            .bind(("id", edge_type_thing.clone()))
+            .await?;
+        let is_acyclic = type_res.take::<Vec<AcyclicCheck>>(0)?
+            .pop()
+            .is_some_and(|c| c.is_acyclic);
 
+        // 3. Cycle detection — walk outgoing acyclic edges under the same
+        //    tenant. Bounded by NASA Power-of-10 max_iters.
         if is_acyclic {
             let max_iters: usize = self.get_parameter("max_dfs_iterations", 10_000).await;
-
-            // Check if 'to' can already reach 'from' (Cycle Detection)
             let mut stack = vec![to_thing.clone()];
             let mut visited = std::collections::HashSet::new();
             let mut iters: usize = 0;
@@ -834,29 +849,44 @@ impl Kernel {
                 assert!(iters <= max_iters, "Safety violation: DFS depth exceeded");
                 if iters > max_iters { return Err(KernelError::SafetyViolation("DFS limit".into())); }
                 if current == from_thing { return Err(KernelError::CycleDetected); }
-
                 if !visited.insert(current.to_string()) { continue; }
 
-                // Walk outgoing structural edges within SAME tenant
-                let query = "SELECT out.id as id FROM relation WHERE in = $id AND tenant_id = $session_tenant AND is_acyclic = true";
-                let mut res = self.db.query(query).bind(("id", current)).await?;
+                let mut res = self.db.query(
+                    "SELECT out.id as id FROM relation \
+                     WHERE in = $id AND tenant = $tenant AND is_acyclic = true"
+                )
+                    .bind(("id", current))
+                    .bind(("tenant", tenant_thing.clone()))
+                    .await?;
                 let children: Vec<IdResult> = res.take(0)?;
                 for c in children { stack.push(c.id); }
             }
         }
 
+        // 4. Pure INSERT — engine refuses UPDATE for superx anyway.
+        //    v2 field names: in / out / type / tenant / is_acyclic (no tenant_id).
         let rel_record_id = Thing::from((
             "relation",
             surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(::uuid::Uuid::now_v7())),
         ));
-        let query = "INSERT INTO relation { id: $id, in: $f, out: $t, type: $ty, tenant_id: $session_tenant, is_acyclic: $acyc }";
-        self.db.query(query)
+        self.db.query(
+            "INSERT INTO relation { \
+                id: $id, \
+                in: $f, \
+                out: $t, \
+                type: $ty, \
+                tenant: $tenant, \
+                is_acyclic: $acyc \
+            }"
+        )
             .bind(("id", rel_record_id))
             .bind(("f", from_thing))
             .bind(("t", to_thing))
-            .bind(("ty", type_thing))
-            .bind(("acyc", is_acyclic)).await?.check()?;
-        
+            .bind(("ty", edge_type_thing))
+            .bind(("tenant", tenant_thing))
+            .bind(("acyc", is_acyclic))
+            .await?.check()?;
+
         let _ = self.log_telemetry(
             serde_json::json!({"from": from, "to": to, "type": edge_type}),
             "edge_create",
