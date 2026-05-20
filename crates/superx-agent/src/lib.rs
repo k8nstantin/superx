@@ -61,45 +61,78 @@ impl<'a> CapabilityGovernor<'a> {
         assert!(!agent_uid.is_empty(), "Agent identity mandatory");
         tracing::info!("governor handshake: agent_uid={agent_uid}");
 
-        // 1. Resolve Session Tenant (Physical Isolation)
-        let mut t_res = self.kernel.db.query("RETURN $session_tenant").await?;
-        let session_tenant: String = t_res.take::<Option<String>>(0)?
-            .ok_or_else(|| KernelError::SafetyViolation("No session tenant set before handshake".into()))?;
+        // 1. Resolve session tenant + metamodel FKs.
+        let session_tenant_str = self.kernel.session_tenant().await?;
+        let tenant_thing = Kernel::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let node_agent = self.kernel.type_thing("node_agent")?;
+        let node_session = self.kernel.type_thing("node_session")?;
 
-        let agent_thing = Thing::from(("entity".to_string(), agent_uid.to_string()));
-        let session_uid = Uuid::now_v7().to_string();
-        let session_thing = Thing::from(("entity".to_string(), session_uid.clone()));
+        let agent_thing = Kernel::parse_id(agent_uid)?;
+        let session_uid = Uuid::now_v7();
+        let session_thing = Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(session_uid)),
+        ));
 
-        // 2. Identity Coercion Check: Ensure agent belongs to this tenant
-        let check_query = "SELECT tenant_id FROM $id LIMIT 1";
-        let mut check_res = self.kernel.db.query(check_query).bind(("id", agent_thing.clone())).await?;
-        if let Ok(Some(row)) = check_res.take::<Vec<serde_json::Value>>(0).map(|mut v| v.pop()) {
-            let existing_tenant = row.get("tenant_id").and_then(serde_json::Value::as_str).unwrap_or_default();
-            if !existing_tenant.is_empty() && existing_tenant != session_tenant {
-                return Err(KernelError::SafetyViolation(format!("Agent {agent_uid} belongs to tenant {existing_tenant}, but session is {session_tenant}")));
+        // 2. Identity-coercion check: if the agent row already exists, it
+        //    must belong to the session's tenant. Under v2 we read the
+        //    typed FK's id field (`tenant.id`) instead of the dropped
+        //    `tenant_id` string.
+        #[derive(serde::Deserialize)]
+        struct TenantOnly { tenant_id: Option<String> }
+        let mut check_res = self.kernel.db
+            .query("SELECT tenant.id AS tenant_id FROM $id LIMIT 1")
+            .bind(("id", agent_thing.clone()))
+            .await?;
+        if let Some(row) = check_res.take::<Vec<TenantOnly>>(0)?.pop() {
+            if let Some(existing) = row.tenant_id {
+                if existing != session_tenant_str {
+                    return Err(KernelError::SafetyViolation(format!(
+                        "Agent {agent_uid} belongs to tenant {existing}, but session is {session_tenant_str}"
+                    )));
+                }
             }
+        } else {
+            // Fresh agent — CREATE under superx (UPSERT is engine-refused).
+            self.kernel.db.query(
+                "CREATE entity CONTENT { \
+                    id: $id, \
+                    type: $type, \
+                    tenant: $tenant, \
+                    role: 'user' \
+                }"
+            )
+                .bind(("id", agent_thing.clone()))
+                .bind(("type", node_agent))
+                .bind(("tenant", tenant_thing.clone()))
+                .await?.check()?;
         }
 
-        // 3. Upsert Identity
-        let _ = self.kernel.db.query("UPSERT $id SET tenant_id = $t, type = type_definition:node_agent")
-            .bind(("id", agent_thing.clone()))
-            .bind(("t", session_tenant.clone())).await?.check()?;
-
-        // 4. Create session
-        let _ = self.kernel.db.query("INSERT INTO entity { id: $id, tenant_id: $t, type: type_definition:node_session }")
+        // 3. Create session entity (node_session, tenant FK to substrate).
+        self.kernel.db.query(
+            "CREATE entity CONTENT { \
+                id: $id, \
+                type: $type, \
+                tenant: $tenant, \
+                role: 'user' \
+            }"
+        )
             .bind(("id", session_thing.clone()))
-            .bind(("t", session_tenant.clone())).await?.check()?;
+            .bind(("type", node_session))
+            .bind(("tenant", tenant_thing))
+            .await?.check()?;
 
-        // 5. Link session to agent
-        self.kernel.create_structural_edge(&format!("entity:{session_uid}"), &format!("entity:{agent_uid}"), "edge_participates_in").await?;
+        // 4. Link session → agent (edge_participates_in).
+        let session_record_id = format!("entity:{session_uid}");
+        self.kernel.create_structural_edge(&session_record_id, agent_uid, "edge_participates_in").await?;
 
         self.kernel.log_telemetry(
-            json!({"agent": agent_uid, "session": session_uid}),
+            json!({"agent": agent_uid, "session": session_record_id}),
             "agent_handshake",
             None,
         ).await?;
 
-        Ok(session_uid)
+        Ok(session_uid.to_string())
     }
 
     /// `check_capability`: Verifies if an agent has permission to execute a tool.
@@ -122,14 +155,20 @@ impl<'a> CapabilityGovernor<'a> {
 
         let agent_thing = Kernel::parse_id(agent_id)?;
         let tool_thing = Kernel::parse_id(&format!("entity:{tool_uid}"))?;
+        let edge_has_capability = self.kernel.type_thing("edge_has_capability")?;
+        let session_tenant_str = self.kernel.session_tenant().await?;
+        let tenant_thing = Kernel::parse_id(&format!("entity:{session_tenant_str}"))?;
 
         let query = "SELECT count() AS count FROM relation \
             WHERE in = $agent AND out = $tool \
-            AND type = type_definition:edge_has_capability \
-            AND tenant_id = $session_tenant GROUP ALL";
+            AND type = $edge_type \
+            AND tenant = $tenant GROUP ALL";
         let mut res = self.kernel.db.query(query)
             .bind(("agent", agent_thing))
-            .bind(("tool", tool_thing)).await?;
+            .bind(("tool", tool_thing))
+            .bind(("edge_type", edge_has_capability))
+            .bind(("tenant", tenant_thing))
+            .await?;
 
         let count = res.take::<Vec<CountRow>>(0)?.pop().map_or(0, |r| r.count);
         if count == 0 {
