@@ -19,7 +19,11 @@
 //!
 //! - `agent_seeded` × N — one per canonical admin agent (today: 2)
 //! - `agent_discovered` × M — one per `mcpServers` entry found across
-//!   probed Claude Desktop configs (cross-platform: macOS, Windows, Linux)
+//!   probed MCP-client configs (Claude Desktop, Claude Code, Gemini CLI;
+//!   cross-platform: macOS, Windows, Linux). The event carries a `source`
+//!   field naming which client declared the agent (`claude_desktop` /
+//!   `claude_code` / `gemini_cli`) so downstream consumers can fan out per
+//!   client.
 //! - `agent_activity_observed` × K — one per `mcp-server-*.log` found in
 //!   the Claude Desktop logs directory (live-agent signal)
 //! - `bootstrap_census` — final summary with counts
@@ -30,12 +34,19 @@
 //! - **Verification step at the end.** Bootstrap counts the telemetry rows
 //!   it just produced and fails loudly if the firehose did not capture them.
 //!   This is the early-warning that the substrate's telemetry pipe broke.
-//! - **Env-var overrides for testing.** `SUPERX_CLAUDE_CONFIG` and
+//! - **Env-var overrides for testing.** `SUPERX_CLAUDE_CONFIG` (Claude Desktop),
+//!   `SUPERX_CLAUDE_CODE_CONFIG` (Claude Code's `~/.claude.json`),
+//!   `SUPERX_GEMINI_CONFIG` (Gemini CLI's `~/.gemini/settings.json`), and
 //!   `SUPERX_CLAUDE_LOGS` redirect the probes to fixture paths so
 //!   integration tests can be hermetic on developer machines.
-//! - **Cross-platform probes** — macOS `~/Library/Application Support/Claude/`,
-//!   Windows `%APPDATA%\Claude\`, Linux `~/.config/Claude/` (best-effort;
-//!   Anthropic does not officially document the Linux path).
+//! - **Probe set covers every coding-agent surface we know about today:**
+//!   Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`
+//!   on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows,
+//!   `~/.config/Claude/claude_desktop_config.json` on Linux), Claude Code
+//!   (`~/.claude.json`, cross-platform), Gemini CLI
+//!   (`~/.gemini/settings.json`, cross-platform). All three use an identical
+//!   `mcpServers` JSON schema, so the parser is one function. Adding a
+//!   future client = one extra entry in [`mcp_client_config_candidates`].
 //!
 //! Copyright (c) 2026 Constantin Alexander <constantin@dedomena.io>.
 //! Licensed under the Apache License, Version 2.0.
@@ -154,7 +165,7 @@ impl<'a> BootstrapBlade<'a> {
 
         let admin_agents = self.seed_admin_agents(tenant_id, run_id, substrate_id, &sys_ns).await?;
         self.seed_standard_tools(tenant_id, &admin_agents).await?;
-        let discovered_count = self.probe_claude_desktop_configs(tenant_id, run_id, substrate_id, &sys_ns).await?;
+        let discovered_count = self.probe_mcp_client_configs(tenant_id, run_id, substrate_id, &sys_ns).await?;
         let activity_count = self.probe_claude_desktop_logs(run_id).await?;
 
         self.kernel.log_telemetry(
@@ -224,9 +235,18 @@ impl<'a> BootstrapBlade<'a> {
         Ok(())
     }
 
-    /// Read every probable Claude Desktop config path for the current platform and emit one
-    /// `agent_discovered` event per declared `mcpServers` entry. Returns the count.
-    async fn probe_claude_desktop_configs(
+    /// Probe every known MCP-client config on the current host (Claude Desktop,
+    /// Claude Code, Gemini CLI; cross-platform) and emit one `agent_discovered`
+    /// event per declared `mcpServers` entry. Each event carries a `source`
+    /// field labelling which client surfaced the agent, so downstream
+    /// consumers can fan out per client. Returns the total agent count.
+    ///
+    /// The agent's substrate uid is `UUIDv5(DNS, "<tenant>:<name>")` so the
+    /// same `mcpServers` entry declared in multiple clients (e.g. an MCP
+    /// server registered in both Claude Code and Gemini CLI) maps to one
+    /// `node_agent` row — re-probing is idempotent and merges sources
+    /// rather than duplicating identities.
+    async fn probe_mcp_client_configs(
         &self,
         tenant_id: &str,
         run_id: &str,
@@ -234,11 +254,11 @@ impl<'a> BootstrapBlade<'a> {
         sys_ns: &Uuid,
     ) -> Result<u64, KernelError> {
         let mut discovered_count: u64 = 0;
-        for cfg_path in claude_desktop_config_candidates() {
+        for (cfg_path, source) in mcp_client_config_candidates() {
             if !cfg_path.exists() {
                 continue;
             }
-            tracing::info!("Probing Claude config at {}", cfg_path.display());
+            tracing::info!("Probing {source} config at {}", cfg_path.display());
             let Some(servers) = read_mcp_servers(&cfg_path) else { continue };
             for (name, server_cfg) in servers {
                 let agent_uuid = Uuid::new_v5(sys_ns, format!("{tenant_id}:{name}").as_bytes()).to_string();
@@ -256,7 +276,7 @@ impl<'a> BootstrapBlade<'a> {
                 self.kernel.supersede_state(
                     &agent_record_id,
                     "attr_desc",
-                    json!({"text": format!("Claude Desktop MCP agent: {name} ({command})")}),
+                    json!({"text": format!("MCP agent `{name}` declared in {source} ({command})")}),
                     Some(run_id.to_string()),
                 ).await?;
                 self.kernel.log_telemetry(
@@ -264,7 +284,7 @@ impl<'a> BootstrapBlade<'a> {
                         "agent_id": agent_record_id,
                         "name": name,
                         "role": "user",
-                        "source": "claude_desktop",
+                        "source": source,
                         "config_path": cfg_path.display().to_string(),
                         "command": command,
                         "arg_count": arg_count
@@ -324,28 +344,42 @@ fn read_mcp_servers(cfg_path: &Path) -> Option<serde_json::Map<String, serde_jso
     cfg.get("mcpServers").and_then(|v| v.as_object()).cloned()
 }
 
-/// Possible Claude Desktop config locations per platform. Order is "most
-/// authoritative" first. `SUPERX_CLAUDE_CONFIG` env override (when set) is
-/// returned first so integration tests can inject a fixture deterministically.
-fn claude_desktop_config_candidates() -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
+/// Probe set: every MCP-client config we know how to read on the current host,
+/// each tagged with a stable `source` label that flows into `agent_discovered`
+/// telemetry so downstream consumers can fan out per client.
+///
+/// Order is "most authoritative" first. Env-var overrides (`SUPERX_CLAUDE_CONFIG`,
+/// `SUPERX_CLAUDE_CODE_CONFIG`, `SUPERX_GEMINI_CONFIG`) are returned ahead of
+/// their default path so integration tests can inject fixtures deterministically.
+///
+/// Adding a new MCP client (Cursor, Continue, Cody, …) is a one-line entry here
+/// — the parser ([`read_mcp_servers`]) already handles the shared `mcpServers`
+/// JSON schema all three clients use.
+fn mcp_client_config_candidates() -> Vec<(PathBuf, &'static str)> {
+    let mut out: Vec<(PathBuf, &'static str)> = Vec::new();
 
-    if let Ok(override_path) = std::env::var("SUPERX_CLAUDE_CONFIG") {
-        if !override_path.is_empty() {
-            out.push(PathBuf::from(override_path));
+    // Claude Desktop — platform-specific path, env override.
+    if let Ok(p) = std::env::var("SUPERX_CLAUDE_CONFIG") {
+        if !p.is_empty() {
+            out.push((PathBuf::from(p), "claude_desktop"));
         }
     }
-
     #[cfg(target_os = "macos")]
     {
         if let Ok(home) = std::env::var("HOME") {
-            out.push(Path::new(&home).join("Library/Application Support/Claude/claude_desktop_config.json"));
+            out.push((
+                Path::new(&home).join("Library/Application Support/Claude/claude_desktop_config.json"),
+                "claude_desktop",
+            ));
         }
     }
     #[cfg(target_os = "windows")]
     {
         if let Ok(appdata) = std::env::var("APPDATA") {
-            out.push(Path::new(&appdata).join("Claude").join("claude_desktop_config.json"));
+            out.push((
+                Path::new(&appdata).join("Claude").join("claude_desktop_config.json"),
+                "claude_desktop",
+            ));
         }
     }
     #[cfg(target_os = "linux")]
@@ -353,8 +387,31 @@ fn claude_desktop_config_candidates() -> Vec<PathBuf> {
         // Linux is not officially documented by Anthropic; probe the conventional XDG path
         // as a best-effort fallback so Linux operators get the same discovery story.
         if let Ok(home) = std::env::var("HOME") {
-            out.push(Path::new(&home).join(".config/Claude/claude_desktop_config.json"));
+            out.push((
+                Path::new(&home).join(".config/Claude/claude_desktop_config.json"),
+                "claude_desktop",
+            ));
         }
+    }
+
+    // Claude Code — cross-platform `~/.claude.json`, env override.
+    if let Ok(p) = std::env::var("SUPERX_CLAUDE_CODE_CONFIG") {
+        if !p.is_empty() {
+            out.push((PathBuf::from(p), "claude_code"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        out.push((Path::new(&home).join(".claude.json"), "claude_code"));
+    }
+
+    // Gemini CLI — cross-platform `~/.gemini/settings.json`, env override.
+    if let Ok(p) = std::env::var("SUPERX_GEMINI_CONFIG") {
+        if !p.is_empty() {
+            out.push((PathBuf::from(p), "gemini_cli"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        out.push((Path::new(&home).join(".gemini/settings.json"), "gemini_cli"));
     }
 
     out
