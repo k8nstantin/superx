@@ -177,12 +177,17 @@ The substrate database (SurrealDB on RocksDB) has two account boundaries. They a
 - The root account is operator-only. The model does not hold root credentials.
 - The model invokes anything that requires root **only when** the operator and the model are designing the schema change together AND the operator has explicitly instructed the model to apply that specific change.
 
-**B. The model uses a service account with minimal privileges required for the work at hand.**
-- All application reads and writes — `SELECT`, `CREATE`, `UPDATE`, `DELETE` on existing rows — happen via a service account scoped to the substrate's existing tables.
-- The service account has **no schema-write permission**. It cannot `DEFINE`, `REMOVE`, `ALTER`, or `UPSERT` any schema entity.
+**B. The model uses a service account with `SELECT` + `CREATE` (INSERT) only.**
+
+- The service account can **read existing rows** (`SELECT`) and **insert new rows** (`CREATE` / `INSERT`). That is the entire grant.
+- The service account **cannot `UPDATE`**, **cannot `DELETE`**, **cannot `UPSERT`**, **cannot `DEFINE`**, **cannot `REMOVE`**, **cannot `ALTER`** anything. No exceptions.
+- The substrate is **versioning + time-travel by design.** Every state change is a fresh insert. The model never mutates an existing row. Mutation destroys history; the model's privileges make that impossible.
+- "Current" is computed at query time by selecting the latest row in a chain (`ORDER BY valid_from DESC LIMIT 1`), **not** by mutating prior rows' `is_current` / `valid_to`. Those fields are set correctly **at insert time** and never touched again by the model.
 - Per-tenant + per-role `PERMISSIONS` clauses on each table apply on top of the service-account scope — defense in depth.
 
-This separation is what makes the substrate safe to develop against. The model cannot accidentally (or via misunderstanding) drift the schema while writing application code. Every schema change is operator-witnessed. Every application bug surfaces as a substrate constraint violation rather than silent corruption.
+**Implication for kernel verbs:** any verb that today uses `BEGIN TRANSACTION; UPDATE prior SET is_current=false…; CREATE new…; COMMIT;` (the close-prior + insert-new pattern in `set_execution_params`, `transition_schedule_status`, etc.) violates this rule and must be redesigned to pure INSERT. The "close-prior" step is removed entirely — `is_current` and `valid_to` become advisory fields set at insert time only, and the canonical "find current" query becomes `ORDER BY valid_from DESC LIMIT 1` filtered by the chain key.
+
+This separation is what makes the substrate safe to develop against. The model cannot accidentally (or via misunderstanding) drift the schema while writing application code. The model cannot mutate or destroy history. Every schema change is operator-witnessed. Every application bug surfaces as a substrate constraint violation rather than silent corruption.
 
 ### 11. Schema-First, Code-After — Binding Workflow
 
