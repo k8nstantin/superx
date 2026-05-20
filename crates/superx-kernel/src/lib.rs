@@ -1094,69 +1094,65 @@ impl Kernel {
         Ok(cursor)
     }
 
-    /// `set_execution_params`: SCD-2 write of per-run agent execution knobs
-    /// (`temperature`, `top_p`, `top_k`, `max_tokens`, `turns`, `branch`,
-    /// `retry_policy`, `model_ref`, …). Closes any prior `is_current` row for the same
-    /// `(run_id, agent_id)` tuple within the calling session's tenant, then
-    /// inserts a fresh `is_current` row — one atomic transaction. The full
-    /// history is recoverable by `SELECT … ORDER BY valid_from ASC`.
+    /// `set_execution_params`: append-only write of per-run agent execution
+    /// knobs (`temperature`, `top_p`, `top_k`, `max_tokens`, `turns`,
+    /// `branch`, `retry_policy`, `model_ref`, …) into the `execution_params`
+    /// table. **Pure INSERT under v2** — no close-prior UPDATE, no
+    /// `is_current` / `valid_to` writes. "Current" is recovered at query
+    /// time via `ORDER BY valid_from DESC LIMIT 1` against the
+    /// `(run, agent)` chain key. The full history is `SELECT … ORDER BY
+    /// valid_from ASC`.
     ///
-    /// `params` is an opaque JSON object: the kernel does not enforce a
-    /// schema on its contents (blades enforce their own knob shape).
+    /// `run` and `agent` are typed `record<entity>` FKs:
+    /// - `run` must point at a `node_run` entity (engine ASSERT).
+    /// - `agent` must point at a `node_agent` entity (engine ASSERT).
+    ///
+    /// `params` is opaque JSON — kernel does not enforce a schema on its
+    /// contents (blades enforce their own knob shape).
+    ///
+    /// Runs under the `superx` service account; the engine refuses any
+    /// UPDATE attempt via PERMISSIONS FOR update NONE.
     ///
     /// Emits an `execution_params_set` telemetry event.
     ///
-    /// # Panics
-    /// Panics if `run_id` or `agent_id` are empty.
-    ///
     /// # Errors
     /// Returns `KernelError::SafetyViolation` if no session is established;
-    /// `KernelError::Database` if the transaction fails.
+    /// `KernelError::Database` if the engine refuses the insert (e.g. an FK
+    /// pointing at the wrong entity type — that's the §12 debugging surface).
     pub async fn set_execution_params(
         &self,
-        run_id: &str,
-        agent_id: &str,
+        run: Thing,
+        agent: Thing,
         params: serde_json::Value,
     ) -> Result<(), KernelError> {
-        assert!(!run_id.is_empty(), "run_id mandatory");
-        assert!(!agent_id.is_empty(), "agent_id mandatory");
-
-        // Pre-condition: caller is in a session. We don't pass tenant explicitly;
-        // it flows through `$session_tenant`. This call is here to surface the
-        // 'no session' case as a clean SafetyViolation rather than a SurrealDB
-        // permission error.
-        let _session_tenant = self.get_session_tenant().await?;
+        // Pre-condition: caller is in a session. Surfaces "no session" as a
+        // clean SafetyViolation rather than a substrate permission error.
+        let session_tenant_str = self.get_session_tenant().await?;
+        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
 
         let row_id = Thing::from((
             "execution_params",
             surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(::uuid::Uuid::now_v7())),
         ));
 
-        let query = r"
-            BEGIN TRANSACTION;
-                UPDATE execution_params SET is_current = false, valid_to = time::now()
-                WHERE run_id = $rid AND agent_id = $aid AND is_current = true AND tenant_id = $session_tenant;
-
-                CREATE execution_params CONTENT {
-                    id: $id,
-                    run_id: $rid,
-                    tenant_id: $session_tenant,
-                    agent_id: $aid,
-                    params_json: $params,
-                    is_current: true,
-                    valid_from: time::now()
-                };
-            COMMIT TRANSACTION;
-        ";
-
-        self.db.query(query)
+        self.db.query(
+            "CREATE execution_params CONTENT { \
+                id: $id, \
+                run: $run, \
+                tenant: $tenant, \
+                agent: $agent, \
+                params_json: $params \
+            };"
+        )
             .bind(("id", row_id))
-            .bind(("rid", run_id.to_string()))
-            .bind(("aid", agent_id.to_string()))
-            .bind(("params", params)).await?.check()?;
+            .bind(("run", run.clone()))
+            .bind(("agent", agent.clone()))
+            .bind(("tenant", tenant_thing))
+            .bind(("params", params))
+            .await?.check()?;
 
         let _ = self.log_telemetry(
-            serde_json::json!({"run_id": run_id, "agent_id": agent_id}),
+            serde_json::json!({"run": run.to_string(), "agent": agent.to_string()}),
             "execution_params_set",
             None
         ).await;
@@ -1164,33 +1160,31 @@ impl Kernel {
         Ok(())
     }
 
-    /// `get_execution_params`: read the current execution-params payload for a
-    /// `(run_id, agent_id)` tuple within the calling session's tenant. Returns
-    /// `Ok(None)` when no row exists; `Ok(Some(params_json))` when it does.
+    /// `get_execution_params`: read the current execution-params payload for
+    /// a `(run, agent)` chain. Returns `Ok(None)` when no row exists;
+    /// `Ok(Some(params_json))` when it does.
     ///
-    /// # Panics
-    /// Panics if `run_id` or `agent_id` are empty.
+    /// "Current" is the most-recent row by `valid_from` against the chain
+    /// key. No `is_current` filter — that field doesn't exist in v2.
     ///
     /// # Errors
     /// Returns `KernelError::Database` if the query fails.
     pub async fn get_execution_params(
         &self,
-        run_id: &str,
-        agent_id: &str,
+        run: Thing,
+        agent: Thing,
     ) -> Result<Option<serde_json::Value>, KernelError> {
         #[derive(serde::Deserialize)]
         struct Row { params_json: serde_json::Value }
 
-        assert!(!run_id.is_empty(), "run_id mandatory");
-        assert!(!agent_id.is_empty(), "agent_id mandatory");
-
-        let query = "SELECT params_json FROM execution_params \
-            WHERE run_id = $rid AND agent_id = $aid AND is_current = true \
-            AND tenant_id = $session_tenant LIMIT 1";
-
-        let mut res = self.db.query(query)
-            .bind(("rid", run_id.to_string()))
-            .bind(("aid", agent_id.to_string())).await?;
+        let mut res = self.db.query(
+            "SELECT params_json FROM execution_params \
+             WHERE run = $run AND agent = $agent \
+             ORDER BY valid_from DESC LIMIT 1"
+        )
+            .bind(("run", run))
+            .bind(("agent", agent))
+            .await?;
 
         let row = res.take::<Vec<Row>>(0)?.pop();
         Ok(row.map(|r| r.params_json))
