@@ -731,6 +731,17 @@ impl Kernel {
         tenant.ok_or_else(|| KernelError::SafetyViolation("No authenticated session. Ensure set_session_auth was called.".into()))
     }
 
+    /// `session_tenant`: public accessor for the calling session's
+    /// substrate-entity uuid (the value of `$session_tenant` set by
+    /// `set_session_auth`). Callers use this when they need to build the
+    /// tenant `Thing` for FK fields under the v2 schema.
+    ///
+    /// # Errors
+    /// Returns `KernelError::SafetyViolation` if no session is established.
+    pub async fn session_tenant(&self) -> Result<String, KernelError> {
+        self.get_session_tenant().await
+    }
+
     /// `get_parameter`: Dynamic lookup of safety/governance parameters from `state_ledger`.
     ///
     /// Resolves the metamodel types (`node_substrate`, `attr_config`) through

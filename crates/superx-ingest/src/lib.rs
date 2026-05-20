@@ -68,12 +68,35 @@ impl IngestionSource for FileSource {
     async fn ingest(&self, kernel: &Kernel, run_id: &str) -> Result<String, KernelError> {
         let root_path = Path::new(&self.path);
         assert!(root_path.exists(), "Root path must exist");
-        
-        let root_uid = uuid::Uuid::now_v7().to_string();
-        let root_thing = Thing::from(("entity".to_string(), root_uid.clone()));
-        
-        kernel.db.query("INSERT INTO entity { id: $id, tenant_id: $session_tenant, type: type_definition:node_code_root }")
-            .bind(("id", root_thing.clone())).await?.check()?;
+
+        // Resolve type FKs through the kernel's type_cache (single chokepoint
+        // replacing the legacy `type_definition:<name>` named-id literals).
+        let node_code_root = kernel.type_thing("node_code_root")?;
+        let node_code = kernel.type_thing("node_code")?;
+        // Tenant FK: substrate entity Thing built from the session's tenant uuid.
+        let session_tenant_str = kernel.session_tenant().await?;
+        let tenant_thing = Kernel::parse_id(&format!("entity:{session_tenant_str}"))?;
+
+        // Root entity for the ingestion (subject of the cursor chain).
+        let root_uuid = uuid::Uuid::now_v7();
+        let root_thing = Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(root_uuid)),
+        ));
+        let root_uid = root_uuid.to_string();
+
+        kernel.db.query(
+            "CREATE entity CONTENT { \
+                id: $id, \
+                type: $type, \
+                tenant: $tenant, \
+                role: 'user' \
+            }"
+        )
+            .bind(("id", root_thing.clone()))
+            .bind(("type", node_code_root))
+            .bind(("tenant", tenant_thing.clone()))
+            .await?.check()?;
 
         let mut path_to_id = std::collections::HashMap::new();
         path_to_id.insert(root_path.to_path_buf(), root_uid.clone());
@@ -104,11 +127,25 @@ impl IngestionSource for FileSource {
             let parent = path.parent().unwrap_or(root_path);
             let parent_uid = path_to_id.get(parent).cloned().unwrap_or(root_uid.clone());
 
-            let node_uid = uuid::Uuid::now_v7().to_string();
-            let entity_thing = Thing::from(("entity".to_string(), node_uid.clone()));
+            let node_uuid = uuid::Uuid::now_v7();
+            let entity_thing = Thing::from((
+                "entity",
+                surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(node_uuid)),
+            ));
+            let node_uid = node_uuid.to_string();
 
-            kernel.db.query("INSERT INTO entity { id: $id, tenant_id: $session_tenant, type: type_definition:node_code }")
-                .bind(("id", entity_thing)).await?.check()?;
+            kernel.db.query(
+                "CREATE entity CONTENT { \
+                    id: $id, \
+                    type: $type, \
+                    tenant: $tenant, \
+                    role: 'user' \
+                }"
+            )
+                .bind(("id", entity_thing))
+                .bind(("type", node_code.clone()))
+                .bind(("tenant", tenant_thing.clone()))
+                .await?.check()?;
 
             path_to_id.insert(path.to_path_buf(), node_uid.clone());
 
@@ -148,15 +185,32 @@ impl IngestionSource for JsonSource {
     /// # Errors
     /// Returns `KernelError` if substrate interaction fails.
     async fn ingest(&self, kernel: &Kernel, run_id: &str) -> Result<String, KernelError> {
-        let json_uid = uuid::Uuid::now_v7().to_string();
-        let json_thing = Thing::from(("entity".to_string(), json_uid.clone()));
-        let json_record_id = format!("entity:{json_uid}");
-        
-        kernel.db.query("INSERT INTO entity { id: $id, tenant_id: $session_tenant, type: type_definition:node_source_external }")
-            .bind(("id", json_thing)).await?.check()?;
+        let node_source_external = kernel.type_thing("node_source_external")?;
+        let session_tenant_str = kernel.session_tenant().await?;
+        let tenant_thing = Kernel::parse_id(&format!("entity:{session_tenant_str}"))?;
+
+        let json_uuid = uuid::Uuid::now_v7();
+        let json_thing = Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(json_uuid)),
+        ));
+        let json_record_id = format!("entity:{json_uuid}");
+
+        kernel.db.query(
+            "CREATE entity CONTENT { \
+                id: $id, \
+                type: $type, \
+                tenant: $tenant, \
+                role: 'user' \
+            }"
+        )
+            .bind(("id", json_thing))
+            .bind(("type", node_source_external))
+            .bind(("tenant", tenant_thing))
+            .await?.check()?;
 
         kernel.supersede_state(&json_record_id, "attr_desc", self.data.clone(), Some(run_id.to_string())).await?;
-        
+
         Ok(json_record_id)
     }
 }
