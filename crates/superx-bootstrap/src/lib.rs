@@ -116,7 +116,7 @@ impl<'a> BootstrapBlade<'a> {
                 "emission_enabled": true,
                 "data_scope": "all"
             }),
-            Some(run_id.clone())
+            None
         ).await?;
 
         // 4. Agent Discovery Phase
@@ -126,7 +126,7 @@ impl<'a> BootstrapBlade<'a> {
         self.kernel.log_telemetry(
             json!({"substrate_id": substrate_id, "status": "provisioned"}),
             "system_bootstrap",
-            Some(run_id.clone())
+            None
         ).await?;
 
         // 6. Verify the telemetry firehose actually captured our writes — this
@@ -175,7 +175,7 @@ impl<'a> BootstrapBlade<'a> {
                 "agents_with_activity": activity_count
             }),
             "bootstrap_census",
-            Some(run_id.to_string()),
+            None,
         ).await?;
 
         Ok(())
@@ -204,11 +204,11 @@ impl<'a> BootstrapBlade<'a> {
             } else {
                 "Gemini CLI Operator Agent"
             };
-            self.kernel.supersede_state(&id_literal, "attr_desc", json!({"text": desc}), Some(run_id.to_string())).await?;
+            self.kernel.supersede_state(&id_literal, "attr_desc", json!({"text": desc}), None).await?;
             self.kernel.log_telemetry(
-                json!({"agent_id": id_literal, "name": name, "role": "admin", "source": "seeded"}),
+                json!({"agent_id": id_literal, "name": name, "role": "admin", "source": "seeded", "run_id": run_id}),
                 "agent_seeded",
-                Some(run_id.to_string()),
+                None,
             ).await?;
             admin_agents.push((name.to_string(), id_literal));
         }
@@ -277,7 +277,7 @@ impl<'a> BootstrapBlade<'a> {
                     &agent_record_id,
                     "attr_desc",
                     json!({"text": format!("MCP agent `{name}` declared in {source} ({command})")}),
-                    Some(run_id.to_string()),
+                    None,
                 ).await?;
                 self.kernel.log_telemetry(
                     json!({
@@ -287,10 +287,11 @@ impl<'a> BootstrapBlade<'a> {
                         "source": source,
                         "config_path": cfg_path.display().to_string(),
                         "command": command,
-                        "arg_count": arg_count
+                        "arg_count": arg_count,
+                        "run_id": run_id,
                     }),
                     "agent_discovered",
-                    Some(run_id.to_string()),
+                    None,
                 ).await?;
                 discovered_count += 1;
             }
@@ -325,10 +326,11 @@ impl<'a> BootstrapBlade<'a> {
                 json!({
                     "name": name,
                     "log_path": path.display().to_string(),
-                    "mtime_since_epoch": mtime_iso
+                    "mtime_since_epoch": mtime_iso,
+                    "run_id": run_id
                 }),
                 "agent_activity_observed",
-                Some(run_id.to_string()),
+                None,
             ).await?;
             activity_count += 1;
         }

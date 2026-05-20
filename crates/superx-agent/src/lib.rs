@@ -96,7 +96,7 @@ impl<'a> CapabilityGovernor<'a> {
         self.kernel.log_telemetry(
             json!({"agent": agent_uid, "session": session_uid}),
             "agent_handshake",
-            Some(session_uid.clone())
+            None,
         ).await?;
 
         Ok(session_uid)

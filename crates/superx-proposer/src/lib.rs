@@ -105,7 +105,7 @@ impl<'a> ProposerBlade<'a> {
             &proposal_record_id, 
             "attr_desc", 
             json!({"text": format!("Proposed {final_type} between {from_id} and {to_id}")}), 
-            Some(run_id.to_string())
+            None
         ).await?;
 
         // 4. Link proposal to the participants
@@ -116,7 +116,7 @@ impl<'a> ProposerBlade<'a> {
         self.kernel.log_telemetry(
             json!({"from": from_id, "to": to_id, "type": final_type, "proposal": proposal_record_id}),
             "relation_proposed",
-            Some(run_id.to_string())
+            None
         ).await?;
 
         Ok(proposal_record_id)
