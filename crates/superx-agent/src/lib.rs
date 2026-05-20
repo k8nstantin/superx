@@ -58,12 +58,14 @@ impl<'a> CapabilityGovernor<'a> {
     /// # Errors
     /// Returns `KernelError` if the agent or session records cannot be created.
     pub async fn handshake(&self, agent_uid: &str) -> Result<String, KernelError> {
+        #[derive(serde::Deserialize)]
+        struct TenantOnly { tenant: Option<Thing> }
+
         assert!(!agent_uid.is_empty(), "Agent identity mandatory");
         tracing::info!("governor handshake: agent_uid={agent_uid}");
 
         // 1. Resolve session tenant + metamodel FKs.
-        let session_tenant_str = self.kernel.session_tenant().await?;
-        let tenant_thing = Kernel::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = self.kernel.session_tenant_thing().await?;
         let node_agent = self.kernel.type_thing("node_agent")?;
         let node_session = self.kernel.type_thing("node_session")?;
 
@@ -75,20 +77,17 @@ impl<'a> CapabilityGovernor<'a> {
         ));
 
         // 2. Identity-coercion check: if the agent row already exists, it
-        //    must belong to the session's tenant. Under v2 we read the
-        //    typed FK's id field (`tenant.id`) instead of the dropped
-        //    `tenant_id` string.
-        #[derive(serde::Deserialize)]
-        struct TenantOnly { tenant_id: Option<String> }
+        //    must belong to the session's tenant. Types flow end-to-end as
+        //    `Thing` — no string conversion at the boundary.
         let mut check_res = self.kernel.db
-            .query("SELECT tenant.id AS tenant_id FROM $id LIMIT 1")
+            .query("SELECT tenant FROM $id LIMIT 1")
             .bind(("id", agent_thing.clone()))
             .await?;
         if let Some(row) = check_res.take::<Vec<TenantOnly>>(0)?.pop() {
-            if let Some(existing) = row.tenant_id {
-                if existing != session_tenant_str {
+            if let Some(existing) = row.tenant {
+                if existing != tenant_thing {
                     return Err(KernelError::SafetyViolation(format!(
-                        "Agent {agent_uid} belongs to tenant {existing}, but session is {session_tenant_str}"
+                        "Agent {agent_uid} belongs to tenant {existing}, but session is {tenant_thing}"
                     )));
                 }
             }
@@ -156,8 +155,7 @@ impl<'a> CapabilityGovernor<'a> {
         let agent_thing = Kernel::parse_id(agent_id)?;
         let tool_thing = Kernel::parse_id(&format!("entity:{tool_uid}"))?;
         let edge_has_capability = self.kernel.type_thing("edge_has_capability")?;
-        let session_tenant_str = self.kernel.session_tenant().await?;
-        let tenant_thing = Kernel::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = self.kernel.session_tenant_thing().await?;
 
         let query = "SELECT count() AS count FROM relation \
             WHERE in = $agent AND out = $tool \

@@ -64,6 +64,9 @@ impl<'a> ProposerBlade<'a> {
         to_id: &str,
         run_id: &str,
     ) -> Result<String, KernelError> {
+        #[derive(serde::Deserialize)]
+        struct UidRow { uid: String }
+
         assert!(!from_id.is_empty(), "Source ID mandatory");
         assert!(!to_id.is_empty(), "Target ID mandatory");
 
@@ -74,8 +77,6 @@ impl<'a> ProposerBlade<'a> {
         //    CONTENT {uid:'edge_…', category:'edge', …}) — never a code
         //    change. Reads come back as the row's uid so we can match the
         //    model's text output.
-        #[derive(serde::Deserialize)]
-        struct UidRow { uid: String }
         let mut allowed_res = self.kernel.db
             .query("SELECT uid FROM type_definition WHERE category = 'edge'")
             .await?;
@@ -120,8 +121,7 @@ impl<'a> ProposerBlade<'a> {
         //    Id::Uuid(UUIDv7), no UPSERT. Engine refuses anything else
         //    under the superx service account.
         let node_proposal = self.kernel.type_thing("node_proposal")?;
-        let session_tenant_str = self.kernel.session_tenant().await?;
-        let tenant_thing = Kernel::parse_id(&format!("entity:{session_tenant_str}"))?;
+        let tenant_thing = self.kernel.session_tenant_thing().await?;
 
         let proposal_uuid = uuid::Uuid::now_v7();
         let proposal_thing = surrealdb::sql::Thing::from((

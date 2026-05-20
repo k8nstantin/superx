@@ -85,6 +85,9 @@ impl<'a> BootstrapBlade<'a> {
     /// # Errors
     /// Returns `KernelError` if bootstrapping or verification fails.
     pub async fn run(&self, tenant_id: &str) -> Result<String, KernelError> {
+        #[derive(serde::Deserialize)]
+        struct IdRow { #[allow(dead_code)] id: Thing }
+
         let run_id = Uuid::now_v7().to_string();
         tracing::info!("Starting NASA-Grade Bootstrap (Run ID: {run_id}) for Tenant: {tenant_id}");
 
@@ -110,8 +113,6 @@ impl<'a> BootstrapBlade<'a> {
             .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
             .bind(("id", substrate_thing.clone()))
             .await?;
-        #[derive(serde::Deserialize)]
-        struct IdRow { #[allow(dead_code)] id: Thing }
         let exists = sel.take::<Vec<IdRow>>(0)?.pop().is_some();
         if !exists {
             self.kernel.db.query(
@@ -216,6 +217,9 @@ impl<'a> BootstrapBlade<'a> {
         substrate_id: &str,
         sys_ns: &Uuid,
     ) -> Result<Vec<(String, String)>, KernelError> {
+        #[derive(serde::Deserialize)]
+        struct IdRow { #[allow(dead_code)] id: Thing }
+
         let node_agent = self.kernel.type_thing("node_agent")?;
         let substrate_thing = superx_kernel::Kernel::parse_id(substrate_id)?;
 
@@ -233,8 +237,6 @@ impl<'a> BootstrapBlade<'a> {
                 .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
                 .bind(("id", agent_thing.clone()))
                 .await?;
-            #[derive(serde::Deserialize)]
-            struct IdRow { #[allow(dead_code)] id: Thing }
             if sel.take::<Vec<IdRow>>(0)?.pop().is_none() {
                 self.kernel.db.query(
                     "CREATE entity CONTENT { \
@@ -267,7 +269,7 @@ impl<'a> BootstrapBlade<'a> {
     }
 
     /// Seed the five canonical tools and grant each admin agent capability to all of them.
-    /// Tool entities use deterministic UUIDv5 ids derived from `(tenant, tool_uid)` so
+    /// Tool entities use deterministic `UUIDv5` ids derived from `(tenant, tool_uid)` so
     /// re-bootstraps reuse the same row idempotently.
     async fn seed_standard_tools(
         &self,
@@ -275,6 +277,9 @@ impl<'a> BootstrapBlade<'a> {
         substrate_id: &str,
         admin_agents: &[(String, String)],
     ) -> Result<(), KernelError> {
+        #[derive(serde::Deserialize)]
+        struct IdRow { #[allow(dead_code)] id: Thing }
+
         let node_tool = self.kernel.type_thing("node_tool")?;
         let substrate_thing = superx_kernel::Kernel::parse_id(substrate_id)?;
         let ns_uuid = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").expect("Valid DNS NS");
@@ -292,8 +297,6 @@ impl<'a> BootstrapBlade<'a> {
                 .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
                 .bind(("id", tool_thing.clone()))
                 .await?;
-            #[derive(serde::Deserialize)]
-            struct IdRow { #[allow(dead_code)] id: Thing }
             if sel.take::<Vec<IdRow>>(0)?.pop().is_none() {
                 self.kernel.db.query(
                     "CREATE entity CONTENT { \
@@ -344,6 +347,9 @@ impl<'a> BootstrapBlade<'a> {
         substrate_id: &str,
         sys_ns: &Uuid,
     ) -> Result<u64, KernelError> {
+        #[derive(serde::Deserialize)]
+        struct IdRow { #[allow(dead_code)] id: Thing }
+
         let node_agent = self.kernel.type_thing("node_agent")?;
         let substrate_thing = superx_kernel::Kernel::parse_id(substrate_id)?;
 
@@ -366,8 +372,6 @@ impl<'a> BootstrapBlade<'a> {
                     .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
                     .bind(("id", agent_thing.clone()))
                     .await?;
-                #[derive(serde::Deserialize)]
-                struct IdRow { #[allow(dead_code)] id: Thing }
                 if sel.take::<Vec<IdRow>>(0)?.pop().is_none() {
                     self.kernel.db.query(
                         "CREATE entity CONTENT { \
