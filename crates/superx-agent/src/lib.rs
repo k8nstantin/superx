@@ -58,6 +58,9 @@ impl<'a> CapabilityGovernor<'a> {
     /// # Errors
     /// Returns `KernelError` if the agent or session records cannot be created.
     pub async fn handshake(&self, agent_uid: &str) -> Result<String, KernelError> {
+        #[derive(serde::Deserialize)]
+        struct TenantOnly { tenant: Option<Thing> }
+
         assert!(!agent_uid.is_empty(), "Agent identity mandatory");
         tracing::info!("governor handshake: agent_uid={agent_uid}");
 
@@ -76,8 +79,6 @@ impl<'a> CapabilityGovernor<'a> {
         // 2. Identity-coercion check: if the agent row already exists, it
         //    must belong to the session's tenant. Types flow end-to-end as
         //    `Thing` — no string conversion at the boundary.
-        #[derive(serde::Deserialize)]
-        struct TenantOnly { tenant: Option<Thing> }
         let mut check_res = self.kernel.db
             .query("SELECT tenant FROM $id LIMIT 1")
             .bind(("id", agent_thing.clone()))

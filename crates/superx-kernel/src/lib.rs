@@ -141,7 +141,7 @@ pub struct Kernel {
     /// [`Kernel::init`] from the seeded metamodel rows. Every verb that
     /// references a metamodel type by name resolves it through this cache via
     /// [`Kernel::type_thing`] — there is no named-id pattern (`type_definition:node_substrate`)
-    /// in the substrate any more; ids are UUIDv7 and lookups go through the cache.
+    /// in the substrate any more; ids are `UUIDv7` and lookups go through the cache.
     type_cache: Arc<OnceLock<HashMap<String, Thing>>>,
     /// Cache of `cursor_type` row ids keyed by their stable `uid` (e.g.,
     /// `"ingestion"`, `"transcript"`). Populated once at the end of
@@ -243,6 +243,10 @@ impl Kernel {
         Ok(kernel)
     }
 
+    // The body is one continuous SurrealQL schema literal (~200 lines: 9 tables,
+    // PERMISSIONS, ASSERT clauses). Splitting it into helpers would obscure the
+    // source-of-truth shape — the schema reads top-to-bottom as one document.
+    #[allow(clippy::too_many_lines)]
     async fn apply_substrate_schema(&self) -> Result<(), KernelError> {
         // Service-account password for the `superx` user.
         // The operator may override via SUPERX_SERVICE_PASSWORD env; otherwise
@@ -504,11 +508,11 @@ impl Kernel {
     }
 
     /// `seed_metamodel`: idempotently seeds the canonical `type_definition`
-    /// rows under the v2 schema (UUIDv7 ids + `uid` field).
+    /// rows under the v2 schema (`UUIDv7` ids + `uid` field).
     ///
     /// For each canonical type:
     /// - SELECT existing row by `uid` (idempotent on re-bootstrap);
-    /// - if not found, CREATE with a fresh UUIDv7 id + the `uid` field;
+    /// - if not found, CREATE with a fresh `UUIDv7` id + the `uid` field;
     /// - record the row's `Thing` in the returned cache.
     ///
     /// The returned `HashMap<uid, Thing>` is installed on `Kernel::type_cache`
@@ -604,7 +608,7 @@ impl Kernel {
     ///
     /// This is the single chokepoint replacing the legacy
     /// `Thing::from(("type_definition", "node_substrate"))` pattern. Under the
-    /// v2 schema, `type_definition` ids are UUIDv7; the human-readable name
+    /// v2 schema, `type_definition` ids are `UUIDv7`; the human-readable name
     /// lives in the `uid` column. Every kernel verb and every caller crate
     /// resolves the FK target through this cache, never by name-id literal.
     ///
@@ -632,7 +636,7 @@ impl Kernel {
     /// Same SELECT-then-CREATE idempotency pattern as `seed_metamodel`.
     /// Returns `HashMap<uid, Thing>` installed on `Kernel::cursor_type_cache`.
     ///
-    /// Runs at init time under root (cursor_type PERMISSIONS FOR create
+    /// Runs at init time under root (`cursor_type` PERMISSIONS FOR create
     /// require admin role).
     ///
     /// # Errors
@@ -691,6 +695,9 @@ impl Kernel {
     /// # Errors
     /// Returns `KernelError::Database` if SELECT or CREATE fails.
     async fn seed_default_substrate(&self, ns: &str, db_name: &str) -> Result<(), KernelError> {
+        #[derive(Deserialize)]
+        struct IdRow { #[allow(dead_code)] id: Thing }
+
         let substrate_uuid = Self::default_substrate_uuid(ns, db_name);
         let substrate_thing = Thing::from((
             "entity",
@@ -698,8 +705,6 @@ impl Kernel {
         ));
 
         // Idempotent: skip if already seeded.
-        #[derive(Deserialize)]
-        struct IdRow { #[allow(dead_code)] id: Thing }
         let mut sel = self.db
             .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
             .bind(("id", substrate_thing.clone()))
@@ -723,9 +728,14 @@ impl Kernel {
         Ok(())
     }
 
-    /// `default_substrate_uuid`: deterministic UUIDv5 derived from
+    /// `default_substrate_uuid`: deterministic `UUIDv5` derived from
     /// `(ns, db_name)`. Same kernel handle always resolves to the same
     /// substrate entity — re-bootstraps reuse it idempotently.
+    ///
+    /// # Panics
+    /// Panics if the hard-coded DNS namespace UUID literal fails to parse —
+    /// that would be a build-time programmer error, not a runtime input
+    /// problem (the literal is the IETF DNS namespace constant from RFC 4122).
     #[must_use]
     pub fn default_substrate_uuid(ns: &str, db_name: &str) -> ::uuid::Uuid {
         let key = format!("{ns}/{db_name}");
@@ -918,6 +928,11 @@ impl Kernel {
         value: serde_json::Value,
         run_id: Option<String>,
     ) -> Result<(), KernelError> {
+        #[derive(serde::Deserialize)]
+        struct SchRow { sch_json: Option<String> }
+        #[derive(serde::Deserialize)]
+        struct TenantRow { tenant: Option<Thing> }
+
         assert!(!target_id.is_empty(), "Target ID mandatory");
         assert!(!type_uid.is_empty(), "Type UID mandatory");
 
@@ -933,8 +948,6 @@ impl Kernel {
         //    conversion at the boundary. Two single-row SELECTs because
         //    SurrealDB's nested-subquery shape is awkward for two distinct
         //    record types.
-        #[derive(serde::Deserialize)]
-        struct SchRow { sch_json: Option<String> }
         let mut sch_res = self.db
             .query("SELECT sch_json FROM $ty LIMIT 1")
             .bind(("ty", type_thing.clone()))
@@ -944,8 +957,6 @@ impl Kernel {
             .ok_or_else(|| KernelError::Validation(format!("Type {type_uid} not found")))?
             .sch_json;
 
-        #[derive(serde::Deserialize)]
-        struct TenantRow { tenant: Option<Thing> }
         let mut tenant_res = self.db
             .query("SELECT tenant FROM $target LIMIT 1")
             .bind(("target", target_thing.clone()))
@@ -1028,6 +1039,9 @@ impl Kernel {
     /// # Errors
     /// Returns `KernelError::CycleDetected` if an acyclic edge would create a cycle.
     pub async fn create_structural_edge(&self, from: &str, to: &str, edge_type: &str) -> Result<(), KernelError> {
+        #[derive(serde::Deserialize)]
+        struct EntityTenant { tenant: Option<Thing> }
+
         assert!(!from.is_empty(), "Source ID mandatory");
         assert!(!to.is_empty(), "Target ID mandatory");
 
@@ -1045,8 +1059,6 @@ impl Kernel {
         //    end-to-end as `Thing`. Substrate-root case: when the source IS
         //    the session's substrate entity, its `tenant` is NONE by schema
         //    and the source's own `id` matches the session — admit it.
-        #[derive(serde::Deserialize)]
-        struct EntityTenant { tenant: Option<Thing> }
         let mut fetch_res = self.db
             .query("SELECT tenant FROM $target LIMIT 1")
             .bind(("target", from_thing.clone()))
@@ -1294,7 +1306,7 @@ impl Kernel {
     /// opaque JSON envelope. Shape per `cursor_type` is defined by the
     /// consuming blade.
     ///
-    /// Replaces the legacy `checkpoint_execution` verb (which UPSERTed into
+    /// Replaces the legacy `checkpoint_execution` verb (which `UPSERTed` into
     /// the dropped `execution_cursor` table). Engine refuses UPDATE/UPSERT
     /// under the superx service account.
     ///
@@ -1586,8 +1598,6 @@ impl Kernel {
         schedule_id: Thing,
         new_status: &str,
     ) -> Result<Thing, KernelError> {
-        assert!(!new_status.is_empty(), "new_status mandatory");
-
         #[derive(serde::Deserialize)]
         struct CurrentRow {
             run: Thing,
@@ -1599,6 +1609,8 @@ impl Kernel {
             depends_on: Vec<Thing>,
             metadata: serde_json::Value,
         }
+
+        assert!(!new_status.is_empty(), "new_status mandatory");
 
         let tenant_thing = self.session_tenant_thing().await?;
 
@@ -1715,6 +1727,9 @@ mod tests {
     /// Returns `(substrate_uuid_string, substrate_record_id)` so tests can
     /// reference both forms.
     async fn provision_tenant(kernel: &Kernel, tenant_name: &str) -> (String, String) {
+        #[derive(serde::Deserialize)]
+        struct IdRow { #[allow(dead_code)] id: Thing }
+
         let ns = ::uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
             .expect("Valid DNS NS UUID");
         let substrate_uuid = ::uuid::Uuid::new_v5(&ns, tenant_name.as_bytes());
@@ -1732,8 +1747,6 @@ mod tests {
         let node_substrate = kernel.type_thing("node_substrate").unwrap();
 
         // Idempotent: skip create if already exists.
-        #[derive(serde::Deserialize)]
-        struct IdRow { #[allow(dead_code)] id: Thing }
         let mut sel = kernel.db
             .query("SELECT id FROM entity WHERE id = $id LIMIT 1")
             .bind(("id", substrate_thing.clone()))
@@ -1793,7 +1806,7 @@ mod tests {
         // 1. Unknown type rejected
         let res = kernel.supersede_state(&v1, "none", serde_json::json!({"text":"x"}), None).await;
         assert!(
-            matches!(&res, Err(KernelError::Integrity(_)) | Err(KernelError::Validation(_))),
+            matches!(&res, Err(KernelError::Integrity(_) | KernelError::Validation(_))),
             "supersede_state must reject unknown type uid, got {res:?}"
         );
 
@@ -1862,6 +1875,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_scd2_supersede_nasa_hardened() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Row {
+            value_json: serde_json::Value,
+            #[allow(dead_code)]
+            valid_from: chrono::DateTime<chrono::Utc>,
+        }
+
         let (_dir, kernel) = setup().await;
         let (tenant_uuid, _) = provision_tenant(&kernel, "t1_scd2").await;
         let v1 = create_entity(&kernel, "node_prod", &tenant_uuid).await;
@@ -1876,12 +1896,6 @@ mod tests {
         //    valid_from) is the v2 payload.
         let attr_desc = kernel.type_thing("attr_desc").unwrap();
 
-        #[derive(serde::Deserialize, Debug)]
-        struct Row {
-            value_json: serde_json::Value,
-            #[allow(dead_code)]
-            valid_from: chrono::DateTime<chrono::Utc>,
-        }
         let mut res = kernel.db.query(
             "SELECT value_json, valid_from FROM state_ledger \
              WHERE target = $target AND `type` = $ty \

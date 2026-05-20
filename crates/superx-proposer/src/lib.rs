@@ -64,6 +64,9 @@ impl<'a> ProposerBlade<'a> {
         to_id: &str,
         run_id: &str,
     ) -> Result<String, KernelError> {
+        #[derive(serde::Deserialize)]
+        struct UidRow { uid: String }
+
         assert!(!from_id.is_empty(), "Source ID mandatory");
         assert!(!to_id.is_empty(), "Target ID mandatory");
 
@@ -74,8 +77,6 @@ impl<'a> ProposerBlade<'a> {
         //    CONTENT {uid:'edge_…', category:'edge', …}) — never a code
         //    change. Reads come back as the row's uid so we can match the
         //    model's text output.
-        #[derive(serde::Deserialize)]
-        struct UidRow { uid: String }
         let mut allowed_res = self.kernel.db
             .query("SELECT uid FROM type_definition WHERE category = 'edge'")
             .await?;

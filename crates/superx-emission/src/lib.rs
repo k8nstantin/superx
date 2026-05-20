@@ -51,7 +51,7 @@ use reqwest::Client;
 ///
 /// Field semantics mirror the v2 `telemetry_stream` schema defined in
 /// `superx-kernel::apply_substrate_schema`:
-/// - `id` — the row's `Thing` record id (UUIDv7, engine-enforced via
+/// - `id` — the row's `Thing` record id (`UUIDv7`, engine-enforced via
 ///   `DEFINE FIELD id ON telemetry_stream TYPE uuid`).
 /// - `valid_from` — wall-clock time the row was written (the only temporal
 ///   column under v2; replaces the legacy `timestamp` field).

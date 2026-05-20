@@ -65,6 +65,10 @@ impl IngestionSource for FileSource {
     ///
     /// # Errors
     /// Returns `KernelError` if directory walk or substrate interaction fails.
+    // `*_uuid` / `*_uid` pairs read as similar but encode distinct types:
+    // a `Uuid` value vs its string form bound into SurrealQL `entity:<uid>`
+    // record-id literals. Renaming would obscure the binary↔string distinction.
+    #[allow(clippy::similar_names)]
     async fn ingest(&self, kernel: &Kernel, run_id: &str) -> Result<String, KernelError> {
         let root_path = Path::new(&self.path);
         assert!(root_path.exists(), "Root path must exist");
