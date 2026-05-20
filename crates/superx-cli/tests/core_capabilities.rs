@@ -15,7 +15,7 @@ use superx_emission::{ApiSink, TelemetryRow};
 use superx_harness::MetaHarness;
 use superx_ingest::{FileSource, JsonSource, UniversalIngestor};
 use superx_kernel::{Kernel, KernelError};
-use surrealdb::sql::Id;
+use surrealdb::sql::{Id, Thing};
 use tempfile::TempDir;
 
 /// Process-wide serialization for tests that mutate `SUPERX_CLAUDE_CONFIG` /
@@ -24,17 +24,6 @@ use tempfile::TempDir;
 fn claude_env_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
-/// Extract the raw uid-string portion of a `Kernel::parse_id`-normalized record id literal.
-/// Bypasses `<string>id`'s backtick escaping for hyphen-bearing UUIDs (see
-/// `surrealdb-core/src/sql/escape.rs::EscapeRidKey`).
-fn local_uid(record_id_literal: &str) -> String {
-    let thing = Kernel::parse_id(record_id_literal).expect("valid record id literal");
-    match thing.id {
-        Id::String(s) => s,
-        other => panic!("expected Id::String, got {other:?}"),
-    }
 }
 
 /// Spin up an isolated kernel + bootstrap a tenant. Returns the temp dir
@@ -48,13 +37,42 @@ async fn bootstrap_tenant(tenant: &str) -> (TempDir, Kernel, String) {
     (dir, kernel, substrate_id)
 }
 
+/// Build a fresh UUIDv7-id `Thing` for a table — useful when a test needs a
+/// distinct id without round-tripping through a string literal.
+fn fresh_thing(table: &str) -> Thing {
+    Thing::from((table.to_string(), Id::Uuid(surrealdb::sql::Uuid::from(uuid::Uuid::now_v7()))))
+}
+
+/// Create a v2 entity of the given metamodel type under the current session
+/// tenant and return its typed `Thing`. The session must already be bound
+/// (via `bootstrap_tenant`) before calling.
+async fn make_typed_entity(kernel: &Kernel, type_uid: &str) -> Thing {
+    let entity_thing = fresh_thing("entity");
+    let type_thing = kernel.type_thing(type_uid).expect("seeded metamodel uid");
+    let tenant_thing = kernel.session_tenant_thing().await.expect("session bound");
+    kernel.db
+        .query("CREATE entity CONTENT { \
+            id: $id, type: $type, tenant: $tenant, role: 'user' \
+        }")
+        .bind(("id", entity_thing.clone()))
+        .bind(("type", type_thing))
+        .bind(("tenant", tenant_thing))
+        .await
+        .expect("create entity")
+        .check()
+        .expect("create entity check");
+    entity_thing
+}
+
 /// Count telemetry events for the current session tenant matching an event name.
 async fn count_events(kernel: &Kernel, lifecycle_event: &str) -> u64 {
     #[derive(serde::Deserialize)]
     struct Row { count: u64 }
     let mut res = kernel
         .db
-        .query("SELECT count() AS count FROM telemetry_stream WHERE tenant_id = $session_tenant AND lifecycle_event = $ev GROUP ALL")
+        .query("SELECT count() AS count FROM telemetry_stream \
+                WHERE tenant = $session_tenant AND lifecycle_event = $ev \
+                GROUP ALL")
         .bind(("ev", lifecycle_event.to_string()))
         .await
         .expect("count query");
@@ -147,34 +165,51 @@ async fn cli_list_agents_after_bootstrap_shows_canonical_admins() {
     // After bootstrap we expect at least the two seeded admins to appear.
     let (_dir, kernel, _sub) = bootstrap_tenant("cli_la").await;
     #[derive(serde::Deserialize)]
-    struct Row { id: String, role: String }
+    struct Row { id: Thing, role: String }
+    let node_agent = kernel.type_thing("node_agent").unwrap();
     let mut res = kernel
         .db
-        .query("SELECT <string>id AS id, role FROM entity WHERE type = type_definition:node_agent AND tenant_id = $session_tenant")
+        .query("SELECT id, role FROM entity WHERE type = $ty AND tenant = $session_tenant")
+        .bind(("ty", node_agent))
         .await
         .unwrap();
     let rows: Vec<Row> = res.take(0).unwrap();
     let admin_count = rows.iter().filter(|r| r.role == "admin").count();
     assert!(admin_count >= 2, "expected ≥2 admin agents (system_controller + gemini_cli), got {admin_count}");
-    assert!(rows.iter().all(|r| r.id.starts_with("entity:")), "every row must carry a fully-qualified id literal");
+    assert!(rows.iter().all(|r| r.id.tb == "entity"), "every row must be on the entity table");
 }
 
 #[tokio::test]
 async fn cli_list_tools_after_bootstrap_shows_five_canonical_tools() {
-    let (_dir, kernel, _sub) = bootstrap_tenant("cli_lt").await;
+    let (_dir, kernel, substrate_id) = bootstrap_tenant("cli_lt").await;
     #[derive(serde::Deserialize)]
-    struct Row { id: String }
+    struct Row { id: Thing }
+    let node_tool = kernel.type_thing("node_tool").unwrap();
     let mut res = kernel
         .db
-        .query("SELECT <string>id AS id FROM entity WHERE type = type_definition:node_tool AND tenant_id = $session_tenant ORDER BY id ASC")
+        .query("SELECT id FROM entity WHERE type = $ty AND tenant = $session_tenant ORDER BY id ASC")
+        .bind(("ty", node_tool))
         .await
         .unwrap();
     let rows: Vec<Row> = res.take(0).unwrap();
     assert_eq!(rows.len(), 5, "bootstrap must seed exactly 5 standard tools, got {}", rows.len());
-    // tool ids are stored as plain strings (no UUID), so they're stable
-    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-    for expected in ["entity:tool_compile", "entity:tool_evaluate", "entity:tool_ingest", "entity:tool_promote", "entity:tool_propose"] {
-        assert!(ids.contains(&expected), "missing canonical tool {expected}; got {ids:?}");
+
+    // Tool ids are deterministic UUIDv5(DNS_NS, "{substrate_uuid}:{tool}") —
+    // recompute them and assert each canonical tool's row was seeded.
+    let ns = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap();
+    let substrate_uuid_str = substrate_id.strip_prefix("entity:").unwrap_or(&substrate_id);
+    let seeded_ids: std::collections::HashSet<String> = rows.iter()
+        .map(|r| match &r.id.id {
+            Id::Uuid(u) => u.to_raw(),
+            other => panic!("tool row id should be Id::Uuid, got {other:?}"),
+        })
+        .collect();
+    for tool in ["tool_compile", "tool_evaluate", "tool_ingest", "tool_promote", "tool_propose"] {
+        let expected = uuid::Uuid::new_v5(&ns, format!("{substrate_uuid_str}:{tool}").as_bytes()).to_string();
+        assert!(
+            seeded_ids.contains(&expected),
+            "missing canonical {tool} (expected UUIDv5 {expected}); seeded ids: {seeded_ids:?}"
+        );
     }
 }
 
@@ -185,10 +220,9 @@ async fn cli_identify_creates_session_for_seeded_admin() {
     // a session entity must appear in the substrate.
     let (_dir, kernel, _sub) = bootstrap_tenant("cli_id").await;
     let admin_full_id = fetch_admin_agent_id(&kernel).await;
-    let agent_uid = local_uid(&admin_full_id);
 
     let gov = CapabilityGovernor::new(&kernel);
-    let session_uid = gov.handshake(&agent_uid).await.expect("identify must succeed");
+    let session_uid = gov.handshake(&admin_full_id).await.expect("identify must succeed");
     assert!(!session_uid.is_empty(), "session_uid returned must be non-empty");
 }
 
@@ -272,9 +306,11 @@ async fn bootstrap_seeds_capability_edges_for_admin_agents() {
     // and grants both admin agents (system_controller, gemini_cli) edge_has_capability to all.
     #[derive(serde::Deserialize)]
     struct Row { count: u64 }
+    let edge_has_capability = kernel.type_thing("edge_has_capability").unwrap();
     let mut res = kernel
         .db
-        .query("SELECT count() AS count FROM relation WHERE type = type_definition:edge_has_capability AND tenant_id = $session_tenant GROUP ALL")
+        .query("SELECT count() AS count FROM relation WHERE type = $ty AND tenant = $session_tenant GROUP ALL")
+        .bind(("ty", edge_has_capability))
         .await
         .unwrap();
     let count = res.take::<Vec<Row>>(0).unwrap().pop().map_or(0, |r| r.count);
@@ -288,13 +324,24 @@ async fn bootstrap_seeds_capability_edges_for_admin_agents() {
 /// Helper: fetch one bootstrap-seeded admin agent's full record id literal.
 async fn fetch_admin_agent_id(kernel: &Kernel) -> String {
     #[derive(serde::Deserialize)]
-    struct Row { id: String }
+    struct Row { id: Thing }
+    let node_agent = kernel.type_thing("node_agent").unwrap();
     let mut res = kernel
         .db
-        .query("SELECT <string>id AS id FROM entity WHERE type = type_definition:node_agent AND role = 'admin' AND tenant_id = $session_tenant LIMIT 1")
+        .query("SELECT id FROM entity WHERE type = $ty AND role = 'admin' AND tenant = $session_tenant LIMIT 1")
+        .bind(("ty", node_agent))
         .await
         .unwrap();
-    res.take::<Vec<Row>>(0).unwrap().pop().expect("at least one admin agent after bootstrap").id
+    let row = res.take::<Vec<Row>>(0).unwrap().pop()
+        .expect("at least one admin agent after bootstrap");
+    // Render the typed `Thing` as its canonical `entity:<uuid>` literal —
+    // every downstream caller (governor handshake, capability check) takes
+    // the record-id literal string at the API boundary.
+    format!("entity:{}", match row.id.id {
+        Id::Uuid(u) => u.to_raw(),
+        Id::String(s) => s,
+        other => panic!("unexpected admin-agent id form {other:?}"),
+    })
 }
 
 #[tokio::test]
@@ -323,18 +370,19 @@ async fn governor_check_capability_denies_when_no_edge_exists() {
 async fn governor_handshake_creates_session_and_participates_edge() {
     let (_dir, kernel, _sub) = bootstrap_tenant("gov_hs").await;
     let agent_id = fetch_admin_agent_id(&kernel).await;
-    let agent_uid = local_uid(&agent_id);
-
     let gov = CapabilityGovernor::new(&kernel);
-    let session_uid = gov.handshake(&agent_uid).await.expect("handshake must succeed");
+    let session_uid = gov.handshake(&agent_id).await.expect("handshake must succeed");
     assert!(!session_uid.is_empty(), "handshake returns a session uid");
 
     // A session entity must now exist with type node_session.
     #[derive(serde::Deserialize)]
     struct Row { count: u64 }
+    let node_session = kernel.type_thing("node_session").unwrap();
+    let edge_participates_in = kernel.type_thing("edge_participates_in").unwrap();
     let mut res = kernel
         .db
-        .query("SELECT count() AS count FROM entity WHERE type = type_definition:node_session AND tenant_id = $session_tenant GROUP ALL")
+        .query("SELECT count() AS count FROM entity WHERE type = $ty AND tenant = $session_tenant GROUP ALL")
+        .bind(("ty", node_session))
         .await
         .unwrap();
     let sessions = res.take::<Vec<Row>>(0).unwrap().pop().map_or(0, |r| r.count);
@@ -343,7 +391,8 @@ async fn governor_handshake_creates_session_and_participates_edge() {
     // An edge_participates_in must link the session to the agent.
     let mut res = kernel
         .db
-        .query("SELECT count() AS count FROM relation WHERE type = type_definition:edge_participates_in AND tenant_id = $session_tenant GROUP ALL")
+        .query("SELECT count() AS count FROM relation WHERE type = $ty AND tenant = $session_tenant GROUP ALL")
+        .bind(("ty", edge_participates_in))
         .await
         .unwrap();
     let edges = res.take::<Vec<Row>>(0).unwrap().pop().map_or(0, |r| r.count);
@@ -366,13 +415,12 @@ async fn governor_handshake_rejects_cross_tenant_identity() {
 
     BootstrapBlade::new(&kernel).run("coerce_a").await.unwrap();
     let agent_id_a = fetch_admin_agent_id(&kernel).await;
-    let agent_uid_a = local_uid(&agent_id_a);
 
     // Bootstrap tenant B; this also leaves the session set to B.
     BootstrapBlade::new(&kernel).run("coerce_b").await.unwrap();
 
     let gov = CapabilityGovernor::new(&kernel);
-    let res = gov.handshake(&agent_uid_a).await;
+    let res = gov.handshake(&agent_id_a).await;
     assert!(
         matches!(&res, Err(KernelError::SafetyViolation(ref m)) if m.contains("belongs to tenant")),
         "cross-tenant handshake must be refused, got {res:?}"
@@ -396,13 +444,22 @@ async fn ingest_json_source_creates_entity_and_state() {
     assert!(root_id.starts_with("entity:"));
 
     // The ingested entity must carry a current attr_desc state row with our payload.
+    // v2: "current" = most-recent by valid_from; no `is_current` flag exists.
     let root_thing = Kernel::parse_id(&root_id).unwrap();
+    let attr_desc = kernel.type_thing("attr_desc").unwrap();
     #[derive(serde::Deserialize)]
-    struct Row { value_json: Value }
+    #[allow(dead_code)]
+    struct Row {
+        value_json: Value,
+        valid_from: chrono::DateTime<chrono::Utc>,
+    }
     let mut res = kernel
         .db
-        .query("SELECT value_json FROM state_ledger WHERE target = $t AND `type` = type_definition:attr_desc AND is_current = true LIMIT 1")
+        .query("SELECT value_json, valid_from FROM state_ledger \
+                WHERE target = $t AND `type` = $ty \
+                ORDER BY valid_from DESC LIMIT 1")
         .bind(("t", root_thing))
+        .bind(("ty", attr_desc))
         .await
         .unwrap();
     let row = res.take::<Vec<Row>>(0).unwrap().pop().expect("attr_desc must exist");
@@ -418,17 +475,7 @@ async fn harness_promote_below_threshold_returns_false() {
     let (_dir, kernel, _sub) = bootstrap_tenant("harn_t").await;
 
     // Create a proposal entity in this tenant and score it 0.3.
-    let proposal_uid = uuid::Uuid::now_v7().to_string();
-    let proposal_thing = surrealdb::sql::Thing::from(("entity".to_string(), proposal_uid.clone()));
-    let proposal_id = format!("entity:{proposal_uid}");
-    kernel
-        .db
-        .query("INSERT INTO entity { id: $id, tenant_id: $session_tenant, type: type_definition:node_proposal }")
-        .bind(("id", proposal_thing))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    let proposal_id = seed_entity(&kernel, "node_proposal").await;
     kernel
         .supersede_state(&proposal_id, "attr_score", serde_json::json!({"score": 0.3}), None)
         .await
@@ -452,18 +499,17 @@ async fn harness_promote_rejects_malformed_proposal_id() {
 // 6. DAG / COMPILE_CONTEXT — descendant traversal, tier filtering, cycles
 // =====================================================================
 
-/// Helper: seed an entity owned by the current session tenant.
-async fn seed_entity(kernel: &Kernel, id_literal: &str, type_uid: &str) {
-    let thing = Kernel::parse_id(id_literal).unwrap();
-    kernel
-        .db
-        .query("INSERT INTO entity { id: $id, tenant_id: $session_tenant, type: type::thing('type_definition', $ty) }")
-        .bind(("id", thing))
-        .bind(("ty", type_uid.to_string()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+/// Helper: seed an entity of the given metamodel type under the current
+/// session tenant. Returns the `entity:<uuidv7>` record-id literal so the
+/// caller can thread it into kernel verbs that take `&str` record ids.
+/// Entity ids are always typed `uuid` per the v2 schema; named string ids
+/// like `entity:foo` are rejected by `DEFINE FIELD id ON entity TYPE uuid`.
+async fn seed_entity(kernel: &Kernel, type_uid: &str) -> String {
+    let entity_thing = make_typed_entity(kernel, type_uid).await;
+    format!("entity:{}", match entity_thing.id {
+        Id::Uuid(u) => u.to_raw(),
+        other => panic!("make_typed_entity must return Id::Uuid, got {other:?}"),
+    })
 }
 
 #[tokio::test]
@@ -471,16 +517,16 @@ async fn compile_context_walks_all_reachable_descendants() {
     // Seed a 3-level chain a -> b -> c, each with attr_desc state.
     // compile_context(a) must surface every reachable descendant in the output XML.
     let (_dir, kernel, _sub) = bootstrap_tenant("dag_walk").await;
-    seed_entity(&kernel, "entity:dag_a", "node_prod").await;
-    seed_entity(&kernel, "entity:dag_b", "node_prod").await;
-    seed_entity(&kernel, "entity:dag_c", "node_prod").await;
-    kernel.create_structural_edge("entity:dag_a", "entity:dag_b", "edge_owns").await.unwrap();
-    kernel.create_structural_edge("entity:dag_b", "entity:dag_c", "edge_owns").await.unwrap();
-    kernel.supersede_state("entity:dag_a", "attr_desc", serde_json::json!({"text": "ALPHA"}), None).await.unwrap();
-    kernel.supersede_state("entity:dag_b", "attr_desc", serde_json::json!({"text": "BETA"}), None).await.unwrap();
-    kernel.supersede_state("entity:dag_c", "attr_desc", serde_json::json!({"text": "GAMMA"}), None).await.unwrap();
+    let a = seed_entity(&kernel, "node_prod").await;
+    let b = seed_entity(&kernel, "node_prod").await;
+    let c = seed_entity(&kernel, "node_prod").await;
+    kernel.create_structural_edge(&a, &b, "edge_owns").await.unwrap();
+    kernel.create_structural_edge(&b, &c, "edge_owns").await.unwrap();
+    kernel.supersede_state(&a, "attr_desc", serde_json::json!({"text": "ALPHA"}), None).await.unwrap();
+    kernel.supersede_state(&b, "attr_desc", serde_json::json!({"text": "BETA"}), None).await.unwrap();
+    kernel.supersede_state(&c, "attr_desc", serde_json::json!({"text": "GAMMA"}), None).await.unwrap();
 
-    let xml = kernel.compile_context("entity:dag_a", "run_dag", None).await.unwrap();
+    let xml = kernel.compile_context(&a, "run_dag", None).await.unwrap();
     for token in ["ALPHA", "BETA", "GAMMA"] {
         assert!(xml.contains(token), "compile_context must include {token}; got {xml}");
     }
@@ -493,15 +539,15 @@ async fn compile_context_filters_by_memory_tier() {
     //   attr_desc   -> "working" tier
     //   attr_config -> "core" tier
     let (_dir, kernel, _sub) = bootstrap_tenant("tier_filter").await;
-    seed_entity(&kernel, "entity:tier_t", "node_prod").await;
-    kernel.supersede_state("entity:tier_t", "attr_desc", serde_json::json!({"text": "WORKING_PAYLOAD"}), None).await.unwrap();
-    kernel.supersede_state("entity:tier_t", "attr_config", serde_json::json!({"core_payload": "CORE_PAYLOAD"}), None).await.unwrap();
+    let t = seed_entity(&kernel, "node_prod").await;
+    kernel.supersede_state(&t, "attr_desc", serde_json::json!({"text": "WORKING_PAYLOAD"}), None).await.unwrap();
+    kernel.supersede_state(&t, "attr_config", serde_json::json!({"core_payload": "CORE_PAYLOAD"}), None).await.unwrap();
 
-    let core_only = kernel.compile_context("entity:tier_t", "run_t", Some(vec!["core".to_string()])).await.unwrap();
+    let core_only = kernel.compile_context(&t, "run_t", Some(vec!["core".to_string()])).await.unwrap();
     assert!(core_only.contains("CORE_PAYLOAD"), "core-only request must surface core state, got {core_only}");
     assert!(!core_only.contains("WORKING_PAYLOAD"), "core-only request must NOT leak working state, got {core_only}");
 
-    let working_only = kernel.compile_context("entity:tier_t", "run_t", Some(vec!["working".to_string()])).await.unwrap();
+    let working_only = kernel.compile_context(&t, "run_t", Some(vec!["working".to_string()])).await.unwrap();
     assert!(working_only.contains("WORKING_PAYLOAD"), "working-only request must surface working state, got {working_only}");
     assert!(!working_only.contains("CORE_PAYLOAD"), "working-only request must NOT leak core state, got {working_only}");
 }
@@ -511,13 +557,13 @@ async fn cycle_prevention_across_multi_hop() {
     // Acyclic-edge guard must catch cycles longer than one hop.
     //   a -> b -> c, then attempt c -> a (three-hop cycle).
     let (_dir, kernel, _sub) = bootstrap_tenant("cycle_mh").await;
-    seed_entity(&kernel, "entity:cy_a", "node_prod").await;
-    seed_entity(&kernel, "entity:cy_b", "node_prod").await;
-    seed_entity(&kernel, "entity:cy_c", "node_prod").await;
-    kernel.create_structural_edge("entity:cy_a", "entity:cy_b", "edge_owns").await.unwrap();
-    kernel.create_structural_edge("entity:cy_b", "entity:cy_c", "edge_owns").await.unwrap();
+    let a = seed_entity(&kernel, "node_prod").await;
+    let b = seed_entity(&kernel, "node_prod").await;
+    let c = seed_entity(&kernel, "node_prod").await;
+    kernel.create_structural_edge(&a, &b, "edge_owns").await.unwrap();
+    kernel.create_structural_edge(&b, &c, "edge_owns").await.unwrap();
 
-    let res = kernel.create_structural_edge("entity:cy_c", "entity:cy_a", "edge_owns").await;
+    let res = kernel.create_structural_edge(&c, &a, "edge_owns").await;
     assert!(matches!(res, Err(KernelError::CycleDetected)), "3-hop cycle must be detected, got {res:?}");
 }
 
@@ -584,41 +630,40 @@ async fn scd2_chain_closes_old_opens_new() {
     // supersede, exactly one row per (target, type) is current with valid_to = NULL,
     // and every prior row is closed with valid_to set.
     let (_dir, kernel, _sub) = bootstrap_tenant("scd2_chain").await;
-    seed_entity(&kernel, "entity:scd_e", "node_prod").await;
-    kernel.supersede_state("entity:scd_e", "attr_desc", serde_json::json!({"text": "v1"}), None).await.unwrap();
-    kernel.supersede_state("entity:scd_e", "attr_desc", serde_json::json!({"text": "v2"}), None).await.unwrap();
+    let scd_e = seed_entity(&kernel, "node_prod").await;
+    kernel.supersede_state(&scd_e, "attr_desc", serde_json::json!({"text": "v1"}), None).await.unwrap();
+    kernel.supersede_state(&scd_e, "attr_desc", serde_json::json!({"text": "v2"}), None).await.unwrap();
 
-    // Query categorically — read valid_to as a JSON value so a NULL doesn't trip the
-    // `<string>` cast (SurrealDB returns `ConvertTo{from: None}` for that).
+    // v2 SCD-2: every write is an append; "current" = most-recent row by
+    // `valid_from`. No `is_current` flag or `valid_to` column under v2 — the
+    // chain is reconstructed from the ledger's timestamps.
+    let scd_e_thing = Kernel::parse_id(&scd_e).unwrap();
+    let attr_desc = kernel.type_thing("attr_desc").unwrap();
     #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
     struct LedgerRow {
-        is_current: bool,
-        valid_to: serde_json::Value,
+        value_json: Value,
+        valid_from: chrono::DateTime<chrono::Utc>,
     }
     let mut res = kernel
         .db
-        .query("SELECT is_current, valid_to FROM state_ledger WHERE target = entity:scd_e AND `type` = type_definition:attr_desc")
+        .query("SELECT value_json, valid_from FROM state_ledger \
+                WHERE target = $t AND `type` = $ty \
+                ORDER BY valid_from ASC")
+        .bind(("t", scd_e_thing))
+        .bind(("ty", attr_desc))
         .await
         .unwrap();
     let rows: Vec<LedgerRow> = res.take(0).unwrap();
     assert_eq!(rows.len(), 2, "SCD-2 history must keep two rows");
 
-    let current: Vec<&LedgerRow> = rows.iter().filter(|r| r.is_current).collect();
-    let closed: Vec<&LedgerRow> = rows.iter().filter(|r| !r.is_current).collect();
-    assert_eq!(current.len(), 1, "exactly one is_current=true row per (target,type)");
-    assert_eq!(closed.len(), 1, "the prior row must be closed (is_current=false)");
-
-    let current_row = current[0];
-    let closed_row = closed[0];
+    // Append order matches valid_from order: oldest first, newest last.
+    assert_eq!(rows[0].value_json.get("text").and_then(Value::as_str), Some("v1"));
+    assert_eq!(rows[1].value_json.get("text").and_then(Value::as_str), Some("v2"));
     assert!(
-        current_row.valid_to.is_null(),
-        "current row's valid_to must be NULL, got {:?}",
-        current_row.valid_to
-    );
-    assert!(
-        !closed_row.valid_to.is_null(),
-        "closed row's valid_to must be set, got {:?}",
-        closed_row.valid_to
+        rows[1].valid_from >= rows[0].valid_from,
+        "later row must have later valid_from, got {:?} vs {:?}",
+        rows[1].valid_from, rows[0].valid_from
     );
 }
 
@@ -632,7 +677,7 @@ async fn harness_evaluate_traps_on_fuel_exhaustion() {
     // A guest module that loops past the 10k-unit budget MUST trap, and the trap
     // must surface as KernelError::SafetyViolation (not Validation, not Integrity).
     let (_dir, kernel, _sub) = bootstrap_tenant("harn_fuel").await;
-    seed_entity(&kernel, "entity:fuel_p", "node_proposal").await;
+    let fuel_p = seed_entity(&kernel, "node_proposal").await;
 
     // 100_000 iterations × ~5 wasm ops per iteration ≈ 500k ops, far above the
     // 10_000-unit fuel limit defined in MetaHarness::evaluate. The trap fires
@@ -651,7 +696,7 @@ async fn harness_evaluate_traps_on_fuel_exhaustion() {
     "#;
     let wasm = wat::parse_str(wat_src).expect("wat compiles");
 
-    let res = MetaHarness::new(&kernel).evaluate("entity:fuel_p", &wasm).await;
+    let res = MetaHarness::new(&kernel).evaluate(&fuel_p, &wasm).await;
     assert!(
         matches!(&res, Err(KernelError::SafetyViolation(_))),
         "fuel exhaustion must surface as SafetyViolation, got {res:?}"
@@ -664,7 +709,8 @@ async fn harness_evaluate_records_score_when_wasm_returns_within_budget() {
     // must run to completion AND its returned score must be persisted to the
     // ledger as an attr_score row (which `promote` later consults).
     let (_dir, kernel, _sub) = bootstrap_tenant("harn_ok").await;
-    seed_entity(&kernel, "entity:ok_p", "node_proposal").await;
+    let ok_p = seed_entity(&kernel, "node_proposal").await;
+    let ok_p_thing = Kernel::parse_id(&ok_p).unwrap();
 
     let wat_src = r#"
         (module
@@ -675,15 +721,25 @@ async fn harness_evaluate_records_score_when_wasm_returns_within_budget() {
     "#;
     let wasm = wat::parse_str(wat_src).expect("wat compiles");
 
-    let score = MetaHarness::new(&kernel).evaluate("entity:ok_p", &wasm).await.expect("evaluate ok");
+    let score = MetaHarness::new(&kernel).evaluate(&ok_p, &wasm).await.expect("evaluate ok");
     assert!((score - 0.90).abs() < f64::EPSILON, "evaluate must return raw_score/100.0, got {score}");
 
-    // Verify the score landed in state_ledger as the current attr_score row.
+    // Verify the score landed in state_ledger as the current attr_score row
+    // (v2: "current" = most-recent by valid_from).
+    let attr_score = kernel.type_thing("attr_score").unwrap();
     #[derive(serde::Deserialize)]
-    struct Row { value_json: serde_json::Value }
+    #[allow(dead_code)]
+    struct Row {
+        value_json: serde_json::Value,
+        valid_from: chrono::DateTime<chrono::Utc>,
+    }
     let mut res = kernel
         .db
-        .query("SELECT value_json FROM state_ledger WHERE target = entity:ok_p AND `type` = type_definition:attr_score AND is_current = true LIMIT 1")
+        .query("SELECT value_json, valid_from FROM state_ledger \
+                WHERE target = $t AND `type` = $ty \
+                ORDER BY valid_from DESC LIMIT 1")
+        .bind(("t", ok_p_thing))
+        .bind(("ty", attr_score))
         .await
         .unwrap();
     let row = res.take::<Vec<Row>>(0).unwrap().pop().expect("attr_score row must exist after evaluate");
@@ -701,10 +757,10 @@ async fn attr_score_rejects_non_numeric_and_missing_score() {
     // supersede_state must reject any payload that fails the schema before touching the
     // ledger. A valid numeric score must pass.
     let (_dir, kernel, _sub) = bootstrap_tenant("attr_neg").await;
-    seed_entity(&kernel, "entity:scorent", "node_proposal").await;
+    let scorent = seed_entity(&kernel, "node_proposal").await;
 
     let missing = kernel
-        .supersede_state("entity:scorent", "attr_score", serde_json::json!({}), None)
+        .supersede_state(&scorent, "attr_score", serde_json::json!({}), None)
         .await;
     assert!(
         matches!(&missing, Err(KernelError::Validation(_))),
@@ -712,7 +768,7 @@ async fn attr_score_rejects_non_numeric_and_missing_score() {
     );
 
     let wrong_type = kernel
-        .supersede_state("entity:scorent", "attr_score", serde_json::json!({"score": "high"}), None)
+        .supersede_state(&scorent, "attr_score", serde_json::json!({"score": "high"}), None)
         .await;
     assert!(
         matches!(&wrong_type, Err(KernelError::Validation(_))),
@@ -720,7 +776,7 @@ async fn attr_score_rejects_non_numeric_and_missing_score() {
     );
 
     kernel
-        .supersede_state("entity:scorent", "attr_score", serde_json::json!({"score": 0.95}), None)
+        .supersede_state(&scorent, "attr_score", serde_json::json!({"score": 0.95}), None)
         .await
         .expect("valid numeric score must pass schema validation");
 }
@@ -845,14 +901,11 @@ async fn apisink_posts_telemetry_row_to_remote_endpoint() {
         .await;
 
     let row = TelemetryRow {
-        id: surrealdb::sql::Thing::from((
-            "telemetry_stream",
-            Id::Uuid(surrealdb::sql::Uuid::from(uuid::Uuid::now_v7())),
-        )),
-        timestamp: "2026-05-18T19:00:00Z".to_string(),
-        tenant_id: "tenant_x".to_string(),
+        id: fresh_thing("telemetry_stream"),
+        valid_from: chrono::Utc::now(),
+        tenant: fresh_thing("entity"),
         lifecycle_event: "test_event".to_string(),
-        run_id: Some("run-1".to_string()),
+        run: Some(fresh_thing("entity")),
         payload: serde_json::json!({"key": "value"}),
     };
 
@@ -872,14 +925,11 @@ async fn apisink_surfaces_non_2xx_as_error() {
         .await;
 
     let row = TelemetryRow {
-        id: surrealdb::sql::Thing::from((
-            "telemetry_stream",
-            Id::Uuid(surrealdb::sql::Uuid::from(uuid::Uuid::now_v7())),
-        )),
-        timestamp: "2026-05-18T19:00:00Z".to_string(),
-        tenant_id: "tenant_x".to_string(),
+        id: fresh_thing("telemetry_stream"),
+        valid_from: chrono::Utc::now(),
+        tenant: fresh_thing("entity"),
         lifecycle_event: "test_event".to_string(),
-        run_id: None,
+        run: None,
         payload: serde_json::json!({}),
     };
 
@@ -891,24 +941,19 @@ async fn apisink_surfaces_non_2xx_as_error() {
 #[tokio::test]
 async fn uuidv7_entity_ids_preserve_temporal_ordering() {
     // ARCHITECTURE.md Invariant 2: "Every mutation is stamped with a UUIDv7, ensuring
-    // history is naturally ordered". All substrate tables (entity, relation,
-    // state_ledger, telemetry_stream) now use native UUIDv7 record ids via
-    // `surrealdb::sql::Id::Uuid`; insertion order MUST match lexical id order.
+    // history is naturally ordered". All substrate tables use native UUIDv7
+    // record ids via `surrealdb::sql::Id::Uuid`; insertion order MUST match
+    // lexical id order.
     let (_dir, kernel, _sub) = bootstrap_tenant("uuid7_order").await;
 
     let mut generated: Vec<String> = Vec::new();
     for _ in 0..5 {
-        let uid = uuid::Uuid::now_v7().to_string();
-        generated.push(uid.clone());
-        let thing = surrealdb::sql::Thing::from(("entity".to_string(), uid));
-        kernel
-            .db
-            .query("INSERT INTO entity { id: $id, tenant_id: $session_tenant, type: type_definition:node_prod }")
-            .bind(("id", thing))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        let entity_thing = make_typed_entity(&kernel, "node_prod").await;
+        let raw = match entity_thing.id {
+            Id::Uuid(u) => u.to_raw(),
+            other => panic!("entity id must be Id::Uuid, got {other:?}"),
+        };
+        generated.push(raw);
     }
 
     // Sanity: the generator itself is monotonic (UUIDv7 has a time-prefix).
@@ -930,75 +975,85 @@ async fn uuidv7_entity_ids_preserve_temporal_ordering() {
 #[tokio::test]
 async fn execution_params_round_trip_returns_what_was_written() {
     let (_dir, kernel, _sub) = bootstrap_tenant("ep_rt").await;
+    let run = make_typed_entity(&kernel, "node_run").await;
+    let agent = make_typed_entity(&kernel, "node_agent").await;
     let payload = serde_json::json!({
         "temperature": 0.7,
         "top_p": 0.9,
         "max_tokens": 1024,
-        "model_ref": "entity:gemma_4_27b_it"
+        "model_ref": format!("entity:{}", uuid::Uuid::now_v7())
     });
 
-    kernel.set_execution_params("run_abc", "agent_xyz", payload.clone()).await.unwrap();
-    let read_back = kernel.get_execution_params("run_abc", "agent_xyz").await.unwrap();
+    kernel.set_execution_params(run.clone(), agent.clone(), payload.clone()).await.unwrap();
+    let read_back = kernel.get_execution_params(run, agent).await.unwrap();
     assert_eq!(read_back, Some(payload), "round-trip must return the same payload");
 }
 
 #[tokio::test]
 async fn execution_params_update_closes_prior_opens_new_scd2() {
-    // Operator updates knobs mid-run — must produce 2 rows in the ledger,
-    // exactly one is_current, the prior with valid_to set.
+    // v2 append-only: each set is a new row; "current" = most-recent by
+    // valid_from. There is no `is_current` flag or `valid_to` column under v2.
     let (_dir, kernel, _sub) = bootstrap_tenant("ep_scd2").await;
-    kernel.set_execution_params("run_x", "agent_a",
+    let run = make_typed_entity(&kernel, "node_run").await;
+    let agent = make_typed_entity(&kernel, "node_agent").await;
+
+    kernel.set_execution_params(run.clone(), agent.clone(),
         serde_json::json!({"temperature": 0.5})).await.unwrap();
-    kernel.set_execution_params("run_x", "agent_a",
+    kernel.set_execution_params(run.clone(), agent.clone(),
         serde_json::json!({"temperature": 0.9})).await.unwrap();
 
     #[derive(serde::Deserialize, Debug)]
     #[allow(dead_code)]
     struct Row {
-        is_current: bool,
-        valid_to: serde_json::Value,
-        valid_from: serde_json::Value,
+        valid_from: chrono::DateTime<chrono::Utc>,
         params_json: serde_json::Value,
     }
     let mut res = kernel.db.query(
-        "SELECT is_current, valid_to, valid_from, params_json FROM execution_params \
-         WHERE run_id = 'run_x' AND agent_id = 'agent_a' AND tenant_id = $session_tenant \
+        "SELECT valid_from, params_json FROM execution_params \
+         WHERE run = $run AND agent = $agent AND tenant = $session_tenant \
          ORDER BY valid_from ASC"
-    ).await.unwrap();
+    )
+        .bind(("run", run.clone()))
+        .bind(("agent", agent.clone()))
+        .await.unwrap();
     let rows: Vec<Row> = res.take(0).unwrap();
-    assert_eq!(rows.len(), 2, "SCD-2 history must keep both versions; got {}", rows.len());
+    assert_eq!(rows.len(), 2, "append-only ledger must keep both versions; got {}", rows.len());
 
-    let current: Vec<&Row> = rows.iter().filter(|r| r.is_current).collect();
-    let closed: Vec<&Row> = rows.iter().filter(|r| !r.is_current).collect();
-    assert_eq!(current.len(), 1, "exactly one is_current per (run_id, agent_id)");
-    assert_eq!(closed.len(), 1, "the prior row must be closed");
-    assert!(current[0].valid_to.is_null(), "current row's valid_to must be NULL");
-    assert!(!closed[0].valid_to.is_null(), "closed row's valid_to must be set");
+    let oldest_temp = rows[0].params_json.get("temperature").and_then(|v| v.as_f64()).unwrap();
+    let newest_temp = rows[1].params_json.get("temperature").and_then(|v| v.as_f64()).unwrap();
+    assert!((oldest_temp - 0.5).abs() < f64::EPSILON, "first row preserves the prior payload");
+    assert!((newest_temp - 0.9).abs() < f64::EPSILON, "last row holds the latest payload");
+    assert!(rows[1].valid_from >= rows[0].valid_from, "valid_from must be monotonic");
 
-    // The current row holds the latest value.
-    let current_temp = current[0].params_json.get("temperature").and_then(|v| v.as_f64()).unwrap();
-    assert!((current_temp - 0.9).abs() < f64::EPSILON, "current row must hold the newer payload");
+    let current = kernel.get_execution_params(run, agent).await.unwrap()
+        .expect("at least one row was written");
+    let current_temp = current.get("temperature").and_then(|v| v.as_f64()).unwrap();
+    assert!((current_temp - 0.9).abs() < f64::EPSILON, "get_execution_params must return latest");
 }
 
 #[tokio::test]
 async fn execution_params_distinct_agents_do_not_collide() {
     // Two agents in the same run must have independent param histories.
     let (_dir, kernel, _sub) = bootstrap_tenant("ep_iso").await;
-    kernel.set_execution_params("run_iso", "agent_a",
+    let run = make_typed_entity(&kernel, "node_run").await;
+    let agent_a = make_typed_entity(&kernel, "node_agent").await;
+    let agent_b = make_typed_entity(&kernel, "node_agent").await;
+
+    kernel.set_execution_params(run.clone(), agent_a.clone(),
         serde_json::json!({"temperature": 0.3})).await.unwrap();
-    kernel.set_execution_params("run_iso", "agent_b",
+    kernel.set_execution_params(run.clone(), agent_b.clone(),
         serde_json::json!({"temperature": 0.8})).await.unwrap();
 
-    let a = kernel.get_execution_params("run_iso", "agent_a").await.unwrap();
-    let b = kernel.get_execution_params("run_iso", "agent_b").await.unwrap();
+    let a = kernel.get_execution_params(run.clone(), agent_a.clone()).await.unwrap();
+    let b = kernel.get_execution_params(run.clone(), agent_b.clone()).await.unwrap();
     assert_eq!(a.unwrap().get("temperature").and_then(|v| v.as_f64()), Some(0.3));
     assert_eq!(b.unwrap().get("temperature").and_then(|v| v.as_f64()), Some(0.8));
 
     // Updating agent_a's knobs must NOT touch agent_b's.
-    kernel.set_execution_params("run_iso", "agent_a",
+    kernel.set_execution_params(run.clone(), agent_a.clone(),
         serde_json::json!({"temperature": 0.1})).await.unwrap();
-    let a2 = kernel.get_execution_params("run_iso", "agent_a").await.unwrap();
-    let b2 = kernel.get_execution_params("run_iso", "agent_b").await.unwrap();
+    let a2 = kernel.get_execution_params(run.clone(), agent_a).await.unwrap();
+    let b2 = kernel.get_execution_params(run, agent_b).await.unwrap();
     assert_eq!(a2.unwrap().get("temperature").and_then(|v| v.as_f64()), Some(0.1));
     assert_eq!(b2.unwrap().get("temperature").and_then(|v| v.as_f64()), Some(0.8));
 }
@@ -1006,16 +1061,17 @@ async fn execution_params_distinct_agents_do_not_collide() {
 #[tokio::test]
 async fn execution_params_get_returns_none_when_not_set() {
     let (_dir, kernel, _sub) = bootstrap_tenant("ep_missing").await;
-    let res = kernel.get_execution_params("never_set_run", "never_set_agent").await.unwrap();
+    let res = kernel.get_execution_params(fresh_thing("entity"), fresh_thing("entity")).await.unwrap();
     assert!(res.is_none(), "missing row must return None, not an error");
 }
 
 #[tokio::test]
 async fn execution_params_set_emits_telemetry() {
     let (_dir, kernel, _sub) = bootstrap_tenant("ep_tele").await;
+    let run = make_typed_entity(&kernel, "node_run").await;
+    let agent = make_typed_entity(&kernel, "node_agent").await;
     let before = count_events(&kernel, "execution_params_set").await;
-    kernel.set_execution_params("run_tele", "agent_one",
-        serde_json::json!({"temperature": 0.5})).await.unwrap();
+    kernel.set_execution_params(run, agent, serde_json::json!({"temperature": 0.5})).await.unwrap();
     let after = count_events(&kernel, "execution_params_set").await;
     assert_eq!(after, before + 1, "each set must emit exactly one execution_params_set event");
 }
@@ -1034,76 +1090,82 @@ fn now_utc() -> chrono::DateTime<chrono::Utc> { chrono::Utc::now() }
 #[tokio::test]
 async fn schedule_enqueue_returns_a_uuidv7_record_id() {
     let (_dir, kernel, _sub) = bootstrap_tenant("sched_id").await;
+    let run = make_typed_entity(&kernel, "node_run").await;
+    let target = make_typed_entity(&kernel, "node_prod").await;
     let sid = kernel.enqueue_schedule_item(
-        "run_a", "ingest", "entity:abc",
+        run.clone(), "ingest", target.clone(),
         now_utc(), vec![], serde_json::json!({}),
     ).await.unwrap();
-    assert!(sid.starts_with("schedule:"), "id must be a `schedule:<uuid>` record id, got {sid}");
-    let payload = kernel.get_schedule_item(&sid).await.unwrap().expect("just-enqueued row must be readable");
-    assert_eq!(payload.get("run_id").and_then(|v| v.as_str()), Some("run_a"));
+    assert_eq!(sid.tb, "schedule", "id must live on the schedule table, got {sid}");
+    assert!(matches!(sid.id, Id::Uuid(_)), "schedule id must be UUIDv7-typed, got {sid:?}");
+    let payload = kernel.get_schedule_item(sid).await.unwrap().expect("just-enqueued row must be readable");
+
+    // v2 field names on schedule: `run` (Thing FK), `target` (Thing FK).
+    assert_eq!(payload.get("run").and_then(|v| v.get("tb")).and_then(|v| v.as_str()), Some("entity"));
     assert_eq!(payload.get("kind").and_then(|v| v.as_str()), Some("ingest"));
     assert_eq!(payload.get("status").and_then(|v| v.as_str()), Some("waiting"));
     assert_eq!(payload.get("attempt").and_then(serde_json::Value::as_i64), Some(0));
-    assert_eq!(payload.get("is_current").and_then(serde_json::Value::as_bool), Some(true));
+    assert_eq!(payload.get("target").and_then(|v| v.get("tb")).and_then(|v| v.as_str()), Some("entity"));
 }
 
 #[tokio::test]
 async fn schedule_transition_closes_prior_opens_new_scd2() {
     let (_dir, kernel, _sub) = bootstrap_tenant("sched_scd2").await;
+    let run = make_typed_entity(&kernel, "node_run").await;
+    let target = make_typed_entity(&kernel, "node_prod").await;
+
     let sid = kernel.enqueue_schedule_item(
-        "run_x", "compile", "entity:tgt",
+        run.clone(), "compile", target.clone(),
         now_utc(), vec![], serde_json::json!({"note": "first"}),
     ).await.unwrap();
-    let _sid2 = kernel.transition_schedule_status(&sid, "scheduled").await.unwrap();
-    let _sid3 = kernel.transition_schedule_status(&_sid2, "running").await.unwrap();
+    let sid2 = kernel.transition_schedule_status(sid.clone(), "scheduled").await.unwrap();
+    let _sid3 = kernel.transition_schedule_status(sid2.clone(), "running").await.unwrap();
 
     #[derive(serde::Deserialize, Debug)]
     #[allow(dead_code)]
     struct Row {
         status: String,
-        is_current: bool,
-        valid_to: serde_json::Value,
-        valid_from: serde_json::Value,
+        valid_from: chrono::DateTime<chrono::Utc>,
     }
     let mut res = kernel.db.query(
-        "SELECT status, is_current, valid_to, valid_from FROM schedule \
-         WHERE run_id = 'run_x' AND tenant_id = $session_tenant \
+        "SELECT status, valid_from FROM schedule \
+         WHERE run = $run AND tenant = $session_tenant \
          ORDER BY valid_from ASC"
-    ).await.unwrap();
+    )
+        .bind(("run", run))
+        .await.unwrap();
     let rows: Vec<Row> = res.take(0).unwrap();
-    assert_eq!(rows.len(), 3, "SCD-2 ledger must preserve all 3 versions, got {}", rows.len());
+    assert_eq!(rows.len(), 3, "append-only ledger must preserve all 3 versions, got {}", rows.len());
 
-    let current: Vec<&Row> = rows.iter().filter(|r| r.is_current).collect();
-    let closed: Vec<&Row> = rows.iter().filter(|r| !r.is_current).collect();
-    assert_eq!(current.len(), 1, "exactly one is_current row per schedule chain");
-    assert_eq!(closed.len(), 2, "the two prior rows must be closed");
-    assert!(current[0].valid_to.is_null(), "current row's valid_to must be NULL");
-    for c in &closed {
-        assert!(!c.valid_to.is_null(), "closed row's valid_to must be set");
-    }
-    assert_eq!(current[0].status, "running", "current row carries the latest status");
-    assert_eq!(closed[0].status, "waiting", "first closed row preserved its original status");
-    assert_eq!(closed[1].status, "scheduled", "second closed row preserved its prior status");
+    // v2: no is_current/valid_to. Most-recent row by valid_from is "current".
+    assert_eq!(rows[0].status, "waiting",   "first row preserved its original status");
+    assert_eq!(rows[1].status, "scheduled", "second row carries the prior transition");
+    assert_eq!(rows[2].status, "running",   "newest row carries the latest status");
+    assert!(rows[1].valid_from >= rows[0].valid_from);
+    assert!(rows[2].valid_from >= rows[1].valid_from);
 }
 
 #[tokio::test]
 async fn schedule_transition_preserves_payload_fields() {
     let (_dir, kernel, _sub) = bootstrap_tenant("sched_payload").await;
+    let run = make_typed_entity(&kernel, "node_run").await;
+    let target = make_typed_entity(&kernel, "node_prod").await;
     let due = now_utc();
+    let dep = fresh_thing("schedule");
     let sid = kernel.enqueue_schedule_item(
-        "run_p", "design", "entity:prod",
-        due, vec!["schedule:dep_one".into()], serde_json::json!({"priority": 7, "memo": "carry-me"}),
+        run.clone(), "design", target.clone(),
+        due, vec![dep.clone()], serde_json::json!({"priority": 7, "memo": "carry-me"}),
     ).await.unwrap();
-    let sid2 = kernel.transition_schedule_status(&sid, "scheduled").await.unwrap();
+    let sid2 = kernel.transition_schedule_status(sid, "scheduled").await.unwrap();
 
-    let after = kernel.get_schedule_item(&sid2).await.unwrap().expect("post-transition row must be readable");
-    assert_eq!(after.get("run_id").and_then(|v| v.as_str()), Some("run_p"));
+    let after = kernel.get_schedule_item(sid2).await.unwrap().expect("post-transition row must be readable");
     assert_eq!(after.get("kind").and_then(|v| v.as_str()), Some("design"));
-    assert_eq!(after.get("target_entity").and_then(|v| v.as_str()), Some("entity:prod"));
     assert_eq!(after.get("status").and_then(|v| v.as_str()), Some("scheduled"));
+    assert_eq!(after.get("run").and_then(|v| v.get("tb")).and_then(|v| v.as_str()), Some("entity"));
+    assert_eq!(after.get("target").and_then(|v| v.get("tb")).and_then(|v| v.as_str()), Some("entity"));
     let deps = after.get("depends_on").and_then(|v| v.as_array()).expect("depends_on must round-trip");
     assert_eq!(deps.len(), 1);
-    assert_eq!(deps[0].as_str(), Some("schedule:dep_one"));
+    assert_eq!(deps[0].get("tb").and_then(|v| v.as_str()), Some("schedule"));
     assert_eq!(after.get("metadata").and_then(|m| m.get("priority")).and_then(serde_json::Value::as_i64), Some(7));
     assert_eq!(after.get("metadata").and_then(|m| m.get("memo")).and_then(|v| v.as_str()), Some("carry-me"));
 }
@@ -1111,22 +1173,24 @@ async fn schedule_transition_preserves_payload_fields() {
 #[tokio::test]
 async fn schedule_get_returns_none_when_id_unknown() {
     let (_dir, kernel, _sub) = bootstrap_tenant("sched_miss").await;
-    let fake = format!("schedule:{}", uuid::Uuid::now_v7());
-    let res = kernel.get_schedule_item(&fake).await.unwrap();
+    let fake = fresh_thing("schedule");
+    let res = kernel.get_schedule_item(fake).await.unwrap();
     assert!(res.is_none(), "unknown schedule id must return None, not an error");
 }
 
 #[tokio::test]
 async fn schedule_emits_enqueued_and_transitioned_telemetry() {
     let (_dir, kernel, _sub) = bootstrap_tenant("sched_tele").await;
+    let run = make_typed_entity(&kernel, "node_run").await;
+    let target = make_typed_entity(&kernel, "node_prod").await;
     let enq_before = count_events(&kernel, "schedule_enqueued").await;
     let tx_before  = count_events(&kernel, "schedule_transitioned").await;
 
     let sid = kernel.enqueue_schedule_item(
-        "run_t", "ingest", "entity:x",
+        run, "ingest", target,
         now_utc(), vec![], serde_json::json!({}),
     ).await.unwrap();
-    let _sid2 = kernel.transition_schedule_status(&sid, "scheduled").await.unwrap();
+    let _sid2 = kernel.transition_schedule_status(sid, "scheduled").await.unwrap();
 
     assert_eq!(count_events(&kernel, "schedule_enqueued").await,    enq_before + 1, "one enqueue → one schedule_enqueued event");
     assert_eq!(count_events(&kernel, "schedule_transitioned").await, tx_before  + 1, "one transition → one schedule_transitioned event");

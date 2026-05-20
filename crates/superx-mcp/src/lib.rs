@@ -82,6 +82,10 @@ pub use superx_kernel::DEFAULT_TENANT;
 /// pieces, returns the same `Result<CallToolResult, McpError>` the rmcp handler
 /// would return. Callable directly from tests; no `RequestContext` needed.
 ///
+/// # Panics
+/// Panics only on build-time programmer error: the hard-coded IETF DNS
+/// namespace UUID literal (RFC 4122) must parse successfully.
+///
 /// # Errors
 /// Returns `McpError::internal_error` on auth / capability failures and
 /// `McpError::invalid_params` when required arguments are missing.
@@ -97,8 +101,17 @@ pub async fn dispatch_tool(
         .unwrap_or(DEFAULT_TENANT)
         .to_string();
 
+    // The tenant arg is the human-readable name (e.g. "default" or whatever
+    // the operator chose at bootstrap). The substrate row's id is
+    // `UUIDv5(DNS_NS, tenant_name)` — bind the session to that uuid so every
+    // tenant-scoped PERMISSIONS check and tool-uuid derivation matches the
+    // substrate row that bootstrap created.
+    let ns_uuid = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+        .expect("DNS namespace UUID is well-formed");
+    let substrate_uuid = uuid::Uuid::new_v5(&ns_uuid, tenant.as_bytes());
+
     kernel
-        .set_session_auth(&tenant, "user")
+        .set_session_auth(&substrate_uuid.to_string(), "user")
         .await
         .map_err(|e| McpError::internal_error(format!("Auth failed: {e}"), None))?;
 

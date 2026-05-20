@@ -91,10 +91,9 @@ impl<'a> BootstrapBlade<'a> {
         let run_id = Uuid::now_v7().to_string();
         tracing::info!("Starting NASA-Grade Bootstrap (Run ID: {run_id}) for Tenant: {tenant_id}");
 
-        // 1. Establish Physical Session (Physical Isolation)
-        self.kernel.set_session_auth(tenant_id, "admin").await?;
-
-        // 2. Provision Substrate Entity (Deterministic UUIDv5 from Tenant)
+        // 1. Compute the substrate UUIDv5 deterministically from the tenant
+        //    name BEFORE binding the session — `set_session_auth` expects the
+        //    substrate uuid string, not the human-readable tenant label.
         let ns_uuid = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").expect("Valid DNS NS");
         let substrate_uuid = Uuid::new_v5(&ns_uuid, tenant_id.as_bytes());
         let substrate_thing = Thing::from((
@@ -102,6 +101,12 @@ impl<'a> BootstrapBlade<'a> {
             surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(substrate_uuid)),
         ));
         let substrate_id = format!("entity:{substrate_uuid}");
+
+        // 2. Establish the physical session, bound to the substrate's UUID
+        //    (so `$session_tenant` is the typed Thing pointing at the row we
+        //    will create below — every PERMISSIONS check and tenant-coercion
+        //    guard then matches by Thing equality).
+        self.kernel.set_session_auth(&substrate_uuid.to_string(), "admin").await?;
 
         // Under v2: typed FK type=$node_substrate, tenant points at the
         // substrate itself (self-reference is how the substrate entity
@@ -115,17 +120,21 @@ impl<'a> BootstrapBlade<'a> {
             .await?;
         let exists = sel.take::<Vec<IdRow>>(0)?.pop().is_some();
         if !exists {
+            // Substrate entities have `tenant: NONE` — they are the root of
+            // the tenancy graph. The v2 ASSERT permits NONE exactly for this
+            // case; a self-reference would also satisfy the type-uid check
+            // semantically but engine-evaluates `$value.type.uid` on the
+            // row-being-created (which doesn't exist yet) and fails.
             self.kernel.db.query(
                 "CREATE entity CONTENT { \
                     id: $id, \
                     type: $type, \
-                    tenant: $tenant_self, \
+                    tenant: NONE, \
                     role: 'admin' \
                 }"
             )
                 .bind(("id", substrate_thing.clone()))
                 .bind(("type", node_substrate))
-                .bind(("tenant_self", substrate_thing.clone()))
                 .await?.check()?;
         }
 
@@ -269,8 +278,10 @@ impl<'a> BootstrapBlade<'a> {
     }
 
     /// Seed the five canonical tools and grant each admin agent capability to all of them.
-    /// Tool entities use deterministic `UUIDv5` ids derived from `(tenant, tool_uid)` so
-    /// re-bootstraps reuse the same row idempotently.
+    /// Tool entities use deterministic `UUIDv5` ids derived from
+    /// `(substrate_uuid, tool_uid)` so `check_capability` (which only has the
+    /// substrate Thing in hand at call time) can recompute the same id
+    /// without needing the human-readable tenant name.
     async fn seed_standard_tools(
         &self,
         tenant_id: &str,
@@ -283,10 +294,14 @@ impl<'a> BootstrapBlade<'a> {
         let node_tool = self.kernel.type_thing("node_tool")?;
         let substrate_thing = superx_kernel::Kernel::parse_id(substrate_id)?;
         let ns_uuid = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").expect("Valid DNS NS");
+        // substrate_id is the literal `entity:<uuid>`. Strip the prefix so
+        // the per-tool namespace is the substrate UUID itself.
+        let substrate_uuid_str = substrate_id.strip_prefix("entity:").unwrap_or(substrate_id);
+        let _ = tenant_id; // reserved for future use; tool seeding is now tenant-name-independent
 
         let tools = ["tool_ingest", "tool_compile", "tool_propose", "tool_evaluate", "tool_promote"];
         for tool in tools {
-            let tool_uuid = Uuid::new_v5(&ns_uuid, format!("{tenant_id}:{tool}").as_bytes());
+            let tool_uuid = Uuid::new_v5(&ns_uuid, format!("{substrate_uuid_str}:{tool}").as_bytes());
             let tool_thing = Thing::from((
                 "entity",
                 surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(tool_uuid)),

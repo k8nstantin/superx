@@ -142,10 +142,15 @@ impl<'a> CapabilityGovernor<'a> {
     /// Existence is verified via `count()` to avoid deserializing the matched row's id
     /// (which is itself a `Thing` enum, not a JSON value).
     ///
+    /// # Panics
+    /// Panics only on build-time programmer error: the hard-coded IETF DNS
+    /// namespace UUID literal (RFC 4122) must parse successfully.
+    ///
     /// # Errors
     /// Returns `KernelError::Validation` if `agent_id` is malformed.
     /// Returns `KernelError::SafetyViolation` if no `edge_has_capability` exists between
     /// the agent and the tool within the current session tenant.
+    #[allow(clippy::similar_names)] // `tool_uuid` (uuid) and `tool_uid` (param) intentional pair
     pub async fn check_capability(&self, agent_id: &str, tool_uid: &str) -> Result<(), KernelError> {
         #[derive(serde::Deserialize)]
         struct CountRow { count: u64 }
@@ -153,9 +158,27 @@ impl<'a> CapabilityGovernor<'a> {
         tracing::info!("capability check: agent_id={agent_id} tool_uid={tool_uid}");
 
         let agent_thing = Kernel::parse_id(agent_id)?;
-        let tool_thing = Kernel::parse_id(&format!("entity:{tool_uid}"))?;
-        let edge_has_capability = self.kernel.type_thing("edge_has_capability")?;
+        // Tool entities are seeded with deterministic
+        // `UUIDv5(DNS_NS, "{substrate_uuid}:{tool_uid}")` ids (see
+        // `BootstrapBlade::seed_standard_tools`). Recompute the same id here
+        // so a caller can resolve a named tool to its typed `Thing` without
+        // a metamodel lookup.
         let tenant_thing = self.kernel.session_tenant_thing().await?;
+        let substrate_uuid_str = match &tenant_thing.id {
+            surrealdb::sql::Id::Uuid(u) => u.to_raw(),
+            surrealdb::sql::Id::String(s) => s.clone(),
+            other => return Err(KernelError::Validation(format!(
+                "session tenant id has unexpected form: {other:?}"
+            ))),
+        };
+        let ns_uuid = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+            .expect("DNS namespace UUID is well-formed");
+        let tool_uuid = uuid::Uuid::new_v5(&ns_uuid, format!("{substrate_uuid_str}:{tool_uid}").as_bytes());
+        let tool_thing = Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(tool_uuid)),
+        ));
+        let edge_has_capability = self.kernel.type_thing("edge_has_capability")?;
 
         let query = "SELECT count() AS count FROM relation \
             WHERE in = $agent AND out = $tool \
