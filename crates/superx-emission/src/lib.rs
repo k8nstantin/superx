@@ -49,23 +49,28 @@ use reqwest::Client;
 /// One row of the unified telemetry firehose, as it travels from
 /// `telemetry_stream` to a downstream sink (`KafkaSink` / `ApiSink`).
 ///
-/// Field semantics mirror the `telemetry_stream` schema defined in
+/// Field semantics mirror the v2 `telemetry_stream` schema defined in
 /// `superx-kernel::apply_substrate_schema`:
-/// - `id` — the row's `Thing` record id (native `Id::Uuid`); preserves
-///   the temporal ordering of when the event was logged.
-/// - `timestamp` — ISO-8601 wall-clock time the row was written.
-/// - `tenant_id` — the tenant that produced the event; sinks may filter on this.
+/// - `id` — the row's `Thing` record id (UUIDv7, engine-enforced via
+///   `DEFINE FIELD id ON telemetry_stream TYPE uuid`).
+/// - `valid_from` — wall-clock time the row was written (the only temporal
+///   column under v2; replaces the legacy `timestamp` field).
+/// - `tenant` — typed `record<entity>` FK to the tenant's `node_substrate`
+///   row. Engine `ASSERT $value.type.uid = 'node_substrate'` refuses a
+///   wrong-type FK at insert.
 /// - `lifecycle_event` — typed event name (`state_supersede`, `edge_create`,
 ///   `agent_discovered`, `system_pulse`, …).
-/// - `run_id` — optional correlation id linking the event to a workflow run.
+/// - `run` — optional typed `record<entity>` FK to a `node_run` row. Engine
+///   `ASSERT $value = NONE OR $value.type.uid = 'node_run'` refuses any
+///   wrong-type FK. `None` until callers create `node_run` entities.
 /// - `payload` — typed structured payload specific to `lifecycle_event`.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TelemetryRow {
     pub id: surrealdb::sql::Thing,
-    pub timestamp: String,
-    pub tenant_id: String,
+    pub valid_from: chrono::DateTime<chrono::Utc>,
+    pub tenant: surrealdb::sql::Thing,
     pub lifecycle_event: String,
-    pub run_id: Option<String>,
+    pub run: Option<surrealdb::sql::Thing>,
     pub payload: serde_json::Value,
 }
 
@@ -181,13 +186,23 @@ impl<'a> TelemetrySubscriber<'a> {
 
         tracing::info!("Starting telemetry subscription for tenant: {tenant_id}");
 
-        // Internal loop runs in root context. We bypass get_parameter and use direct queries
-        // because we don't have a $auth context in the background thread.
-        let query = "SELECT * FROM state_ledger WHERE target.type = type_definition:node_substrate AND tenant_id = $tnt AND `type` = type_definition:attr_config AND is_current = true LIMIT 1";
-        let mut config_res = self.kernel.db.query(query).bind(("tnt", tenant_id.to_string())).await?;
-        
+        // Config lookup migrated to v2: type FKs resolved via the kernel's
+        // type_cache; "current" is the most-recent state_ledger row by
+        // valid_from for the (substrate, attr_config) chain.
+        let node_substrate = self.kernel.type_thing("node_substrate")?;
+        let attr_config = self.kernel.type_thing("attr_config")?;
+        let query = "SELECT value_json FROM state_ledger \
+            WHERE target.type = $node_substrate AND target.tenant.id = $tnt \
+              AND `type` = $attr_config \
+            ORDER BY valid_from DESC LIMIT 1";
+        let mut config_res = self.kernel.db.query(query)
+            .bind(("node_substrate", node_substrate))
+            .bind(("attr_config", attr_config))
+            .bind(("tnt", tenant_id.to_string()))
+            .await?;
+
         let config_row: Option<ValueRow> = config_res.take::<Vec<ValueRow>>(0)?.pop();
-        
+
         let (enabled, scope) = if let Some(row) = config_row {
             (
                 row.value_json.get("emission_enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
@@ -202,8 +217,9 @@ impl<'a> TelemetrySubscriber<'a> {
             return Ok(());
         }
 
-        // 2. LIVE SELECT as root (local mode bypasses PERMISSIONS for root)
-        let live_query = "LIVE SELECT * FROM telemetry_stream WHERE tenant_id = $tnt";
+        // 2. LIVE SELECT filtered by the typed tenant FK's id (under v2 the
+        //    field is `tenant: record<entity>`, not `tenant_id: string`).
+        let live_query = "LIVE SELECT * FROM telemetry_stream WHERE tenant.id = $tnt";
         let mut response = self.kernel.db.query(live_query)
             .bind(("tnt", tenant_id.to_string())).await?;
 
