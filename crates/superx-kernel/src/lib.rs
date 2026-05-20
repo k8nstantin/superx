@@ -68,7 +68,9 @@ use surrealdb::engine::local::{Db, RocksDb};
 use surrealdb::sql::Thing;
 use surrealdb::Surreal;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::fmt::Write as _;
 use jsonschema::JSONSchema;
 
@@ -134,15 +136,16 @@ pub struct Kernel {
     pub ns: String,
     /// The `SurrealDB` database name this kernel is bound to (set at `init` time).
     pub db_name: String,
+    /// Cache of `type_definition` row ids keyed by their stable `uid` (e.g.,
+    /// `"node_substrate"`, `"edge_owns"`). Populated once at the end of
+    /// [`Kernel::init`] from the seeded metamodel rows. Every verb that
+    /// references a metamodel type by name resolves it through this cache via
+    /// [`Kernel::type_thing`] — there is no named-id pattern (`type_definition:node_substrate`)
+    /// in the substrate any more; ids are UUIDv7 and lookups go through the cache.
+    type_cache: Arc<OnceLock<HashMap<String, Thing>>>,
 }
 
-#[derive(Deserialize)] 
-struct FetchResult { 
-    sch_json: Option<String>, 
-    tenant: Option<String> 
-}
-
-#[derive(Deserialize)] 
+#[derive(Deserialize)]
 struct AcyclicCheck { 
     is_acyclic: bool 
 }
@@ -191,10 +194,38 @@ impl Kernel {
         let db = Surreal::new::<RocksDb>(path).await?;
         db.use_ns(ns).use_db(db_name).await?;
 
-        let kernel = Self { db, ns: ns.to_string(), db_name: db_name.to_string() };
+        let kernel = Self {
+            db,
+            ns: ns.to_string(),
+            db_name: db_name.to_string(),
+            type_cache: Arc::new(OnceLock::new()),
+        };
+
+        // Phase 1: schema + seed run under root (embedded RocksDB default).
+        // This is the only operator-authorised root activity per skill §10.A.
         kernel.apply_substrate_schema().await?;
-        kernel.seed_metamodel().await?;
-        
+        let cache = kernel.seed_metamodel().await?;
+        kernel.type_cache
+            .set(cache)
+            .map_err(|_| KernelError::Init("type_cache already initialised".to_string()))?;
+
+        // Phase 2: switch to the `superx` service account for the entire
+        // remaining lifetime of this Kernel handle. Every subsequent verb
+        // touches the substrate as `superx` — engine-restricted to SELECT +
+        // CREATE only via per-table PERMISSIONS FOR update NONE; FOR delete NONE.
+        // Bound by skill §13.
+        let service_password = std::env::var("SUPERX_SERVICE_PASSWORD")
+            .unwrap_or_else(|_| "superx-v01-dev-x9KmP2nQ7tR3vW8y".to_string());
+        kernel.db
+            .signin(surrealdb::opt::auth::Database {
+                namespace: ns,
+                database: db_name,
+                username: "superx",
+                password: service_password.as_str(),
+            })
+            .await
+            .map_err(|e| KernelError::Init(format!("signin as `superx` failed: {e}")))?;
+
         assert!(kernel.db.health().await.is_ok(), "Substrate health check failed after init");
         Ok(kernel)
     }
@@ -205,8 +236,13 @@ impl Kernel {
         // we use the dev default that is also recorded in the skill so the
         // model knows what credentials to authenticate with.
         // CONTRACT: see .claude/skills/zero-trust-execution/SKILL.md §13.
+        //
+        // We escape any embedded `"` in the password before inlining into the
+        // DEFINE USER statement because SurrealDB requires `PASSWORD` to be a
+        // string literal — `$var` parameter binding is rejected inside DDL.
         let service_password = std::env::var("SUPERX_SERVICE_PASSWORD")
             .unwrap_or_else(|_| "superx-v01-dev-x9KmP2nQ7tR3vW8y".to_string());
+        let escaped_password = service_password.replace('\\', "\\\\").replace('"', "\\\"");
 
         // v2 schema — append-only, insert-only, fully cross-referenceable.
         // Every table has one temporal field (`valid_from`) — no `is_current`,
@@ -423,77 +459,148 @@ impl Kernel {
             DEFINE ACCESS IF NOT EXISTS tenant_access ON DATABASE TYPE RECORD
                 SIGNIN ( SELECT * FROM entity WHERE tenant.id = $tenant AND role = $role LIMIT 1 );
 
-            -- ====================================================================
-            -- Service account (the model's runtime user)
-            -- Login: `superx`
-            -- EDITOR role at the user level, narrowed by per-table PERMISSIONS
-            -- (`FOR update NONE; FOR delete NONE;` on every table above) so
-            -- the effective grant is SELECT + CREATE only — no UPDATE, no
-            -- DELETE, no schema mutation.
-            -- Credentials are documented in
-            --   .claude/skills/zero-trust-execution/SKILL.md §13
-            -- The operator may override the password via the
-            -- SUPERX_SERVICE_PASSWORD environment variable.
-            -- ====================================================================
-            DEFINE USER IF NOT EXISTS superx ON DATABASE
-                PASSWORD $superx_service_password
-                ROLES EDITOR
-                DURATION FOR SESSION 1h, FOR TOKEN 1h;
+            -- (Service account `superx` is defined in a separate statement
+            --  below — SurrealDB requires DEFINE USER PASSWORD to be a
+            --  literal, not a parameter, so the password is interpolated by
+            --  the kernel just before this schema applies. The contract is
+            --  binding even though the DEFINE statement itself is split out:
+            --  Login `superx`, EDITOR role, SELECT + CREATE only via the
+            --  per-table PERMISSIONS clauses above. See skill §13.)
         ";
-        // Apply schema. AlreadyExists errors are tolerated for idempotency on
-        // re-bootstrap; other errors propagate.
-        let _ = self.db.query(surql)
-            .bind(("superx_service_password", service_password))
-            .await;
+        // Apply the main schema first (tables + fields + indexes + accesses).
+        // AlreadyExists errors are tolerated for idempotency on re-bootstrap.
+        let _ = self.db.query(surql).await;
+
+        // Then define the service-account user with the password inlined.
+        // DEFINE USER does not accept $parameter binding for PASSWORD; the
+        // password is escaped above and inlined here as a string literal.
+        let define_user_sql = format!(
+            "DEFINE USER IF NOT EXISTS superx ON DATABASE \
+                PASSWORD \"{escaped_password}\" \
+                ROLES EDITOR \
+                DURATION FOR SESSION 1h, FOR TOKEN 1h;"
+        );
+        let _ = self.db.query(&define_user_sql).await;
+
         Ok(())
     }
 
-    async fn seed_metamodel(&self) -> Result<(), KernelError> {
-        let types = vec![
+    /// `seed_metamodel`: idempotently seeds the canonical `type_definition`
+    /// rows under the v2 schema (UUIDv7 ids + `uid` field).
+    ///
+    /// For each canonical type:
+    /// - SELECT existing row by `uid` (idempotent on re-bootstrap);
+    /// - if not found, CREATE with a fresh UUIDv7 id + the `uid` field;
+    /// - record the row's `Thing` in the returned cache.
+    ///
+    /// The returned `HashMap<uid, Thing>` is installed on `Kernel::type_cache`
+    /// at the end of [`Kernel::init`]. Every other kernel verb resolves
+    /// metamodel types via [`Kernel::type_thing`] so the substrate never
+    /// stores or queries by a named-string id ever again.
+    ///
+    /// Runs at init time under root context (schema apply + seed precede
+    /// any service-account `signin`).
+    ///
+    /// # Errors
+    /// Returns `KernelError::Database` if a SELECT or CREATE fails.
+    async fn seed_metamodel(&self) -> Result<HashMap<String, Thing>, KernelError> {
+        // Canonical metamodel: (uid, category, is_acyclic, sch_json, memory_tier)
+        let types: Vec<(&str, &str, bool, Option<&str>, &str)> = vec![
             // Core substrate identities
             ("node_substrate", "node", false, None, "core"),
-            ("node_agent", "node", false, None, "core"),
-            ("node_session", "node", false, None, "working"),
-            ("node_capability", "node", false, None, "core"),
-            ("node_tool", "node", false, None, "core"),
+            ("node_agent",     "node", false, None, "core"),
+            ("node_session",   "node", false, None, "working"),
+            ("node_capability","node", false, None, "core"),
+            ("node_tool",      "node", false, None, "core"),
             ("node_component", "node", false, None, "core"),
             ("node_hardened_model", "node", false, None, "working"),
+            // Execution-tier identities (new in v2 — typed FK targets)
+            ("node_run",       "node", false, None, "core"),
+            ("node_source",    "node", false, None, "core"),
             // Domain identities (ingested artifacts and cognitive products)
-            ("node_prod", "node", false, None, "working"),
-            ("node_code", "node", false, None, "working"),
-            ("node_code_root", "node", false, None, "working"),
-            ("node_artifact", "node", false, None, "working"),
-            ("node_proposal", "node", false, None, "working"),
-            ("node_harness", "node", false, None, "core"),
-            ("node_source_external", "node", false, None, "archival"),
-            ("node_rag_source", "node", false, None, "archival"),
-            // Attribute types (SCD-2 ledger payload shapes)
-            ("attr_desc", "attribute", false, Some("{\"type\":\"object\",\"required\":[\"text\"],\"properties\":{\"text\":{\"type\":\"string\",\"minLength\":1}}}"), "working"),
+            ("node_prod",          "node", false, None, "working"),
+            ("node_code",          "node", false, None, "working"),
+            ("node_code_root",     "node", false, None, "working"),
+            ("node_artifact",      "node", false, None, "working"),
+            ("node_proposal",      "node", false, None, "working"),
+            ("node_harness",       "node", false, None, "core"),
+            ("node_source_external","node", false, None, "archival"),
+            ("node_rag_source",    "node", false, None, "archival"),
+            // Attribute types (typed payloads on state_ledger writes)
+            ("attr_desc",   "attribute", false, Some("{\"type\":\"object\",\"required\":[\"text\"],\"properties\":{\"text\":{\"type\":\"string\",\"minLength\":1}}}"), "working"),
             ("attr_config", "attribute", false, None, "core"),
-            ("attr_score", "attribute", false, Some("{\"type\":\"object\",\"required\":[\"score\"],\"properties\":{\"score\":{\"type\":\"number\"}}}"), "working"),
+            ("attr_score",  "attribute", false, Some("{\"type\":\"object\",\"required\":[\"score\"],\"properties\":{\"score\":{\"type\":\"number\"}}}"), "working"),
             // Edge types (graph topology)
-            ("edge_owns", "edge", true, None, "working"),
-            ("edge_compiled_from", "edge", true, None, "working"),
-            ("edge_distilled_from", "edge", true, None, "working"),
-            ("edge_evaluates", "edge", false, None, "working"),
-            ("edge_promotes", "edge", true, None, "working"),
-            ("edge_implements", "edge", true, None, "core"),
-            ("edge_has_capability", "edge", false, None, "core"),
+            ("edge_owns",            "edge", true,  None, "working"),
+            ("edge_compiled_from",   "edge", true,  None, "working"),
+            ("edge_distilled_from",  "edge", true,  None, "working"),
+            ("edge_evaluates",       "edge", false, None, "working"),
+            ("edge_promotes",        "edge", true,  None, "working"),
+            ("edge_implements",      "edge", true,  None, "core"),
+            ("edge_has_capability",  "edge", false, None, "core"),
             ("edge_participates_in", "edge", false, None, "working"),
-            ("edge_semantic", "edge", false, None, "recall"),
+            ("edge_semantic",        "edge", false, None, "recall"),
         ];
 
+        let mut cache: HashMap<String, Thing> = HashMap::with_capacity(types.len());
+
         for (uid, cat, acyclic, sch, tier) in types {
-            let id = Thing::from(("type_definition".to_string(), uid.to_string()));
-            let _ = self.db.query("UPSERT $id SET category = $cat, is_acyclic = $acyc, sch_json = $sch, memory_tier = $tier")
-                .bind(("id", id))
-                .bind(("cat", cat.to_string()))
-                .bind(("acyc", acyclic))
-                .bind(("sch", sch.map(std::string::ToString::to_string)))
-                .bind(("tier", tier.to_string()))
-                .await?.check()?;
+            // 1. Look up existing row by uid (idempotent across re-bootstraps).
+            let mut select_res = self.db
+                .query("SELECT id FROM type_definition WHERE uid = $uid LIMIT 1")
+                .bind(("uid", uid.to_string()))
+                .await?;
+            let existing: Option<IdResult> = select_res.take::<Vec<IdResult>>(0)?.pop();
+
+            let id_thing = if let Some(row) = existing {
+                // Already seeded — reuse the existing Thing.
+                row.id
+            } else {
+                // Fresh seed: generate a UUIDv7 id and CREATE the row.
+                let new_uuid = ::uuid::Uuid::now_v7();
+                let new_id = Thing::from((
+                    "type_definition",
+                    surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(new_uuid)),
+                ));
+                self.db
+                    .query("CREATE type_definition CONTENT { id: $id, uid: $uid, category: $cat, is_acyclic: $acyc, sch_json: $sch, memory_tier: $tier }")
+                    .bind(("id", new_id.clone()))
+                    .bind(("uid", uid.to_string()))
+                    .bind(("cat", cat.to_string()))
+                    .bind(("acyc", acyclic))
+                    .bind(("sch", sch.map(std::string::ToString::to_string)))
+                    .bind(("tier", tier.to_string()))
+                    .await?
+                    .check()?;
+                new_id
+            };
+
+            cache.insert(uid.to_string(), id_thing);
         }
-        Ok(())
+
+        Ok(cache)
+    }
+
+    /// `type_thing`: resolve a canonical metamodel `uid` (e.g. `"node_substrate"`,
+    /// `"edge_owns"`, `"attr_desc"`) to its `Thing` reference in the substrate.
+    ///
+    /// This is the single chokepoint replacing the legacy
+    /// `Thing::from(("type_definition", "node_substrate"))` pattern. Under the
+    /// v2 schema, `type_definition` ids are UUIDv7; the human-readable name
+    /// lives in the `uid` column. Every kernel verb and every caller crate
+    /// resolves the FK target through this cache, never by name-id literal.
+    ///
+    /// # Errors
+    /// Returns `KernelError::Integrity` if the cache is uninitialised (only
+    /// possible if `type_thing` is called before `Kernel::init` completes) or
+    /// if the requested `uid` was not seeded.
+    pub fn type_thing(&self, uid: &str) -> Result<Thing, KernelError> {
+        let cache = self.type_cache.get().ok_or_else(|| {
+            KernelError::Integrity("type_cache not yet initialised — called before Kernel::init completed".to_string())
+        })?;
+        cache.get(uid).cloned().ok_or_else(|| {
+            KernelError::Integrity(format!("type_definition uid '{uid}' not in cache — missing from seed_metamodel?"))
+        })
     }
 
     /// `set_session_auth`: Set the `SurrealDB` session context using custom variables.
@@ -544,10 +651,25 @@ impl Kernel {
     }
 
     /// `get_parameter`: Dynamic lookup of safety/governance parameters from `state_ledger`.
+    ///
+    /// Resolves the metamodel types (`node_substrate`, `attr_config`) through
+    /// the `type_cache` instead of the legacy `type_definition:<name>` named-id
+    /// pattern. Uses recency ordering (`ORDER BY valid_from DESC LIMIT 1`)
+    /// instead of the dropped `is_current = true` filter.
     pub async fn get_parameter<T: for<'de> serde::Deserialize<'de>>(&self, key: &str, default: T) -> T {
-        let query = "SELECT value_json FROM state_ledger WHERE target.type = type_definition:node_substrate AND tenant_id = $session_tenant AND `type` = type_definition:attr_config AND is_current = true LIMIT 1";
-        
-        if let Ok(mut res) = self.db.query(query).await {
+        let (Ok(node_substrate), Ok(attr_config)) = (self.type_thing("node_substrate"), self.type_thing("attr_config")) else {
+            return default;
+        };
+
+        let query = "SELECT value_json FROM state_ledger \
+            WHERE target.type = $node_substrate AND `type` = $attr_config \
+            ORDER BY valid_from DESC LIMIT 1";
+
+        if let Ok(mut res) = self.db.query(query)
+            .bind(("node_substrate", node_substrate))
+            .bind(("attr_config", attr_config))
+            .await
+        {
             if let Ok(Some(row)) = res.take::<Vec<StateResult>>(0).map(|mut v| v.pop()) {
                 if let Some(val) = row.value_json {
                     if let Some(p) = val.get(key) {
@@ -578,68 +700,85 @@ impl Kernel {
         assert!(!target_id.is_empty(), "Target ID mandatory");
         assert!(!type_uid.is_empty(), "Type UID mandatory");
 
-        let session_tenant = self.get_session_tenant().await?;
-        let type_thing = Thing::from(("type_definition".to_string(), type_uid.to_string()));
+        // Resolve the attribute type through the metamodel cache.
+        // Under v2 the type_definition row id is UUIDv7; the human-readable
+        // `type_uid` (e.g. "attr_desc") resolves to a Thing via type_thing().
+        let type_thing = self.type_thing(type_uid)?;
         let target_thing = Self::parse_id(target_id)?;
-        
-        // 1. Atomic fetch of validation schema and target tenant
-        let fetch_query = "SELECT sch_json, (SELECT tenant_id FROM $target LIMIT 1)[0].tenant_id AS tenant FROM $id";
+        let session_tenant_str = self.get_session_tenant().await?;
+        let substrate_thing = self.type_thing("node_substrate")?;
+
+        // 1. Fetch the attribute type's JSON Schema (if any) + the target
+        //    entity's tenant. Tenant comes back as `record<entity>` under v2;
+        //    we read .id to get the UUIDv7 string for the cross-tenant check.
+        #[derive(serde::Deserialize)]
+        struct FetchV2 {
+            sch_json: Option<String>,
+            tenant_id: Option<String>,
+        }
+        let fetch_query = "SELECT \
+            (SELECT sch_json FROM $ty LIMIT 1)[0].sch_json AS sch_json, \
+            (SELECT tenant FROM $target LIMIT 1)[0].tenant.id AS tenant_id \
+            FROM { ty: $ty }";
         let mut fetch_res = self.db.query(fetch_query)
-            .bind(("id", type_thing.clone()))
+            .bind(("ty", type_thing.clone()))
             .bind(("target", target_thing.clone())).await?;
-        
-        let info: FetchResult = fetch_res.take::<Vec<FetchResult>>(0)?
+        let info: FetchV2 = fetch_res.take::<Vec<FetchV2>>(0)?
             .pop()
             .ok_or_else(|| KernelError::Validation(format!("Type {type_uid} not found")))?;
+        let target_tenant = info.tenant_id
+            .ok_or_else(|| KernelError::Validation(format!("Target {target_id} not found")))?;
 
-        let target_tenant = info.tenant.ok_or_else(|| KernelError::Validation(format!("Target {target_id} not found")))?;
-
-        // 2. Physical Isolation Check (Anti-Coercion)
-        if target_tenant != session_tenant {
-            return Err(KernelError::SafetyViolation(format!("Tenant mismatch: Entity belongs to {target_tenant}, session is {session_tenant}")));
+        // 2. Tenant-coercion guard.
+        if target_tenant != session_tenant_str {
+            return Err(KernelError::SafetyViolation(format!(
+                "Tenant mismatch: Entity belongs to {target_tenant}, session is {session_tenant_str}"
+            )));
         }
 
-        // 3. Real JSON Schema Validation
+        // 3. JSON-Schema validation at the write boundary.
         if let Some(schema_str) = info.sch_json {
-            let schema_val: serde_json::Value = serde_json::from_str(&schema_str).map_err(|e| KernelError::Validation(e.to_string()))?;
-            let schema = JSONSchema::compile(&schema_val).map_err(|e| KernelError::Validation(e.to_string()))?;
+            let schema_val: serde_json::Value = serde_json::from_str(&schema_str)
+                .map_err(|e| KernelError::Validation(e.to_string()))?;
+            let schema = JSONSchema::compile(&schema_val)
+                .map_err(|e| KernelError::Validation(e.to_string()))?;
             if !schema.is_valid(&value) {
                 return Err(KernelError::Validation(format!("Value fails validation for {type_uid}")));
             }
         }
 
-        // 4. Atomic SCD-2 Transition: Close old, open new.
-        // Native UUIDv7 id preserves the temporal ordering promised by ARCHITECTURE.md
-        // Invariant 2; SurrealDB's Id::Uuid round-trips without backtick escaping.
+        // 4. Pure-INSERT append. No UPDATE close-prior — under §10.B the
+        //    service account has no UPDATE privilege. "Current" is recovered
+        //    at query time via `ORDER BY valid_from DESC LIMIT 1` against
+        //    the (target, type) chain key.
         let state_record_id = Thing::from((
             "state_ledger",
             surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(::uuid::Uuid::now_v7())),
         ));
-        
-        let query = r"
-            BEGIN TRANSACTION;
-                UPDATE state_ledger SET is_current = false, valid_to = time::now()
-                WHERE target = $target AND `type` = $ty AND is_current = true;
+        // Tenant FK is a record<entity> per v2 schema. The kernel session-
+        // var $session_tenant holds the substrate-entity UUID string; we
+        // resolve it to a Thing here for the bind.
+        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
 
-                CREATE state_ledger CONTENT {
-                    id: $id,
-                    target: $target,
-                    `type`: $ty,
-                    tenant_id: $session_tenant,
-                    is_current: true,
-                    valid_from: time::now(),
-                    value_json: $val
-                };
-            COMMIT TRANSACTION;
-        ";
-        
-        self.db.query(query)
+        self.db.query(
+            "CREATE state_ledger CONTENT { \
+                id: $id, \
+                target: $target, \
+                `type`: $ty, \
+                tenant: $tenant, \
+                value_json: $val \
+            };"
+        )
             .bind(("id", state_record_id))
             .bind(("target", target_thing))
             .bind(("ty", type_thing))
+            .bind(("tenant", tenant_thing))
             .bind(("val", value)).await?.check()?;
 
-        // 5. Log to telemetry
+        // Suppress unused warning until tenant-coercion uses it.
+        let _ = substrate_thing;
+
+        // 5. Telemetry on every typed write.
         let _ = self.log_telemetry(
             serde_json::json!({"target": target_id, "type": type_uid}),
             "state_supersede",
