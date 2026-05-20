@@ -1192,218 +1192,221 @@ impl Kernel {
 
     /// `enqueue_schedule_item`: append a new pending work item to the `schedule`
     /// table in `status = 'waiting'`. Returns the row id (`schedule:<uuidv7>`)
-    /// so callers can refer to it from `depends_on` or pass it to
-    /// `transition_schedule_status`. Emits a `schedule_enqueued` telemetry event.
+    /// `enqueue_schedule_item`: append a new pending work item to the
+    /// `schedule` table in `status = 'waiting'`. Pure INSERT — the schedule
+    /// table is append-only under v2; status transitions are new rows in
+    /// the chain, not in-place mutations.
     ///
-    /// The `metadata` payload is opaque to the kernel — the consuming blade
-    /// (`RunnerBlade`) defines its shape. `depends_on` is a list of schedule
-    /// row ids (`schedule:<uuid>`); the runner is responsible for honouring it.
+    /// FKs are typed `record<entity>`:
+    /// - `run` must point at a `node_run` entity (engine ASSERT).
+    /// - `target` is any entity (the DAG-node being acted on).
+    /// - `tenant` resolved from the session's substrate Thing.
+    ///
+    /// `depends_on` is a list of `Thing` references into the `schedule`
+    /// table — the latest-by-`valid_from` row of each chain this item
+    /// depends on. The runner is responsible for honouring it.
+    ///
+    /// `metadata` is opaque to the kernel.
+    ///
+    /// Emits a `schedule_enqueued` telemetry event.
     ///
     /// # Panics
-    /// Panics if `run_id`, `kind`, or `target_entity` are empty.
+    /// Panics if `kind` is empty.
     ///
     /// # Errors
     /// Returns `KernelError::SafetyViolation` if no session is established;
-    /// `KernelError::Database` if the insert fails.
+    /// `KernelError::Database` if the engine refuses (e.g. an FK pointing
+    /// at the wrong entity type — that's the §12 debugging surface).
     pub async fn enqueue_schedule_item(
         &self,
-        run_id: &str,
+        run: Thing,
         kind: &str,
-        target_entity: &str,
+        target: Thing,
         due_at: chrono::DateTime<chrono::Utc>,
-        depends_on: Vec<String>,
+        depends_on: Vec<Thing>,
         metadata: serde_json::Value,
-    ) -> Result<String, KernelError> {
-        assert!(!run_id.is_empty(), "run_id mandatory");
+    ) -> Result<Thing, KernelError> {
         assert!(!kind.is_empty(), "kind mandatory");
-        assert!(!target_entity.is_empty(), "target_entity mandatory");
 
-        let _session_tenant = self.get_session_tenant().await?;
+        let session_tenant_str = self.get_session_tenant().await?;
+        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
 
-        let new_uuid = ::uuid::Uuid::now_v7();
         let row_id = Thing::from((
             "schedule",
-            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(new_uuid)),
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(::uuid::Uuid::now_v7())),
         ));
-        let row_id_str = format!("schedule:{new_uuid}");
 
-        let query = r"
-            CREATE schedule CONTENT {
-                id: $id,
-                run_id: $rid,
-                tenant_id: $session_tenant,
-                kind: $kind,
-                target_entity: $target,
-                due_at: <datetime> $due,
-                status: 'waiting',
-                attempt: 0,
-                depends_on: $deps,
-                metadata: $meta,
-                is_current: true,
-                valid_from: time::now()
-            };
-        ";
-
-        self.db.query(query)
-            .bind(("id", row_id))
-            .bind(("rid", run_id.to_string()))
+        self.db.query(
+            "CREATE schedule CONTENT { \
+                id: $id, \
+                run: $run, \
+                tenant: $tenant, \
+                kind: $kind, \
+                target: $target, \
+                due_at: <datetime> $due, \
+                status: 'waiting', \
+                attempt: 0, \
+                depends_on: $deps, \
+                metadata: $meta \
+            };"
+        )
+            .bind(("id", row_id.clone()))
+            .bind(("run", run.clone()))
+            .bind(("tenant", tenant_thing))
             .bind(("kind", kind.to_string()))
-            .bind(("target", target_entity.to_string()))
+            .bind(("target", target.clone()))
             .bind(("due", due_at.to_rfc3339()))
             .bind(("deps", depends_on))
-            .bind(("meta", metadata)).await?.check()?;
+            .bind(("meta", metadata))
+            .await?.check()?;
 
         let _ = self.log_telemetry(
-            serde_json::json!({"schedule_id": row_id_str, "run_id": run_id, "kind": kind, "target": target_entity}),
+            serde_json::json!({
+                "schedule_id": row_id.to_string(),
+                "run": run.to_string(),
+                "kind": kind,
+                "target": target.to_string()
+            }),
             "schedule_enqueued",
             None
         ).await;
 
-        Ok(row_id_str)
+        Ok(row_id)
     }
 
-    /// `transition_schedule_status`: SCD-2 status transition for a schedule item.
-    /// Closes the current row (`is_current = false`, `valid_to = now()`) and
-    /// inserts a fresh row with the new status, preserving all other fields
-    /// from the closed row — in one atomic transaction.
+    /// `transition_schedule_status`: append a new row to a schedule chain
+    /// with a new status. **Pure INSERT under v2** — the prior row is *not*
+    /// updated; "current" is always the latest-by-`valid_from` row in the
+    /// chain. The superx service account has no UPDATE privilege and
+    /// PERMISSIONS FOR update NONE would refuse it anyway.
     ///
-    /// Status transitions follow `waiting → scheduled → running → completed/failed`
-    /// (plus `awaiting_human` for HITL gates). The kernel does not validate the
-    /// transition graph — that's the `RunnerBlade`'s job — but every transition
-    /// emits a `schedule_transitioned` telemetry event with both states.
+    /// Reads the prior row to carry forward `run` / `kind` / `target` /
+    /// `due_at` / `attempt` / `depends_on` / `metadata`, changes only the
+    /// `status` field on the new row.
+    ///
+    /// Status transitions follow `waiting → scheduled → running →
+    /// completed/failed` (plus `awaiting_human` for HITL gates). The
+    /// `schedule.status` field's ASSERT INSIDE [...] clause enforces the
+    /// allowed values; the engine refuses any other.
+    ///
+    /// Emits a `schedule_transitioned` telemetry event with both states.
     ///
     /// # Panics
-    /// Panics if `schedule_id` or `new_status` is empty.
+    /// Panics if `new_status` is empty.
     ///
     /// # Errors
-    /// Returns `KernelError::SafetyViolation` if no session is established;
-    /// `KernelError::Validation` if the schedule row doesn't exist or isn't
-    /// current; `KernelError::Database` if the transaction fails.
+    /// Returns `KernelError::Validation` if no prior row exists for the
+    /// given chain id; `KernelError::Database` if the insert is refused.
     pub async fn transition_schedule_status(
         &self,
-        schedule_id: &str,
+        schedule_id: Thing,
         new_status: &str,
-    ) -> Result<String, KernelError> {
+    ) -> Result<Thing, KernelError> {
+        assert!(!new_status.is_empty(), "new_status mandatory");
+
         #[derive(serde::Deserialize)]
         struct CurrentRow {
-            run_id: String,
+            run: Thing,
             kind: String,
-            target_entity: String,
+            target: Thing,
             due_at: chrono::DateTime<chrono::Utc>,
             status: String,
             attempt: i64,
-            depends_on: Vec<String>,
+            depends_on: Vec<Thing>,
             metadata: serde_json::Value,
         }
 
-        assert!(!schedule_id.is_empty(), "schedule_id mandatory");
-        assert!(!new_status.is_empty(), "new_status mandatory");
+        let session_tenant_str = self.get_session_tenant().await?;
+        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
 
-        let _session_tenant = self.get_session_tenant().await?;
-
-        let sid_uuid_str = schedule_id.strip_prefix("schedule:").unwrap_or(schedule_id).to_string();
-        let sid_uuid = ::uuid::Uuid::parse_str(&sid_uuid_str)
-            .map_err(|e| KernelError::Validation(format!("schedule_id must be `schedule:<uuidv7>`, got {schedule_id}: {e}")))?;
-        let sid_thing = Thing::from((
-            "schedule",
-            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(sid_uuid)),
-        ));
-
-        let fetch = "SELECT run_id, kind, target_entity, due_at, status, attempt, depends_on, metadata \
-            FROM schedule WHERE id = $sid AND is_current = true AND tenant_id = $session_tenant LIMIT 1";
-
-        let mut res = self.db.query(fetch)
-            .bind(("sid", sid_thing.clone())).await?;
+        // 1. Fetch the latest row in the chain. The chain root is the
+        //    schedule_id the caller has in hand; from there we walk to the
+        //    most-recent successor by valid_from. For v0.1 we just read the
+        //    given row (chains are short; full chain-walk is later when
+        //    SchedulerBlade lands).
+        let mut res = self.db.query(
+            "SELECT run, kind, target, due_at, status, attempt, depends_on, metadata \
+             FROM schedule WHERE id = $sid \
+             ORDER BY valid_from DESC LIMIT 1"
+        )
+            .bind(("sid", schedule_id.clone()))
+            .await?;
         let current: CurrentRow = res.take::<Vec<CurrentRow>>(0)?
             .pop()
-            .ok_or_else(|| KernelError::Validation(format!("schedule item not found or not current: {schedule_id}")))?;
+            .ok_or_else(|| KernelError::Validation(format!(
+                "schedule item not found: {schedule_id}"
+            )))?;
 
         let prior_status = current.status.clone();
 
-        let new_uuid = ::uuid::Uuid::now_v7();
+        // 2. Pure INSERT — no UPDATE, no close-prior. The chain is
+        //    reconstructed at query time via ORDER BY valid_from.
         let new_row_id = Thing::from((
             "schedule",
-            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(new_uuid)),
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(::uuid::Uuid::now_v7())),
         ));
-        let new_row_id_str = format!("schedule:{new_uuid}");
 
-        let tx = r"
-            BEGIN TRANSACTION;
-                UPDATE schedule SET is_current = false, valid_to = time::now()
-                WHERE id = $sid AND is_current = true AND tenant_id = $session_tenant;
-
-                CREATE schedule CONTENT {
-                    id: $new_id,
-                    run_id: $rid,
-                    tenant_id: $session_tenant,
-                    kind: $kind,
-                    target_entity: $target,
-                    due_at: <datetime> $due,
-                    status: $new_status,
-                    attempt: $attempt,
-                    depends_on: $deps,
-                    metadata: $meta,
-                    is_current: true,
-                    valid_from: time::now()
-                };
-            COMMIT TRANSACTION;
-        ";
-
-        self.db.query(tx)
-            .bind(("sid", sid_thing))
-            .bind(("new_id", new_row_id))
-            .bind(("rid", current.run_id.clone()))
+        self.db.query(
+            "CREATE schedule CONTENT { \
+                id: $new_id, \
+                run: $run, \
+                tenant: $tenant, \
+                kind: $kind, \
+                target: $target, \
+                due_at: <datetime> $due, \
+                status: $new_status, \
+                attempt: $attempt, \
+                depends_on: $deps, \
+                metadata: $meta \
+            };"
+        )
+            .bind(("new_id", new_row_id.clone()))
+            .bind(("run", current.run.clone()))
+            .bind(("tenant", tenant_thing))
             .bind(("kind", current.kind))
-            .bind(("target", current.target_entity))
+            .bind(("target", current.target))
             .bind(("due", current.due_at.to_rfc3339()))
             .bind(("new_status", new_status.to_string()))
             .bind(("attempt", current.attempt))
             .bind(("deps", current.depends_on))
-            .bind(("meta", current.metadata)).await?.check()?;
+            .bind(("meta", current.metadata))
+            .await?.check()?;
 
         let _ = self.log_telemetry(
             serde_json::json!({
-                "schedule_id": schedule_id,
-                "new_schedule_id": new_row_id_str,
+                "schedule_id": schedule_id.to_string(),
+                "new_schedule_id": new_row_id.to_string(),
                 "prior_status": prior_status,
                 "new_status": new_status,
-                "run_id": current.run_id,
+                "run": current.run.to_string(),
             }),
             "schedule_transitioned",
             None
         ).await;
 
-        Ok(new_row_id_str)
+        Ok(new_row_id)
     }
 
-    /// `get_schedule_item`: returns the current row for a given schedule id as
-    /// a JSON object (or `None` if the row is missing / not current in the
-    /// caller's tenant). The JSON shape mirrors the substrate row exactly.
+    /// `get_schedule_item`: returns the latest-by-`valid_from` row for a
+    /// given schedule chain id (or `None` if no row exists). The JSON shape
+    /// mirrors the substrate row exactly.
     ///
-    /// # Panics
-    /// Panics if `schedule_id` is empty.
+    /// "Current" is the most recent row by `valid_from` — there is no
+    /// `is_current` filter under v2.
     ///
     /// # Errors
     /// Returns `KernelError::Database` if the query fails.
     pub async fn get_schedule_item(
         &self,
-        schedule_id: &str,
+        schedule_id: Thing,
     ) -> Result<Option<serde_json::Value>, KernelError> {
-        assert!(!schedule_id.is_empty(), "schedule_id mandatory");
-
-        let sid_uuid_str = schedule_id.strip_prefix("schedule:").unwrap_or(schedule_id).to_string();
-        let Ok(sid_uuid) = ::uuid::Uuid::parse_str(&sid_uuid_str) else {
-            return Ok(None);
-        };
-        let sid_thing = Thing::from((
-            "schedule",
-            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(sid_uuid)),
-        ));
-
-        let query = "SELECT run_id, kind, target_entity, due_at, status, attempt, depends_on, metadata, is_current, valid_from, valid_to \
-            FROM schedule WHERE id = $sid AND is_current = true AND tenant_id = $session_tenant LIMIT 1";
-
-        let mut res = self.db.query(query).bind(("sid", sid_thing)).await?;
+        let mut res = self.db.query(
+            "SELECT run, kind, target, due_at, status, attempt, depends_on, metadata, valid_from \
+             FROM schedule WHERE id = $sid \
+             ORDER BY valid_from DESC LIMIT 1"
+        )
+            .bind(("sid", schedule_id))
+            .await?;
         let row = res.take::<Vec<serde_json::Value>>(0)?.pop();
         Ok(row)
     }
