@@ -122,7 +122,14 @@ impl IngestionSource for FileSource {
                 }
             }
 
-            kernel.checkpoint_execution(run_id, "ingestion", Some(path_str.to_string()), None).await?;
+            // Cursor subject = the ingestion root entity. The cursor chain
+            // for this directory walk advances by file path as we traverse.
+            kernel.write_cursor(
+                root_thing.clone(),
+                "ingestion",
+                Some(path_str.to_string()),
+                Some(serde_json::json!({"run_id": run_id})),
+            ).await?;
         }
 
         Ok(format!("entity:{root_uid}"))

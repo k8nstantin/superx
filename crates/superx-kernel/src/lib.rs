@@ -143,6 +143,12 @@ pub struct Kernel {
     /// [`Kernel::type_thing`] — there is no named-id pattern (`type_definition:node_substrate`)
     /// in the substrate any more; ids are UUIDv7 and lookups go through the cache.
     type_cache: Arc<OnceLock<HashMap<String, Thing>>>,
+    /// Cache of `cursor_type` row ids keyed by their stable `uid` (e.g.,
+    /// `"ingestion"`, `"transcript"`). Populated once at the end of
+    /// [`Kernel::init`] from the seeded `cursor_type` rows. Every cursor
+    /// verb (`write_cursor`, `read_cursor`) resolves its categorisation
+    /// through this cache via [`Kernel::cursor_type_thing`].
+    cursor_type_cache: Arc<OnceLock<HashMap<String, Thing>>>,
 }
 
 #[derive(Deserialize)]
@@ -160,8 +166,8 @@ struct StateResult {
     value_json: Option<serde_json::Value>
 }
 
-/// Read-side projection of a `execution_cursor` row, returned by
-/// `Kernel::get_execution_cursor`. `last_processed` is the cursor token a
+/// Read-side projection of a `cursor` row, returned by
+/// [`Kernel::read_cursor`]. `last_processed` is the cursor token a
 /// resumer can hand back to the source (e.g. the last filesystem path
 /// ingested, or the last offset processed); `metadata` is an opaque JSON
 /// envelope the producer chose to attach.
@@ -194,6 +200,7 @@ impl Kernel {
             ns: ns.to_string(),
             db_name: db_name.to_string(),
             type_cache: Arc::new(OnceLock::new()),
+            cursor_type_cache: Arc::new(OnceLock::new()),
         };
 
         // Phase 1: schema + seed run under root (embedded RocksDB default).
@@ -203,6 +210,10 @@ impl Kernel {
         kernel.type_cache
             .set(cache)
             .map_err(|_| KernelError::Init("type_cache already initialised".to_string()))?;
+        let cursor_cache = kernel.seed_cursor_types().await?;
+        kernel.cursor_type_cache
+            .set(cursor_cache)
+            .map_err(|_| KernelError::Init("cursor_type_cache already initialised".to_string()))?;
 
         // Phase 2: switch to the `superx` service account for the entire
         // remaining lifetime of this Kernel handle. Every subsequent verb
@@ -595,6 +606,81 @@ impl Kernel {
         })?;
         cache.get(uid).cloned().ok_or_else(|| {
             KernelError::Integrity(format!("type_definition uid '{uid}' not in cache — missing from seed_metamodel?"))
+        })
+    }
+
+    /// `seed_cursor_types`: idempotently seeds the canonical `cursor_type`
+    /// rows for the v2 substrate. Categorises every cursor kind:
+    ///
+    /// - **workload** — `ingestion`, `compile_context`, `compile_proposal`
+    ///   (resume points for the kernel's existing workflow verbs).
+    /// - **telemetry** — `transcript`, `otlp`, `hook` (capture-source
+    ///   watermarks for the v0.1 multi-vector telemetry pipeline).
+    ///
+    /// Same SELECT-then-CREATE idempotency pattern as `seed_metamodel`.
+    /// Returns `HashMap<uid, Thing>` installed on `Kernel::cursor_type_cache`.
+    ///
+    /// Runs at init time under root (cursor_type PERMISSIONS FOR create
+    /// require admin role).
+    ///
+    /// # Errors
+    /// Returns `KernelError::Database` if a SELECT or CREATE fails.
+    async fn seed_cursor_types(&self) -> Result<HashMap<String, Thing>, KernelError> {
+        // (uid, category, description)
+        let kinds: Vec<(&str, &str, &str)> = vec![
+            ("ingestion",        "workload",  "Per-subject file/directory ingestion progress"),
+            ("compile_context",  "workload",  "Compiler context-distillation walk"),
+            ("compile_proposal", "workload",  "Compiler proposal-evaluation walk"),
+            ("transcript",       "telemetry", "Agent-transcript file-tail byte offset"),
+            ("otlp",             "telemetry", "OTLP receiver last-seen span id"),
+            ("hook",             "telemetry", "HTTP hook receiver delivery id"),
+        ];
+
+        let mut cache: HashMap<String, Thing> = HashMap::with_capacity(kinds.len());
+        for (uid, category, description) in kinds {
+            let mut select_res = self.db
+                .query("SELECT id FROM cursor_type WHERE uid = $uid LIMIT 1")
+                .bind(("uid", uid.to_string()))
+                .await?;
+            let existing: Option<IdResult> = select_res.take::<Vec<IdResult>>(0)?.pop();
+
+            let id_thing = if let Some(row) = existing {
+                row.id
+            } else {
+                let new_uuid = ::uuid::Uuid::now_v7();
+                let new_id = Thing::from((
+                    "cursor_type",
+                    surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(new_uuid)),
+                ));
+                self.db
+                    .query("CREATE cursor_type CONTENT { id: $id, uid: $uid, category: $cat, description: $desc, sch_json: NONE }")
+                    .bind(("id", new_id.clone()))
+                    .bind(("uid", uid.to_string()))
+                    .bind(("cat", category.to_string()))
+                    .bind(("desc", description.to_string()))
+                    .await?
+                    .check()?;
+                new_id
+            };
+            cache.insert(uid.to_string(), id_thing);
+        }
+        Ok(cache)
+    }
+
+    /// `cursor_type_thing`: resolve a canonical cursor-type `uid` (e.g.
+    /// `"ingestion"`, `"transcript"`) to its `Thing` reference. Single
+    /// chokepoint for the new `cursor.cursor_type` FK — never a named-id
+    /// literal.
+    ///
+    /// # Errors
+    /// Returns `KernelError::Integrity` if the cache is uninitialised or the
+    /// `uid` was not seeded.
+    pub fn cursor_type_thing(&self, uid: &str) -> Result<Thing, KernelError> {
+        let cache = self.cursor_type_cache.get().ok_or_else(|| {
+            KernelError::Integrity("cursor_type_cache not yet initialised — called before Kernel::init completed".to_string())
+        })?;
+        cache.get(uid).cloned().ok_or_else(|| {
+            KernelError::Integrity(format!("cursor_type uid '{uid}' not in cache — missing from seed_cursor_types?"))
         })
     }
 
@@ -1033,62 +1119,104 @@ impl Kernel {
         Ok(())
     }
 
-    /// `checkpoint_execution`: Atomic upsert of a resume-point.
+    /// `write_cursor`: append a new resume-point to the `cursor` chain for a
+    /// given `(subject, cursor_type)` tuple. Pure INSERT — the `cursor`
+    /// table is append-only under v2; every checkpoint is a fresh row and
+    /// "current" is recovered at query time via [`Kernel::read_cursor`].
     ///
-    /// # Panics
-    /// Panics if `run_id` is empty.
+    /// `subject` is a `record<entity>` Thing — the entity whose progress is
+    /// being tracked (a `node_run` for workload cursors, a `node_source`
+    /// for telemetry cursors, or any other entity the caller chooses).
+    ///
+    /// `cursor_type_uid` resolves through [`Kernel::cursor_type_thing`] to
+    /// the typed `record<cursor_type>` FK on the row.
+    ///
+    /// `last_processed` is the opaque cursor token; `metadata` is an
+    /// opaque JSON envelope. Shape per `cursor_type` is defined by the
+    /// consuming blade.
+    ///
+    /// Replaces the legacy `checkpoint_execution` verb (which UPSERTed into
+    /// the dropped `execution_cursor` table). Engine refuses UPDATE/UPSERT
+    /// under the superx service account.
+    ///
+    /// Emits a `cursor_write` telemetry event.
     ///
     /// # Errors
-    /// Returns `KernelError::Database` if upsert fails.
-    pub async fn checkpoint_execution(
+    /// `KernelError::Integrity` if `cursor_type_uid` is not in the cache;
+    /// `KernelError::SafetyViolation` if no session is established;
+    /// `KernelError::Database` if the engine refuses the insert.
+    pub async fn write_cursor(
         &self,
-        run_id: &str,
-        cursor_type: &str,
+        subject: Thing,
+        cursor_type_uid: &str,
         last_processed: Option<String>,
         metadata: Option<serde_json::Value>,
     ) -> Result<(), KernelError> {
-        assert!(!run_id.is_empty(), "Run ID mandatory");
+        let cursor_type_thing = self.cursor_type_thing(cursor_type_uid)?;
+        let session_tenant_str = self.get_session_tenant().await?;
+        let tenant_thing = Self::parse_id(&format!("entity:{session_tenant_str}"))?;
 
-        let cursor_id = Thing::from(("execution_cursor".to_string(), run_id.to_string()));
-        let query = r"
-            UPSERT $id CONTENT {
-                run_id: $run_id,
-                tenant_id: $session_tenant,
-                cursor_type: $cursor_type,
-                last_processed: $last_processed,
-                metadata: $metadata,
-                updated_at: time::now()
-            }
-        ";
-        self.db.query(query)
-            .bind(("id", cursor_id))
-            .bind(("run_id", run_id.to_string()))
-            .bind(("cursor_type", cursor_type.to_string()))
-            .bind(("last_processed", last_processed.clone()))
-            .bind(("metadata", metadata)).await?.check()?;
-        
+        let row_id = Thing::from((
+            "cursor",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(::uuid::Uuid::now_v7())),
+        ));
+
+        self.db.query(
+            "CREATE cursor CONTENT { \
+                id: $id, \
+                subject: $subject, \
+                tenant: $tenant, \
+                cursor_type: $ct, \
+                last_processed: $last, \
+                metadata: $meta \
+            };"
+        )
+            .bind(("id", row_id))
+            .bind(("subject", subject.clone()))
+            .bind(("tenant", tenant_thing))
+            .bind(("ct", cursor_type_thing))
+            .bind(("last", last_processed.clone()))
+            .bind(("meta", metadata))
+            .await?.check()?;
+
         let _ = self.log_telemetry(
-            serde_json::json!({"type": cursor_type, "last": last_processed}),
-            "execution_checkpoint",
+            serde_json::json!({
+                "subject": subject.to_string(),
+                "cursor_type": cursor_type_uid,
+                "last": last_processed
+            }),
+            "cursor_write",
             None
         ).await;
 
         Ok(())
     }
 
-    /// `get_execution_cursor`: Retrieve a resume-point.
+    /// `read_cursor`: read the latest cursor row in a chain (or `None` if
+    /// none exists). "Latest" is the most-recent row by `valid_from`
+    /// against the `(subject, cursor_type)` chain key. No `is_current`
+    /// filter — that field doesn't exist in v2.
     ///
-    /// # Panics
-    /// Panics if `run_id` is empty.
+    /// Replaces the legacy `get_execution_cursor` verb.
     ///
     /// # Errors
-    /// Returns `KernelError::Database` if query fails.
-    pub async fn get_execution_cursor(&self, run_id: &str) -> Result<Option<CursorResult>, KernelError> {
-        assert!(!run_id.is_empty(), "Run ID mandatory");
+    /// `KernelError::Integrity` if `cursor_type_uid` is not in the cache;
+    /// `KernelError::Database` if the query fails.
+    pub async fn read_cursor(
+        &self,
+        subject: Thing,
+        cursor_type_uid: &str,
+    ) -> Result<Option<CursorResult>, KernelError> {
+        let cursor_type_thing = self.cursor_type_thing(cursor_type_uid)?;
 
-        let query = "SELECT last_processed, metadata FROM execution_cursor WHERE run_id = $run_id AND tenant_id = $session_tenant LIMIT 1";
-        let mut res = self.db.query(query)
-            .bind(("run_id", run_id.to_string())).await?;
+        let mut res = self.db.query(
+            "SELECT last_processed, metadata FROM cursor \
+             WHERE subject = $subject AND cursor_type = $ct \
+             ORDER BY valid_from DESC LIMIT 1"
+        )
+            .bind(("subject", subject))
+            .bind(("ct", cursor_type_thing))
+            .await?;
 
         let cursor = res.take::<Vec<CursorResult>>(0)?.pop();
         Ok(cursor)
