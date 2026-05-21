@@ -39,17 +39,12 @@
 use superx_kernel::{Kernel, KernelError};
 use wasmtime::{Engine, Module, Store, Linker, Config};
 use serde_json::json;
-use surrealdb::sql::Thing;
 
 /// `MetaHarness`: The evaluation engine for verifiable system evolution.
 pub struct MetaHarness<'a> {
     pub kernel: &'a Kernel,
 }
 
-#[derive(serde::Deserialize)] 
-struct SubRes { 
-    target: Thing 
-}
 
 impl<'a> MetaHarness<'a> {
     /// Creates a new `MetaHarness`.
@@ -97,39 +92,50 @@ impl<'a> MetaHarness<'a> {
     /// Returns `KernelError::Validation` if `proposal_id` is malformed; `KernelError::Database`
     /// if the substrate query fails; `KernelError::Integrity` if the tenant substrate is missing.
     pub async fn promote(&self, proposal_id: &str, threshold: f64) -> Result<bool, KernelError> {
-        // 1. Fetch current score within SAME tenant. Parse the proposal id via the kernel
-        //    helper so we reject malformed inputs at the boundary rather than silently
-        //    constructing a phantom Thing.
-        let target_thing = Kernel::parse_id(proposal_id)?;
-        let query = "SELECT value_json, is_current, tenant_id FROM state_ledger WHERE target = $id AND `type` = type_definition:attr_score";
-        let mut res = self.kernel.db.query(query)
-            .bind(("id", target_thing.clone())).await?;
-        
-        let all_records: Vec<serde_json::Value> = res.take(0)?;
-        tracing::debug!("raw attr_score rows for {proposal_id}: {all_records:?}");
-
-        let mut score = 0.0;
-        for rec in all_records {
-            if rec.get("is_current").and_then(serde_json::Value::as_bool).unwrap_or(false) {
-                if let Some(val) = rec.get("value_json") {
-                    if let Some(s_val) = val.get("score").and_then(serde_json::Value::as_f64) {
-                        score = s_val;
-                        break;
-                    }
-                }
-            }
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct ScoreRow {
+            value_json: serde_json::Value,
+            valid_from: chrono::DateTime<chrono::Utc>,
         }
+
+        // 1. Fetch the proposal's current attr_score. Under v2 "current" is
+        //    the most-recent row by `valid_from` (no `is_current` column);
+        //    the type FK is a typed `record<type_definition>` Thing, not a
+        //    named-id literal; tenant is filtered by the schema PERMISSIONS
+        //    so no explicit `tenant_id` predicate is needed at the SELECT.
+        let target_thing = Kernel::parse_id(proposal_id)?;
+        let attr_score = self.kernel.type_thing("attr_score")?;
+
+        let mut res = self.kernel.db
+            .query("SELECT value_json, valid_from FROM state_ledger \
+                    WHERE target = $id AND `type` = $ty \
+                    ORDER BY valid_from DESC LIMIT 1")
+            .bind(("id", target_thing))
+            .bind(("ty", attr_score))
+            .await?;
+        let row = res.take::<Vec<ScoreRow>>(0)?.pop();
+        let score = row
+            .and_then(|r| r.value_json.get("score").and_then(serde_json::Value::as_f64))
+            .unwrap_or(0.0);
 
         if score >= threshold {
             tracing::info!("Proposal {proposal_id} passed threshold ({score} >= {threshold}). Promoting...");
-            
-            // 2. Resolve the tenant's substrate entity (UUIDv7) from the session
-            let sub_query = "SELECT target FROM state_ledger WHERE target.type = type_definition:node_substrate AND tenant_id = $session_tenant AND is_current = true LIMIT 1";
-            let mut sub_res = self.kernel.db.query(sub_query).await?;
-            let substrate = sub_res.take::<Vec<SubRes>>(0)?.pop().map(|r| r.target.to_string()).ok_or_else(|| KernelError::Integrity("Substrate entity not found for tenant session".into()))?;
 
-            // 3. Link proposal to the real substrate entity
-            self.kernel.create_structural_edge(proposal_id, &substrate, "edge_promotes").await?;
+            // 2. The substrate Thing is exactly the session's `$session_tenant`
+            //    — no extra query needed; the kernel's typed accessor returns
+            //    it directly.
+            let substrate_thing = self.kernel.session_tenant_thing().await?;
+            let substrate_id = match &substrate_thing.id {
+                surrealdb::sql::Id::Uuid(u) => format!("entity:{}", u.to_raw()),
+                surrealdb::sql::Id::String(s) => format!("entity:{s}"),
+                other => return Err(KernelError::Integrity(format!(
+                    "session substrate id has unexpected form: {other:?}"
+                ))),
+            };
+
+            // 3. Link proposal to the substrate entity via `edge_promotes`.
+            self.kernel.create_structural_edge(proposal_id, &substrate_id, "edge_promotes").await?;
             Ok(true)
         } else {
             tracing::info!("Proposal {proposal_id} failed threshold ({score} < {threshold}).");

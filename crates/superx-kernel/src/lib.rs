@@ -1695,6 +1695,19 @@ impl Kernel {
         &self,
         schedule_id: Thing,
     ) -> Result<Option<serde_json::Value>, KernelError> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            run: Thing,
+            kind: String,
+            target: Thing,
+            due_at: chrono::DateTime<chrono::Utc>,
+            status: String,
+            attempt: i64,
+            depends_on: Vec<Thing>,
+            metadata: serde_json::Value,
+            valid_from: chrono::DateTime<chrono::Utc>,
+        }
+
         let mut res = self.db.query(
             "SELECT run, kind, target, due_at, status, attempt, depends_on, metadata, valid_from \
              FROM schedule WHERE id = $sid \
@@ -1702,9 +1715,34 @@ impl Kernel {
         )
             .bind(("sid", schedule_id))
             .await?;
-        let row = res.take::<Vec<serde_json::Value>>(0)?.pop();
-        Ok(row)
+        let row = res.take::<Vec<Row>>(0)?.pop();
+        // Convert the strongly-typed row into a plain JSON object. `Thing`
+        // fields surface as `{"tb": "<table>", "id": "<uuid-string>"}` so
+        // callers can read them without a SurrealDB-specific schema.
+        Ok(row.map(|r| serde_json::json!({
+            "run":        thing_to_json(&r.run),
+            "kind":       r.kind,
+            "target":     thing_to_json(&r.target),
+            "due_at":     r.due_at,
+            "status":     r.status,
+            "attempt":    r.attempt,
+            "depends_on": r.depends_on.iter().map(thing_to_json).collect::<Vec<_>>(),
+            "metadata":   r.metadata,
+            "valid_from": r.valid_from,
+        })))
     }
+}
+
+/// Render a `Thing` as a plain JSON object — `{"tb": "<table>", "id":
+/// "<uuid-string>"}` — so callers receive a deserializer-friendly shape
+/// instead of `SurrealDB`'s internal enum form.
+fn thing_to_json(t: &Thing) -> serde_json::Value {
+    let id = match &t.id {
+        surrealdb::sql::Id::Uuid(u) => u.to_raw(),
+        surrealdb::sql::Id::String(s) => s.clone(),
+        other => format!("{other:?}"),
+    };
+    serde_json::json!({ "tb": t.tb, "id": id })
 }
 
 #[cfg(test)]
