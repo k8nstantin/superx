@@ -13,6 +13,7 @@ superx-emission = { path = "../superx-emission" }
 superx-proposer = { path = "../superx-proposer" }
 superx-bootstrap = { path = "../superx-bootstrap" }
 superx-agent = { path = "../superx-agent" }
+superx-runner = { path = "../superx-runner" }
 surrealdb.workspace = true
 tokio.workspace = true
 serde.workspace = true
