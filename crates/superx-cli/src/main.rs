@@ -19,6 +19,7 @@
 //! | `list-tools` | Enumerate registered tools for the tenant |
 //! | `demo` | One-shot bootstrap → ingest → propose → promote |
 //! | `stats` | Stream recent telemetry events |
+//! | `runner` | Long-running background daemon: consume due `schedule` rows |
 //!
 //! ## Telemetry-pipe lifetime
 //!
@@ -158,6 +159,17 @@ enum Commands {
         #[arg(short, long, default_value = "demo")]
         tenant: String,
     },
+    /// Long-running background daemon: consume due `schedule` rows and walk
+    /// them through the SCD-2 lifecycle. Pure mechanical executor — no
+    /// scheduling decisions (those live in the future `SchedulerBlade`).
+    /// Stop with Ctrl-C.
+    Runner {
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
+        tenant: String,
+        /// Interval between ticks in milliseconds.
+        #[arg(long, default_value = "1000")]
+        interval_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -211,7 +223,8 @@ fn get_command_tenant(cmd: &Commands) -> String {
         Commands::Identify { tenant, .. } |
         Commands::ListAgents { tenant } |
         Commands::ListTools { tenant } |
-        Commands::Demo { tenant } => tenant.clone(),
+        Commands::Demo { tenant } |
+        Commands::Runner { tenant, .. } => tenant.clone(),
     }
 }
 
@@ -284,6 +297,7 @@ async fn handle_command(cmd: Commands, kernel: Arc<Kernel>) -> Result<(), Box<dy
         Commands::ListAgents { tenant } => run_list_agents(&kernel, &tenant).await?,
         Commands::ListTools { tenant } => run_list_tools(&kernel, &tenant).await?,
         Commands::Demo { tenant } => run_demo(&kernel, &tenant).await?,
+        Commands::Runner { tenant, interval_ms } => run_runner(&kernel, &tenant, interval_ms).await?,
         Commands::Stats { tenant, limit } => {
             kernel.set_session_auth(&tenant, "user").await?;
             println!("Fetching latest {limit} telemetry events for {tenant}...");
@@ -301,6 +315,56 @@ async fn handle_command(cmd: Commands, kernel: Arc<Kernel>) -> Result<(), Box<dy
                 }
             }
             println!("------------------------");
+        }
+    }
+    Ok(())
+}
+
+/// Long-running daemon — consume due `schedule` rows in `tenant` and walk
+/// each chain through the SCD-2 lifecycle until Ctrl-C. The runner uses
+/// the same UUIDv5-substrate-id derivation `BootstrapBlade` uses, so the
+/// session binds to the substrate row that holds the schedule chains
+/// rather than to the bare tenant-name string.
+///
+/// Ships with the default `NoopDispatcher` for v0.1 — real tool dispatch
+/// (`CapabilityGovernor` + tool blades) plugs in via `Dispatcher` in a
+/// follow-up PR. The SCD-2 transition loop is fully exercised regardless.
+async fn run_runner(
+    kernel: &Kernel,
+    tenant: &str,
+    interval_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Derive the substrate Thing the same way bootstrap does, then bind
+    // the session to that substrate uuid — the schedule PERMISSIONS use
+    // `tenant = $session_tenant` (typed Thing compare).
+    let ns_uuid = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+        .expect("DNS namespace UUID is well-formed");
+    let substrate_uuid = uuid::Uuid::new_v5(&ns_uuid, tenant.as_bytes());
+    kernel.set_session_auth(&substrate_uuid.to_string(), "user").await?;
+
+    let runner = superx_runner::RunnerBlade::new(kernel);
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+    // The first tick fires immediately; from then on every `interval_ms`.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    println!(
+        "RunnerBlade started for tenant `{tenant}` (substrate {substrate_uuid}). \
+         Tick interval = {interval_ms}ms. Ctrl-C to stop."
+    );
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                match runner.tick().await {
+                    Ok(0) => { /* nothing due — stay quiet */ }
+                    Ok(n) => println!("tick: processed {n} schedule chain(s)"),
+                    Err(e) => eprintln!("tick error: {e}"),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("Ctrl-C received; runner stopping.");
+                break;
+            }
         }
     }
     Ok(())

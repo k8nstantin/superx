@@ -5533,6 +5533,7 @@ dependencies = [
  "superx-kernel",
  "superx-mcp",
  "superx-proposer",
+ "superx-runner",
  "surrealdb",
  "tempfile",
  "tokio",
