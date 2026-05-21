@@ -384,6 +384,52 @@ impl superx_runner::Dispatcher for KernelDispatcher {
                 let harness = superx_harness::MetaHarness::new(&self.kernel);
                 harness.promote(&target_id, threshold).await.map(|_| ())
             }
+            "ingest" => {
+                // Per ARCHITECTURE.md §8 ("schedule is a dumb queue"), the
+                // source path lives on the target entity (a `node_source_external`
+                // or similar source-typed node), not on the schedule row.
+                // The agent reads the current `attr_desc.text` to get the path.
+                #[derive(serde::Deserialize)]
+                #[allow(dead_code)]
+                struct DescRow {
+                    value_json: serde_json::Value,
+                    valid_from: chrono::DateTime<chrono::Utc>,
+                }
+                let attr_desc = self.kernel.type_thing("attr_desc")?;
+                let mut res = self
+                    .kernel
+                    .db
+                    .query(
+                        "SELECT value_json, valid_from FROM state_ledger \
+                         WHERE target = $t AND `type` = $ty \
+                         ORDER BY valid_from DESC LIMIT 1",
+                    )
+                    .bind(("t", target.clone()))
+                    .bind(("ty", attr_desc))
+                    .await?;
+                let row = res.take::<Vec<DescRow>>(0)?.pop().ok_or_else(|| {
+                    superx_kernel::KernelError::Validation(format!(
+                        "ingest dispatcher: target {target_id} has no \
+                         attr_desc — the file path must live there per \
+                         ARCHITECTURE.md §8"
+                    ))
+                })?;
+                let path = row
+                    .value_json
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        superx_kernel::KernelError::Validation(format!(
+                            "ingest dispatcher: target {target_id} \
+                             attr_desc.text is missing or not a string"
+                        ))
+                    })?
+                    .to_string();
+
+                let ingestor = superx_ingest::UniversalIngestor::new(&self.kernel);
+                let source = Box::new(superx_ingest::FileSource { path });
+                ingestor.ingest(source, &run_id).await.map(|_root_id| ())
+            }
             other => Err(superx_kernel::KernelError::Validation(format!(
                 "runner dispatcher: kind `{other}` not yet implemented — \
                  needs target-entity attr-resolution (ARCHITECTURE.md §8); \
