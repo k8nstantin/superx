@@ -1,0 +1,19 @@
+[package]
+name = "superx-dispatcher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+superx-kernel = { path = "../superx-kernel" }
+superx-runner = { path = "../superx-runner" }
+superx-agent = { path = "../superx-agent" }
+superx-compiler = { path = "../superx-compiler" }
+superx-harness = { path = "../superx-harness" }
+superx-ingest = { path = "../superx-ingest" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+surrealdb.workspace = true

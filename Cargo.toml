@@ -10,6 +10,7 @@ members = [
     "crates/superx-bootstrap",
     "crates/superx-agent",
     "crates/superx-runner",
+    "crates/superx-dispatcher",
     "crates/superx-cli",
     "crates/superx-mcp"
 ]

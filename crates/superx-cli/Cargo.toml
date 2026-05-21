@@ -14,6 +14,7 @@ superx-proposer = { path = "../superx-proposer" }
 superx-bootstrap = { path = "../superx-bootstrap" }
 superx-agent = { path = "../superx-agent" }
 superx-runner = { path = "../superx-runner" }
+superx-dispatcher = { path = "../superx-dispatcher" }
 surrealdb.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -22,10 +23,9 @@ clap = { version = "4.4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
 tempfile.workspace = true
-async-trait.workspace = true
-chrono.workspace = true
 
 [dev-dependencies]
 superx-mcp = { path = "../superx-mcp" }
+chrono.workspace = true
 wat = "1"
 wiremock = "0.6"

@@ -329,128 +329,6 @@ async fn handle_command(cmd: Commands, kernel: Arc<Kernel>) -> Result<(), Box<dy
     Ok(())
 }
 
-/// `KernelDispatcher` — the CLI's concrete `Dispatcher` impl. Routes
-/// schedule-row `kind` values to the appropriate tool blade after a
-/// `CapabilityGovernor::check_capability` gate.
-///
-/// v0.1 wiring handles only `kind = "compile"` because it is the simplest
-/// blade whose entire input shape (target entity + run id) is already
-/// present on the schedule row. Other kinds (`ingest`, `propose`,
-/// `evaluate`, `promote`) need their additional inputs (source path,
-/// peer entity, wasm bytes, threshold) resolved from the target
-/// entity's attribute ledger per ARCHITECTURE.md §8 — those land in
-/// follow-up PRs alongside the attr-resolution helpers they need.
-///
-/// Unknown kinds return `KernelError::Validation` so the runner records
-/// a clean `failed` transition with rationale in telemetry instead of
-/// silently misbehaving.
-struct KernelDispatcher {
-    kernel: Arc<Kernel>,
-    agent_id: String,
-}
-
-#[async_trait::async_trait]
-impl superx_runner::Dispatcher for KernelDispatcher {
-    async fn dispatch(
-        &self,
-        kind: &str,
-        target: &surrealdb::sql::Thing,
-        run: &surrealdb::sql::Thing,
-    ) -> Result<(), superx_kernel::KernelError> {
-        // Capability gate first — every dispatch is governor-checked.
-        let tool_uid = format!("tool_{kind}");
-        let gov = superx_agent::CapabilityGovernor::new(&self.kernel);
-        gov.check_capability(&self.agent_id, &tool_uid).await?;
-
-        // Render record-id literals at the dispatch boundary — the
-        // blades' v2 APIs all take `&str` record-id literals.
-        let target_id = thing_to_record_id_literal(target);
-        let run_id = thing_to_record_id_literal(run);
-
-        match kind {
-            "compile" => {
-                let compiler = superx_compiler::CompilerBlade::new(&self.kernel, None);
-                compiler.compile(&target_id, &run_id, None).await.map(|_xml| ())
-            }
-            "promote" => {
-                // Threshold comes from substrate `attr_config.promote_threshold`
-                // (bootstrap-seeded, operator-overridable). Per §9 the runtime
-                // policy decision lives in the parameter store, not as a
-                // hardcoded constant in dispatch code.
-                let threshold: f64 = self
-                    .kernel
-                    .get_parameter("promote_threshold", 0.8_f64)
-                    .await;
-                let harness = superx_harness::MetaHarness::new(&self.kernel);
-                harness.promote(&target_id, threshold).await.map(|_| ())
-            }
-            "ingest" => {
-                // Per ARCHITECTURE.md §8 ("schedule is a dumb queue"), the
-                // source path lives on the target entity (a `node_source_external`
-                // or similar source-typed node), not on the schedule row.
-                // The agent reads the current `attr_desc.text` to get the path.
-                #[derive(serde::Deserialize)]
-                #[allow(dead_code)]
-                struct DescRow {
-                    value_json: serde_json::Value,
-                    valid_from: chrono::DateTime<chrono::Utc>,
-                }
-                let attr_desc = self.kernel.type_thing("attr_desc")?;
-                let mut res = self
-                    .kernel
-                    .db
-                    .query(
-                        "SELECT value_json, valid_from FROM state_ledger \
-                         WHERE target = $t AND `type` = $ty \
-                         ORDER BY valid_from DESC LIMIT 1",
-                    )
-                    .bind(("t", target.clone()))
-                    .bind(("ty", attr_desc))
-                    .await?;
-                let row = res.take::<Vec<DescRow>>(0)?.pop().ok_or_else(|| {
-                    superx_kernel::KernelError::Validation(format!(
-                        "ingest dispatcher: target {target_id} has no \
-                         attr_desc — the file path must live there per \
-                         ARCHITECTURE.md §8"
-                    ))
-                })?;
-                let path = row
-                    .value_json
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        superx_kernel::KernelError::Validation(format!(
-                            "ingest dispatcher: target {target_id} \
-                             attr_desc.text is missing or not a string"
-                        ))
-                    })?
-                    .to_string();
-
-                let ingestor = superx_ingest::UniversalIngestor::new(&self.kernel);
-                let source = Box::new(superx_ingest::FileSource { path });
-                ingestor.ingest(source, &run_id).await.map(|_root_id| ())
-            }
-            other => Err(superx_kernel::KernelError::Validation(format!(
-                "runner dispatcher: kind `{other}` not yet implemented — \
-                 needs target-entity attr-resolution (ARCHITECTURE.md §8); \
-                 see follow-up PRs"
-            ))),
-        }
-    }
-}
-
-/// Render a `Thing` as its canonical `<table>:<uuid>` record-id literal
-/// without going through `Display` (which adds backtick escaping for
-/// hyphen-bearing UUIDs and breaks `Kernel::parse_id` round-trip).
-fn thing_to_record_id_literal(t: &surrealdb::sql::Thing) -> String {
-    let id = match &t.id {
-        surrealdb::sql::Id::Uuid(u) => u.to_raw(),
-        surrealdb::sql::Id::String(s) => s.clone(),
-        other => format!("{other:?}"),
-    };
-    format!("{}:{}", t.tb, id)
-}
-
 /// Long-running daemon — consume due `schedule` rows in `tenant` and walk
 /// each chain through the SCD-2 lifecycle until Ctrl-C. The runner uses
 /// the same UUIDv5-substrate-id derivation `BootstrapBlade` uses, so the
@@ -478,10 +356,7 @@ async fn run_runner(
     // Build the runner with whichever dispatcher matches the CLI flags.
     let dispatcher: std::sync::Arc<dyn superx_runner::Dispatcher> = if let Some(aid) = agent_id {
         println!("Dispatching via KernelDispatcher (agent_id={aid}).");
-        std::sync::Arc::new(KernelDispatcher {
-            kernel: kernel.clone(),
-            agent_id: aid,
-        })
+        std::sync::Arc::new(superx_dispatcher::KernelDispatcher::new(kernel.clone(), aid))
     } else {
         println!("Dispatching via NoopDispatcher (no --agent-id supplied).");
         std::sync::Arc::new(superx_runner::NoopDispatcher)
