@@ -5641,15 +5641,19 @@ dependencies = [
 name = "superx-mcp"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "chrono",
  "rmcp",
  "serde",
  "serde_json",
  "superx-agent",
  "superx-compiler",
  "superx-emission",
+ "superx-harness",
  "superx-ingest",
  "superx-kernel",
  "superx-runner",
+ "surrealdb",
  "tokio",
  "tracing",
  "tracing-subscriber",

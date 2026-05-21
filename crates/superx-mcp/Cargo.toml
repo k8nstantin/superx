@@ -18,6 +18,8 @@ superx-compiler = { path = "../superx-compiler" }
 superx-agent = { path = "../superx-agent" }
 superx-emission = { path = "../superx-emission" }
 superx-runner = { path = "../superx-runner" }
+superx-harness = { path = "../superx-harness" }
+surrealdb.workspace = true
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -25,3 +27,5 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
