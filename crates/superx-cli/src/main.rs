@@ -372,6 +372,18 @@ impl superx_runner::Dispatcher for KernelDispatcher {
                 let compiler = superx_compiler::CompilerBlade::new(&self.kernel, None);
                 compiler.compile(&target_id, &run_id, None).await.map(|_xml| ())
             }
+            "promote" => {
+                // Threshold comes from substrate `attr_config.promote_threshold`
+                // (bootstrap-seeded, operator-overridable). Per §9 the runtime
+                // policy decision lives in the parameter store, not as a
+                // hardcoded constant in dispatch code.
+                let threshold: f64 = self
+                    .kernel
+                    .get_parameter("promote_threshold", 0.8_f64)
+                    .await;
+                let harness = superx_harness::MetaHarness::new(&self.kernel);
+                harness.promote(&target_id, threshold).await.map(|_| ())
+            }
             other => Err(superx_kernel::KernelError::Validation(format!(
                 "runner dispatcher: kind `{other}` not yet implemented — \
                  needs target-entity attr-resolution (ARCHITECTURE.md §8); \

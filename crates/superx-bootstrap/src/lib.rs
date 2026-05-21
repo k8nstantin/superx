@@ -148,7 +148,8 @@ impl<'a> BootstrapBlade<'a> {
                 "max_traversal_depth": 10,
                 "max_ingestion_entries": 10_000,
                 "emission_enabled": true,
-                "data_scope": "all"
+                "data_scope": "all",
+                "promote_threshold": 0.8
             }),
             None
         ).await?;
