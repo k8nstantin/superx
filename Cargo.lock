@@ -5519,7 +5519,6 @@ dependencies = [
 name = "superx-cli"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "chrono",
  "clap",
  "serde",
@@ -5527,6 +5526,7 @@ dependencies = [
  "superx-agent",
  "superx-bootstrap",
  "superx-compiler",
+ "superx-dispatcher",
  "superx-emission",
  "superx-harness",
  "superx-inference",
@@ -5556,6 +5556,25 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "superx-dispatcher"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "superx-agent",
+ "superx-compiler",
+ "superx-harness",
+ "superx-ingest",
+ "superx-kernel",
+ "superx-runner",
+ "surrealdb",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5641,19 +5660,16 @@ dependencies = [
 name = "superx-mcp"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "chrono",
  "rmcp",
  "serde",
  "serde_json",
  "superx-agent",
  "superx-compiler",
+ "superx-dispatcher",
  "superx-emission",
- "superx-harness",
  "superx-ingest",
  "superx-kernel",
  "superx-runner",
- "surrealdb",
  "tokio",
  "tracing",
  "tracing-subscriber",
