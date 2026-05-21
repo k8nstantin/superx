@@ -5669,6 +5669,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "superx-runner"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "superx-kernel",
+ "surrealdb",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "surrealdb"
 version = "2.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -9,6 +9,7 @@ members = [
     "crates/superx-proposer",
     "crates/superx-bootstrap",
     "crates/superx-agent",
+    "crates/superx-runner",
     "crates/superx-cli",
     "crates/superx-mcp"
 ]
