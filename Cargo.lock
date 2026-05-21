@@ -5648,6 +5648,7 @@ dependencies = [
  "superx-emission",
  "superx-ingest",
  "superx-kernel",
+ "superx-runner",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -17,6 +17,7 @@ superx-ingest = { path = "../superx-ingest" }
 superx-compiler = { path = "../superx-compiler" }
 superx-agent = { path = "../superx-agent" }
 superx-emission = { path = "../superx-emission" }
+superx-runner = { path = "../superx-runner" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true
