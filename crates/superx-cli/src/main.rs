@@ -169,6 +169,13 @@ enum Commands {
         /// Interval between ticks in milliseconds.
         #[arg(long, default_value = "1000")]
         interval_ms: u64,
+        /// Agent record-id literal (`entity:<uuid>`) the runner dispatches as.
+        /// When set, the runner uses `CapabilityGovernor::check_capability`
+        /// then the appropriate tool blade for each dispatch. When unset,
+        /// the runner uses `NoopDispatcher` and only walks schedule rows
+        /// through the SCD-2 lifecycle (useful for smoke-testing the loop).
+        #[arg(long)]
+        agent_id: Option<String>,
     },
 }
 
@@ -297,7 +304,9 @@ async fn handle_command(cmd: Commands, kernel: Arc<Kernel>) -> Result<(), Box<dy
         Commands::ListAgents { tenant } => run_list_agents(&kernel, &tenant).await?,
         Commands::ListTools { tenant } => run_list_tools(&kernel, &tenant).await?,
         Commands::Demo { tenant } => run_demo(&kernel, &tenant).await?,
-        Commands::Runner { tenant, interval_ms } => run_runner(&kernel, &tenant, interval_ms).await?,
+        Commands::Runner { tenant, interval_ms, agent_id } => {
+            run_runner(kernel.clone(), &tenant, interval_ms, agent_id).await?;
+        }
         Commands::Stats { tenant, limit } => {
             kernel.set_session_auth(&tenant, "user").await?;
             println!("Fetching latest {limit} telemetry events for {tenant}...");
@@ -320,19 +329,85 @@ async fn handle_command(cmd: Commands, kernel: Arc<Kernel>) -> Result<(), Box<dy
     Ok(())
 }
 
+/// `KernelDispatcher` — the CLI's concrete `Dispatcher` impl. Routes
+/// schedule-row `kind` values to the appropriate tool blade after a
+/// `CapabilityGovernor::check_capability` gate.
+///
+/// v0.1 wiring handles only `kind = "compile"` because it is the simplest
+/// blade whose entire input shape (target entity + run id) is already
+/// present on the schedule row. Other kinds (`ingest`, `propose`,
+/// `evaluate`, `promote`) need their additional inputs (source path,
+/// peer entity, wasm bytes, threshold) resolved from the target
+/// entity's attribute ledger per ARCHITECTURE.md §8 — those land in
+/// follow-up PRs alongside the attr-resolution helpers they need.
+///
+/// Unknown kinds return `KernelError::Validation` so the runner records
+/// a clean `failed` transition with rationale in telemetry instead of
+/// silently misbehaving.
+struct KernelDispatcher {
+    kernel: Arc<Kernel>,
+    agent_id: String,
+}
+
+#[async_trait::async_trait]
+impl superx_runner::Dispatcher for KernelDispatcher {
+    async fn dispatch(
+        &self,
+        kind: &str,
+        target: &surrealdb::sql::Thing,
+        run: &surrealdb::sql::Thing,
+    ) -> Result<(), superx_kernel::KernelError> {
+        // Capability gate first — every dispatch is governor-checked.
+        let tool_uid = format!("tool_{kind}");
+        let gov = superx_agent::CapabilityGovernor::new(&self.kernel);
+        gov.check_capability(&self.agent_id, &tool_uid).await?;
+
+        // Render record-id literals at the dispatch boundary — the
+        // blades' v2 APIs all take `&str` record-id literals.
+        let target_id = thing_to_record_id_literal(target);
+        let run_id = thing_to_record_id_literal(run);
+
+        match kind {
+            "compile" => {
+                let compiler = superx_compiler::CompilerBlade::new(&self.kernel, None);
+                compiler.compile(&target_id, &run_id, None).await.map(|_xml| ())
+            }
+            other => Err(superx_kernel::KernelError::Validation(format!(
+                "runner dispatcher: kind `{other}` not yet implemented — \
+                 needs target-entity attr-resolution (ARCHITECTURE.md §8); \
+                 see follow-up PRs"
+            ))),
+        }
+    }
+}
+
+/// Render a `Thing` as its canonical `<table>:<uuid>` record-id literal
+/// without going through `Display` (which adds backtick escaping for
+/// hyphen-bearing UUIDs and breaks `Kernel::parse_id` round-trip).
+fn thing_to_record_id_literal(t: &surrealdb::sql::Thing) -> String {
+    let id = match &t.id {
+        surrealdb::sql::Id::Uuid(u) => u.to_raw(),
+        surrealdb::sql::Id::String(s) => s.clone(),
+        other => format!("{other:?}"),
+    };
+    format!("{}:{}", t.tb, id)
+}
+
 /// Long-running daemon — consume due `schedule` rows in `tenant` and walk
 /// each chain through the SCD-2 lifecycle until Ctrl-C. The runner uses
 /// the same UUIDv5-substrate-id derivation `BootstrapBlade` uses, so the
 /// session binds to the substrate row that holds the schedule chains
 /// rather than to the bare tenant-name string.
 ///
-/// Ships with the default `NoopDispatcher` for v0.1 — real tool dispatch
-/// (`CapabilityGovernor` + tool blades) plugs in via `Dispatcher` in a
-/// follow-up PR. The SCD-2 transition loop is fully exercised regardless.
+/// When `agent_id` is supplied, dispatches through `KernelDispatcher`
+/// (capability-gated, real tool blades). Otherwise falls back to
+/// `NoopDispatcher` — the SCD-2 transition loop is fully exercised
+/// either way.
 async fn run_runner(
-    kernel: &Kernel,
+    kernel: Arc<Kernel>,
     tenant: &str,
     interval_ms: u64,
+    agent_id: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Derive the substrate Thing the same way bootstrap does, then bind
     // the session to that substrate uuid — the schedule PERMISSIONS use
@@ -342,7 +417,19 @@ async fn run_runner(
     let substrate_uuid = uuid::Uuid::new_v5(&ns_uuid, tenant.as_bytes());
     kernel.set_session_auth(&substrate_uuid.to_string(), "user").await?;
 
-    let runner = superx_runner::RunnerBlade::new(kernel);
+    // Build the runner with whichever dispatcher matches the CLI flags.
+    let dispatcher: std::sync::Arc<dyn superx_runner::Dispatcher> = if let Some(aid) = agent_id {
+        println!("Dispatching via KernelDispatcher (agent_id={aid}).");
+        std::sync::Arc::new(KernelDispatcher {
+            kernel: kernel.clone(),
+            agent_id: aid,
+        })
+    } else {
+        println!("Dispatching via NoopDispatcher (no --agent-id supplied).");
+        std::sync::Arc::new(superx_runner::NoopDispatcher)
+    };
+    let runner = superx_runner::RunnerBlade::with_dispatcher(&kernel, dispatcher);
+
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
     // The first tick fires immediately; from then on every `interval_ms`.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

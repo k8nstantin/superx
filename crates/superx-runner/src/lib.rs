@@ -72,22 +72,39 @@ pub trait Dispatcher: Send + Sync {
     /// capability via `CapabilityGovernor`, dispatch to the named tool
     /// blade, write artifacts back to the substrate as superseded state.
     ///
+    /// Receives the schedule row's typed `kind` plus the `target` and
+    /// `run` `Thing` FKs. Implementations are free to ignore any of
+    /// these (e.g. the [`NoopDispatcher`]) but the trait surface is
+    /// stable so concrete dispatchers don't break their `RunnerBlade`
+    /// integration when the runner adds context.
+    ///
     /// # Errors
     /// Returns any `KernelError` raised by the underlying dispatch
     /// path. The runner translates an `Err` into a `failed` schedule
     /// transition; an `Ok(())` into `completed`.
-    async fn dispatch(&self, kind: &str, target: &Thing) -> Result<(), KernelError>;
+    async fn dispatch(
+        &self,
+        kind: &str,
+        target: &Thing,
+        run: &Thing,
+    ) -> Result<(), KernelError>;
 }
 
-/// Default dispatcher used until the real wiring lands in task #19. Logs
-/// the dispatch at INFO and returns `Ok(())` — useful for tests that
-/// exercise the SCD-2 loop without depending on a tool registry.
+/// Default dispatcher — logs the dispatch at INFO and returns `Ok(())`.
+/// Useful for tests that exercise the SCD-2 loop without depending on a
+/// tool registry, and for CLI/MCP boot paths where the operator hasn't
+/// yet supplied an agent identity for capability-checked dispatch.
 pub struct NoopDispatcher;
 
 #[async_trait]
 impl Dispatcher for NoopDispatcher {
-    async fn dispatch(&self, kind: &str, target: &Thing) -> Result<(), KernelError> {
-        tracing::info!("noop dispatch: kind={kind} target={target}");
+    async fn dispatch(
+        &self,
+        kind: &str,
+        target: &Thing,
+        run: &Thing,
+    ) -> Result<(), KernelError> {
+        tracing::info!("noop dispatch: kind={kind} target={target} run={run}");
         Ok(())
     }
 }
@@ -190,13 +207,14 @@ impl<'a> RunnerBlade<'a> {
             .transition_schedule_status(scheduled, "running")
             .await?;
 
-        let outcome_status = match self.dispatcher.dispatch(&head.kind, &head.target).await {
+        let outcome_status = match self.dispatcher.dispatch(&head.kind, &head.target, &head.run).await {
             Ok(()) => "completed",
             Err(e) => {
                 tracing::warn!(
-                    "dispatch failed for kind={} target={}: {e}",
+                    "dispatch failed for kind={} target={} run={}: {e}",
                     head.kind,
-                    head.target
+                    head.target,
+                    head.run
                 );
                 "failed"
             }
@@ -399,7 +417,12 @@ mod tests {
         }
         #[async_trait]
         impl Dispatcher for FailingDispatcher {
-            async fn dispatch(&self, _kind: &str, _target: &Thing) -> Result<(), KernelError> {
+            async fn dispatch(
+                &self,
+                _kind: &str,
+                _target: &Thing,
+                _run: &Thing,
+            ) -> Result<(), KernelError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Err(KernelError::Validation("synthetic dispatch error".into()))
             }
