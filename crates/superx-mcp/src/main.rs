@@ -9,7 +9,8 @@
 //! rmcp transport. This file is *only* runtime concerns:
 //!
 //! - environment-variable configuration (`SUPERX_DB_PATH`, `SUPERX_NS`,
-//!   `SUPERX_DB_NAME`, `SUPERX_TENANT`, `SUPERX_KAFKA_*`, `SUPERX_EMISSION_API`)
+//!   `SUPERX_DB_NAME`, `SUPERX_TENANT`, `SUPERX_KAFKA_*`, `SUPERX_EMISSION_API`,
+//!   `SUPERX_RUNNER_INTERVAL_MS`)
 //! - tracing init with `RUST_LOG` honored via `EnvFilter`
 //! - background-task lifecycle with error logging (no silent failures)
 //!
@@ -76,6 +77,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Err(e) = k_pulse.pulse().await {
                 tracing::error!("pulse emission failed: {e}");
+            }
+        }
+    });
+
+    // 3. RunnerBlade — consume due `schedule` rows on a configurable cadence.
+    //    The session is re-bound to the tenant's substrate uuid (not the human
+    //    tenant name) on every tick so interleaved `dispatch_tool` / pulse
+    //    session changes can't clobber the runner's view of `$session_tenant`
+    //    across tick boundaries. Tick errors log but don't tear down the loop.
+    //    Ships with the default `NoopDispatcher` in v0.1; the real
+    //    `CapabilityGovernor` + tool-blade dispatch plugs in via the
+    //    `Dispatcher` trait in a follow-up PR.
+    let k_run = kernel.clone();
+    let r_tenant = tenant.clone();
+    let runner_interval_ms: u64 = std::env::var("SUPERX_RUNNER_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    tokio::spawn(async move {
+        let ns_uuid = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+            .expect("DNS namespace UUID is well-formed");
+        let substrate_uuid = uuid::Uuid::new_v5(&ns_uuid, r_tenant.as_bytes()).to_string();
+        let runner = superx_runner::RunnerBlade::new(&k_run);
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(runner_interval_ms));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(e) = k_run.set_session_auth(&substrate_uuid, "user").await {
+                tracing::error!("runner session bind failed: {e}");
+                continue;
+            }
+            match runner.tick().await {
+                Ok(0) => { /* nothing due — stay quiet */ }
+                Ok(n) => tracing::info!("runner: processed {n} schedule chain(s)"),
+                Err(e) => tracing::error!("runner tick error: {e}"),
             }
         }
     });
