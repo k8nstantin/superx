@@ -100,6 +100,59 @@ async fn kernel_seeds_metamodel_creates_entity_and_logs_telemetry_end_to_end(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recent_telemetry_returns_events_newest_first() -> Result<(), Box<dyn Error>> {
+    let db = connect("mem://").await?;
+    db.use_ns(TEST_NS).use_db(TEST_DB).await?;
+    let ddl = SCHEMA_DDL.replace("$SUPERX_SERVICE_PASSWORD", TEST_SERVICE_PASSWORD);
+    db.query(ddl).await?.check()?;
+    db.signin(Database {
+        namespace: TEST_NS.to_string(),
+        database: TEST_DB.to_string(),
+        username: "superx".to_string(),
+        password: TEST_SERVICE_PASSWORD.to_string(),
+    })
+    .await?;
+
+    let kernel = Kernel::from_db(db);
+
+    // Empty substrate — no telemetry yet.
+    let events_empty = kernel.recent_telemetry(25).await?;
+    assert!(events_empty.is_empty(), "fresh substrate must have no telemetry");
+
+    // Seed + create + log produces a chain of events.
+    kernel.seed_metamodel().await?;
+    let _run = kernel.create_entity("node_run", "admin").await?;
+    let _agent = kernel.create_entity("node_agent", "user").await?;
+    let mut payload = surrealdb::types::Object::new();
+    payload.insert(
+        "phase".to_string(),
+        surrealdb::types::Value::String("manual".to_string()),
+    );
+    let _ = kernel
+        .log_telemetry(
+            "system_pulse",
+            surrealdb::types::Value::Object(payload),
+            None,
+        )
+        .await?;
+
+    // recent_telemetry returns the chain newest-first.
+    let events = kernel.recent_telemetry(25).await?;
+    assert!(
+        events.len() >= 4,
+        "expected at least 4 events: metamodel_seeded + 2 entity_created + 1 system_pulse, got {}",
+        events.len()
+    );
+    assert_eq!(events[0].lifecycle_event, "system_pulse");
+
+    // Limit clamps the row count.
+    let events_limited = kernel.recent_telemetry(2).await?;
+    assert_eq!(events_limited.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_entity_refuses_unknown_type_uid() -> Result<(), Box<dyn Error>> {
     let db = connect("mem://").await?;
     db.use_ns(TEST_NS).use_db(TEST_DB).await?;

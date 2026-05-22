@@ -17,5 +17,5 @@ pub mod kernel;
 pub mod schema;
 
 pub use error::{KernelError, Result};
-pub use kernel::Kernel;
+pub use kernel::{Kernel, TelemetryRecord};
 pub use schema::SCHEMA_DDL;
