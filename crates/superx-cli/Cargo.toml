@@ -22,10 +22,10 @@ serde_json.workspace = true
 clap = { version = "4.4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
+chrono.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
 superx-mcp = { path = "../superx-mcp" }
-chrono.workspace = true
 wat = "1"
 wiremock = "0.6"

@@ -20,6 +20,8 @@
 //! | `demo` | One-shot bootstrap → ingest → propose → promote |
 //! | `stats` | Stream recent telemetry events |
 //! | `runner` | Long-running background daemon: consume due `schedule` rows |
+//! | `enqueue` | Add a `schedule` row for the runner to pick up |
+//! | `schedule-list` | Show every schedule chain's current state |
 //!
 //! ## Telemetry-pipe lifetime
 //!
@@ -159,6 +161,38 @@ enum Commands {
         #[arg(short, long, default_value = "demo")]
         tenant: String,
     },
+    /// Enqueue a `schedule` row for the runner to pick up. Outputs the
+    /// resulting schedule chain's record-id literal on stdout. The target
+    /// entity must already exist and (for kinds requiring per-target
+    /// attrs like `ingest`) be populated with the relevant attribute
+    /// rows before enqueueing.
+    Enqueue {
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
+        tenant: String,
+        /// Schedule kind. Routed by `KernelDispatcher` — currently
+        /// `compile`, `promote`, `ingest`.
+        #[arg(short, long)]
+        kind: String,
+        /// Target entity (`entity:<uuid>` record-id literal).
+        #[arg(long)]
+        target: String,
+        /// Run entity (`entity:<uuid>` record-id literal). If omitted,
+        /// a fresh `node_run` is created under the tenant.
+        #[arg(long)]
+        run: Option<String>,
+        /// JSON metadata blob to attach to the schedule row's `metadata`
+        /// field. Defaults to `{}`.
+        #[arg(long, default_value = "{}")]
+        metadata: String,
+    },
+    /// List the current state of every schedule chain in the tenant —
+    /// one line per chain showing its latest status row.
+    ScheduleList {
+        #[arg(short, long, default_value = DEFAULT_TENANT)]
+        tenant: String,
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
     /// Long-running background daemon: consume due `schedule` rows and walk
     /// them through the SCD-2 lifecycle. Pure mechanical executor — no
     /// scheduling decisions (those live in the future `SchedulerBlade`).
@@ -231,7 +265,9 @@ fn get_command_tenant(cmd: &Commands) -> String {
         Commands::ListAgents { tenant } |
         Commands::ListTools { tenant } |
         Commands::Demo { tenant } |
-        Commands::Runner { tenant, .. } => tenant.clone(),
+        Commands::Runner { tenant, .. } |
+        Commands::Enqueue { tenant, .. } |
+        Commands::ScheduleList { tenant, .. } => tenant.clone(),
     }
 }
 
@@ -304,6 +340,12 @@ async fn handle_command(cmd: Commands, kernel: Arc<Kernel>) -> Result<(), Box<dy
         Commands::ListAgents { tenant } => run_list_agents(&kernel, &tenant).await?,
         Commands::ListTools { tenant } => run_list_tools(&kernel, &tenant).await?,
         Commands::Demo { tenant } => run_demo(&kernel, &tenant).await?,
+        Commands::Enqueue { tenant, kind, target, run, metadata } => {
+            run_enqueue(&kernel, &tenant, &kind, &target, run.as_deref(), &metadata).await?;
+        }
+        Commands::ScheduleList { tenant, limit } => {
+            run_schedule_list(&kernel, &tenant, limit).await?;
+        }
         Commands::Runner { tenant, interval_ms, agent_id } => {
             run_runner(kernel.clone(), &tenant, interval_ms, agent_id).await?;
         }
@@ -325,6 +367,160 @@ async fn handle_command(cmd: Commands, kernel: Arc<Kernel>) -> Result<(), Box<dy
             }
             println!("------------------------");
         }
+    }
+    Ok(())
+}
+
+/// Enqueue a `schedule` row. The operator hands the runner a typed unit
+/// of work to dispatch. The handler binds the session to the tenant's
+/// substrate, optionally provisions a fresh `node_run` entity, then
+/// calls `Kernel::enqueue_schedule_item` with the typed Things the
+/// kernel verb requires.
+async fn run_enqueue(
+    kernel: &Kernel,
+    tenant: &str,
+    kind: &str,
+    target: &str,
+    run: Option<&str>,
+    metadata_json: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ns_uuid = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+        .expect("DNS namespace UUID is well-formed");
+    let substrate_uuid = uuid::Uuid::new_v5(&ns_uuid, tenant.as_bytes());
+    kernel
+        .set_session_auth(&substrate_uuid.to_string(), "admin")
+        .await?;
+
+    let target_thing = Kernel::parse_id(target)?;
+
+    // Resolve or create the run entity. Operators that already have a
+    // run can pass `--run entity:<uuid>`; otherwise a fresh `node_run`
+    // is provisioned so the schedule row's `run` FK has a valid target.
+    let run_thing = if let Some(run_id) = run {
+        Kernel::parse_id(run_id)?
+    } else {
+        let run_uuid = uuid::Uuid::now_v7();
+        let run_thing = surrealdb::sql::Thing::from((
+            "entity",
+            surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(run_uuid)),
+        ));
+        let node_run = kernel.type_thing("node_run")?;
+        let tenant_thing = kernel.session_tenant_thing().await?;
+        kernel
+            .db
+            .query(
+                "CREATE entity CONTENT { \
+                    id: $id, type: $type, tenant: $tenant, role: 'user' \
+                }",
+            )
+            .bind(("id", run_thing.clone()))
+            .bind(("type", node_run))
+            .bind(("tenant", tenant_thing))
+            .await?
+            .check()?;
+        println!("Provisioned fresh node_run: entity:{run_uuid}");
+        run_thing
+    };
+
+    let metadata: serde_json::Value = serde_json::from_str(metadata_json)
+        .map_err(|e| format!("--metadata is not valid JSON: {e}"))?;
+
+    let sid = kernel
+        .enqueue_schedule_item(
+            run_thing,
+            kind,
+            target_thing,
+            chrono::Utc::now(),
+            vec![],
+            metadata,
+        )
+        .await?;
+
+    // Render the schedule id as the canonical literal so the operator
+    // can pass it into follow-up CLI calls.
+    let sid_literal = match &sid.id {
+        surrealdb::sql::Id::Uuid(u) => format!("schedule:{}", u.to_raw()),
+        surrealdb::sql::Id::String(s) => format!("schedule:{s}"),
+        other => format!("schedule:{other:?}"),
+    };
+    println!("Enqueued: {sid_literal} (kind={kind}, target={target})");
+    Ok(())
+}
+
+/// Print one line per schedule chain in the tenant showing the chain's
+/// current state (most-recent row by `valid_from`).
+async fn run_schedule_list(
+    kernel: &Kernel,
+    tenant: &str,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Row {
+        run: surrealdb::sql::Thing,
+        kind: String,
+        target: surrealdb::sql::Thing,
+        status: String,
+        attempt: i64,
+        valid_from: chrono::DateTime<chrono::Utc>,
+    }
+
+    let ns_uuid = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+        .expect("DNS namespace UUID is well-formed");
+    let substrate_uuid = uuid::Uuid::new_v5(&ns_uuid, tenant.as_bytes());
+    kernel
+        .set_session_auth(&substrate_uuid.to_string(), "admin")
+        .await?;
+
+    // Per-run dedupe in SQL would need a self-join; simpler to scan
+    // rows ordered by (run, valid_from DESC) and dedupe by run in Rust.
+    let mut res = kernel
+        .db
+        .query(
+            "SELECT run, kind, target, status, attempt, valid_from \
+             FROM schedule WHERE tenant = $session_tenant \
+             ORDER BY run ASC, valid_from DESC",
+        )
+        .await?;
+    let rows: Vec<Row> = res.take(0)?;
+
+    let mut seen_runs = std::collections::HashSet::new();
+    let mut printed = 0_usize;
+    println!(
+        "{:<30} {:<12} {:<14} {:>3} {:<32} VALID_FROM",
+        "RUN", "KIND", "STATUS", "ATT", "TARGET"
+    );
+    for r in rows {
+        let key = r.run.to_string();
+        if !seen_runs.insert(key) {
+            continue;
+        }
+        if printed >= limit {
+            break;
+        }
+        let run_id = match &r.run.id {
+            surrealdb::sql::Id::Uuid(u) => u.to_raw(),
+            surrealdb::sql::Id::String(s) => s.clone(),
+            other => format!("{other:?}"),
+        };
+        let target_id = match &r.target.id {
+            surrealdb::sql::Id::Uuid(u) => u.to_raw(),
+            surrealdb::sql::Id::String(s) => s.clone(),
+            other => format!("{other:?}"),
+        };
+        println!(
+            "{:<30} {:<12} {:<14} {:>3} {:<32} {}",
+            &run_id[..run_id.len().min(28)],
+            r.kind,
+            r.status,
+            r.attempt,
+            &target_id[..target_id.len().min(30)],
+            r.valid_from.format("%Y-%m-%dT%H:%M:%SZ"),
+        );
+        printed += 1;
+    }
+    if printed == 0 {
+        println!("(no schedule chains in tenant `{tenant}`)");
     }
     Ok(())
 }
