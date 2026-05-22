@@ -1,0 +1,280 @@
+name: skill-audit
+
+# Independent gate that enforces the bright-line rules of the
+# zero-trust-execution skill on every push and every pull request.
+#
+# This workflow is configured as a REQUIRED CHECK on `main` in repo
+# branch-protection settings — merge is blocked until it passes. The
+# model has no permission to modify branch protection; only the
+# repository owner can.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # --------------------------------------------------------------------
+  # Bright-line audit. Runs the unified Python script. Fails the build on
+  # any §9 / §10 / §11 / §13 / §14 / quality / arch / observability rule.
+  # --------------------------------------------------------------------
+  bright-line:
+    name: Bright-line skill rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run skill audit (bright-line rules + service-account checks)
+        # `--skip-drift` is in place only until the rebuild lands an
+        # `apply_substrate_schema` implementation that matches
+        # SUPERX_SCHEMA.md. Drop the flag in the PR that introduces
+        # the kernel's schema-apply path.
+        run: python3 tools/skill_audit.py --skip-drift --no-color
+
+  # --------------------------------------------------------------------
+  # Schema-drift detector. Informational at install time (the workspace
+  # is empty post-burn so the doc-side DDL has nothing to match yet).
+  # Promoted to required-check status once the rebuild adds DDL.
+  # --------------------------------------------------------------------
+  schema-drift:
+    name: Schema drift (SUPERX_SCHEMA.md vs apply_substrate_schema)
+    runs-on: ubuntu-latest
+    continue-on-error: true  # informational until rebuild lands DDL
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run full audit including schema-drift
+        run: python3 tools/skill_audit.py --no-color
+
+  # --------------------------------------------------------------------
+  # §7 schema-immutability gate. Any diff touching schema-defining files
+  # must declare `Operator-approved: …` in the PR body. The model cannot
+  # forge this — the PR body is set by the operator at PR-creation time
+  # and CI inspects the actual GitHub payload.
+  # --------------------------------------------------------------------
+  schema-immutability:
+    name: §7 schema change requires operator approval
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect schema-touching diff
+        id: detect
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if git diff --name-only "$base..$head" \
+              | grep -qE '(SUPERX_SCHEMA\.md|apply_substrate_schema|seed_metamodel)'; then
+            echo "schema_touched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "schema_touched=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require Operator-approved marker when schema is touched
+        if: steps.detect.outputs.schema_touched == 'true'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ -z "${PR_BODY:-}" ] || ! grep -q 'Operator-approved:' <<<"$PR_BODY"; then
+            echo "❌ §7: this PR touches schema-defining files but the PR body"
+            echo "    does not include an 'Operator-approved: …' marker."
+            echo "    Per skill §7, every schema change requires explicit, prior"
+            echo "    per-change permission from the operator. Add the marker to"
+            echo "    the PR body — e.g."
+            echo "        Operator-approved: YES — 2026-05-22 — add attr_X for FVP"
+            exit 1
+          fi
+          echo "✅ §7: Operator-approved marker present in PR body."
+
+  # --------------------------------------------------------------------
+  # Skill-immutability gate. Identical pattern for the skill text itself.
+  # --------------------------------------------------------------------
+  skill-immutability:
+    name: Skill text change requires operator approval
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect skill-touching diff
+        id: detect
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if git diff --name-only "$base..$head" \
+              | grep -qE '^\.claude/skills/'; then
+            echo "skill_touched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skill_touched=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require Operator-approved marker when skill is touched
+        if: steps.detect.outputs.skill_touched == 'true'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ -z "${PR_BODY:-}" ] || ! grep -q 'Operator-approved:' <<<"$PR_BODY"; then
+            echo "❌ Skill edit: this PR modifies .claude/skills/ but the PR"
+            echo "    body does not include an 'Operator-approved: …' marker."
+            echo "    The skill is operator-only territory. Add the marker."
+            exit 1
+          fi
+          echo "✅ Skill edit: Operator-approved marker present in PR body."
+
+  # --------------------------------------------------------------------
+  # PR-body skill-checklist enforcement.
+  #
+  # Per the experienced-dev review of the audit tool, every PR must
+  # include an explicit "Skill compliance" block in the description so
+  # the agent has to consciously answer the bright-line questions
+  # before opening the PR. CI parses the PR body and fails if any
+  # required answer is missing or unanswered.
+  #
+  # The block must look like:
+  #
+  #   ## Skill compliance
+  #   - §7 schema touched?    no
+  #   - §11 UUIDv7 only?      yes
+  #   - §9 hardcoded values?  no
+  #   - §10 SELECT+CREATE only? yes
+  #   - §13 superx-only auth? yes
+  #   - §14 typed throughout? yes
+  #   - §3 architecture change? no
+  #
+  # "yes" / "no" / "exception (<rule-id>: <rationale>)" / "Operator-approved: …"
+  # are the only accepted answers; any other value or a missing line fails.
+  # --------------------------------------------------------------------
+  pr-body-checklist:
+    name: PR body must include Skill-compliance checklist
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Validate Skill-compliance block
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          required=(
+              "§7 schema touched"
+              "§11 UUIDv7 only"
+              "§9 hardcoded values"
+              "§10 SELECT+CREATE only"
+              "§13 superx-only auth"
+              "§14 typed throughout"
+              "§3 architecture change"
+          )
+
+          if [ -z "${PR_BODY:-}" ]; then
+              echo "❌ PR body is empty. The Skill-compliance block is required."
+              exit 1
+          fi
+
+          if ! grep -q "Skill compliance" <<<"$PR_BODY"; then
+              echo "❌ PR body is missing the '## Skill compliance' section."
+              echo "   Add the block per .github/workflows/skill-audit.yml comments."
+              exit 1
+          fi
+
+          missing=0
+          for q in "${required[@]}"; do
+              # Each question must appear AND be followed (on the same line)
+              # by a non-empty answer.
+              line=$(grep -F "$q" <<<"$PR_BODY" || true)
+              if [ -z "$line" ]; then
+                  echo "❌ missing checklist line: '$q'"
+                  missing=$((missing + 1))
+                  continue
+              fi
+              # Extract what follows the '?' on that line.
+              answer=$(sed -E 's/.*\?\s*//' <<<"$line" | tr -d '[:space:]')
+              if [ -z "$answer" ]; then
+                  echo "❌ unanswered checklist line: '$q'"
+                  missing=$((missing + 1))
+              fi
+          done
+
+          if [ "$missing" -gt 0 ]; then
+              echo
+              echo "❌ Skill-compliance checklist incomplete: $missing question(s)."
+              exit 1
+          fi
+
+          echo "✅ Skill-compliance checklist complete."
+
+  # --------------------------------------------------------------------
+  # Mandate-5 gate (§5). Runs only when there's Rust code to test —
+  # the workspace doesn't exist yet at burn time, so we skip if there
+  # is no Cargo.toml. Once the rebuild puts a workspace back, this
+  # gate fires on every PR.
+  # --------------------------------------------------------------------
+  mandate-5-tests:
+    name: §5 cargo test --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if no workspace yet
+        id: precheck
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "has_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ No Cargo.toml at repo root — workspace not yet rebuilt; skipping."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.precheck.outputs.has_workspace == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        if: steps.precheck.outputs.has_workspace == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace
+        if: steps.precheck.outputs.has_workspace == 'true'
+        run: cargo test --workspace
+
+  mandate-5-clippy:
+    name: §5 cargo clippy -- -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if no workspace yet
+        id: precheck
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "has_workspace=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_workspace=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ No Cargo.toml at repo root — workspace not yet rebuilt; skipping."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.precheck.outputs.has_workspace == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        if: steps.precheck.outputs.has_workspace == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy --all-targets --all-features -- -D warnings
+        if: steps.precheck.outputs.has_workspace == 'true'
+        run: cargo clippy --all-targets --all-features -- -D warnings
