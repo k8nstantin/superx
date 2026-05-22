@@ -17,7 +17,8 @@
 //! | `identify` | Agent handshake; returns a session uid |
 //! | `list-agents` | Enumerate registered agents for the tenant |
 //! | `list-tools` | Enumerate registered tools for the tenant |
-//! | `demo` | One-shot bootstrap → ingest → propose → promote |
+//! | `demo` | One-shot bootstrap → ingest → propose → promote (direct API) |
+//! | `runner-demo` | Same end-to-end flow but driven via schedule queue + runner |
 //! | `stats` | Stream recent telemetry events |
 //! | `runner` | Long-running background daemon: consume due `schedule` rows |
 //! | `enqueue` | Add a `schedule` row for the runner to pick up |
@@ -161,6 +162,20 @@ enum Commands {
         #[arg(short, long, default_value = "demo")]
         tenant: String,
     },
+    /// End-to-end demo that drives the pipeline through the SCHEDULE
+    /// QUEUE + RUNNER (not the direct-API path). Bootstraps a tenant,
+    /// creates a source-typed entity pointing at a temp fixture,
+    /// enqueues a `kind=ingest` schedule row, ticks the runner with
+    /// the real `KernelDispatcher` until the chain completes (or a
+    /// safety bound trips), then prints the final chain state. Proves
+    /// the full operator-facing pipeline works end-to-end.
+    RunnerDemo {
+        #[arg(short, long, default_value = "runner_demo")]
+        tenant: String,
+        /// Max ticks before giving up — bounded loop per NASA Rule 2.
+        #[arg(long, default_value = "10")]
+        max_ticks: u32,
+    },
     /// Enqueue a `schedule` row for the runner to pick up. Outputs the
     /// resulting schedule chain's record-id literal on stdout. The target
     /// entity must already exist and (for kinds requiring per-target
@@ -267,7 +282,8 @@ fn get_command_tenant(cmd: &Commands) -> String {
         Commands::Demo { tenant } |
         Commands::Runner { tenant, .. } |
         Commands::Enqueue { tenant, .. } |
-        Commands::ScheduleList { tenant, .. } => tenant.clone(),
+        Commands::ScheduleList { tenant, .. } |
+        Commands::RunnerDemo { tenant, .. } => tenant.clone(),
     }
 }
 
@@ -340,6 +356,9 @@ async fn handle_command(cmd: Commands, kernel: Arc<Kernel>) -> Result<(), Box<dy
         Commands::ListAgents { tenant } => run_list_agents(&kernel, &tenant).await?,
         Commands::ListTools { tenant } => run_list_tools(&kernel, &tenant).await?,
         Commands::Demo { tenant } => run_demo(&kernel, &tenant).await?,
+        Commands::RunnerDemo { tenant, max_ticks } => {
+            run_runner_demo(kernel.clone(), &tenant, max_ticks).await?;
+        }
         Commands::Enqueue { tenant, kind, target, run, metadata } => {
             run_enqueue(&kernel, &tenant, &kind, &target, run.as_deref(), &metadata).await?;
         }
@@ -368,6 +387,157 @@ async fn handle_command(cmd: Commands, kernel: Arc<Kernel>) -> Result<(), Box<dy
             println!("------------------------");
         }
     }
+    Ok(())
+}
+
+/// `runner-demo`: full end-to-end pipeline driven through the schedule
+/// queue + runner. The most operator-facing demonstration of the v0.1
+/// runtime: every step happens via the same kernel verbs and dispatcher
+/// the daemon process uses in production.
+///
+/// Lives as one function — clippy's 100-line cap doesn't fit a demo
+/// that wires bootstrap + entity provisioning + enqueue + tick loop in
+/// the right order. Splitting it would just scatter the demo's
+/// narrative across helpers operators have to follow back and forth.
+#[allow(clippy::too_many_lines)]
+async fn run_runner_demo(
+    kernel: std::sync::Arc<Kernel>,
+    tenant: &str,
+    max_ticks: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+
+    #[derive(serde::Deserialize)]
+    struct IdRow { id: surrealdb::sql::Thing }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct StatusRow {
+        status: String,
+        valid_from: chrono::DateTime<chrono::Utc>,
+    }
+
+    println!("=== SuperX Runner Demo (tenant=`{tenant}`) ===");
+
+    // 1. Bootstrap — provisions substrate, seeds admin agents + 5 tools,
+    //    grants edge_has_capability so the dispatch path is admissible.
+    println!("[1/5] Bootstrapping tenant…");
+    let _substrate_id = superx_bootstrap::BootstrapBlade::new(&kernel).run(tenant).await?;
+
+    // 2. Locate one bootstrap-seeded admin agent — the runner will
+    //    dispatch as this identity. system_controller + gemini_cli are
+    //    both seeded with full tool capability.
+    let node_agent = kernel.type_thing("node_agent")?;
+    let mut res = kernel.db
+        .query("SELECT id FROM entity WHERE type = $ty AND role = 'admin' \
+                AND tenant = $session_tenant LIMIT 1")
+        .bind(("ty", node_agent))
+        .await?;
+    let admin_thing = res.take::<Vec<IdRow>>(0)?
+        .pop()
+        .ok_or("no admin agent after bootstrap")?
+        .id;
+    let admin_id = format!(
+        "entity:{}",
+        match admin_thing.id {
+            surrealdb::sql::Id::Uuid(u) => u.to_raw(),
+            surrealdb::sql::Id::String(s) => s,
+            other => format!("{other:?}"),
+        }
+    );
+    println!("      admin agent: {admin_id}");
+
+    // 3. Create a source-typed entity with attr_desc pointing at a temp
+    //    fixture file. This is the §8 pattern: the schedule row carries
+    //    only the entity id; the agent reads the path from the entity's
+    //    attr ledger at dispatch time.
+    println!("[2/5] Provisioning source entity + fixture…");
+    let fixture = tempfile::tempdir()?;
+    let fixture_path = fixture.path().join("payload.txt");
+    std::fs::write(&fixture_path, "runner demo payload — exercises the ingest dispatch path")?;
+    let source_uuid = uuid::Uuid::now_v7();
+    let source_thing = surrealdb::sql::Thing::from((
+        "entity",
+        surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(source_uuid)),
+    ));
+    let source_id = format!("entity:{source_uuid}");
+    let node_source = kernel.type_thing("node_source_external")?;
+    let tenant_thing = kernel.session_tenant_thing().await?;
+    kernel.db
+        .query("CREATE entity CONTENT { \
+            id: $id, type: $type, tenant: $tenant, role: 'user' \
+        }")
+        .bind(("id", source_thing.clone()))
+        .bind(("type", node_source))
+        .bind(("tenant", tenant_thing))
+        .await?.check()?;
+    kernel.supersede_state(
+        &source_id,
+        "attr_desc",
+        serde_json::json!({"text": fixture.path().to_string_lossy().to_string()}),
+        None,
+    ).await?;
+    println!("      source: {source_id}");
+    println!("      fixture: {}", fixture.path().display());
+
+    // 4. Enqueue an ingest schedule row + provision a node_run.
+    println!("[3/5] Enqueueing ingest schedule item…");
+    let run_uuid = uuid::Uuid::now_v7();
+    let run_thing = surrealdb::sql::Thing::from((
+        "entity",
+        surrealdb::sql::Id::Uuid(surrealdb::sql::Uuid::from(run_uuid)),
+    ));
+    let node_run = kernel.type_thing("node_run")?;
+    let tenant_thing = kernel.session_tenant_thing().await?;
+    kernel.db
+        .query("CREATE entity CONTENT { \
+            id: $id, type: $type, tenant: $tenant, role: 'user' \
+        }")
+        .bind(("id", run_thing.clone()))
+        .bind(("type", node_run))
+        .bind(("tenant", tenant_thing))
+        .await?.check()?;
+    let _sid = kernel.enqueue_schedule_item(
+        run_thing.clone(),
+        "ingest",
+        source_thing,
+        chrono::Utc::now(),
+        vec![],
+        serde_json::json!({}),
+    ).await?;
+    println!("      run: entity:{run_uuid}");
+
+    // 5. Build the real KernelDispatcher and tick until the chain
+    //    completes (or max_ticks trips per NASA Rule 2 bounded loop).
+    println!("[4/5] Ticking RunnerBlade with KernelDispatcher…");
+    let dispatcher: Arc<dyn superx_runner::Dispatcher> = Arc::new(
+        superx_dispatcher::KernelDispatcher::new(kernel.clone(), admin_id.clone())
+    );
+    let runner = superx_runner::RunnerBlade::with_dispatcher(&kernel, dispatcher);
+    let mut tick_count = 0_u32;
+    let final_status = loop {
+        if tick_count >= max_ticks {
+            break "<max_ticks tripped>".to_string();
+        }
+        let processed = runner.tick().await?;
+        tick_count += 1;
+        println!("      tick {tick_count}: processed {processed} chain(s)");
+
+        // Peek the chain's current status.
+        let mut res = kernel.db
+            .query("SELECT status, valid_from FROM schedule \
+                    WHERE run = $run AND tenant = $session_tenant \
+                    ORDER BY valid_from DESC LIMIT 1")
+            .bind(("run", run_thing.clone()))
+            .await?;
+        let latest: Option<StatusRow> = res.take::<Vec<StatusRow>>(0)?.pop();
+        let status = latest.map_or_else(|| "<no row>".to_string(), |r| r.status);
+        if matches!(status.as_str(), "completed" | "failed") {
+            break status;
+        }
+    };
+
+    println!("[5/5] Final chain status: {final_status}");
+    println!("=== Done ===");
     Ok(())
 }
 
