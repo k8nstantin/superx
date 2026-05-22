@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/superx-kernel"]
+members = [
+    "crates/superx-kernel",
+    "crates/superx-cli",
+]
 
 [workspace.package]
 edition      = "2021"
@@ -18,6 +21,9 @@ rust-version = "1.83"
 # server speaks; production deployments point the kernel at a `ws://`
 # or `wss://` URL.
 surrealdb  = { version = "3", default-features = false, features = ["protocol-ws", "kv-mem"] }
+
+# Operator-facing CLI.
+clap = { version = "4", features = ["derive", "env"] }
 
 # Std-adjacent toolkit.
 chrono     = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
