@@ -17,6 +17,12 @@ pub enum KernelError {
     /// JSON serialization error when shaping a payload for a kernel verb.
     #[error("json serialization error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A SELECT lookup expected at least one row and got none — e.g.
+    /// [`crate::Kernel::find_type`] was asked for a `type_definition`
+    /// row by uid and no row with that uid exists in the substrate.
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, KernelError>;
