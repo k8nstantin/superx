@@ -12,17 +12,6 @@
 -- `Operator-approved: …` marker in the PR body that touches this file.
 -- See .claude/skills/zero-trust-execution/SKILL.md §7 (Schema Immutability).
 --
--- Authority:
---   * Field list + types — SUPERX_SCHEMA.md (per-table sections).
---   * Cross-reference FKs + ASSERTs — SUPERX_SCHEMA.md
---     ("Cross-reference graph" table).
---   * Enum-style value-domain ASSERTs — SUPERX_SCHEMA.md
---     ("Additional enum-style ASSERTs" table).
---   * NOT-NULL / option<> contract — SUPERX_SCHEMA.md
---     ("NOT NULL contract" table).
---   * Service-account model — SUPERX_SCHEMA.md ("Database users + access")
---     and SKILL.md §10 / §13.
---
 -- Workflow contract:
 --   1. Operator applies this file ONCE under root account.
 --   2. Model code signs in as `superx` (EDITOR role) for everything
@@ -32,6 +21,14 @@
 --      system users; the append-only invariant is enforced by KERNEL-VERB
 --      DISCIPLINE — no kernel verb emits UPDATE or DELETE statements,
 --      ever. See SKILL.md §10 (Database Account Separation).
+--
+-- Deployment model:
+--   SuperX v0.1 is a SINGLE GLOBAL AGENTIC OS — one installation, one
+--   operator, telemetry global across everything. No multi-tenant
+--   isolation at the data layer. If multi-customer SaaS isolation is
+--   added in a future release, it lands as a separate schema PR with
+--   explicit operator approval. Until then, every table is global and
+--   every kernel verb writes without a tenant FK.
 --
 -- Substitution:
 --   `$SUPERX_SERVICE_PASSWORD` (below) is replaced by `envsubst` in
@@ -44,11 +41,6 @@
 -- -------------------------------------------------------------------------
 -- Service-account user — the model's only credential after schema deploy.
 -- -------------------------------------------------------------------------
---
--- SurrealDB built-in roles are OWNER / EDITOR / VIEWER. EDITOR is the
--- narrowest that allows row creation. Per-table PERMISSIONS narrow the
--- intended grant to SELECT + CREATE (documentation; see workflow contract
--- above for actual enforcement).
 DEFINE USER IF NOT EXISTS superx ON DATABASE
     PASSWORD '$SUPERX_SERVICE_PASSWORD'
     ROLES EDITOR
@@ -59,12 +51,11 @@ DEFINE USER IF NOT EXISTS superx ON DATABASE
 -- type_definition — the metamodel
 -- =========================================================================
 -- Global registry of every entity / edge / attribute type known to the
--- substrate. Not tenant-scoped: type definitions are shared across all
--- tenants. New types are added by INSERT, never by schema change.
+-- substrate. New types are added by INSERT, never by schema change.
 DEFINE TABLE type_definition SCHEMAFULL
     PERMISSIONS
         FOR select FULL
-        FOR create WHERE $session_role = 'admin'
+        FOR create FULL
         FOR update NONE
         FOR delete NONE;
 
@@ -81,11 +72,11 @@ DEFINE FIELD valid_from  ON TABLE type_definition TYPE datetime;
 -- cursor_type — the cursor-kind metamodel
 -- =========================================================================
 -- Global registry of cursor categories. `workload` for run-progress
--- cursors, `telemetry` for capture-source cursors. Not tenant-scoped.
+-- cursors, `telemetry` for capture-source cursors.
 DEFINE TABLE cursor_type SCHEMAFULL
     PERMISSIONS
         FOR select FULL
-        FOR create WHERE $session_role = 'admin'
+        FOR create FULL
         FOR update NONE
         FOR delete NONE;
 
@@ -101,20 +92,17 @@ DEFINE FIELD valid_from  ON TABLE cursor_type TYPE datetime;
 -- entity — identity (the persistent "who")
 -- =========================================================================
 -- Every product, component, task, agent, model, prompt, data-source,
--- proposal, classification, insight, run, source, tenant, …, lives here.
--- Differentiated by `type`. Multi-tenant; every entity carries a `tenant`
--- FK pointing at a node_substrate entity.
+-- proposal, classification, insight, run, source, …, lives here.
+-- Differentiated by `type`.
 DEFINE TABLE entity SCHEMAFULL
     PERMISSIONS
-        FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-        FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+        FOR select FULL
+        FOR create FULL
         FOR update NONE
         FOR delete NONE;
 
 DEFINE FIELD type        ON TABLE entity TYPE record<type_definition>
     ASSERT $value.category = 'node';
-DEFINE FIELD tenant      ON TABLE entity TYPE record<entity>
-    ASSERT $value.type.uid = 'node_substrate';
 DEFINE FIELD role        ON TABLE entity TYPE string
     ASSERT $value INSIDE ['user', 'admin'];
 DEFINE FIELD valid_from  ON TABLE entity TYPE datetime;
@@ -128,8 +116,8 @@ DEFINE FIELD valid_from  ON TABLE entity TYPE datetime;
 -- entities (rows of type_definition with category='edge').
 DEFINE TABLE relation SCHEMAFULL
     PERMISSIONS
-        FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-        FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+        FOR select FULL
+        FOR create FULL
         FOR update NONE
         FOR delete NONE;
 
@@ -137,8 +125,6 @@ DEFINE FIELD in          ON TABLE relation TYPE record<entity>;
 DEFINE FIELD out         ON TABLE relation TYPE record<entity>;
 DEFINE FIELD type        ON TABLE relation TYPE record<type_definition>
     ASSERT $value.category = 'edge';
-DEFINE FIELD tenant      ON TABLE relation TYPE record<entity>
-    ASSERT $value.type.uid = 'node_substrate';
 DEFINE FIELD is_acyclic  ON TABLE relation TYPE bool;
 DEFINE FIELD valid_from  ON TABLE relation TYPE datetime;
 
@@ -153,16 +139,14 @@ DEFINE FIELD valid_from  ON TABLE relation TYPE datetime;
 -- recovered by ORDER BY valid_from DESC LIMIT 1.
 DEFINE TABLE state_ledger SCHEMAFULL
     PERMISSIONS
-        FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-        FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+        FOR select FULL
+        FOR create FULL
         FOR update NONE
         FOR delete NONE;
 
 DEFINE FIELD target      ON TABLE state_ledger TYPE record<entity>;
 DEFINE FIELD type        ON TABLE state_ledger TYPE record<type_definition>
     ASSERT $value.category = 'attribute';
-DEFINE FIELD tenant      ON TABLE state_ledger TYPE record<entity>
-    ASSERT $value.type.uid = 'node_substrate';
 DEFINE FIELD valid_from  ON TABLE state_ledger TYPE datetime;
 
 
@@ -175,14 +159,12 @@ DEFINE FIELD valid_from  ON TABLE state_ledger TYPE datetime;
 -- create new rows; "current" is the latest by (subject, cursor_type).
 DEFINE TABLE cursor SCHEMAFULL
     PERMISSIONS
-        FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-        FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+        FOR select FULL
+        FOR create FULL
         FOR update NONE
         FOR delete NONE;
 
 DEFINE FIELD subject        ON TABLE cursor TYPE record<entity>;
-DEFINE FIELD tenant         ON TABLE cursor TYPE record<entity>
-    ASSERT $value.type.uid = 'node_substrate';
 DEFINE FIELD cursor_type    ON TABLE cursor TYPE record<cursor_type>;
 DEFINE FIELD last_processed ON TABLE cursor TYPE option<string>;
 DEFINE FIELD metadata       ON TABLE cursor TYPE option<object>;
@@ -198,15 +180,13 @@ DEFINE FIELD valid_from     ON TABLE cursor TYPE datetime;
 -- the latest row for (run, agent) at dispatch time.
 DEFINE TABLE execution_params SCHEMAFULL
     PERMISSIONS
-        FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-        FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+        FOR select FULL
+        FOR create FULL
         FOR update NONE
         FOR delete NONE;
 
 DEFINE FIELD run         ON TABLE execution_params TYPE record<entity>
     ASSERT $value.type.uid = 'node_run';
-DEFINE FIELD tenant      ON TABLE execution_params TYPE record<entity>
-    ASSERT $value.type.uid = 'node_substrate';
 DEFINE FIELD agent       ON TABLE execution_params TYPE record<entity>
     ASSERT $value.type.uid = 'node_agent';
 DEFINE FIELD params_json ON TABLE execution_params TYPE object;
@@ -222,15 +202,13 @@ DEFINE FIELD valid_from  ON TABLE execution_params TYPE datetime;
 -- dumb FIFO. Append-only — status transitions create new rows.
 DEFINE TABLE schedule SCHEMAFULL
     PERMISSIONS
-        FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-        FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+        FOR select FULL
+        FOR create FULL
         FOR update NONE
         FOR delete NONE;
 
 DEFINE FIELD run         ON TABLE schedule TYPE record<entity>
     ASSERT $value.type.uid = 'node_run';
-DEFINE FIELD tenant      ON TABLE schedule TYPE record<entity>
-    ASSERT $value.type.uid = 'node_substrate';
 DEFINE FIELD kind        ON TABLE schedule TYPE string;
 DEFINE FIELD target      ON TABLE schedule TYPE record<entity>;
 DEFINE FIELD due_at      ON TABLE schedule TYPE datetime;
@@ -249,11 +227,12 @@ DEFINE FIELD valid_from  ON TABLE schedule TYPE datetime;
 -- Every kernel mutation, every dispatch decision, every state write,
 -- every transition emits one row. CHANGEFEED-friendly. Subscribers
 -- (TelemetrySubscriber, classifier, insight harvester, …) consume via
--- LIVE SELECT.
+-- LIVE SELECT. Telemetry is GLOBAL — no tenant scoping; events are
+-- observed across the entire OS.
 DEFINE TABLE telemetry_stream SCHEMAFULL
     PERMISSIONS
-        FOR select WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-        FOR create WHERE tenant.id = $session_tenant OR $session_role = 'admin'
+        FOR select FULL
+        FOR create FULL
         FOR update NONE
         FOR delete NONE;
 
@@ -261,8 +240,6 @@ DEFINE FIELD lifecycle_event ON TABLE telemetry_stream TYPE string;
 DEFINE FIELD payload         ON TABLE telemetry_stream TYPE any;
 DEFINE FIELD run             ON TABLE telemetry_stream TYPE option<record<entity>>
     ASSERT $value = NONE OR $value.type.uid = 'node_run';
-DEFINE FIELD tenant          ON TABLE telemetry_stream TYPE record<entity>
-    ASSERT $value.type.uid = 'node_substrate';
 DEFINE FIELD valid_from      ON TABLE telemetry_stream TYPE datetime;
 
 

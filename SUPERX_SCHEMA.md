@@ -1,5 +1,14 @@
 # SUPERX SCHEMA
 
+> **v0.1 single-deployment model.** SuperX is one global agentic OS — one
+> installation, one operator, telemetry global across everything. No
+> multi-tenant isolation at the data layer. Earlier drafts of this doc
+> carried a `tenant: record<entity>` FK on every table plus a
+> `node_substrate` metamodel concept; both were removed in the
+> "drop multi-tenant scaffolding" operator-approved schema amendment.
+> If multi-customer SaaS isolation is added in a future release, it
+> lands as a separate schema PR with its own operator approval.
+
 ## Universal contract (binding on every table)
 
 Every row in every table carries:
@@ -38,13 +47,13 @@ Per [SurrealDB's `DEFINE USER` docs](https://surrealdb.com/docs/surrealql/statem
 ```sql
 DEFINE TABLE <table> SCHEMAFULL
     PERMISSIONS
-        FOR select  WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-        FOR create  WHERE tenant.id = $session_tenant OR $session_role = 'admin'
-        FOR update  NONE
-        FOR delete  NONE;
+        FOR select FULL
+        FOR create FULL
+        FOR update NONE
+        FOR delete NONE;
 ```
 
-`FOR update NONE` and `FOR delete NONE` refuse those statements engine-side for every user including the EDITOR-roled `service_account`. Combined with the tenant-isolation clauses, this gives us **SELECT + CREATE only**, tenant-scoped, with mutation engine-rejected.
+`FOR update NONE` and `FOR delete NONE` document the intended write surface (SELECT + CREATE only). Per SKILL.md §10 the EDITOR role does not honour those clauses for system users; the append-only invariant is actually enforced by **kernel-verb discipline** — no kernel verb emits an UPDATE or DELETE statement, ever. The `FOR update / FOR delete NONE` lines are kept as in-schema documentation of intent, not as the enforcement layer.
 
 The password is bound from the `SUPERX_SERVICE_PASSWORD` environment variable at bootstrap time. The operator sets this once; the model never sees it in plain text after handover.
 
@@ -56,12 +65,11 @@ Three special entity types underpin the cross-reference graph:
 
 | Entity type | Purpose | Referenced by |
 |---|---|---|
-| `node_substrate` | Tenant marker — one per tenant boundary | every `tenant` field on every table |
 | `node_run` | Workflow run identity | every `run` field on `execution_params`, `schedule`, `telemetry_stream` |
 | `node_agent` | Agent identity | `execution_params.agent` |
 | `node_source` | Telemetry capture source (file path, OTLP endpoint, …) | `cursor.subject` when `cursor_type.category = 'telemetry'` |
 
-`node_substrate` and `node_agent` exist in the metamodel today. `node_run` and `node_source` are **new** — added to `seed_metamodel`.
+All three are seeded by `seed_metamodel` on first deploy.
 
 ---
 
@@ -83,7 +91,6 @@ Three special entity types underpin the cross-reference graph:
 |---|---|
 | id | uuidv7 |
 | type | record<type_definition> |
-| tenant | record<entity> |
 | role | string |
 | valid_from | datetime |
 
@@ -95,7 +102,6 @@ Three special entity types underpin the cross-reference graph:
 | in | record<entity> |
 | out | record<entity> |
 | type | record<type_definition> |
-| tenant | record<entity> |
 | is_acyclic | bool |
 | valid_from | datetime |
 
@@ -106,7 +112,6 @@ Three special entity types underpin the cross-reference graph:
 | id | uuidv7 |
 | target | record<entity> |
 | type | record<type_definition> |
-| tenant | record<entity> |
 | valid_from | datetime |
 
 ## cursor
@@ -115,7 +120,6 @@ Three special entity types underpin the cross-reference graph:
 |---|---|
 | id | uuidv7 |
 | subject | record<entity> |
-| tenant | record<entity> |
 | cursor_type | record<cursor_type> |
 | last_processed | option<string> |
 | metadata | option<object> |
@@ -138,7 +142,6 @@ Three special entity types underpin the cross-reference graph:
 |---|---|
 | id | uuidv7 |
 | run | record<entity> |
-| tenant | record<entity> |
 | agent | record<entity> |
 | params_json | object |
 | valid_from | datetime |
@@ -149,7 +152,6 @@ Three special entity types underpin the cross-reference graph:
 |---|---|
 | id | uuidv7 |
 | run | record<entity> |
-| tenant | record<entity> |
 | kind | string |
 | target | record<entity> |
 | due_at | datetime |
@@ -167,7 +169,6 @@ Three special entity types underpin the cross-reference graph:
 | lifecycle_event | string |
 | payload | any |
 | run | option<record<entity>> |
-| tenant | record<entity> |
 | valid_from | datetime |
 
 ---
@@ -179,26 +180,19 @@ Every FK is `record<table>` (typed reference) plus an `ASSERT` clause that enfor
 | Table | FK field | Type | ASSERT |
 |---|---|---|---|
 | `entity` | `type` | `record<type_definition>` | `$value.category = 'node'` |
-| `entity` | `tenant` | `record<entity>` | `$value.type.uid = 'node_substrate'` |
 | `relation` | `in` | `record<entity>` | — (any entity) |
 | `relation` | `out` | `record<entity>` | — (any entity) |
 | `relation` | `type` | `record<type_definition>` | `$value.category = 'edge'` |
-| `relation` | `tenant` | `record<entity>` | `$value.type.uid = 'node_substrate'` |
 | `state_ledger` | `target` | `record<entity>` | — (any entity) |
 | `state_ledger` | `type` | `record<type_definition>` | `$value.category = 'attribute'` |
-| `state_ledger` | `tenant` | `record<entity>` | `$value.type.uid = 'node_substrate'` |
 | `cursor` | `subject` | `record<entity>` | — (polymorphic: `node_run` for workload, `node_source` for telemetry) |
 | `cursor` | `cursor_type` | `record<cursor_type>` | — (table is self-discriminating) |
-| `cursor` | `tenant` | `record<entity>` | `$value.type.uid = 'node_substrate'` |
 | `execution_params` | `run` | `record<entity>` | `$value.type.uid = 'node_run'` |
 | `execution_params` | `agent` | `record<entity>` | `$value.type.uid = 'node_agent'` |
-| `execution_params` | `tenant` | `record<entity>` | `$value.type.uid = 'node_substrate'` |
 | `schedule` | `run` | `record<entity>` | `$value.type.uid = 'node_run'` |
 | `schedule` | `target` | `record<entity>` | — (any DAG-node entity: product, component, task, …) |
 | `schedule` | `depends_on[]` | `array<record<schedule>>` | — (each element points at a `schedule` row) |
-| `schedule` | `tenant` | `record<entity>` | `$value.type.uid = 'node_substrate'` |
 | `telemetry_stream` | `run` | `option<record<entity>>` | `$value = NONE OR $value.type.uid = 'node_run'` |
-| `telemetry_stream` | `tenant` | `record<entity>` | `$value.type.uid = 'node_substrate'` |
 
 Additional enum-style ASSERTs (not FKs but value-domain constraints):
 
@@ -216,7 +210,7 @@ Every field is NOT NULL **by default** in SurrealDB unless explicitly declared `
 
 | Table | Nullable field | Why |
 |---|---|---|
-| `type_definition` | `sch_json: option<string>` | Many types have no JSON Schema (e.g. node_substrate, edge_owns) |
+| `type_definition` | `sch_json: option<string>` | Many types have no JSON Schema (e.g. `edge_owns`, `node_agent`) |
 | `cursor` | `last_processed: option<string>` | A freshly-enqueued cursor has no progress yet |
 | `cursor` | `metadata: option<object>` | Optional envelope |
 | `cursor_type` | `sch_json: option<string>` | Most cursor types have no metadata schema yet |
@@ -275,8 +269,8 @@ History is the full SELECT without `LIMIT 1`, ordered ASC. Time-travel is filter
 |---|---|
 | all tables | explicit UUIDv7 row id contract (was implicit auto-id on some tables) |
 | all tables | only `valid_from` as the temporal column. `is_current` and `valid_to` are **dropped** (model is insert-only; mutable advisory columns would drift). |
-| all tables | `tenant_id: string` → `tenant: record<entity>` (typed FK to the `node_substrate` tenant entity) |
-| all tables | `PERMISSIONS FOR update NONE; FOR delete NONE;` to refuse mutation engine-side |
+| all tables | tenant FK dropped — v0.1 is a single global agentic OS, no multi-tenant isolation at the data layer |
+| all tables | `PERMISSIONS FOR update NONE; FOR delete NONE;` as documentation of intent (kernel-verb discipline is the actual enforcement, per SKILL.md §10) |
 | `type_definition` | + `uid string` (human-readable identifier separated from row id; previously row id was the named string) |
 | `entity` | − `is_deleted` (drop; superseding entities create a new row with a later `valid_from`) |
 | `execution_cursor` → `cursor` | renamed; `subject: record<entity>` replaces `run_id: string`; `cursor_type` is `record<cursor_type>` FK; − `updated_at` (replaced by `valid_from`) |
@@ -290,31 +284,30 @@ History is the full SELECT without `LIMIT 1`, ordered ASC. Time-travel is filter
 
 | Type | Status | Purpose |
 |---|---|---|
-| `node_substrate` | existing | tenant marker; every `tenant` FK points here |
-| `node_agent` | existing | agent identity; `execution_params.agent` FK |
-| `node_run` | **new** | workflow-run identity; every `run` FK across substrate points here. Today runs are opaque UUID strings; promotion to entity gives them a first-class place in the substrate, enabling per-run JOINs, lifecycle tracking, and lineage queries. |
-| `node_source` | **new** | telemetry capture source (Claude Code session file, Gemini transcript dir, OTLP endpoint, …); `cursor.subject` FK when `cursor_type.category = 'telemetry'`. Today these are encoded in opaque string keys; promotion to entity makes capture sources queryable in the substrate. |
+| `node_agent` | seeded | agent identity; `execution_params.agent` FK |
+| `node_run` | seeded | workflow-run identity; every `run` FK across substrate points here. Enables per-run JOINs, lifecycle tracking, and lineage queries. |
+| `node_source` | seeded | telemetry capture source (Claude Code session file, Gemini transcript dir, OTLP endpoint, …); `cursor.subject` FK when `cursor_type.category = 'telemetry'`. Makes capture sources queryable in the substrate. |
 
 ## Implied kernel-verb changes (design-level only; gated by operator authorization)
 
 | Verb | Change |
 |---|---|
-| `set_session_auth` | switches from `db.set("session_tenant", …)` session-variable assertion to `db.signin(…)` against `service_account` (or against `tenant_access` for record-based tenant auth, future roadmap #8) |
+| `set_session_auth` | `db.signin(…)` against the `superx` service account (EDITOR role). No session variables, no `db.set("session_tenant", …)` — v0.1 has no tenant scoping. |
 | `supersede_state` | drops the `BEGIN TRANSACTION; UPDATE prior; CREATE new; COMMIT;` pattern. Becomes pure `CREATE state_ledger CONTENT {…};`. "Current" is recovered via `ORDER BY valid_from DESC LIMIT 1` filtered by `(target, type)`. |
 | `set_execution_params` | same — pure INSERT, no close-prior |
 | `transition_schedule_status` | same |
 | `checkpoint_execution` | renamed to `write_cursor` (or similar) — accepts `Thing` for `subject`, not a string; pure INSERT |
 | `enqueue_schedule_item` | accepts `Thing` for `run` and `target`, not strings |
 | `log_telemetry` | accepts `Option<Thing>` for `run`, not `Option<String>` |
-| PERMISSIONS clauses on every table | `tenant = $session_tenant` instead of `tenant_id = $session_tenant`, plus `FOR update NONE; FOR delete NONE;` |
+| PERMISSIONS clauses on every table | `FOR select FULL FOR create FULL FOR update NONE FOR delete NONE` (intent-doc; kernel-verb discipline is the actual enforcement) |
 
 These are gated by explicit operator authorization per skill §10.A. The model does not modify any of them without per-change sign-off.
 
 ## Why this matters for the agentic OS
 
-Once all FK fields are `record<table>` typed and PERMISSIONS refuse update/delete, the substrate becomes a **fully joinable, append-only graph that cannot be coerced into a corrupt state by application code**:
+Once all FK fields are `record<table>` typed and kernel-verb discipline refuses update/delete, the substrate becomes a **fully joinable, append-only graph that cannot be coerced into a corrupt state by application code**:
 
-- Every cursor knows its subject; every schedule item knows its run + tenant + target entity; every telemetry event knows its run; every state-ledger write knows its target entity.
+- Every cursor knows its subject; every schedule item knows its run + target entity; every telemetry event optionally knows its run; every state-ledger write knows its target entity.
 - Cross-referenceable end-to-end — no opaque string keys, no string-to-id parsing at the verb boundary, no downstream consumer having to reconstruct relationships from naming conventions.
-- The model cannot silently corrupt history — every state change is a new row with its own UUIDv7, and the engine refuses to delete or mutate prior rows.
+- The model cannot silently corrupt history — every state change is a new row with its own UUIDv7, and kernel-verb discipline refuses to delete or mutate prior rows.
 - Bugs surface as substrate constraint violations within milliseconds (§12), not as silent downstream drift.
