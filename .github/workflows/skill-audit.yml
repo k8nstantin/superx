@@ -12,6 +12,9 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `edited` so PR-body edits re-trigger the checklist gate;
+    # default trigger types do not fire on body-only edits.
+    types: [opened, synchronize, reopened, edited]
     branches: [main]
 
 jobs:
