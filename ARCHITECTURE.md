@@ -285,7 +285,23 @@ What is explicitly *out of scope* for MVP:
 - The 5-table substrate is the kernel of (3); already implemented.
 - The MetaHarness wasm sandbox is the verification step for (5); already implemented.
 - The CapabilityGovernor is the policy layer that gates (6); already implemented.
-- **The schedule + runner of (6) is the load-bearing primitive not yet built.** Everything else is in place to receive it. The new work items below in §9 *Roadmap* are scoped against this vision.
+- **The schedule + runner of (6) is shipped** (`superx-runner` + `superx-dispatcher`). `superx-cli runner-demo` drives the full pipeline end-to-end.
+
+#### Runner dispatcher coverage (v0.1)
+
+`KernelDispatcher` (in `superx-dispatcher`) currently routes three schedule `kind` values to real tool blades after a `CapabilityGovernor::check_capability` gate:
+
+| `kind` | Wired in v0.1 | Blade | Inputs read from |
+| --- | --- | --- | --- |
+| `compile` | ✅ | `CompilerBlade::compile` | schedule row only (target + run) |
+| `promote` | ✅ | `MetaHarness::promote` | `attr_config.promote_threshold` (substrate parameter) |
+| `ingest` | ✅ | `UniversalIngestor::ingest(FileSource)` | target's `attr_desc.text` (file path) |
+| `propose` | ❌ (deferred) | `ProposerBlade::propose_relation` | needs peer entity discovery |
+| `evaluate` | ❌ (deferred) | `MetaHarness::evaluate` | needs wasm bytes |
+
+**Why `propose` and `evaluate` are deferred**: both are inner steps of autonomous loops that don't exist yet (`EdgeProposerBlade` #25, `DesignerBlade` #3, autonomous `MetaHarness` continuous-scoring loop). Wiring them now means designing schema (a new `edge_proposes_against` type, or `attr_evaluator_path/wasm` attr types) **before** the caller that motivates the design is built — exactly the §11 "schema-first / code-after" trap in reverse. When `EdgeProposerBlade` / `DesignerBlade` / autonomous `MetaHarness` ship, the corresponding dispatcher kind + its schema are designed in the same PR as the caller. Until then, the existing direct-CLI paths (`superx-cli propose --from --to`, `superx-cli evaluate --proposal --wasm`) remain the only way to trigger those blades.
+
+This is documented coverage, not a TODO — there is nothing to "fix"; the autonomous callers don't exist yet.
 
 ### 1. The 5-Table Substrate + Cursor (SurrealDB + RocksDB)
 
