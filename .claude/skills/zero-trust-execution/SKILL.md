@@ -179,11 +179,11 @@ The substrate database (SurrealDB on RocksDB) has two account boundaries. They a
 
 **B. The model uses a service account with `SELECT` + `CREATE` (INSERT) only.**
 
-- The service account can **read existing rows** (`SELECT`) and **insert new rows** (`CREATE` / `INSERT`). That is the entire grant.
-- The service account **cannot `UPDATE`**, **cannot `DELETE`**, **cannot `UPSERT`**, **cannot `DEFINE`**, **cannot `REMOVE`**, **cannot `ALTER`** anything. No exceptions.
-- The substrate is **versioning + time-travel by design.** Every state change is a fresh insert. The model never mutates an existing row. Mutation destroys history; the model's privileges make that impossible.
-- "Current" is computed at query time by selecting the latest row in a chain (`ORDER BY valid_from DESC LIMIT 1`), **not** by mutating prior rows' `is_current` / `valid_to`. Those fields are set correctly **at insert time** and never touched again by the model.
-- Per-tenant + per-role `PERMISSIONS` clauses on each table apply on top of the service-account scope — defense in depth.
+- The service account's *behavior contract* is: **read existing rows** (`SELECT`) and **insert new rows** (`CREATE` / `INSERT`). That is the entire surface kernel verbs are written against.
+- The service account is **forbidden** from issuing `UPDATE`, `DELETE`, `UPSERT`, `DEFINE`, `REMOVE`, or `ALTER`. This is enforced by **kernel-verb discipline**: no `Kernel::*` method emits any of those statements. Operationally, "the model never mutates an existing row" because no verb knows how to.
+- **Enforcement is single-layer by design.** SurrealDB's three built-in roles (`OWNER` / `EDITOR` / `VIEWER`) don't include a "SELECT + INSERT only" option, and `DEFINE USER ... ROLES EDITOR` (which we use) carries full CRUD — table-level `PERMISSIONS FOR update/delete NONE` clauses do **not** restrict system users. The only way to make the engine enforce "no UPDATE / no DELETE" is `DEFINE ACCESS TYPE RECORD` with record-bound sessions; that introduces a custom permissions/identity system we have explicitly chosen not to maintain. **Kernel-verb discipline is the enforcement layer.** Period.
+- The substrate is **versioning + time-travel by design.** Every state change is a fresh insert. "Current" is computed at query time by selecting the latest row in a chain (`ORDER BY valid_from DESC LIMIT 1`), **not** by mutating prior rows. Append-only is preserved because no verb writes anything except `CREATE`.
+- The `PERMISSIONS FOR update NONE; FOR delete NONE;` clauses in the schema are kept as **documentation of intent**, not enforcement. They activate the day someone migrates the service account to `DEFINE ACCESS TYPE RECORD`. Until then they're harmless dead code that documents what the kernel verbs already refuse to do.
 
 **Implication for kernel verbs:** any verb that today uses `BEGIN TRANSACTION; UPDATE prior SET is_current=false…; CREATE new…; COMMIT;` (the close-prior + insert-new pattern in `set_execution_params`, `transition_schedule_status`, etc.) violates this rule and must be redesigned to pure INSERT. The "close-prior" step is removed entirely — `is_current` and `valid_to` become advisory fields set at insert time only, and the canonical "find current" query becomes `ORDER BY valid_from DESC LIMIT 1` filtered by the chain key.
 
@@ -252,11 +252,15 @@ db.signin(surrealdb::opt::auth::Database {
 }).await?;
 ```
 
-The substrate enforces this from its side: `PERMISSIONS FOR update NONE; FOR delete NONE;` on every table makes UPDATE and DELETE engine-refused for every user including the EDITOR-roled `superx`. Combined with the SELECT + CREATE-scoped queries the kernel issues, the model's reach is bounded by both layers.
+**The append-only contract is enforced by kernel-verb discipline, not by the engine.** SurrealDB's `DEFINE USER ... ROLES EDITOR` is a system user with full CRUD baked into the role — table-level `PERMISSIONS FOR update NONE; FOR delete NONE;` clauses do **not** restrict system users (those clauses only apply to record-bound `DEFINE ACCESS TYPE RECORD` sessions, which we deliberately do not use to avoid maintaining a custom permissions/identity system). The `FOR NONE` clauses in the schema are intent-documentation only.
+
+What this means in practice: the substrate's append-only invariant is preserved because **no kernel verb writes anything except `CREATE`** — there is no `Kernel::update_*` or `Kernel::delete_*` method anywhere, and the test in `crates/superx-cli/tests/schedule_scd2.rs` proves the row-count invariant directly (N transitions → N+1 rows). The hardening contract is "kernel-verb discipline + ASSERTs at field-type boundaries"; the database is **not** the second line of defense.
 
 **Root account boundary:** root is reserved for the operator. The operator uses root only to apply schema changes that they have explicitly designed (per §11 schema-first workflow) and explicitly authorised. The model is forbidden from invoking root under any circumstance. If a verb or test or migration needs root, **STOP and ask the operator** to run it.
 
-**Never use root to bypass engine refusals.** If the substrate refuses an operation — an `UPDATE` blocked by `FOR update NONE`, a `record<entity>` insert rejected by an `ASSERT` clause, a SCHEMAFULL field-type violation, a missing required field, a tenant-coercion attempt refused by `PERMISSIONS` — the answer is **fix the code so it stops issuing the rejected operation**. The answer is **never** to authenticate as root and re-run the operation. Engine refusals are the §12 debugging surface working as designed; bypassing them under root reintroduces every class of bug the constraints were put there to catch.
+**Never use root to bypass engine refusals.** If the substrate refuses an operation — a `record<entity>` insert rejected by an `ASSERT` clause, a SCHEMAFULL field-type violation, a missing required field, a tenant-coercion attempt refused by `PERMISSIONS` on a record-bound session — the answer is **fix the code so it stops issuing the rejected operation**. The answer is **never** to authenticate as root and re-run the operation. Engine refusals are the §12 debugging surface working as designed; bypassing them under root reintroduces every class of bug the constraints were put there to catch.
+
+(Note: UPDATE and DELETE refusals are **not** in the engine-refusal list under our current `DEFINE USER ROLES EDITOR` setup — those are enforced by kernel-verb discipline, not by the database. See §10 / §13.)
 
 Anti-patterns (banned outright):
 - ❌ "I'll just signin as root for this one query to get past the constraint."
