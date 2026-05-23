@@ -112,6 +112,7 @@ All three are seeded by `seed_metamodel` on first deploy.
 | id | uuidv7 |
 | target | record<entity> |
 | type | record<type_definition> |
+| payload | object |
 | valid_from | datetime |
 
 ## cursor
