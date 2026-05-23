@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 # =========================================================================
-# scripts/deploy-schema.sh — operator-only schema apply
+# scripts/deploy-schema.sh — operator-only kernel schema apply
 # =========================================================================
 #
-# Applies schema/superx.surql to a running SurrealDB instance under the
+# Applies schema/kernel.surql to a running SurrealDB instance under the
 # operator's ROOT credentials. Run ONCE on a fresh substrate. From that
-# moment forward the schema is locked; any subsequent change requires an
-# `Operator-approved:` marker in the PR body that modifies the schema.
-# (See .claude/skills/zero-trust-execution/SKILL.md §7.)
+# moment forward the kernel schema is locked; any subsequent change
+# requires an `Operator-approved:` marker in the PR body that modifies
+# the schema. (See .claude/skills/zero-trust-execution/SKILL.md §7.)
+#
+# This script applies ONLY the kernel layer. Drivers and apps each ship
+# their own schemas in their own crates, each with its own service
+# account, each applied via its own deploy step (later scripts —
+# e.g. scripts/deploy-driver-schema.sh <name>, scripts/deploy-app-schema.sh
+# <name>). For FVP only the kernel schema is applied.
 #
 # This script is operator-owned. The model never invokes root and never
 # runs this in an automated path. It exists as the documented one-shot
@@ -22,19 +28,20 @@
 #            rocksdb:./db/superx.db
 #   3. envsubst available (gettext package on macOS via Homebrew).
 #   4. Environment variables set:
-#        SUPERX_ROOT_PASSWORD       root account password (operator-only)
-#        SUPERX_SERVICE_PASSWORD    becomes the model service-account
-#                                   password ('superx' user). The model
-#                                   reads this same env var at signin.
+#        SUPERX_ROOT_PASSWORD     root account password (operator-only)
+#        SUPERX_KERNEL_PASSWORD   becomes the kernel service-account
+#                                 password (the `superx_kernel` user).
+#                                 The kernel reads this same env var
+#                                 at signin.
 #
 # Optional environment variables (defaults shown):
 #        SUPERX_DB_ENDPOINT=http://localhost:8000
 #        SUPERX_NS=superx
-#        SUPERX_DB=v01
+#        SUPERX_DB=kernel
 #
 # Usage:
 #   export SUPERX_ROOT_PASSWORD='<your root pwd>'
-#   export SUPERX_SERVICE_PASSWORD='<your service pwd>'
+#   export SUPERX_KERNEL_PASSWORD='<your kernel pwd>'
 #   ./scripts/deploy-schema.sh
 # =========================================================================
 
@@ -42,14 +49,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
-SCHEMA_FILE="$REPO_ROOT/schema/superx.surql"
+SCHEMA_FILE="$REPO_ROOT/schema/kernel.surql"
 
 : "${SUPERX_ROOT_PASSWORD:?env var SUPERX_ROOT_PASSWORD must be set (root account)}"
-: "${SUPERX_SERVICE_PASSWORD:?env var SUPERX_SERVICE_PASSWORD must be set (model service account)}"
+: "${SUPERX_KERNEL_PASSWORD:?env var SUPERX_KERNEL_PASSWORD must be set (kernel service account)}"
 
 : "${SUPERX_DB_ENDPOINT:=http://localhost:8000}"
 : "${SUPERX_NS:=superx}"
-: "${SUPERX_DB:=v01}"
+: "${SUPERX_DB:=kernel}"
 
 if ! command -v surreal >/dev/null 2>&1; then
     echo "ERROR: surreal CLI not found in PATH." >&2
@@ -65,23 +72,24 @@ if ! command -v envsubst >/dev/null 2>&1; then
 fi
 
 if [ ! -f "$SCHEMA_FILE" ]; then
-    echo "ERROR: Schema file not found: $SCHEMA_FILE" >&2
+    echo "ERROR: Kernel schema file not found: $SCHEMA_FILE" >&2
     exit 1
 fi
 
-echo "→ SuperX schema deploy"
+echo "→ SuperX kernel schema deploy"
 echo "   endpoint: $SUPERX_DB_ENDPOINT"
 echo "   ns / db:  $SUPERX_NS / $SUPERX_DB"
 echo "   source:   $SCHEMA_FILE"
-echo "   account:  root (operator)"
+echo "   account:  root (operator) — applies the schema"
+echo "   creates:  superx_kernel (EDITOR) — the kernel's service account"
 echo
 
 # envsubst is given an explicit allow-list of variables to substitute,
 # so any dollar-sign tokens in the SurrealQL that are not in the list
-# (e.g. PERMISSIONS expressions using $session_tenant) pass through
+# (e.g. PERMISSIONS expressions using $session_role) pass through
 # untouched.
-export SUPERX_SERVICE_PASSWORD
-envsubst '$SUPERX_SERVICE_PASSWORD' < "$SCHEMA_FILE" | \
+export SUPERX_KERNEL_PASSWORD
+envsubst '$SUPERX_KERNEL_PASSWORD' < "$SCHEMA_FILE" | \
     surreal sql \
         --endpoint "$SUPERX_DB_ENDPOINT" \
         --username root --password "$SUPERX_ROOT_PASSWORD" \
@@ -90,8 +98,10 @@ envsubst '$SUPERX_SERVICE_PASSWORD' < "$SCHEMA_FILE" | \
         --pretty
 
 echo
-echo "✓ Schema applied. Substrate is locked at the engine layer."
-echo "  The 'superx' service account exists with EDITOR role + 1h session."
-echo "  All subsequent SuperX code MUST sign in as 'superx' (never root)."
+echo "✓ Kernel schema applied. Substrate is locked at the engine layer."
+echo "  The 'superx_kernel' service account exists with EDITOR role + 1h session."
+echo "  All kernel code MUST sign in as 'superx_kernel' (never root)."
+echo "  Drivers and apps each get their own service accounts in their"
+echo "  own schemas (post-FVP)."
 echo "  Append-only invariant is enforced by kernel-verb discipline"
 echo "  (no kernel verb emits UPDATE or DELETE). See SKILL.md §10 / §13."
