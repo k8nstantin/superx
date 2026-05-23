@@ -153,7 +153,13 @@ DEFINE FIELD type        ON TABLE state_ledger TYPE record<type_definition>
 -- attribute type and enforced by kernel-verb discipline at the
 -- boundary, not by the engine. Mirrors the
 -- `execution_params.params_json` / `schedule.metadata` pattern.
-DEFINE FIELD payload     ON TABLE state_ledger TYPE object;
+--
+-- FLEXIBLE because SurrealDB SCHEMAFULL otherwise requires every
+-- nested key (`payload.text`, `payload.score`, …) to be explicitly
+-- DEFINE FIELD'd, which would defeat the "opaque-to-the-engine"
+-- payload contract. FLEXIBLE lets the kernel verb hand any
+-- well-formed object through unchanged.
+DEFINE FIELD payload     ON TABLE state_ledger TYPE object FLEXIBLE;
 DEFINE FIELD valid_from  ON TABLE state_ledger TYPE datetime;
 
 
@@ -174,7 +180,7 @@ DEFINE TABLE cursor SCHEMAFULL
 DEFINE FIELD subject        ON TABLE cursor TYPE record<entity>;
 DEFINE FIELD cursor_type    ON TABLE cursor TYPE record<cursor_type>;
 DEFINE FIELD last_processed ON TABLE cursor TYPE option<string>;
-DEFINE FIELD metadata       ON TABLE cursor TYPE option<object>;
+DEFINE FIELD metadata       ON TABLE cursor TYPE option<object> FLEXIBLE;
 DEFINE FIELD valid_from     ON TABLE cursor TYPE datetime;
 
 
@@ -196,7 +202,7 @@ DEFINE FIELD run         ON TABLE execution_params TYPE record<entity>
     ASSERT $value.type.uid = 'node_run';
 DEFINE FIELD agent       ON TABLE execution_params TYPE record<entity>
     ASSERT $value.type.uid = 'node_agent';
-DEFINE FIELD params_json ON TABLE execution_params TYPE object;
+DEFINE FIELD params_json ON TABLE execution_params TYPE object FLEXIBLE;
 DEFINE FIELD valid_from  ON TABLE execution_params TYPE datetime;
 
 
@@ -224,7 +230,7 @@ DEFINE FIELD status      ON TABLE schedule TYPE string
 DEFINE FIELD attempt     ON TABLE schedule TYPE int
     ASSERT $value >= 0;
 DEFINE FIELD depends_on  ON TABLE schedule TYPE array<record<schedule>>;
-DEFINE FIELD metadata    ON TABLE schedule TYPE object;
+DEFINE FIELD metadata    ON TABLE schedule TYPE object FLEXIBLE;
 DEFINE FIELD valid_from  ON TABLE schedule TYPE datetime;
 
 
