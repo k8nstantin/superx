@@ -55,8 +55,9 @@ async fn kernel_seeds_metamodel_creates_entity_and_logs_telemetry_end_to_end(
         .query("SELECT count() AS count FROM type_definition GROUP ALL")
         .await?
         .take(0)?;
-    // 4 rows: node_run, node_agent, node_source, edge_owns.
-    assert_eq!(counts.first().map(|c| c.count), Some(4));
+    // 6 rows: node_run, node_agent, node_source, edge_owns,
+    // attr_desc, attr_score.
+    assert_eq!(counts.first().map(|c| c.count), Some(6));
 
     // 2. Create a node_run entity. find_type resolves uid='node_run'
     //    to the row seeded above; create_entity sets an explicit
@@ -236,6 +237,147 @@ async fn create_relation_refuses_node_type_uid() -> Result<(), Box<dyn Error>> {
     assert!(
         msg.contains("edge") || msg.contains("category"),
         "expected engine ASSERT refusal mentioning category/edge, got: {msg}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supersede_state_appends_and_current_state_returns_latest(
+) -> Result<(), Box<dyn Error>> {
+    let db = connect("mem://").await?;
+    db.use_ns(TEST_NS).use_db(TEST_DB).await?;
+    let ddl = SCHEMA_DDL.replace("$SUPERX_SERVICE_PASSWORD", TEST_SERVICE_PASSWORD);
+    db.query(ddl).await?.check()?;
+    db.signin(Database {
+        namespace: TEST_NS.to_string(),
+        database: TEST_DB.to_string(),
+        username: "superx".to_string(),
+        password: TEST_SERVICE_PASSWORD.to_string(),
+    })
+    .await?;
+
+    let kernel = Kernel::from_db(db);
+    kernel.seed_metamodel().await?;
+    let entity = kernel.create_entity("node_agent", "user").await?;
+
+    // Before any supersede_state, current_state is None.
+    let initial = kernel.current_state(entity.clone(), "attr_desc").await?;
+    assert!(initial.is_none());
+
+    // First write: attr_desc with text "first description".
+    let mut payload_v1 = surrealdb::types::Object::new();
+    payload_v1.insert(
+        "text".to_string(),
+        surrealdb::types::Value::String("first description".to_string()),
+    );
+    let _id_v1 = kernel
+        .supersede_state(
+            entity.clone(),
+            "attr_desc",
+            surrealdb::types::Value::Object(payload_v1),
+        )
+        .await?;
+
+    // current_state must return the v1 payload.
+    let after_v1 = kernel
+        .current_state(entity.clone(), "attr_desc")
+        .await?
+        .expect("v1 payload present");
+    match &after_v1 {
+        surrealdb::types::Value::Object(obj) => {
+            let text = obj.get("text").expect("text field");
+            assert_eq!(
+                text,
+                &surrealdb::types::Value::String("first description".to_string())
+            );
+        }
+        other => panic!("expected Object payload, got {other:?}"),
+    }
+
+    // Supersede with v2.
+    let mut payload_v2 = surrealdb::types::Object::new();
+    payload_v2.insert(
+        "text".to_string(),
+        surrealdb::types::Value::String("revised description".to_string()),
+    );
+    let _id_v2 = kernel
+        .supersede_state(
+            entity.clone(),
+            "attr_desc",
+            surrealdb::types::Value::Object(payload_v2),
+        )
+        .await?;
+
+    // current_state must now return v2 (latest by valid_from).
+    let after_v2 = kernel
+        .current_state(entity.clone(), "attr_desc")
+        .await?
+        .expect("v2 payload present");
+    match &after_v2 {
+        surrealdb::types::Value::Object(obj) => {
+            let text = obj.get("text").expect("text field");
+            assert_eq!(
+                text,
+                &surrealdb::types::Value::String("revised description".to_string())
+            );
+        }
+        other => panic!("expected Object payload, got {other:?}"),
+    }
+
+    // Full history: 2 rows for this (target, type) chain.
+    #[derive(SurrealValue)]
+    struct CountRow {
+        count: i64,
+    }
+    let counts: Vec<CountRow> = kernel
+        .db()
+        .query(
+            "SELECT count() AS count FROM state_ledger \
+             WHERE target = $target \
+             GROUP ALL",
+        )
+        .bind(("target", entity))
+        .await?
+        .take(0)?;
+    assert_eq!(counts.first().map(|c| c.count), Some(2));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supersede_state_refuses_node_type_uid() -> Result<(), Box<dyn Error>> {
+    let db = connect("mem://").await?;
+    db.use_ns(TEST_NS).use_db(TEST_DB).await?;
+    let ddl = SCHEMA_DDL.replace("$SUPERX_SERVICE_PASSWORD", TEST_SERVICE_PASSWORD);
+    db.query(ddl).await?.check()?;
+    db.signin(Database {
+        namespace: TEST_NS.to_string(),
+        database: TEST_DB.to_string(),
+        username: "superx".to_string(),
+        password: TEST_SERVICE_PASSWORD.to_string(),
+    })
+    .await?;
+
+    let kernel = Kernel::from_db(db);
+    kernel.seed_metamodel().await?;
+    let entity = kernel.create_entity("node_run", "admin").await?;
+
+    // Try to use a node-category type as an attribute — engine must
+    // refuse via `state_ledger.type ASSERT $value.category = 'attribute'`.
+    let err = kernel
+        .supersede_state(
+            entity,
+            "node_run",
+            surrealdb::types::Value::Object(surrealdb::types::Object::new()),
+        )
+        .await
+        .expect_err("must refuse when type's category is not 'attribute'");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("attribute") || msg.contains("category"),
+        "expected engine ASSERT refusal mentioning category/attribute, got: {msg}"
     );
 
     Ok(())
