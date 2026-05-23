@@ -55,7 +55,8 @@ async fn kernel_seeds_metamodel_creates_entity_and_logs_telemetry_end_to_end(
         .query("SELECT count() AS count FROM type_definition GROUP ALL")
         .await?
         .take(0)?;
-    assert_eq!(counts.first().map(|c| c.count), Some(3));
+    // 4 rows: node_run, node_agent, node_source, edge_owns.
+    assert_eq!(counts.first().map(|c| c.count), Some(4));
 
     // 2. Create a node_run entity. find_type resolves uid='node_run'
     //    to the row seeded above; create_entity sets an explicit
@@ -148,6 +149,94 @@ async fn recent_telemetry_returns_events_newest_first() -> Result<(), Box<dyn Er
     // Limit clamps the row count.
     let events_limited = kernel.recent_telemetry(2).await?;
     assert_eq!(events_limited.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_relation_links_two_entities_via_edge_owns(
+) -> Result<(), Box<dyn Error>> {
+    let db = connect("mem://").await?;
+    db.use_ns(TEST_NS).use_db(TEST_DB).await?;
+    let ddl = SCHEMA_DDL.replace("$SUPERX_SERVICE_PASSWORD", TEST_SERVICE_PASSWORD);
+    db.query(ddl).await?.check()?;
+    db.signin(Database {
+        namespace: TEST_NS.to_string(),
+        database: TEST_DB.to_string(),
+        username: "superx".to_string(),
+        password: TEST_SERVICE_PASSWORD.to_string(),
+    })
+    .await?;
+
+    let kernel = Kernel::from_db(db);
+    kernel.seed_metamodel().await?;
+
+    // Create a "parent" run and a "child" agent, then link them via
+    // edge_owns. The schema's `relation.type` ASSERT requires the
+    // type_definition to have category='edge'; seed_metamodel just
+    // seeded edge_owns with that category.
+    let parent = kernel.create_entity("node_run", "admin").await?;
+    let child = kernel.create_entity("node_agent", "user").await?;
+
+    let rel_id = kernel
+        .create_relation(parent.clone(), child.clone(), "edge_owns", true)
+        .await?;
+
+    assert_eq!(rel_id.table, "relation".into());
+
+    // Verify the row landed with the right typed FKs.
+    #[derive(SurrealValue)]
+    struct RelSlice {
+        #[surreal(rename = "in")]
+        in_: RecordId,
+        out: RecordId,
+        is_acyclic: bool,
+    }
+    let rows: Vec<RelSlice> = kernel
+        .db()
+        .query("SELECT in, out, is_acyclic FROM $id")
+        .bind(("id", rel_id))
+        .await?
+        .take(0)?;
+    let row = rows.into_iter().next().expect("relation row roundtrips");
+    assert_eq!(row.in_, parent);
+    assert_eq!(row.out, child);
+    assert!(row.is_acyclic);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_relation_refuses_node_type_uid() -> Result<(), Box<dyn Error>> {
+    let db = connect("mem://").await?;
+    db.use_ns(TEST_NS).use_db(TEST_DB).await?;
+    let ddl = SCHEMA_DDL.replace("$SUPERX_SERVICE_PASSWORD", TEST_SERVICE_PASSWORD);
+    db.query(ddl).await?.check()?;
+    db.signin(Database {
+        namespace: TEST_NS.to_string(),
+        database: TEST_DB.to_string(),
+        username: "superx".to_string(),
+        password: TEST_SERVICE_PASSWORD.to_string(),
+    })
+    .await?;
+
+    let kernel = Kernel::from_db(db);
+    kernel.seed_metamodel().await?;
+    let a = kernel.create_entity("node_run", "admin").await?;
+    let b = kernel.create_entity("node_agent", "user").await?;
+
+    // Try to use a node-category type_definition as an edge — engine
+    // must refuse via `relation.type ASSERT $value.category = 'edge'`.
+    let err = kernel
+        .create_relation(a, b, "node_run", true)
+        .await
+        .expect_err("must refuse when type's category is not 'edge'");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("edge") || msg.contains("category"),
+        "expected engine ASSERT refusal mentioning category/edge, got: {msg}"
+    );
 
     Ok(())
 }

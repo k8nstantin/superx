@@ -27,6 +27,7 @@ const METAMODEL_TYPES: &[MetamodelType] = &[
     MetamodelType { uid: "node_run",    category: "node", memory_tier: "core" },
     MetamodelType { uid: "node_agent",  category: "node", memory_tier: "core" },
     MetamodelType { uid: "node_source", category: "node", memory_tier: "core" },
+    MetamodelType { uid: "edge_owns",   category: "edge", memory_tier: "core" },
 ];
 
 struct MetamodelType {
@@ -238,6 +239,73 @@ impl Kernel {
         Ok(id)
     }
 
+    /// CREATE one row in `relation` with an explicit UUIDv7 id (§11),
+    /// linking two entities via a typed edge.
+    ///
+    /// `type_uid` resolves to a `type_definition` row whose
+    /// `category = 'edge'` (engine-asserted). `in_id` / `out_id` are
+    /// the source / target entities; either may be any entity in the
+    /// substrate (the schema deliberately does not constrain edge
+    /// endpoints to particular node types — that's a higher-layer
+    /// concern, since edge semantics vary per edge type).
+    ///
+    /// `is_acyclic` is recorded on the row as the edge's structural
+    /// intent. The engine does not enforce acyclicity globally —
+    /// cycle prevention is an application-level walk concern.
+    ///
+    /// Emits one `relation_created` telemetry event.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::NotFound`] if `type_uid` doesn't resolve;
+    /// [`KernelError::Db`] for engine errors (e.g. the type_definition
+    /// row's category is not `'edge'`).
+    pub async fn create_relation(
+        &self,
+        in_id: RecordId,
+        out_id: RecordId,
+        type_uid: &str,
+        is_acyclic: bool,
+    ) -> Result<RecordId> {
+        let type_id = self.find_type(type_uid).await?;
+        let id = RecordId::new("relation", surrealdb::types::Uuid::from(Uuid::now_v7()));
+        let row = RelationRow {
+            in_: in_id.clone(),
+            out: out_id.clone(),
+            r#type: type_id,
+            is_acyclic,
+            valid_from: Utc::now(),
+        };
+
+        let _: Option<RelationRow> = self.db.create(id.clone()).content(row).await?;
+
+        let mut payload = surrealdb::types::Object::new();
+        payload.insert(
+            "relation_id".to_string(),
+            surrealdb::types::Value::RecordId(id.clone()),
+        );
+        payload.insert(
+            "type_uid".to_string(),
+            surrealdb::types::Value::String(type_uid.to_string()),
+        );
+        payload.insert(
+            "in".to_string(),
+            surrealdb::types::Value::RecordId(in_id),
+        );
+        payload.insert(
+            "out".to_string(),
+            surrealdb::types::Value::RecordId(out_id),
+        );
+        self.log_telemetry(
+            "relation_created",
+            surrealdb::types::Value::Object(payload),
+            None,
+        )
+        .await?;
+
+        Ok(id)
+    }
+
     /// Read the most recent `telemetry_stream` rows, newest first.
     ///
     /// Pure SELECT — no mutation, no telemetry emission. `limit` caps
@@ -307,6 +375,17 @@ struct EntityRow {
     #[surreal(rename = "type")]
     r#type: RecordId,
     role: String,
+    valid_from: DateTime<Utc>,
+}
+
+#[derive(Debug, SurrealValue)]
+struct RelationRow {
+    #[surreal(rename = "in")]
+    in_: RecordId,
+    out: RecordId,
+    #[surreal(rename = "type")]
+    r#type: RecordId,
+    is_acyclic: bool,
     valid_from: DateTime<Utc>,
 }
 
