@@ -147,6 +147,13 @@ DEFINE TABLE state_ledger SCHEMAFULL
 DEFINE FIELD target      ON TABLE state_ledger TYPE record<entity>;
 DEFINE FIELD type        ON TABLE state_ledger TYPE record<type_definition>
     ASSERT $value.category = 'attribute';
+-- `payload` holds the typed value for this attribute write. The
+-- type-specific shape (e.g. `attr_desc` requires `{ text: string }`,
+-- `attr_score` requires `{ score: number }`) is documented per
+-- attribute type and enforced by kernel-verb discipline at the
+-- boundary, not by the engine. Mirrors the
+-- `execution_params.params_json` / `schedule.metadata` pattern.
+DEFINE FIELD payload     ON TABLE state_ledger TYPE object;
 DEFINE FIELD valid_from  ON TABLE state_ledger TYPE datetime;
 
 
