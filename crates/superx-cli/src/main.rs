@@ -47,6 +47,26 @@ enum Command {
         #[arg(long, env = "SUPERX_DB", default_value = "v01")] // skill-allow: §9-default
         database: String,
     },
+
+    /// Print recent `telemetry_stream` rows, newest first. Read-only.
+    Stats {
+        /// SurrealDB endpoint URL. `ws://host:port`, `wss://...`,
+        /// `http://...`, or `https://...`.
+        #[arg(long, env = "SUPERX_DB_ENDPOINT", default_value = "ws://localhost:8000")] // skill-allow: §9-default
+        endpoint: String,
+
+        /// SurrealDB namespace.
+        #[arg(long, env = "SUPERX_NS", default_value = "superx")] // skill-allow: §9-default
+        namespace: String,
+
+        /// SurrealDB database.
+        #[arg(long, env = "SUPERX_DB", default_value = "v01")] // skill-allow: §9-default
+        database: String,
+
+        /// Maximum number of telemetry rows to show.
+        #[arg(long, default_value_t = 25)]
+        limit: u32,
+    },
 }
 
 #[tokio::main]
@@ -58,6 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             namespace,
             database,
         } => bootstrap(&endpoint, &namespace, &database).await,
+        Command::Stats {
+            endpoint,
+            namespace,
+            database,
+            limit,
+        } => stats(&endpoint, &namespace, &database, limit).await,
     }
 }
 
@@ -75,5 +101,38 @@ async fn bootstrap(
     println!("  metamodel seeded (node_run, node_agent, node_source).");
 
     println!("✓ Bootstrap complete. Substrate is ready for kernel verbs.");
+    Ok(())
+}
+
+async fn stats(
+    endpoint: &str,
+    namespace: &str,
+    database: &str,
+    limit: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let kernel = Kernel::connect_service(endpoint, namespace, database).await?;
+    let events = kernel.recent_telemetry(limit).await?;
+
+    if events.is_empty() {
+        println!("(no telemetry rows yet — run `superx bootstrap` to seed the metamodel)");
+        return Ok(());
+    }
+
+    for event in &events {
+        let run_field = match &event.run {
+            Some(r) => format!("run={r:?}"),
+            None => String::new(),
+        };
+        println!(
+            "{ts}  {event:<22}  {run_field}  {payload:?}",
+            ts = event.valid_from.to_rfc3339(),
+            event = event.lifecycle_event,
+            run_field = run_field,
+            payload = event.payload,
+        );
+    }
+
+    println!();
+    println!("({n} row{s}, newest first)", n = events.len(), s = if events.len() == 1 { "" } else { "s" });
     Ok(())
 }

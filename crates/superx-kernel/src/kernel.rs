@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use surrealdb::engine::any::{connect, Any};
 use surrealdb::opt::auth::Database;
-use surrealdb::types::{RecordId, SurrealValue};
+use surrealdb::types::{RecordId, SurrealValue, Value};
 use surrealdb::Surreal;
 use uuid::Uuid;
 
@@ -238,6 +238,28 @@ impl Kernel {
         Ok(id)
     }
 
+    /// Read the most recent `telemetry_stream` rows, newest first.
+    ///
+    /// Pure SELECT — no mutation, no telemetry emission. `limit` caps
+    /// the number of rows returned; pass the desired window size.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces engine errors verbatim via [`KernelError::Db`].
+    pub async fn recent_telemetry(&self, limit: u32) -> Result<Vec<TelemetryRecord>> {
+        let rows: Vec<TelemetryRecord> = self
+            .db
+            .query(
+                "SELECT * FROM telemetry_stream \
+                 ORDER BY valid_from DESC \
+                 LIMIT $limit",
+            )
+            .bind(("limit", limit))
+            .await?
+            .take(0)?;
+        Ok(rows)
+    }
+
     /// Append one row to `telemetry_stream` with an explicit UUIDv7 id.
     ///
     /// Telemetry is global across the entire OS (v0.1 single-deployment
@@ -291,7 +313,18 @@ struct EntityRow {
 #[derive(Debug, SurrealValue)]
 struct TelemetryRow {
     lifecycle_event: String,
-    payload: surrealdb::types::Value,
+    payload: Value,
     run: Option<RecordId>,
     valid_from: DateTime<Utc>,
+}
+
+/// One row read back from `telemetry_stream`. Returned in newest-first
+/// order by [`Kernel::recent_telemetry`].
+#[derive(Debug, SurrealValue)]
+pub struct TelemetryRecord {
+    pub id: RecordId,
+    pub lifecycle_event: String,
+    pub payload: Value,
+    pub run: Option<RecordId>,
+    pub valid_from: DateTime<Utc>,
 }
