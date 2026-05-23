@@ -367,7 +367,9 @@ Dispatch denial is verified by `mcp_dispatch_denies_uncapped_agent_on_graphify`;
 
 ```
 crates/
-  superx-kernel/      5-table substrate, sessions, SCD-2, schema, cycle detection
+  superx-kernel/      9-table substrate, sessions, SCD-2, schema, kernel verbs
+  superx-gmaster/     gmaster (graph master) — graphify-pattern source extraction
+                      into the substrate as typed entities + relations + state
   superx-bootstrap/   First-run substrate provisioning, agent + tool seeding
   superx-ingest/      Universal ingestor: FileSource (walk + per-file attr_desc), JsonSource
   superx-compiler/    Tier-aware context distillation, optional LLM-distilled output
@@ -377,11 +379,12 @@ crates/
   superx-agent/       Capability Governor (handshake, check_capability)
   superx-emission/    Telemetry subscriber + Kafka/HTTP sinks
   superx-cli/         Operator CLI:
-                        bootstrap | graphify | compile | propose | evaluate |
-                        promote | identify | list-agents | list-tools |
-                        demo | stats
+                        bootstrap | stats | gmaster infer | (later: compile,
+                        identify, list-agents, list-tools, install, infer ask)
   superx-mcp/         MCP stdio server (lib + bin)
 ```
+
+The shipped-today subset is `superx-kernel` + `superx-gmaster` + `superx-cli`. Others land per the §10.4 phase plan.
 
 ### 7. Hardening Invariants (binding for every future change)
 

@@ -13,6 +13,7 @@ name = "superx"
 path = "src/main.rs"
 
 [dependencies]
-clap          .workspace = true
-tokio         .workspace = true
-superx-kernel = { path = "../superx-kernel" }
+clap           .workspace = true
+tokio          .workspace = true
+superx-kernel  = { path = "../superx-kernel" }
+superx-gmaster = { path = "../superx-gmaster" }

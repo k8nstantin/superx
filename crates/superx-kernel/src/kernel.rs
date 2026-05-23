@@ -166,6 +166,70 @@ impl Kernel {
         Ok(())
     }
 
+    /// Idempotently CREATE one `type_definition` row, returning the
+    /// resolved [`RecordId`]. If a row with this `uid` already exists,
+    /// returns its id without creating a new row.
+    ///
+    /// This is the primitive that lets feature crates
+    /// (`superx-ingest`, `superx-infer`, `superx-runtime`, …) seed
+    /// their own metamodel types without the kernel knowing about
+    /// every feature. Each feature exposes its own
+    /// `seed_<feature>_metamodel(&Kernel)` helper that calls this verb
+    /// once per type.
+    ///
+    /// Emits one `type_definition_ensured` telemetry event when a new
+    /// row is created. Repeat calls for the same uid are silent.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::Db`] for engine errors (e.g. `memory_tier`
+    /// outside the schema-enforced `INSIDE [...]` ASSERT).
+    pub async fn ensure_type_definition(
+        &self,
+        uid: &str,
+        category: &str,
+        memory_tier: &str,
+    ) -> Result<RecordId> {
+        if let Some(existing) = self.find_type_opt(uid).await? {
+            return Ok(existing);
+        }
+        let id = RecordId::new(
+            "type_definition",
+            surrealdb::types::Uuid::from(Uuid::now_v7()),
+        );
+        let row = TypeDefinitionRow {
+            uid: uid.to_string(),
+            category: category.to_string(),
+            is_acyclic: true,
+            sch_json: None,
+            memory_tier: memory_tier.to_string(),
+            valid_from: Utc::now(),
+        };
+        let _: Option<TypeDefinitionRow> = self.db.create(id.clone()).content(row).await?;
+
+        let mut payload = surrealdb::types::Object::new();
+        payload.insert(
+            "type_definition_id".to_string(),
+            surrealdb::types::Value::RecordId(id.clone()),
+        );
+        payload.insert(
+            "uid".to_string(),
+            surrealdb::types::Value::String(uid.to_string()),
+        );
+        payload.insert(
+            "category".to_string(),
+            surrealdb::types::Value::String(category.to_string()),
+        );
+        self.log_telemetry(
+            "type_definition_ensured",
+            surrealdb::types::Value::Object(payload),
+            None,
+        )
+        .await?;
+
+        Ok(id)
+    }
+
     /// Look up the [`RecordId`] of the latest `type_definition` row
     /// whose `uid` matches the argument. Returns [`KernelError::NotFound`]
     /// if no such row exists.

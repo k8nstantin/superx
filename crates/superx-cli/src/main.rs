@@ -5,8 +5,34 @@
 //! through the typed kernel API (which signs in as the `superx` EDITOR
 //! service account, never root, per SKILL.md §13).
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use superx_kernel::Kernel;
+
+#[derive(Debug, Subcommand)]
+enum GmasterAction {
+    /// Infer a typed knowledge graph from the source files under
+    /// `<path>` and persist it to the substrate as entities +
+    /// relations + state_ledger rows. v1 walks Rust files; more
+    /// languages, docs, PDFs in subsequent PRs.
+    Infer {
+        /// Directory or file to ingest.
+        path: PathBuf,
+
+        /// SurrealDB endpoint URL.
+        #[arg(long, env = "SUPERX_DB_ENDPOINT", default_value = "ws://localhost:8000")] // skill-allow: §9-default
+        endpoint: String,
+
+        /// SurrealDB namespace.
+        #[arg(long, env = "SUPERX_NS", default_value = "superx")] // skill-allow: §9-default
+        namespace: String,
+
+        /// SurrealDB database.
+        #[arg(long, env = "SUPERX_DB", default_value = "v01")] // skill-allow: §9-default
+        database: String,
+    },
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -48,6 +74,16 @@ enum Command {
         database: String,
     },
 
+    /// gmaster — graph master. Source-extraction (and, in later PRs,
+    /// clustering + graph queries). The "graphify" pattern with a
+    /// graph-database substrate: turn raw inputs (Rust code in v1;
+    /// more languages, docs, PDFs, URLs, SQL in subsequent PRs) into
+    /// a typed knowledge graph in SurrealDB.
+    Gmaster {
+        #[command(subcommand)]
+        action: GmasterAction,
+    },
+
     /// Print recent `telemetry_stream` rows, newest first. Read-only.
     Stats {
         /// SurrealDB endpoint URL. `ws://host:port`, `wss://...`,
@@ -78,6 +114,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             namespace,
             database,
         } => bootstrap(&endpoint, &namespace, &database).await,
+        Command::Gmaster { action } => match action {
+            GmasterAction::Infer {
+                path,
+                endpoint,
+                namespace,
+                database,
+            } => gmaster_infer(&path, &endpoint, &namespace, &database).await,
+        },
         Command::Stats {
             endpoint,
             namespace,
@@ -85,6 +129,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             limit,
         } => stats(&endpoint, &namespace, &database, limit).await,
     }
+}
+
+async fn gmaster_infer(
+    path: &std::path::Path,
+    endpoint: &str,
+    namespace: &str,
+    database: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("→ Connecting to {endpoint} (ns={namespace} db={database}) as service account 'superx'");
+    let kernel = Kernel::connect_service(endpoint, namespace, database).await?;
+    println!("  signed in.");
+
+    println!("→ Inferring graph from {}", path.display());
+    let stats = superx_gmaster::infer(&kernel, path).await?;
+
+    println!(
+        "  {files} files · {functions} functions · {classes} classes · {modules} modules",
+        files = stats.files,
+        functions = stats.functions,
+        classes = stats.classes,
+        modules = stats.modules,
+    );
+    println!(
+        "  {defines} defines edges · {imports} imports edges",
+        defines = stats.edges_defines,
+        imports = stats.edges_imports,
+    );
+    println!("✓ gmaster infer complete.");
+    Ok(())
 }
 
 async fn bootstrap(

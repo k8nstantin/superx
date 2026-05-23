@@ -1,0 +1,22 @@
+[package]
+name        = "superx-gmaster"
+description = "gmaster (graph master) — extracts knowledge graphs from source data (Rust code in v1; more languages, docs, PDFs, URLs, SQL in subsequent PRs) into the SuperX substrate as typed entities + relations + state_ledger rows."
+
+edition      .workspace = true
+version      .workspace = true
+license      .workspace = true
+authors      .workspace = true
+rust-version .workspace = true
+
+[dependencies]
+petgraph         .workspace = true
+tree-sitter      .workspace = true
+tree-sitter-rust .workspace = true
+walkdir          .workspace = true
+chrono           .workspace = true
+surrealdb        .workspace = true
+thiserror        .workspace = true
+superx-kernel    = { path = "../superx-kernel" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
