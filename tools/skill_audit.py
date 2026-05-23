@@ -175,11 +175,15 @@ RULES: List[Rule] = [
     Rule(
         id="S13-2",
         section="§13",
-        description='db.signin with username other than "superx"',
-        # Look for any signin call that references a username other than "superx".
-        # We match `username: "X"` with X != superx — covers Database/Record/Namespace
-        # auth shapes where username is the field name.
-        pattern=r'username:\s*"(?!superx")[^"]*"',
+        description='db.signin with username outside the per-layer naming convention (superx_kernel / superx_driver_<name> / superx_app_<name>)',
+        # Per the per-layer service-account naming convention locked in
+        # `project_superx_architecture.md` memory:
+        #   • kernel: username MUST be exactly "superx_kernel"
+        #   • drivers: username MUST start with "superx_driver_"
+        #   • apps:    username MUST start with "superx_app_"
+        # Match `username: "X"` where X is NONE of those — that's a §13 violation.
+        # The negative-lookahead enumerates the allowed prefixes.
+        pattern=r'username:\s*"(?!superx_kernel"|superx_driver_[^"]+"|superx_app_[^"]+")[^"]*"',
         scope="all",
         exempt_marker="// skill-allow: §13-username",
         line_filter=_not_comment,
@@ -689,7 +693,7 @@ def detect_arch_drift() -> List[Violation]:
 #
 # Any `DEFINE` or `REMOVE` statement targeting a database object is a
 # **schema mutation**. Per SKILL.md §7 + §10, schema mutations are
-# OPERATOR-ONLY territory — they live in `schema/superx.surql`, are
+# OPERATOR-ONLY territory — they live in `schema/kernel.surql`, are
 # applied by the operator under root via `scripts/deploy-schema.sh`,
 # and are NEVER issued from application code.
 #
@@ -699,7 +703,7 @@ def detect_arch_drift() -> List[Violation]:
 # The goal: stop the model from sneaking schema mutations into Rust
 # (`db.query("DEFINE FIELD ...")`), Python tools, shell scripts, or any
 # other executable path. If the model needs a schema change it must
-# stop and ask; the operator amends `schema/superx.surql` in a
+# stop and ask; the operator amends `schema/kernel.surql` in a
 # dedicated schema PR with an explicit `Operator-approved:` marker.
 # --------------------------------------------------------------------------
 
@@ -808,7 +812,7 @@ def detect_unauthorized_ddl_in_code() -> List[Violation]:
     No `// skill-allow:` marker is honoured for this rule — DDL outside
     `schema/*.surql` is unconditionally forbidden. The only path to a
     schema change is an operator-authored amendment to
-    `schema/superx.surql` in a dedicated schema PR with the
+    `schema/kernel.surql` in a dedicated schema PR with the
     `Operator-approved:` marker required by the §7 CI gate.
 
     Comments are skipped (Rust `//` / `///`, Python / Shell / TOML / YAML
@@ -882,7 +886,7 @@ def print_human(violations: List[Violation]) -> None:
     print("     `// skill-allow: ...` marker for a legitimate exception")
     print("     (visible in the diff, defensible at PR review).")
     print("  3. For [X1] DDL-bypass violations: there is NO exemption marker.")
-    print("     STOP and ask the operator to amend schema/superx.surql in a")
+    print("     STOP and ask the operator to amend schema/kernel.surql in a")
     print("     dedicated schema PR with an `Operator-approved:` marker.")
     print("     Embedding DDL in code is unconditionally forbidden.")
     print("  4. If the audit rule itself is wrong: propose changing this script")
