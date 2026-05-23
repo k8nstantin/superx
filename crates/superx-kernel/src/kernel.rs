@@ -24,10 +24,12 @@ const SERVICE_PASSWORD_DEV_DEFAULT: &str = "superx-v01-dev-x9KmP2nQ7tR3vW8y";
 /// [`Kernel::seed_metamodel`] once per substrate, idempotent on repeat
 /// invocation.
 const METAMODEL_TYPES: &[MetamodelType] = &[
-    MetamodelType { uid: "node_run",    category: "node", memory_tier: "core" },
-    MetamodelType { uid: "node_agent",  category: "node", memory_tier: "core" },
-    MetamodelType { uid: "node_source", category: "node", memory_tier: "core" },
-    MetamodelType { uid: "edge_owns",   category: "edge", memory_tier: "core" },
+    MetamodelType { uid: "node_run",    category: "node",      memory_tier: "core" },
+    MetamodelType { uid: "node_agent",  category: "node",      memory_tier: "core" },
+    MetamodelType { uid: "node_source", category: "node",      memory_tier: "core" },
+    MetamodelType { uid: "edge_owns",   category: "edge",      memory_tier: "core" },
+    MetamodelType { uid: "attr_desc",   category: "attribute", memory_tier: "working" },
+    MetamodelType { uid: "attr_score",  category: "attribute", memory_tier: "working" },
 ];
 
 struct MetamodelType {
@@ -306,6 +308,110 @@ impl Kernel {
         Ok(id)
     }
 
+    /// CREATE one row in `state_ledger` with an explicit UUIDv7 id (§11),
+    /// attaching a typed attribute value to an entity.
+    ///
+    /// The substrate is append-only: this verb does NOT update a prior
+    /// row in place. Every call creates a fresh row chained by
+    /// `(target, type)`; the "current" value is recovered by
+    /// [`Kernel::current_state`] (which selects the latest by
+    /// `valid_from`). This is the SCD-2 pattern made literal — full
+    /// history of every attribute change is preserved for free.
+    ///
+    /// `type_uid` resolves to a `type_definition` row whose
+    /// `category = 'attribute'` (engine-asserted). `payload` shape is
+    /// type-specific (e.g. `attr_desc` → `{ text: ... }`,
+    /// `attr_score` → `{ score: ... }`) and enforced by callers, not
+    /// by the engine — per SKILL.md §10 the engine accepts `object`.
+    ///
+    /// Emits one `state_superseded` telemetry event.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::NotFound`] if `type_uid` doesn't resolve;
+    /// [`KernelError::Db`] for engine errors (e.g. the type_definition
+    /// row's category is not `'attribute'`).
+    pub async fn supersede_state(
+        &self,
+        target: RecordId,
+        type_uid: &str,
+        payload: Value,
+    ) -> Result<RecordId> {
+        let type_id = self.find_type(type_uid).await?;
+        let id = RecordId::new("state_ledger", surrealdb::types::Uuid::from(Uuid::now_v7()));
+        let row = StateLedgerRow {
+            target: target.clone(),
+            r#type: type_id,
+            payload,
+            valid_from: Utc::now(),
+        };
+
+        let _: Option<StateLedgerRow> = self.db.create(id.clone()).content(row).await?;
+
+        let mut tele = surrealdb::types::Object::new();
+        tele.insert(
+            "state_ledger_id".to_string(),
+            surrealdb::types::Value::RecordId(id.clone()),
+        );
+        tele.insert(
+            "target".to_string(),
+            surrealdb::types::Value::RecordId(target),
+        );
+        tele.insert(
+            "type_uid".to_string(),
+            surrealdb::types::Value::String(type_uid.to_string()),
+        );
+        self.log_telemetry(
+            "state_superseded",
+            surrealdb::types::Value::Object(tele),
+            None,
+        )
+        .await?;
+
+        Ok(id)
+    }
+
+    /// Recover the latest `state_ledger.payload` for a `(target, type)`
+    /// chain. Returns `None` if no row has been written yet for that
+    /// pair.
+    ///
+    /// This is the SCD-2 "current" query — `ORDER BY valid_from DESC
+    /// LIMIT 1` filtered by chain key. Every blade and every
+    /// `compile_context` call reads attribute values through this verb
+    /// (or its successors), never by direct query.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::NotFound`] if `type_uid` doesn't resolve;
+    /// [`KernelError::Db`] for engine errors.
+    pub async fn current_state(
+        &self,
+        target: RecordId,
+        type_uid: &str,
+    ) -> Result<Option<Value>> {
+        let type_id = self.find_type(type_uid).await?;
+
+        #[derive(SurrealValue)]
+        struct PayloadRow {
+            payload: Value,
+            valid_from: DateTime<Utc>,
+        }
+
+        let rows: Vec<PayloadRow> = self
+            .db
+            .query(
+                "SELECT payload, valid_from FROM state_ledger \
+                 WHERE target = $target AND type = $type \
+                 ORDER BY valid_from DESC LIMIT 1",
+            )
+            .bind(("target", target))
+            .bind(("type", type_id))
+            .await?
+            .take(0)?;
+
+        Ok(rows.into_iter().next().map(|r| r.payload))
+    }
+
     /// Read the most recent `telemetry_stream` rows, newest first.
     ///
     /// Pure SELECT — no mutation, no telemetry emission. `limit` caps
@@ -386,6 +492,15 @@ struct RelationRow {
     #[surreal(rename = "type")]
     r#type: RecordId,
     is_acyclic: bool,
+    valid_from: DateTime<Utc>,
+}
+
+#[derive(Debug, SurrealValue)]
+struct StateLedgerRow {
+    target: RecordId,
+    #[surreal(rename = "type")]
+    r#type: RecordId,
+    payload: Value,
     valid_from: DateTime<Utc>,
 }
 
