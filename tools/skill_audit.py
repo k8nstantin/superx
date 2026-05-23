@@ -19,9 +19,8 @@ Designed to be impossible for the model to bypass:
 Exit codes
 ----------
   0  clean — no violations detected
-  1  at least one bright-line violation
-  2  schema-drift detected (SUPERX_SCHEMA.md vs apply_substrate_schema)
-  3  internal error (parser failure, missing file the audit requires, …)
+  1  at least one violation (per-line bright-line rule OR DDL-bypass
+     OR structural check — all are hard violations)
 
 Usage
 -----
@@ -99,20 +98,6 @@ class Violation:
             "file": str(self.file),
             "line": self.line,
             "snippet": self.snippet,
-        }
-
-
-@dataclass
-class SchemaDrift:
-    kind: str           # "code-only" or "doc-only"
-    statement: str      # the DEFINE / DROP / etc. statement that diverges
-    location: str       # path:line where found
-
-    def to_dict(self) -> dict:
-        return {
-            "kind": self.kind,
-            "statement": self.statement,
-            "location": self.location,
         }
 
 
@@ -699,106 +684,146 @@ def detect_arch_drift() -> List[Violation]:
 # Schema-drift detector
 # --------------------------------------------------------------------------
 
-DEFINE_RX = re.compile(
-    r"\bDEFINE\s+(TABLE|FIELD|INDEX|USER|ACCESS|FUNCTION|ANALYZER|EVENT|PARAM|CONFIG)"
-    r"\b[^;]*?;",
-    flags=re.IGNORECASE | re.DOTALL,
+# --------------------------------------------------------------------------
+# Hard DDL-bypass detector (replaces the earlier schema-drift heuristic).
+#
+# Any `DEFINE` or `REMOVE` statement targeting a database object is a
+# **schema mutation**. Per SKILL.md §7 + §10, schema mutations are
+# OPERATOR-ONLY territory — they live in `schema/superx.surql`, are
+# applied by the operator under root via `scripts/deploy-schema.sh`,
+# and are NEVER issued from application code.
+#
+# This check scans the entire repo for DDL keywords appearing anywhere
+# outside the operator-controlled allowlist. ANY hit is a hard
+# violation that blocks merge — no exempt markers, no escape hatches.
+# The goal: stop the model from sneaking schema mutations into Rust
+# (`db.query("DEFINE FIELD ...")`), Python tools, shell scripts, or any
+# other executable path. If the model needs a schema change it must
+# stop and ask; the operator amends `schema/superx.surql` in a
+# dedicated schema PR with an explicit `Operator-approved:` marker.
+# --------------------------------------------------------------------------
+
+DDL_RX = re.compile(
+    r"\b(DEFINE|REMOVE)\s+"
+    r"(TABLE|FIELD|INDEX|USER|ACCESS|FUNCTION|ANALYZER|EVENT|PARAM|CONFIG|"
+    r"NAMESPACE|DATABASE|TOKEN|SCOPE|MODEL)\b",
+    flags=re.IGNORECASE,
+)
+
+# Specific files where DDL keywords are permitted. Everything else
+# (Rust, Python, shell, TOML, JSON, …) must be DDL-free.
+DDL_ALLOWED_FILES = {
+    "tools/skill_audit.py",                 # this script — has DDL_RX patterns
+    ".github/workflows/skill-audit.yml",    # workflow comments / job names
+}
+
+# Directory prefixes whose contents are exempt wholesale.
+DDL_ALLOWED_DIR_PREFIXES = (
+    "schema/",     # the operator-controlled DDL source-of-truth
+    "archive/",    # historical / pre-burn snapshots
+    "target/",     # cargo build artifacts (gitignored)
+    ".git/",       # git internals
+    "node_modules/",
+)
+
+# File-suffix-based exemptions (documentation).
+DDL_ALLOWED_SUFFIXES = (
+    ".md",         # markdown — DDL in fenced blocks is documentation
+)
+
+DDL_BYPASS_RULE = Rule(
+    id="X1",
+    section="schema-bypass (operator-only)",
+    description=(
+        "DDL statement (DEFINE/REMOVE) outside schema/*.surql — schema "
+        "mutations are OPERATOR-ONLY territory per SKILL.md §7. Embedding "
+        "DDL in code bypasses the operator-approval gate and the deploy "
+        "script. If a schema change is needed, STOP and ask the operator "
+        "to amend schema/superx.surql in a dedicated schema PR."
+    ),
+    pattern=DDL_RX.pattern,
+    scope="production",
+    exempt_marker=None,    # intentionally no exemption marker — no escape hatch
+    line_filter=None,
 )
 
 
-def _normalize_ddl(stmt: str) -> str:
-    """Collapse whitespace and trailing semicolons for comparison."""
-    s = re.sub(r"\s+", " ", stmt).strip()
-    if not s.endswith(";"):
-        s += ";"
-    return s
+def _is_ddl_allowed_path(path: Path) -> bool:
+    """True if DDL appearing in this path is allowed (operator-controlled
+    schema files, documentation, or the audit infrastructure itself)."""
+    try:
+        rel = path.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return False
+    if rel in DDL_ALLOWED_FILES:
+        return True
+    if rel.endswith(DDL_ALLOWED_SUFFIXES):
+        return True
+    return any(rel.startswith(p) for p in DDL_ALLOWED_DIR_PREFIXES)
 
 
-def extract_ddl_from_schema_doc() -> List[str]:
-    """Parse SUPERX_SCHEMA.md and return every DEFINE statement found in
-    fenced code blocks (sql / surql). Returns normalized statements."""
-    if not SCHEMA_DOC.exists():
-        return []
-    text = SCHEMA_DOC.read_text(encoding="utf-8")
-    statements: List[str] = []
-    # Find fenced code blocks of type sql or surql or no-type.
-    fence_rx = re.compile(
-        r"```(?:sql|surql|surrealql)?\n(.*?)```",
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    for block_match in fence_rx.finditer(text):
-        block = block_match.group(1)
-        for m in DEFINE_RX.finditer(block):
-            statements.append(_normalize_ddl(m.group(0)))
-    return statements
+_COMMENT_PREFIXES = ("//", "///", "/*", "*", "#", "--", ";;")
 
 
-def extract_ddl_from_source() -> List[tuple[str, str]]:
-    """Walk crates/ for Rust source containing DEFINE statements inside string
-    literals (e.g. `db.query("DEFINE TABLE ...")`). Returns list of
-    (statement, location) tuples."""
-    out: List[tuple[str, str]] = []
-    if not CRATES_DIR.exists():
-        return out
-    # Find any multi-line string literal that contains DEFINE keywords.
-    # Use a simplified approach: scan all *.rs files, find DEFINE matches
-    # inside them, and capture file:line.
-    for path in iter_rust_files("all"):
+def _line_is_comment(line: str) -> bool:
+    """Heuristic — treat the line as a pure-comment line if its first
+    non-whitespace token matches a known comment prefix. Catches Rust
+    (`//`, `///`, `/*`, ` *` continuation), Python / Shell / TOML / YAML
+    (`#`), and SQL (`--`). Empty lines are skipped too."""
+    stripped = line.lstrip()
+    if not stripped:
+        return True
+    return stripped.startswith(_COMMENT_PREFIXES)
+
+
+def detect_unauthorized_ddl_in_code() -> List[Violation]:
+    """Scan every file in the repo (outside the allowlist) for DDL
+    keywords. Any hit on a non-comment line is a hard violation that
+    fails the audit.
+
+    No `// skill-allow:` marker is honoured for this rule — DDL outside
+    `schema/*.surql` is unconditionally forbidden. The only path to a
+    schema change is an operator-authored amendment to
+    `schema/superx.surql` in a dedicated schema PR with the
+    `Operator-approved:` marker required by the §7 CI gate.
+
+    Comments are skipped (Rust `//` / `///`, Python / Shell / TOML / YAML
+    `#`, SQL `--`, C `/* ... */` and `*` continuation lines). This means
+    documentation can describe DDL freely; executable lines cannot
+    issue it.
+    """
+    violations: List[Violation] = []
+    for path in sorted(REPO_ROOT.rglob("*")):
+        if not path.is_file():
+            continue
+        if _is_ddl_allowed_path(path):
+            continue
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
+            content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        # Only look at content that's likely inside a string literal — i.e.
-        # match against the raw file text but require the statement to appear
-        # within double-quotes (heuristic).
-        for m in DEFINE_RX.finditer(content):
-            # Determine line number
-            line_no = content.count("\n", 0, m.start()) + 1
-            # Heuristic check: the DEFINE has to be within a string literal,
-            # signalled by the nearest preceding `"` or `r#"` etc.
-            # For now we accept any DEFINE occurrence; this may catch DDL in
-            # comments too, which is acceptable noise.
-            out.append((
-                _normalize_ddl(m.group(0)),
-                f"{path.relative_to(REPO_ROOT)}:{line_no}",
+        if not DDL_RX.search(content):
+            continue
+        lines = content.splitlines()
+        for m in DDL_RX.finditer(content):
+            line_idx = content.count("\n", 0, m.start())
+            line_text = lines[line_idx] if line_idx < len(lines) else ""
+            if _line_is_comment(line_text):
+                continue
+            violations.append(Violation(
+                rule=DDL_BYPASS_RULE,
+                file=path.relative_to(REPO_ROOT),
+                line=line_idx + 1,
+                snippet=line_text.rstrip(),
             ))
-    return out
-
-
-def detect_schema_drift() -> List[SchemaDrift]:
-    """Compare SUPERX_SCHEMA.md DDL against source DDL. Report divergences."""
-    doc_ddl = set(extract_ddl_from_schema_doc())
-    src_ddl_with_loc = extract_ddl_from_source()
-    src_ddl = {stmt for stmt, _ in src_ddl_with_loc}
-
-    drifts: List[SchemaDrift] = []
-
-    # Code has DDL the doc doesn't mention → schema-first violated.
-    for stmt, loc in src_ddl_with_loc:
-        if stmt not in doc_ddl:
-            drifts.append(SchemaDrift(
-                kind="code-only",
-                statement=stmt,
-                location=loc,
-            ))
-
-    # Doc has DDL the code doesn't implement → unfinished schema.
-    for stmt in doc_ddl:
-        if stmt not in src_ddl:
-            drifts.append(SchemaDrift(
-                kind="doc-only",
-                statement=stmt,
-                location=str(SCHEMA_DOC.relative_to(REPO_ROOT)),
-            ))
-
-    return drifts
+    return violations
 
 
 # --------------------------------------------------------------------------
 # Reporting
 # --------------------------------------------------------------------------
 
-def print_human(violations: List[Violation], drifts: List[SchemaDrift]) -> None:
+def print_human(violations: List[Violation]) -> None:
     if violations:
         print()
         print(f"{Ansi.RED}{Ansi.BOLD}── Bright-line violations ──{Ansi.NC}")
@@ -815,20 +840,8 @@ def print_human(violations: List[Violation], drifts: List[SchemaDrift]) -> None:
                 print(f"     {v.snippet}")
             print()
 
-    if drifts:
-        print(f"{Ansi.RED}{Ansi.BOLD}── Schema drift ──{Ansi.NC}")
-        print(f"  {Ansi.DIM}({SCHEMA_DOC.relative_to(REPO_ROOT)} vs source DDL){Ansi.NC}")
-        print()
-        for d in drifts:
-            tag = (f"{Ansi.YEL}doc-only{Ansi.NC}"
-                   if d.kind == "doc-only"
-                   else f"{Ansi.RED}code-only{Ansi.NC}")
-            print(f"  [{tag}] {d.statement}")
-            print(f"     {Ansi.DIM}{d.location}{Ansi.NC}")
-        print()
-
     print()
-    if not violations and not drifts:
+    if not violations:
         print(f"{Ansi.GRN}════════════════════════════════════════════════════════{Ansi.NC}")
         print(f"{Ansi.GRN}{Ansi.BOLD}✅ SKILL AUDIT CLEAN{Ansi.NC}")
         print(f"{Ansi.GRN}════════════════════════════════════════════════════════{Ansi.NC}")
@@ -837,29 +850,28 @@ def print_human(violations: List[Violation], drifts: List[SchemaDrift]) -> None:
     print(f"{Ansi.RED}════════════════════════════════════════════════════════{Ansi.NC}")
     print(f"{Ansi.RED}{Ansi.BOLD}❌ SKILL AUDIT FAILED{Ansi.NC}")
     print(f"{Ansi.RED}════════════════════════════════════════════════════════{Ansi.NC}")
-    print(f"  {len(violations)} bright-line violation(s)")
-    print(f"  {len(drifts)} schema-drift entry(ies)")
+    print(f"  {len(violations)} violation(s)")
     print()
     print("Resolution paths:")
     print("  1. Fix the code so the rule no longer fires.")
-    print("  2. Apply an explicit `// skill-allow: ...` marker for a legitimate")
-    print("     exception (visible in the diff, defensible at PR review).")
-    print("  3. Update SUPERX_SCHEMA.md to match the source if doc-side drift,")
-    print("     or update apply_substrate_schema if code-side drift — but per §7,")
-    print("     any schema-side change requires `Operator-approved:` in the PR body.")
-    print("  4. If the audit rule is wrong, propose changing this script in a")
-    print("     separate PR with operator approval. Do not edit script + fix in")
-    print("     the same PR.")
+    print("  2. For per-line bright-line rules: apply an explicit")
+    print("     `// skill-allow: ...` marker for a legitimate exception")
+    print("     (visible in the diff, defensible at PR review).")
+    print("  3. For [X1] DDL-bypass violations: there is NO exemption marker.")
+    print("     STOP and ask the operator to amend schema/superx.surql in a")
+    print("     dedicated schema PR with an `Operator-approved:` marker.")
+    print("     Embedding DDL in code is unconditionally forbidden.")
+    print("  4. If the audit rule itself is wrong: propose changing this script")
+    print("     in a separate PR with operator approval. Do not edit script +")
+    print("     fix in the same PR.")
 
 
-def print_json(violations: List[Violation], drifts: List[SchemaDrift]) -> None:
+def print_json(violations: List[Violation]) -> None:
     out = {
         "violations": [v.to_dict() for v in violations],
-        "schema_drift": [d.to_dict() for d in drifts],
         "summary": {
             "violations_count": len(violations),
-            "drift_count": len(drifts),
-            "clean": (not violations) and (not drifts),
+            "clean": not violations,
         },
     }
     json.dump(out, sys.stdout, indent=2)
@@ -873,6 +885,14 @@ def print_rules_only() -> None:
         print(f"  [{r.id}] {r.section} — {r.description}")
         print(f"      scope={r.scope}  marker={r.exempt_marker or '(none)'}")
         print()
+    # Structural checks (not in the per-line RULES list — they run their
+    # own scanners over multi-file structure).
+    print(f"  [D1] structural — duplicate UUID literals across files")
+    print(f"  [D2] structural — kernel verb without log_telemetry call")
+    print(f"  [D3] structural — crate not referenced in ARCHITECTURE.md")
+    print(f"  [{DDL_BYPASS_RULE.id}] {DDL_BYPASS_RULE.section} — {DDL_BYPASS_RULE.description}")
+    print(f"      scope=all-files  marker=(none — DDL is unconditionally forbidden outside schema/*.surql)")
+    print()
 
 
 # --------------------------------------------------------------------------
@@ -898,11 +918,6 @@ def main() -> int:
         action="store_true",
         help="list every rule and exit 0",
     )
-    parser.add_argument(
-        "--skip-drift",
-        action="store_true",
-        help="skip schema-drift check (useful for early-restart phases)",
-    )
     args = parser.parse_args()
 
     if args.no_color or not sys.stdout.isatty():
@@ -918,21 +933,16 @@ def main() -> int:
     violations.extend(detect_duplicate_literals())
     violations.extend(detect_telemetry_gaps())
     violations.extend(detect_arch_drift())
-
-    drifts: List[SchemaDrift] = []
-    if not args.skip_drift:
-        drifts = detect_schema_drift()
+    # Hard DDL-bypass detector — any DEFINE/REMOVE statement outside
+    # schema/*.surql is unconditionally forbidden.
+    violations.extend(detect_unauthorized_ddl_in_code())
 
     if args.json:
-        print_json(violations, drifts)
+        print_json(violations)
     else:
-        print_human(violations, drifts)
+        print_human(violations)
 
-    if violations:
-        return 1
-    if drifts:
-        return 2
-    return 0
+    return 1 if violations else 0
 
 
 if __name__ == "__main__":

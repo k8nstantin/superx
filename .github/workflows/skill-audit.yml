@@ -31,29 +31,11 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Run skill audit (bright-line rules + service-account checks)
-        # `--skip-drift` is in place only until the rebuild lands an
-        # `apply_substrate_schema` implementation that matches
-        # SUPERX_SCHEMA.md. Drop the flag in the PR that introduces
-        # the kernel's schema-apply path.
-        run: python3 tools/skill_audit.py --skip-drift --no-color
-
-  # --------------------------------------------------------------------
-  # Schema-drift detector. Informational at install time (the workspace
-  # is empty post-burn so the doc-side DDL has nothing to match yet).
-  # Promoted to required-check status once the rebuild adds DDL.
-  # --------------------------------------------------------------------
-  schema-drift:
-    name: Schema drift (SUPERX_SCHEMA.md vs apply_substrate_schema)
-    runs-on: ubuntu-latest
-    continue-on-error: true  # informational until rebuild lands DDL
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
-      - name: Run full audit including schema-drift
+      - name: Run skill audit (bright-line rules + DDL-bypass detector)
+        # The audit's [X1] DDL-bypass rule is the operator's lock against
+        # the model issuing schema mutations from code. Any DEFINE /
+        # REMOVE statement found outside schema/*.surql or markdown
+        # documentation fails the build — no skill-allow marker honoured.
         run: python3 tools/skill_audit.py --no-color
 
   # --------------------------------------------------------------------
@@ -77,7 +59,7 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
           if git diff --name-only "$base..$head" \
-              | grep -qE '(SUPERX_SCHEMA\.md|apply_substrate_schema|seed_metamodel)'; then
+              | grep -qE '(SUPERX_SCHEMA\.md|^schema/.*\.surql$)'; then
             echo "schema_touched=true" >> "$GITHUB_OUTPUT"
           else
             echo "schema_touched=false" >> "$GITHUB_OUTPUT"
