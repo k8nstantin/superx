@@ -1,21 +1,35 @@
 -- =========================================================================
--- SuperX substrate schema — SOURCE OF TRUTH
+-- SuperX kernel schema — SOURCE OF TRUTH for the kernel layer
 -- =========================================================================
 --
--- This file is the locked DDL for the SuperX substrate. It is applied
+-- This file is the locked DDL for the SuperX KERNEL substrate. The
+-- kernel + every kernel module shares this one schema. It is applied
 -- ONCE under the operator's root account on a fresh database via
 -- scripts/deploy-schema.sh.
 --
--- From the moment this file is applied, the schema is LOCKED. Any change
--- to a DEFINE TABLE, DEFINE FIELD, DEFINE INDEX, DEFINE USER, or DEFINE
--- ACCESS statement here requires an explicit, prior, per-change
--- `Operator-approved: …` marker in the PR body that touches this file.
--- See .claude/skills/zero-trust-execution/SKILL.md §7 (Schema Immutability).
+-- From the moment this file is applied, the kernel schema is LOCKED.
+-- Any change to a DEFINE TABLE, DEFINE FIELD, DEFINE INDEX, DEFINE
+-- USER, or DEFINE ACCESS statement here requires an explicit, prior,
+-- per-change `Operator-approved: …` marker in the PR body that touches
+-- this file. See SKILL.md §7 (Schema Immutability).
+--
+-- Other layers ship their own schemas in their own crates:
+--   • drivers: crates/superx-driver-<name>/schema/<name>.surql
+--              each with its own service account `superx_driver_<name>`
+--              and its own database `superx.<name>`
+--   • apps:    crates/superx-<app>/schema/<app>.surql
+--              each with its own service account `superx_<app>` and its
+--              own database `superx.<app>`
+-- The kernel sees all of them (cross-database SELECT permissions); each
+-- driver/app sees only its own DB + read-only access to kernel for
+-- shared identity lookups. None of that is in FVP — only the kernel
+-- schema lands in this file.
 --
 -- Workflow contract:
 --   1. Operator applies this file ONCE under root account.
---   2. Model code signs in as `superx` (EDITOR role) for everything
---      thereafter. Model NEVER signs in as root after this point.
+--   2. Kernel code signs in as `superx_kernel` (EDITOR role) for
+--      everything thereafter. Kernel NEVER signs in as root after
+--      this point.
 --   3. PERMISSIONS clauses below are documentation of intent. SurrealDB's
 --      EDITOR role does not honour `FOR update / FOR delete NONE` for
 --      system users; the append-only invariant is enforced by KERNEL-VERB
@@ -30,8 +44,23 @@
 --   explicit operator approval. Until then, every table is global and
 --   every kernel verb writes without a tenant FK.
 --
+-- Registry pattern (no hardcoded category tables):
+--   The kernel's "what's installed" knowledge — kernel modules,
+--   drivers, apps, future contributions of unknown categories — lives
+--   as DATA in the 9-table substrate:
+--     • node_kernel_module entities for kernel modules
+--     • node_contribution entities for drivers / apps / future things
+--     • attr_contribution_category captures the category string (driver,
+--       app, model, quantum_thing, …) as PAYLOAD, not as schema
+--     • attr_contribution_database captures which database the
+--       contribution owns
+--     • attr_contribution_schema_dag mirrors the contribution's DAG
+--   The kernel does NOT bake "driver" or "app" as table names. Future
+--   categories arrive without schema changes — just new
+--   type_definition INSERTs by kernel-bootstrap.
+--
 -- Substitution:
---   `$SUPERX_SERVICE_PASSWORD` (below) is replaced by `envsubst` in
+--   `$SUPERX_KERNEL_PASSWORD` (below) is replaced by `envsubst` in
 --   scripts/deploy-schema.sh with the operator-supplied env var value
 --   at apply time. The schema file source never contains a real
 --   password literal.
@@ -39,10 +68,13 @@
 
 
 -- -------------------------------------------------------------------------
--- Service-account user — the model's only credential after schema deploy.
+-- Kernel service-account user — the kernel's only credential after
+-- schema deploy. Drivers and apps each get their own service accounts
+-- (`superx_driver_<name>`, `superx_<app>`) defined in their own schemas
+-- when they ship. Only the kernel account lives in this file.
 -- -------------------------------------------------------------------------
-DEFINE USER IF NOT EXISTS superx ON DATABASE
-    PASSWORD '$SUPERX_SERVICE_PASSWORD'
+DEFINE USER IF NOT EXISTS superx_kernel ON DATABASE
+    PASSWORD '$SUPERX_KERNEL_PASSWORD'
     ROLES EDITOR
     DURATION FOR SESSION 1h, FOR TOKEN 1h;
 

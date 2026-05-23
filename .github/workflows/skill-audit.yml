@@ -59,7 +59,7 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
           if git diff --name-only "$base..$head" \
-              | grep -qE '(SUPERX_SCHEMA\.md|^schema/.*\.surql$)'; then
+              | grep -qE '(SUPERX_SCHEMA\.md|^schema/.*\.surql$|^crates/.*/schema/.*\.surql$)'; then
             echo "schema_touched=true" >> "$GITHUB_OUTPUT"
           else
             echo "schema_touched=false" >> "$GITHUB_OUTPUT"

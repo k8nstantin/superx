@@ -20,7 +20,7 @@ SuperX is a safety-critical Agentic Operating System written in Rust, designed t
 ## Deploy substrate schema (operator one-shot)
 
 The substrate schema is shipped as a single locked DDL file —
-[`schema/superx.surql`](schema/superx.surql) — and applied **once** under
+[`schema/kernel.surql`](schema/kernel.surql) — and applied **once** under
 the operator's root account. From that moment forward the schema is
 locked; every subsequent change requires an explicit per-change
 `Operator-approved:` marker on the PR that touches it
@@ -35,12 +35,14 @@ export SUPERX_ROOT_PASSWORD='<choose a strong root password>'
 surreal start --user root --pass "$SUPERX_ROOT_PASSWORD" rocksdb:./db/superx.db &
 
 # 3. Apply the schema once
-export SUPERX_SERVICE_PASSWORD='<choose the model service-account password>'
+export SUPERX_KERNEL_PASSWORD='<choose the kernel service-account password>'
 ./scripts/deploy-schema.sh
 ```
 
-After this point, all SuperX code signs in as the `superx` service
-account (EDITOR role) — never root. The append-only invariant is
+After this point, all SuperX kernel code signs in as the `superx_kernel`
+service account (EDITOR role) — never root. Drivers and apps each
+ship their own schemas + service accounts (post-FVP). The append-only
+invariant is
 enforced by **kernel-verb discipline**: no kernel verb emits UPDATE or
 DELETE statements (SKILL.md §10 / §13).
 

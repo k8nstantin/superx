@@ -29,18 +29,21 @@ The substrate has two accounts. The operator owns root; the model uses a service
 -- Used only by the operator, only to apply schema changes.
 -- Not represented here as a DEFINE USER — it is the engine's root.
 
--- Model: service account named `superx`.
+-- Kernel: service account named `superx_kernel`.
 -- EDITOR role at user level, narrowed by per-table PERMISSIONS so the
 -- effective grant is SELECT + CREATE only (no UPDATE, no DELETE).
-DEFINE USER IF NOT EXISTS superx ON DATABASE
-    PASSWORD $superx_service_password
+-- Drivers and apps each get their own service accounts
+-- (`superx_driver_<name>`, `superx_<app>`) defined in their own
+-- schemas post-FVP.
+DEFINE USER IF NOT EXISTS superx_kernel ON DATABASE
+    PASSWORD $superx_kernel_password
     ROLES EDITOR
     DURATION FOR SESSION 1h, FOR TOKEN 1h;
 ```
 
 **Credentials** (also recorded in `.claude/skills/zero-trust-execution/SKILL.md §13`):
-- Login: `superx`
-- Password: `superx-v01-dev-x9KmP2nQ7tR3vW8y` (v0.1 dev default; operator overrides via `SUPERX_SERVICE_PASSWORD` env)
+- Login: `superx_kernel`
+- Password: `superx-kernel-v01-dev-x9KmP2nQ7tR3vW8y` (v0.1 dev default; operator overrides via `SUPERX_KERNEL_PASSWORD` env)
 
 Per [SurrealDB's `DEFINE USER` docs](https://surrealdb.com/docs/surrealql/statements/define/user), only the built-in `OWNER` / `EDITOR` / `VIEWER` roles are available at the user level. To enforce **SELECT + CREATE only** at the substrate, every table additionally carries:
 
@@ -55,7 +58,7 @@ DEFINE TABLE <table> SCHEMAFULL
 
 `FOR update NONE` and `FOR delete NONE` document the intended write surface (SELECT + CREATE only). Per SKILL.md §10 the EDITOR role does not honour those clauses for system users; the append-only invariant is actually enforced by **kernel-verb discipline** — no kernel verb emits an UPDATE or DELETE statement, ever. The `FOR update / FOR delete NONE` lines are kept as in-schema documentation of intent, not as the enforcement layer.
 
-The password is bound from the `SUPERX_SERVICE_PASSWORD` environment variable at bootstrap time. The operator sets this once; the model never sees it in plain text after handover.
+The password is bound from the `SUPERX_KERNEL_PASSWORD` environment variable at bootstrap time. The operator sets this once; the kernel never sees it in plain text after handover. Drivers and apps each have their own per-component password env vars (`SUPERX_DRIVER_<NAME>_PASSWORD`, `SUPERX_<APP>_PASSWORD`) defined when they ship.
 
 ## Cross-reference contract
 

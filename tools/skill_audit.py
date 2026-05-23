@@ -718,8 +718,14 @@ DDL_ALLOWED_FILES = {
 }
 
 # Directory prefixes whose contents are exempt wholesale.
+#
+# `schema/` holds the kernel's locked DDL — operator-controlled, the
+# source of truth for kernel + kernel modules. Driver and app schemas
+# (each owning their own DDL) live in `crates/<crate-name>/schema/`
+# matched by the regex check in `_is_ddl_allowed_path` (since glob
+# prefixes can't express that pattern).
 DDL_ALLOWED_DIR_PREFIXES = (
-    "schema/",     # the operator-controlled DDL source-of-truth
+    "schema/",     # kernel schema (locked, operator-controlled)
     "archive/",    # historical / pre-burn snapshots
     "target/",     # cargo build artifacts (gitignored)
     ".git/",       # git internals
@@ -731,15 +737,23 @@ DDL_ALLOWED_SUFFIXES = (
     ".md",         # markdown — DDL in fenced blocks is documentation
 )
 
+# Per-crate schema files — each driver / app crate may ship its own
+# schema/<name>.surql under its crate directory. This regex matches
+# those paths.
+DDL_PER_CRATE_SCHEMA_RX = re.compile(r"^crates/[^/]+/schema/[^/]+\.surql$")
+
 DDL_BYPASS_RULE = Rule(
     id="X1",
     section="schema-bypass (operator-only)",
     description=(
-        "DDL statement (DEFINE/REMOVE) outside schema/*.surql — schema "
-        "mutations are OPERATOR-ONLY territory per SKILL.md §7. Embedding "
-        "DDL in code bypasses the operator-approval gate and the deploy "
-        "script. If a schema change is needed, STOP and ask the operator "
-        "to amend schema/superx.surql in a dedicated schema PR."
+        "DDL statement (DEFINE/REMOVE) outside an operator-controlled "
+        "schema file — schema mutations are OPERATOR-ONLY territory per "
+        "SKILL.md §7. Embedding DDL in code bypasses the operator-"
+        "approval gate and the deploy script. If a schema change is "
+        "needed, STOP and ask the operator to amend the relevant "
+        "schema file (schema/kernel.surql for the kernel, or "
+        "crates/<crate>/schema/<crate>.surql for a driver/app) in a "
+        "dedicated schema PR."
     ),
     pattern=DDL_RX.pattern,
     scope="production",
@@ -750,7 +764,15 @@ DDL_BYPASS_RULE = Rule(
 
 def _is_ddl_allowed_path(path: Path) -> bool:
     """True if DDL appearing in this path is allowed (operator-controlled
-    schema files, documentation, or the audit infrastructure itself)."""
+    schema files, documentation, or the audit infrastructure itself).
+
+    Allowed paths:
+      • schema/*.surql                              kernel schema
+      • crates/<crate>/schema/<crate>.surql         driver / app schemas
+      • *.md                                        documentation
+      • tools/skill_audit.py, .github/workflows/skill-audit.yml
+      • archive/, target/, .git/, node_modules/    build / historical
+    """
     try:
         rel = path.relative_to(REPO_ROOT).as_posix()
     except ValueError:
@@ -758,6 +780,8 @@ def _is_ddl_allowed_path(path: Path) -> bool:
     if rel in DDL_ALLOWED_FILES:
         return True
     if rel.endswith(DDL_ALLOWED_SUFFIXES):
+        return True
+    if DDL_PER_CRATE_SCHEMA_RX.match(rel):
         return True
     return any(rel.startswith(p) for p in DDL_ALLOWED_DIR_PREFIXES)
 
