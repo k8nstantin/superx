@@ -1,0 +1,22 @@
+[package]
+name        = "superx-kernel"
+description = "SuperX atomic kernel — substrate access, telemetry primitive, kernel module registry. The four pillars: bootstrap-init, storage, telemetry, registry. Stays minimal."
+
+edition      .workspace = true
+version      .workspace = true
+license      .workspace = true
+authors      .workspace = true
+rust-version .workspace = true
+
+[dependencies]
+async-trait .workspace = true
+chrono      .workspace = true
+linkme      .workspace = true
+serde       .workspace = true
+serde_json  .workspace = true
+surrealdb   .workspace = true
+thiserror   .workspace = true
+uuid        .workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

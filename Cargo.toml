@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/superx-kernel"]
+
+[workspace.package]
+edition      = "2021"
+version      = "0.1.0"
+license      = "Apache-2.0"
+authors      = ["Constantin Alexander <constantin@dedomena.io>"]
+rust-version = "1.83"
+
+[workspace.dependencies]
+# Substrate SDK — kv-mem for in-process tests; protocol-ws for the
+# wire protocol the operator-provisioned standalone server speaks.
+surrealdb   = { version = "3", default-features = false, features = ["protocol-ws", "kv-mem"] }
+
+# Std-adjacent toolkit.
+async-trait = "0.1"
+chrono      = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+serde       = { version = "1",   features = ["derive"] }
+serde_json  = { version = "1" }
+thiserror   = "2"
+tokio       = { version = "1",   features = ["rt", "rt-multi-thread", "macros"] }
+uuid        = { version = "1",   features = ["v7", "serde"] }
+
+# Compile-time inventory — every kernel module / driver / app crate
+# registers its descriptor via `#[distributed_slice]`. Core iterates
+# the slices; nothing centrally enumerates contributions.
+linkme      = "0.3"
