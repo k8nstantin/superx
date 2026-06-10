@@ -49,6 +49,7 @@
 pub mod error;
 pub mod lifecycle;
 pub mod metamodel;
+pub mod parameters;
 pub mod registry;
 pub mod schema;
 pub mod substrate;
