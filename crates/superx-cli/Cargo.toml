@@ -1,0 +1,25 @@
+[package]
+name        = "superx-cli"
+description = "SuperX operator CLI — the `superx` binary. L3 app: `superx kernel bootstrap | modules list | stats`."
+
+edition      .workspace = true
+version      .workspace = true
+license      .workspace = true
+authors      .workspace = true
+rust-version .workspace = true
+
+[[bin]]
+name = "superx"
+path = "src/main.rs"
+
+[dependencies]
+async-trait             = { workspace = true }
+clap                    = { workspace = true }
+linkme                  = { workspace = true }
+serde_json              = { workspace = true }
+superx-kernel           = { path = "../superx-kernel" }
+superx-kernel-bootstrap = { path = "../superx-kernel-bootstrap" }
+tokio                   = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+surrealdb = { workspace = true }

@@ -10,7 +10,8 @@
 > - **Current plan:** [`docs/ROADMAP.md`](docs/ROADMAP.md)
 > - **Current schema truth:** [`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md) + [`schema/kernel.surql`](schema/kernel.surql)
 > - **Current code:** `crates/superx-kernel` (F0 atomic core, PR #96),
->   `crates/superx-kernel-bootstrap` (F6 boot orchestrator)
+>   `crates/superx-kernel-bootstrap` (F6 boot orchestrator),
+>   `crates/superx-cli` (F7 `superx` operator binary)
 
 ## Status (implemented surface)
 

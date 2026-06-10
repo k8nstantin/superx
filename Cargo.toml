@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/superx-cli",
     "crates/superx-kernel",
     "crates/superx-kernel-bootstrap",
 ]
@@ -19,6 +20,7 @@ surrealdb   = { version = "3", default-features = false, features = ["protocol-w
 
 # Std-adjacent toolkit.
 async-trait = "0.1"
+clap        = { version = "4", features = ["derive", "env"] }
 chrono      = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
 serde       = { version = "1",   features = ["derive"] }
 serde_json  = { version = "1" }
