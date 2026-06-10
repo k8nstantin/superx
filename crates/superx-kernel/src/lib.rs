@@ -46,6 +46,7 @@
 //! See `project_superx_architecture.md` in memory for the locked
 //! architectural canon.
 
+pub mod cursor;
 pub mod error;
 pub mod lifecycle;
 pub mod metamodel;
@@ -55,6 +56,7 @@ pub mod schema;
 pub mod substrate;
 pub mod telemetry;
 
+pub use cursor::Cursor;
 pub use error::{KernelError, Result};
 pub use lifecycle::LifecycleState;
 pub use metamodel::{MetamodelType, REQUIRED_METAMODEL_TYPES};
