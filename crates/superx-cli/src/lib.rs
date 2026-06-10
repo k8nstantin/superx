@@ -68,17 +68,26 @@ pub struct Cli {
 
 /// Where the substrate lives. Every value can come from a flag or an
 /// env var; defaults match the operator quickstart in README.md.
+///
+/// These three carry `skill-allow: §9-default` markers: connection
+/// bootstrap parameters are the one legitimate hardcoded-default
+/// exception — they locate the substrate and therefore cannot be
+/// read *from* it. Everything downstream of the connection is an
+/// `attr_config` parameter per §9.
 #[derive(Debug, Args)]
 pub struct ConnectionArgs {
     /// SurrealDB connection URL.
+    // skill-allow: §9-default — locates the substrate; cannot be read from it
     #[arg(long, env = "SUPERX_ENDPOINT", default_value = "ws://127.0.0.1:8000")]
     pub endpoint: String,
 
     /// SurrealDB namespace.
+    // skill-allow: §9-default — locates the substrate; cannot be read from it
     #[arg(long, env = "SUPERX_NAMESPACE", default_value = "superx")]
     pub namespace: String,
 
     /// SurrealDB database.
+    // skill-allow: §9-default — locates the substrate; cannot be read from it
     #[arg(long, env = "SUPERX_DATABASE", default_value = "kernel")]
     pub database: String,
 }
