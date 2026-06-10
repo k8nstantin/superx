@@ -1,5 +1,16 @@
 # SuperX Architecture: The Hardened Cognitive Substrate + Autonomous Product Builder (v42.15)
 
+> ## ⚠️ HISTORICAL DOCUMENT
+>
+> This document describes the **pre-2026-05-23 system**, which was wiped in
+> the redesign reset (PR #93, tagged `archive/pre-redesign-2026-05-23`).
+> The 12-crate workspace, the test counts, and the "blade" components below
+> **no longer exist**. It is retained as the long-term vision reference only.
+>
+> - **Current plan:** [`docs/ROADMAP.md`](docs/ROADMAP.md)
+> - **Current schema truth:** [`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md) + [`schema/kernel.surql`](schema/kernel.surql)
+> - **Current code:** `crates/superx-kernel` (F0 atomic core, PR #96)
+
 ## Status (implemented surface)
 
 - `cargo test --workspace`: **44 / 44 passing**

@@ -12,10 +12,20 @@ SuperX is a safety-critical Agentic Operating System written in Rust, designed t
 
 ## Status
 
-- **`cargo test --workspace`**: 44 / 44 passing
-- **`cargo clippy --workspace --all-targets --all-features -- -D warnings`**: clean
-- **Verification gate**: enforced before any `ARCHITECTURE.md` update lands
-- See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full vision, roadmap, and excellence-bar criteria.
+Rebuilt from line zero after the 2026-05-23 redesign reset (PR #93; the
+pre-reset system is tagged `archive/pre-redesign-2026-05-23`).
+
+- **Implemented:** `crates/superx-kernel` — the F0 atomic core (PR #96):
+  substrate verbs (SELECT + CREATE only), telemetry primitive, kernel-module
+  registry (linkme), lifecycle state machine. 10 / 10 tests passing,
+  clippy-clean under `-D warnings`.
+- **Not yet implemented:** CLI, bootstrap orchestrator, agent discovery,
+  capture loop — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the phased
+  plan to the First Viable Product.
+- **FVP bar:** run `superx kernel bootstrap`, open Claude Code, watch live
+  activity stream in `superx kernel stats --live`.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) is a **historical** vision document
+  (pre-reset); current schema truth is [`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md).
 
 ## Deploy substrate schema (operator one-shot)
 
@@ -48,33 +58,18 @@ DELETE statements (SKILL.md §10 / §13).
 
 ## Quickstart
 
+The operator-facing CLI ships at roadmap phase F7
+(see [`docs/ROADMAP.md`](docs/ROADMAP.md)). Until then the kernel is a
+library crate:
+
 ```bash
-# Provision substrate, seed default agents and capability edges
-cargo run -p superx-cli -- bootstrap --tenant demo
-
-# One-shot end-to-end smoke run — bootstrap → ingest → propose → promote
-cargo run -p superx-cli -- demo --tenant demo
-
-# Ingest a directory as a DAG of node_code entities
-cargo run -p superx-cli -- graphify --path ./my_project --tenant demo
-
-# Inspect what's registered
-cargo run -p superx-cli -- list-agents --tenant demo
-cargo run -p superx-cli -- list-tools  --tenant demo
-
-# Stream recent telemetry (newest first)
-cargo run -p superx-cli -- stats --tenant demo --limit 25
-
-# Run as an MCP server (foreground; talks to Claude Desktop / Claude Code / etc.)
-cargo run -p superx-mcp
-
-# Same, with external egress:
-SUPERX_EMISSION_API=https://your-ingest/v1/events \
-SUPERX_KAFKA_BROKERS=localhost:9092 SUPERX_KAFKA_TOPIC=superx.telemetry \
-cargo run -p superx-mcp
+# Verify the kernel (in-memory engine; no server required)
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-State persists in `./db/superx.db` (RocksDB) between runs.
+State persists in `./db/superx.db` (RocksDB) between runs of a deployed
+substrate (see schema deployment above).
 
 ## Architectural principles (binding)
 
@@ -93,25 +88,20 @@ Plus the §7 invariants in [`ARCHITECTURE.md`](ARCHITECTURE.md): SCD-2 + append-
 
 ```
 crates/
-  superx-kernel/      5-table substrate, sessions, SCD-2, schema, cycle detection
-  superx-bootstrap/   First-run substrate provisioning, agent + tool seeding
-  superx-ingest/      Universal ingestor: FileSource, JsonSource (+ planned: SQL/Iceberg/RAG)
-  superx-compiler/    Tier-aware context distillation, optional LLM-distilled output
-  superx-inference/   Local Candle + GGUF runner (zero-cloud inference)
-  superx-proposer/    LLM-driven structural-edge proposer
-  superx-harness/     wasmtime Meta-Harness (fuel-metered) + promote
-  superx-agent/       Capability Governor (handshake, check_capability)
-  superx-emission/    Telemetry subscriber + Kafka/HTTP sinks (+ planned: OTLP)
-  superx-cli/         Operator CLI: bootstrap / graphify / compile / propose /
-                                    evaluate / promote / identify / list-agents /
-                                    list-tools / demo / stats
-  superx-mcp/         MCP stdio server (lib + bin)
+  superx-kernel/      L0 atomic core: substrate verbs (SELECT + CREATE only),
+                      telemetry primitive, kernel-module registry (linkme),
+                      lifecycle state machine
 ```
+
+Future layers land per [`docs/ROADMAP.md`](docs/ROADMAP.md): kernel modules
+(`superx-kernel-<feature>`), drivers (`superx-driver-<name>`), apps
+(`superx-<name>`, starting with `superx-cli`).
 
 ## Documentation
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — full vision, principles, invariants, roadmap, operator quickstart.
-- GitHub Issues — task tracker for the roadmap, mirrored from the in-repo task list.
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — current phased plan to FVP and beyond.
+- [`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md) — schema source of truth.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — **historical** long-term vision (pre-reset).
 - `.claude/skills/zero-trust-execution/SKILL.md` — operator-mandated execution mode for contributors using LLM-assisted development.
 
 ## License
