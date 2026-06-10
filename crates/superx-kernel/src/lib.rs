@@ -61,7 +61,8 @@ pub use error::{KernelError, Result};
 pub use lifecycle::LifecycleState;
 pub use metamodel::{MetamodelType, REQUIRED_METAMODEL_TYPES};
 pub use registry::{
-    KernelModule, KernelModuleDescriptor, NodeKind, RegistryStatus, KERNEL_MODULES,
+    KernelModule, KernelModuleDescriptor, ModuleStatus, NodeKind, RegistryStatus,
+    KERNEL_MODULES,
 };
 pub use schema::SCHEMA_DDL;
 pub use substrate::Kernel;
