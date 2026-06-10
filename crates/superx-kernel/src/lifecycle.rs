@@ -116,8 +116,9 @@ impl LifecycleRow {
         }
     }
 
-    fn into_state(self) -> LifecycleState {
-        match self.tag.as_str() {
+    fn into_state(self) -> Result<LifecycleState> {
+        Ok(match self.tag.as_str() {
+            "enabled"  => LifecycleState::Enabled,
             "starting" => LifecycleState::Starting,
             "active"   => LifecycleState::Active {
                 startup_duration_ms: self.startup_duration_ms.unwrap_or(0).max(0) as u64,
@@ -130,8 +131,16 @@ impl LifecycleRow {
                 reason: self.reason.unwrap_or_default(),
             },
             "disabled" => LifecycleState::Disabled,
-            _          => LifecycleState::Enabled,
-        }
+            // An unknown tag is corrupt substrate state (a foreign or
+            // bad write). It must surface as an error — defaulting to
+            // Enabled would tell a boot orchestrator "healthy, not yet
+            // started" about a row it cannot actually interpret.
+            other => {
+                return Err(crate::error::KernelError::Corrupt(format!(
+                    "unknown lifecycle tag '{other}' in attr_lifecycle_state payload"
+                )))
+            }
+        })
     }
 }
 
@@ -140,6 +149,13 @@ impl LifecycleRow {
 /// Returns `None` if no lifecycle state has been written for this
 /// entity yet (i.e., the entity exists but the lifecycle column on
 /// `state_ledger` is empty for it).
+///
+/// # Errors
+///
+/// Returns [`KernelError::Corrupt`](crate::error::KernelError::Corrupt)
+/// if a lifecycle row exists but cannot be interpreted — wrong payload
+/// shape or an unknown state tag. Corrupt state is never coerced into
+/// a default.
 pub(crate) async fn read_lifecycle(
     kernel: &Kernel,
     entity_id: RecordId,
@@ -149,11 +165,11 @@ pub(crate) async fn read_lifecycle(
         .await?;
     let Some(v) = value else { return Ok(None) };
     let row = LifecycleRow::from_value(v).map_err(|e| {
-        crate::error::KernelError::NotFound(format!(
+        crate::error::KernelError::Corrupt(format!(
             "attr_lifecycle_state payload not in expected shape: {e}"
         ))
     })?;
-    Ok(Some(row.into_state()))
+    Ok(Some(row.into_state()?))
 }
 
 impl Kernel {

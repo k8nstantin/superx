@@ -281,14 +281,18 @@ impl Kernel {
         // SELECT target from state_ledger where the payload's name
         // matches AND the target entity's type matches the kind.
         // FLEXIBLE payload lets us reach into payload.name from SurrealQL.
+        // valid_from is in the projection because the engine requires
+        // every ORDER BY idiom to appear in the selection (same pattern
+        // as Kernel::current_state).
         #[derive(SurrealValue)]
         struct TargetRow {
             target: RecordId,
+            valid_from: chrono::DateTime<chrono::Utc>,
         }
         let rows: Vec<TargetRow> = self
             .db()
             .query(
-                "SELECT target FROM state_ledger \
+                "SELECT target, valid_from FROM state_ledger \
                  WHERE type = $desc_type \
                    AND target.type = $entity_type \
                    AND payload.name = $name \
