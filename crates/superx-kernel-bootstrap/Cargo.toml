@@ -1,0 +1,19 @@
+[package]
+name        = "superx-kernel-bootstrap"
+description = "SuperX boot orchestrator — seeds the metamodel, registers the linkme inventory, topo-sorts by depends_on, and starts every enabled module with failure isolation. L1 kernel module."
+
+edition      .workspace = true
+version      .workspace = true
+license      .workspace = true
+authors      .workspace = true
+rust-version .workspace = true
+
+[dependencies]
+async-trait   .workspace = true
+linkme        .workspace = true
+superx-kernel = { path = "../superx-kernel" }
+tokio         .workspace = true
+
+[dev-dependencies]
+surrealdb = { workspace = true }
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }

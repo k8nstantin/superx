@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/superx-kernel"]
+members = [
+    "crates/superx-kernel",
+    "crates/superx-kernel-bootstrap",
+]
 
 [workspace.package]
 edition      = "2021"

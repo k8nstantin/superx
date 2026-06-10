@@ -418,7 +418,7 @@ impl Kernel {
 /// Enabled / disabled flag persisted on `attr_module_status`. Distinct
 /// from the lifecycle state (`Active` / `Failed` / etc.) — status is
 /// the operator's intent, lifecycle is the runtime reality.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleStatus {
     Enabled,
     Disabled,
@@ -429,6 +429,49 @@ impl ModuleStatus {
         match self {
             Self::Enabled => "enabled",
             Self::Disabled => "disabled",
+        }
+    }
+}
+
+impl Kernel {
+    /// Read the operator's enable/disable intent for a registered
+    /// module. Returns `None` if the module isn't registered or no
+    /// status row has been written yet (callers treat both as
+    /// enabled — installed = enabled).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::KernelError::Corrupt`] when a status row
+    /// exists but doesn't carry `{ value: "enabled" | "disabled" }`.
+    pub async fn module_status(
+        &self,
+        kind: NodeKind,
+        name: &str,
+    ) -> Result<Option<ModuleStatus>> {
+        let Some(entity_id) = self.find_module_by_name(kind, name).await? else {
+            return Ok(None);
+        };
+        let Some(value) = self
+            .current_state(entity_id, "attr_module_status")
+            .await?
+        else {
+            return Ok(None);
+        };
+        let surrealdb::types::Value::Object(obj) = value else {
+            return Err(crate::error::KernelError::Corrupt(
+                "attr_module_status payload is not an object".to_string(),
+            ));
+        };
+        match obj.get("value") {
+            Some(surrealdb::types::Value::String(s)) if s == "enabled" => {
+                Ok(Some(ModuleStatus::Enabled))
+            }
+            Some(surrealdb::types::Value::String(s)) if s == "disabled" => {
+                Ok(Some(ModuleStatus::Disabled))
+            }
+            other => Err(crate::error::KernelError::Corrupt(format!(
+                "attr_module_status value is not 'enabled' / 'disabled': {other:?}"
+            ))),
         }
     }
 }
