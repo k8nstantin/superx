@@ -9,6 +9,13 @@
 //! Other layers (kernel modules, drivers, apps) publish their own
 //! per-crate REQUIRED_METAMODEL_TYPES slices; the orchestrator
 //! aggregates them all at boot time.
+//!
+//! Canon note: this 11-type list — with the single open-ended
+//! `node_contribution` registry type — supersedes the earlier 8-type
+//! list in the locked canon memo (`project_superx_architecture.md`
+//! §12), which had separate `node_driver` / `node_app` types.
+//! Categories are open-ended strings on the descriptor, not entity
+//! types (see `NodeKind`).
 
 /// Spec for one type_definition row the kernel relies on.
 #[derive(Debug, Clone, Copy)]
