@@ -1,5 +1,12 @@
 # SuperX Architectural Remediation (Revision 42.14)
 
+> ## ⚠️ HISTORICAL DOCUMENT
+>
+> This remediation log applies to the **pre-2026-05-23 system**, wiped in the
+> redesign reset (PR #93). The crates and verbs it references no longer
+> exist. Current plan: [`docs/ROADMAP.md`](docs/ROADMAP.md); current schema
+> truth: [`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md).
+
 ## Status: Phase 1 (Hardened Reset) COMPLETE
 
 This document tracks the resolution of the **Revision 42.3 Architect Audit** and the subsequent **Phase 1 Hardening**.
