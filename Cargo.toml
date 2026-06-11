@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/superx-cli",
+    "crates/superx-driver-claude-code",
     "crates/superx-kernel",
     "crates/superx-kernel-bootstrap",
     "crates/superx-kernel-discovery",

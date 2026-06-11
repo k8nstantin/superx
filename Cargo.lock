@@ -3653,6 +3653,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "superx-driver-claude-code"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "linkme",
+ "superx-kernel",
+ "superx-kernel-bootstrap",
+ "superx-kernel-discovery",
+ "surrealdb",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "superx-kernel"
 version = "0.1.0"
 dependencies = [
