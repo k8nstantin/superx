@@ -58,9 +58,8 @@ SCHEMA_FILE="$REPO_ROOT/schema/kernel.surql"
 : "${SUPERX_NS:=superx}"
 : "${SUPERX_DB:=kernel}"
 
-if ! command -v surreal >/dev/null 2>&1; then
-    echo "ERROR: surreal CLI not found in PATH." >&2
-    echo "       Install: curl --proto '=https' --tlsv1.2 -sSf https://install.surrealdb.com | sh" >&2
+if ! command -v curl >/dev/null 2>&1; then
+    echo "ERROR: curl not found in PATH." >&2
     exit 1
 fi
 
@@ -88,14 +87,37 @@ echo
 # so any dollar-sign tokens in the SurrealQL that are not in the list
 # (e.g. PERMISSIONS expressions using $session_role) pass through
 # untouched.
+#
+# The whole script is POSTed to the /sql HTTP endpoint as ONE
+# multi-statement request. Do NOT pipe it into `surreal sql`: with
+# piped stdin that CLI executes LINE BY LINE, which splits every
+# multi-line DEFINE into parse errors and (observed on 3.1.4) silently
+# creates a defaulted superx_kernel user — VIEWER role, empty
+# password — while the script still looks successful. `surreal import`
+# is no alternative either: it requires `OPTION IMPORT;`, which
+# disables the side effects schema DDL needs, and its own error
+# message points at /sql for this use case.
 export SUPERX_KERNEL_PASSWORD
-envsubst '$SUPERX_KERNEL_PASSWORD' < "$SCHEMA_FILE" | \
-    surreal sql \
-        --endpoint "$SUPERX_DB_ENDPOINT" \
-        --username root --password "$SUPERX_ROOT_PASSWORD" \
-        --auth-level root \
-        --namespace "$SUPERX_NS" --database "$SUPERX_DB" \
-        --pretty
+RESPONSE="$(envsubst '$SUPERX_KERNEL_PASSWORD' < "$SCHEMA_FILE" | \
+    curl --silent --show-error --fail-with-body \
+        --user "root:$SUPERX_ROOT_PASSWORD" \
+        --header "surreal-ns: $SUPERX_NS" \
+        --header "surreal-db: $SUPERX_DB" \
+        --header "Accept: application/json" \
+        --data-binary @- \
+        "$SUPERX_DB_ENDPOINT/sql")"
+
+# Per-statement error check — a schema deploy must be all-or-nothing
+# loud, never silently partial.
+echo "$RESPONSE" | python3 -c '
+import json, sys
+results = json.load(sys.stdin)
+errors = [r for r in results if r.get("status") != "OK"]
+print(f"   statements: {len(results)}, errors: {len(errors)}")
+for e in errors[:10]:
+    print(f"   ERR: {str(e)[:300]}", file=sys.stderr)
+sys.exit(1 if errors else 0)
+'
 
 echo
 echo "✓ Kernel schema applied. Substrate is locked at the engine layer."
