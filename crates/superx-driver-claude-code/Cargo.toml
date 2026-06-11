@@ -1,0 +1,21 @@
+[package]
+name        = "superx-driver-claude-code"
+description = "SuperX Claude Code driver — discovers Claude Code's per-project transcript directories as capture sources. L2 driver."
+
+edition      .workspace = true
+version      .workspace = true
+license      .workspace = true
+authors      .workspace = true
+rust-version .workspace = true
+
+[dependencies]
+async-trait             = { workspace = true }
+linkme                  = { workspace = true }
+superx-kernel           = { path = "../superx-kernel" }
+superx-kernel-discovery = { path = "../superx-kernel-discovery" }
+
+[dev-dependencies]
+superx-kernel-bootstrap = { path = "../superx-kernel-bootstrap" }
+surrealdb               = { workspace = true }
+tokio                   = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid                    = { workspace = true }
