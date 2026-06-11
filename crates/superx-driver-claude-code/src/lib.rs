@@ -14,6 +14,14 @@
 //! parameter** — the default becomes visible, auditable,
 //! operator-supersedable substrate state. Tests point the parameter
 //! at fixture directories via `set_parameter`; no env hacks.
+//!
+//! The capture half lives in [`watcher`]: a [`TranscriptWatcher`]
+//! registered into the capture loop's `CAPTURE_SOURCES` slice tails
+//! the discovered directories' `*.jsonl` transcripts.
+//!
+//! [`TranscriptWatcher`]: watcher::TranscriptWatcher
+
+pub mod watcher;
 
 use std::path::PathBuf;
 

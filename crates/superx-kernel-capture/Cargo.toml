@@ -1,0 +1,20 @@
+[package]
+name        = "superx-kernel-capture"
+description = "SuperX telemetry capture loop — polls every discovered source through its driver's watcher, emits typed telemetry per event, checkpoints via cursors. L1 kernel module; THE core FVP function."
+
+edition      .workspace = true
+version      .workspace = true
+license      .workspace = true
+authors      .workspace = true
+rust-version .workspace = true
+
+[dependencies]
+async-trait   = { workspace = true }
+linkme        = { workspace = true }
+superx-kernel = { path = "../superx-kernel" }
+tokio         = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+surrealdb  = { workspace = true }
+tokio      = { workspace = true, features = ["macros", "rt-multi-thread"] }

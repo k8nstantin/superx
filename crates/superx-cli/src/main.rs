@@ -23,15 +23,25 @@ async fn run(cli: Cli) -> superx_kernel::Result<()> {
     )
     .await?;
 
-    let rendered = match cli.command {
-        Command::Kernel(KernelCommand::Bootstrap) => superx_cli::run_bootstrap(&kernel).await?,
+    match cli.command {
+        Command::Kernel(KernelCommand::Bootstrap) => {
+            let (report, rendered) = superx_cli::run_bootstrap(&kernel).await?;
+            print!("{rendered}");
+            if superx_cli::capture_is_active(&report) {
+                println!(
+                    "\ncapture is running — telemetry is streaming into the substrate.\n\
+                     watch it live from another terminal:  superx kernel stats\n\
+                     press ctrl-c to stop."
+                );
+                tokio::signal::ctrl_c().await.ok();
+            }
+        }
         Command::Kernel(KernelCommand::Modules(ModulesCommand::List)) => {
-            superx_cli::run_modules_list(&kernel).await?
+            print!("{}", superx_cli::run_modules_list(&kernel).await?);
         }
         Command::Kernel(KernelCommand::Stats { limit }) => {
-            superx_cli::run_stats(&kernel, limit).await?
+            print!("{}", superx_cli::run_stats(&kernel, limit).await?);
         }
-    };
-    print!("{rendered}");
+    }
     Ok(())
 }

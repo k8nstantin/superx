@@ -5,6 +5,7 @@ members = [
     "crates/superx-driver-claude-code",
     "crates/superx-kernel",
     "crates/superx-kernel-bootstrap",
+    "crates/superx-kernel-capture",
     "crates/superx-kernel-discovery",
 ]
 

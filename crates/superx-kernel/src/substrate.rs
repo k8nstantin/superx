@@ -297,6 +297,51 @@ impl Kernel {
         Ok(rows.into_iter().next().map(|r| r.target))
     }
 
+    /// Enumerate every entity of a type together with the latest
+    /// payload of its descriptor-style attribute. The inverse of
+    /// [`Kernel::find_entity_by_name`]: where that resolves one name
+    /// to one entity, this lists everything that carries the naming
+    /// attribute — agents (`attr_agent_descriptor`), sources
+    /// (`attr_source_descriptor`), and future named kinds.
+    ///
+    /// Entities of the type that have no descriptor row yet are
+    /// omitted (they have no name to list).
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::NotFound`] if either type uid doesn't resolve;
+    /// [`KernelError::Db`] for engine errors.
+    pub async fn list_named_entities(
+        &self,
+        entity_type_uid: &str,
+        attr_type_uid: &str,
+    ) -> Result<Vec<NamedEntity>> {
+        let entity_type = self.find_type(entity_type_uid).await?;
+
+        #[derive(SurrealValue)]
+        struct IdOnly {
+            id: RecordId,
+        }
+        let entities: Vec<IdOnly> = self
+            .db
+            .query("SELECT id FROM entity WHERE type = $type")
+            .bind(("type", entity_type))
+            .await?
+            .take(0)?;
+
+        let mut out = Vec::with_capacity(entities.len());
+        for e in entities {
+            let Some(payload) = self.current_state(e.id.clone(), attr_type_uid).await? else {
+                continue;
+            };
+            out.push(NamedEntity {
+                entity_id: e.id,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+
     /// Recover the latest `state_ledger.payload` for a
     /// `(target, type_uid)` chain. Returns `None` if no row has
     /// been written yet for that pair.
@@ -370,6 +415,16 @@ impl Kernel {
         )
         .await
     }
+}
+
+/// One row of [`Kernel::list_named_entities`]: an entity plus the
+/// latest payload of its descriptor-style attribute.
+#[derive(Debug, Clone)]
+pub struct NamedEntity {
+    /// The entity's substrate identity.
+    pub entity_id: RecordId,
+    /// The latest descriptor payload (e.g. `{name, locator, probe}`).
+    pub payload: Value,
 }
 
 // ─────────────────────────────────────────────────────────────────────

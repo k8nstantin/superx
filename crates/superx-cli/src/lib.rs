@@ -22,6 +22,14 @@ use superx_kernel::{
 };
 use superx_kernel_bootstrap::{bootstrap, BootReport};
 
+// Link the FVP contribution set into every binary built on this
+// library (the `superx` bin and the test binaries): their linkme
+// registrations fill KERNEL_MODULES / DISCOVERY_PROBES /
+// CAPTURE_SOURCES at link time. No other coupling.
+use superx_driver_claude_code as _;
+use superx_kernel_capture as _;
+use superx_kernel_discovery as _;
+
 // ─────────────────────────────────────────────────────────────────────
 // App registration
 // ─────────────────────────────────────────────────────────────────────
@@ -126,16 +134,28 @@ pub enum ModulesCommand {
 // Command handlers — take &Kernel, return rendered text
 // ─────────────────────────────────────────────────────────────────────
 
-/// `superx kernel bootstrap` — run the boot orchestrator and render
-/// the report.
+/// `superx kernel bootstrap` — run the boot orchestrator. Returns the
+/// report (so the binary can decide whether to stay foreground for
+/// capture) together with its rendering.
 ///
 /// # Errors
 ///
 /// Substrate-level failures of the boot machinery itself; per-module
 /// problems are isolated into the rendered report.
-pub async fn run_bootstrap(kernel: &Kernel) -> Result<String> {
+pub async fn run_bootstrap(kernel: &Kernel) -> Result<(BootReport, String)> {
     let report = bootstrap(kernel).await?;
-    Ok(render_boot_report(&report))
+    let rendered = render_boot_report(&report);
+    Ok((report, rendered))
+}
+
+/// True when the capture module booted Active — the binary stays
+/// foreground so the capture loop keeps streaming (D6).
+#[must_use]
+pub fn capture_is_active(report: &BootReport) -> bool {
+    report.entries.iter().any(|e| {
+        e.name == superx_kernel_capture::MODULE_NAME
+            && matches!(e.outcome, LifecycleState::Active { .. })
+    })
 }
 
 /// `superx kernel modules list` — render the registry.
