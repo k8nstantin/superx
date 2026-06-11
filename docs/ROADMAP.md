@@ -1,10 +1,12 @@
 # SuperX Roadmap — F0 → FVP and Beyond
 
-> **Status:** F0 (atomic kernel core, PR #96) is merged. This document is the
-> living plan from F0 to the First Viable Product and slightly beyond. It
-> supersedes the roadmap sections of `ARCHITECTURE.md` (v42.15), which
-> describes the pre-2026-05-23 system and is retained as a historical
-> vision document. Schema truth lives in [`SUPERX_SCHEMA.md`](../SUPERX_SCHEMA.md)
+> **Status (2026-06-11):** phases **F1–F11 are merged** (PRs #97–#106) —
+> **the First Viable Product is complete**; the test protocol lives in
+> [`README.md`](../README.md). This document tracks the post-FVP plan and
+> the quality backlog from the FVP readiness review. It supersedes the
+> roadmap sections of `ARCHITECTURE.md` (v42.15), which describes the
+> pre-2026-05-23 system and is retained as a historical vision document.
+> Schema truth lives in [`SUPERX_SCHEMA.md`](../SUPERX_SCHEMA.md)
 > and [`schema/kernel.surql`](../schema/kernel.surql).
 
 ## Terminology
@@ -109,6 +111,49 @@ cancellation assert.
 4. **F15** — DAG compile step (JSON-canonical singleton + graph derivative +
    CID hashing, per the locked canon).
 
+## Quality backlog — FVP readiness review (2026-06-11)
+
+Findings from the 14-agent adversarial review that shipped F11's
+demo-critical fixes; everything below is verified-real but deferred.
+Severity is the review's verdict.
+
+**Needs an operator-approved schema PR (§7):**
+- 1 h `DURATION FOR SESSION/TOKEN` on `superx_kernel` kills both
+  long-running FVP processes after an hour (minor → operator decision).
+- No UNIQUE indexes backing the `ensure_*` / `register_module`
+  find-then-create idempotency — cross-process races can fork SCD-2
+  chains (minor).
+- No index on `telemetry_stream.valid_from` — every poll full-scans a
+  growing table (note; measure first).
+
+**Capture / discovery robustness (code, post-FVP PRs):**
+- Discovery is one-shot at bootstrap; project dirs created later are
+  never discovered (major for UX; continuous re-probing).
+- Per-process `STOP` static: re-bootstrap in one process leaks a
+  duplicate capture loop; shutdown affects all instances (minor).
+- Checkpoint-after-emit = at-least-once delivery; a mid-poll failure
+  re-emits already-captured lines next tick (minor).
+- Equal-or-longer file replacement is not detected (only shrinkage
+  resets the offset); cursor `files` metadata never pruned (minor).
+- Probe panics are not per-probe isolated; one failing probe marks the
+  whole discovery module Failed — per-probe lifecycle granularity
+  (minor). Persistent per-tick `capture_error` has no backoff (note).
+- Disabled module on a dependency cycle is marked Failed, overriding
+  operator intent; skip reason says "unknown module" for
+  failed-registration deps (minor).
+
+**Kernel / CLI quality (code, post-FVP PRs):**
+- `find_entity_by_name` matches the latest row *that ever carried the
+  name* — a renamed entity's old name resolves forever; resolve per
+  target's current descriptor instead (minor).
+- Every CLI invocation emits a `system_boot` row — readers mutate the
+  stream they observe (minor).
+- `stats` payload rendering is externally-tagged serde JSON — noisy;
+  human rendering pass (minor). `--module` is a raw substring match
+  (note). Dead `KernelError::Json` variant (note).
+- The entire ws wire path is untested in CI — F12's
+  `SUPERX_WS_TEST_ENDPOINT` environment is the fix (note).
+
 **Deferred with no dates:** emission sinks (Kafka/HTTP/OTLP), model router +
 providers, scheduler / runner / harness, MCP app, gmaster, permissions
 framework, A2A comm, vector / cache / secrets, daemonization,
@@ -137,4 +182,10 @@ framework, A2A comm, vector / cache / secrets, daemonization,
    incl. `node_driver` / `node_app`) is superseded by F0's shipped 11 types
    with `node_contribution`; the D1 parameters clarification should also be
    recorded. Memory-file edits, operator's call.
-4. **D6 foreground-bootstrap semantics** — confirm before F10.
+4. **D6 foreground-bootstrap semantics** — shipped as designed in F10
+   (foreground hold until ctrl-c); retro-confirm or amend.
+5. **Schema amendment candidates** from the 2026-06-11 readiness review
+   (each its own operator-approved schema PR per §7): session/token
+   `DURATION` longer than 1 h; `DEFINE INDEX` UNIQUE on
+   `type_definition.uid` / `cursor_type.uid`; index on
+   `telemetry_stream.valid_from`.
