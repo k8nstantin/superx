@@ -250,6 +250,53 @@ impl Kernel {
         Ok(id)
     }
 
+    /// Find an entity by the `name` key of its latest descriptor-style
+    /// attribute. The substrate names entities through `state_ledger`
+    /// payloads, not entity columns — this is the canonical
+    /// found-by-name lookup used by the module registry
+    /// (`attr_module_descriptor`), agent discovery
+    /// (`attr_agent_descriptor`), source discovery
+    /// (`attr_source_descriptor`), and any future naming attribute.
+    ///
+    /// `valid_from` is in the projection because the engine requires
+    /// every ORDER BY idiom to appear in the selection.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::NotFound`] if either type uid doesn't resolve;
+    /// [`KernelError::Db`] for engine errors.
+    pub async fn find_entity_by_name(
+        &self,
+        entity_type_uid: &str,
+        attr_type_uid: &str,
+        name: &str,
+    ) -> Result<Option<RecordId>> {
+        let entity_type = self.find_type(entity_type_uid).await?;
+        let attr_type = self.find_type(attr_type_uid).await?;
+
+        #[derive(SurrealValue)]
+        struct TargetRow {
+            target: RecordId,
+            valid_from: DateTime<Utc>,
+        }
+        let rows: Vec<TargetRow> = self
+            .db
+            .query(
+                "SELECT target, valid_from FROM state_ledger \
+                 WHERE type = $attr_type \
+                   AND target.type = $entity_type \
+                   AND payload.name = $name \
+                 ORDER BY valid_from DESC LIMIT 1",
+            )
+            .bind(("attr_type", attr_type))
+            .bind(("entity_type", entity_type))
+            .bind(("name", name.to_string()))
+            .await?
+            .take(0)?;
+
+        Ok(rows.into_iter().next().map(|r| r.target))
+    }
+
     /// Recover the latest `state_ledger.payload` for a
     /// `(target, type_uid)` chain. Returns `None` if no row has
     /// been written yet for that pair.

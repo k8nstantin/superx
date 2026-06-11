@@ -56,6 +56,13 @@ pub mod schema;
 pub mod substrate;
 pub mod telemetry;
 
+/// Substrate value/record types, re-exported for kernel modules,
+/// drivers, and apps. The canon boundary rule says no layer above L0
+/// imports `surrealdb` directly — payload construction goes through
+/// this re-export, which also guarantees a single surrealdb version
+/// across the workspace.
+pub use surrealdb::types;
+
 pub use cursor::Cursor;
 pub use error::{KernelError, Result};
 pub use lifecycle::LifecycleState;

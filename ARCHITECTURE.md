@@ -11,7 +11,8 @@
 > - **Current schema truth:** [`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md) + [`schema/kernel.surql`](schema/kernel.surql)
 > - **Current code:** `crates/superx-kernel` (F0 atomic core, PR #96),
 >   `crates/superx-kernel-bootstrap` (F6 boot orchestrator),
->   `crates/superx-cli` (F7 `superx` operator binary)
+>   `crates/superx-cli` (F7 `superx` operator binary),
+>   `crates/superx-kernel-discovery` (F8 agent-discovery probe framework)
 
 ## Status (implemented surface)
 

@@ -31,6 +31,13 @@ pub enum KernelError {
     /// never silently coerced into a default value.
     #[error("corrupt substrate state: {0}")]
     Corrupt(String),
+
+    /// A kernel module / driver / app failed in its own domain logic —
+    /// e.g. a discovery probe errored, a capture source went away.
+    /// Carried through [`crate::KernelModule::startup`] so bootstrap
+    /// records the failure verbatim in the module's lifecycle.
+    #[error("module error: {0}")]
+    Module(String),
 }
 
 pub type Result<T> = std::result::Result<T, KernelError>;
