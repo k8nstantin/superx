@@ -4,6 +4,7 @@ members = [
     "crates/superx-cli",
     "crates/superx-kernel",
     "crates/superx-kernel-bootstrap",
+    "crates/superx-kernel-discovery",
 ]
 
 [workspace.package]

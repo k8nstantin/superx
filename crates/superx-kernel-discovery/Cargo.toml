@@ -1,0 +1,18 @@
+[package]
+name        = "superx-kernel-discovery"
+description = "SuperX agent discovery — the probe framework. L1 kernel module: drivers register DiscoveryProbe implementations; discovery turns what they find into node_agent / node_source entities with full telemetry."
+
+edition      .workspace = true
+version      .workspace = true
+license      .workspace = true
+authors      .workspace = true
+rust-version .workspace = true
+
+[dependencies]
+async-trait   .workspace = true
+linkme        .workspace = true
+superx-kernel = { path = "../superx-kernel" }
+
+[dev-dependencies]
+surrealdb = { workspace = true }
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -275,36 +275,8 @@ impl Kernel {
         kind: NodeKind,
         name: &str,
     ) -> Result<Option<RecordId>> {
-        let type_id = self.find_type(kind.type_uid()).await?;
-        let descriptor_type_id = self.find_type("attr_module_descriptor").await?;
-
-        // SELECT target from state_ledger where the payload's name
-        // matches AND the target entity's type matches the kind.
-        // FLEXIBLE payload lets us reach into payload.name from SurrealQL.
-        // valid_from is in the projection because the engine requires
-        // every ORDER BY idiom to appear in the selection (same pattern
-        // as Kernel::current_state).
-        #[derive(SurrealValue)]
-        struct TargetRow {
-            target: RecordId,
-            valid_from: chrono::DateTime<chrono::Utc>,
-        }
-        let rows: Vec<TargetRow> = self
-            .db()
-            .query(
-                "SELECT target, valid_from FROM state_ledger \
-                 WHERE type = $desc_type \
-                   AND target.type = $entity_type \
-                   AND payload.name = $name \
-                 ORDER BY valid_from DESC LIMIT 1",
-            )
-            .bind(("desc_type", descriptor_type_id))
-            .bind(("entity_type", type_id))
-            .bind(("name", name.to_string()))
-            .await?
-            .take(0)?;
-
-        Ok(rows.into_iter().next().map(|r| r.target))
+        self.find_entity_by_name(kind.type_uid(), "attr_module_descriptor", name)
+            .await
     }
 
     /// Write (supersede) the descriptor payload on a registered
