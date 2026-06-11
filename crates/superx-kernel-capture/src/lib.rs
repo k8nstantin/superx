@@ -139,21 +139,23 @@ impl KernelModule for CaptureModule {
 static CAPTURE_REGISTRATION: &'static (dyn KernelModule + Sync) = &CaptureModule;
 
 /// The background loop: tick, sleep the configured interval, repeat
-/// until [`CaptureModule::shutdown`] flips the stop flag. Tick
-/// failures are recorded as telemetry by `capture_tick` itself;
-/// substrate-level failures here end the loop with a final
-/// `capture_loop_stopped` event attempt.
+/// until [`CaptureModule::shutdown`] flips the stop flag.
+///
+/// **Resilient by contract:** the loop never exits on error. Watcher
+/// errors are isolated inside `capture_tick`; a tick-level failure
+/// (substrate hiccup, transient ws drop) emits a best-effort
+/// `capture_tick_failed` telemetry event and the loop sleeps and
+/// retries — over a real wire connection, one transient error must
+/// not silently kill the firehose while the bootstrap terminal still
+/// claims it is streaming. The only way out is the STOP flag.
 pub async fn run_loop(kernel: &Kernel) {
     while !STOP.load(Ordering::SeqCst) {
         if let Err(e) = capture_tick(kernel).await {
-            // Loop-level failure (substrate unreachable, …) — try to
-            // leave a trace, then stop rather than spin.
             let mut payload = Object::new();
             payload.insert("error".to_string(), Value::String(e.to_string()));
             let _ = kernel
-                .log_telemetry("capture_loop_stopped", Value::Object(payload), None)
+                .log_telemetry("capture_tick_failed", Value::Object(payload), None)
                 .await;
-            return;
         }
         let secs = interval_secs(kernel).await.unwrap_or(DEFAULT_INTERVAL_SECS);
         let secs = u64::try_from(secs).unwrap_or(DEFAULT_INTERVAL_SECS as u64).max(1);

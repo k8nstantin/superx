@@ -116,12 +116,27 @@ pub enum KernelCommand {
     #[command(subcommand)]
     Modules(ModulesCommand),
 
-    /// Show recent telemetry (newest first).
+    /// Show recent telemetry (newest first), or follow it live.
     Stats {
-        /// How many events to show.
+        /// How many events to show (initial backlog in --live mode).
+        // skill-allow: §9-default — render-size knob for a one-shot read; the
+        // live-poll interval is the substrate parameter
         #[arg(short = 'n', long, default_value_t = 25)]
         limit: u32,
+
+        /// Follow the firehose: render new events as they land
+        /// (rolling poll; interval = attr_stats_poll_interval_secs).
+        #[arg(long)]
+        live: bool,
+
+        /// Only show events whose payload mentions this module /
+        /// agent name.
+        #[arg(long)]
+        module: Option<String>,
     },
+
+    /// List discovered agents and their capture sources.
+    Agents,
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,25 +208,252 @@ pub async fn run_modules_list(kernel: &Kernel) -> Result<String> {
 }
 
 /// `superx kernel stats -n <limit>` — render recent telemetry,
-/// newest first.
+/// newest first, optionally filtered by `--module`.
 ///
 /// # Errors
 ///
 /// Substrate errors.
-pub async fn run_stats(kernel: &Kernel, limit: u32) -> Result<String> {
+pub async fn run_stats(kernel: &Kernel, limit: u32, module: Option<&str>) -> Result<String> {
     let events = kernel.recent_telemetry(limit).await?;
     let mut out = String::new();
+    let mut shown = 0usize;
     for e in &events {
-        out.push_str(&format!(
-            "{}  {:<24} {}\n",
-            e.valid_from.format("%Y-%m-%d %H:%M:%S%.3f"),
-            e.lifecycle_event,
-            serde_json::to_string(&e.payload)
-                .unwrap_or_else(|_| format!("{:?}", e.payload)),
-        ));
+        let Some(line) = render_event(e, module) else { continue };
+        out.push_str(&line);
+        shown += 1;
     }
-    out.push_str(&format!("\n{} event(s)\n", events.len()));
+    out.push_str(&format!("\n{shown} event(s)\n"));
     Ok(out)
+}
+
+/// Rolling state for the `--live` tail.
+///
+/// `valid_from` timestamps are assigned client-side by each writer
+/// *before* its insert commits, so under concurrent writers (the
+/// capture loop + lifecycle emitters — exactly the FVP topology) a
+/// strictly-greater watermark could permanently skip an event whose
+/// commit landed after a later-stamped event was already rendered.
+/// The tail therefore re-reads an **overlap window** behind the
+/// watermark each tick and dedupes by UUIDv7 row id; the seen-set is
+/// pruned to the window so memory stays bounded.
+#[derive(Debug)]
+pub struct LiveTail {
+    high_water: chrono::DateTime<chrono::Utc>,
+    overlap: chrono::Duration,
+    /// Row ids already rendered, with their valid_from for pruning.
+    seen: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+}
+
+impl LiveTail {
+    /// Start a tail. `after` is the newest already-rendered event
+    /// timestamp (or `MIN_UTC` to replay everything); `overlap` is
+    /// how far behind the watermark each poll re-reads —
+    /// conventionally 2× the poll interval.
+    #[must_use]
+    pub fn new(after: chrono::DateTime<chrono::Utc>, overlap: chrono::Duration) -> Self {
+        Self {
+            high_water: after,
+            overlap,
+            seen: std::collections::HashMap::new(),
+        }
+    }
+
+    /// One poll: render every not-yet-seen event since
+    /// `high_water − overlap`, oldest first, and advance the
+    /// watermark. Pulled out of the timer loop so tests drive ticks
+    /// directly.
+    ///
+    /// # Errors
+    ///
+    /// Substrate errors.
+    pub async fn tick(&mut self, kernel: &Kernel, module: Option<&str>) -> Result<String> {
+        let from = self
+            .high_water
+            .checked_sub_signed(self.overlap)
+            .unwrap_or(self.high_water);
+        let events = kernel.telemetry_since(from, LIVE_PAGE_SIZE).await?;
+        let mut out = String::new();
+        for e in &events {
+            // UUIDv7 row id, rendered via Debug (RecordId has no
+            // Display impl) — uniqueness is what matters for dedup.
+            let key = format!("{:?}", e.id);
+            if self.seen.contains_key(&key) {
+                continue;
+            }
+            self.seen.insert(key, e.valid_from);
+            if e.valid_from > self.high_water {
+                self.high_water = e.valid_from;
+            }
+            if let Some(line) = render_event(e, module) {
+                out.push_str(&line);
+            }
+        }
+        // Prune the seen-set to the overlap window — anything older
+        // can never be returned by a future poll.
+        let horizon = self
+            .high_water
+            .checked_sub_signed(self.overlap)
+            .unwrap_or(self.high_water);
+        self.seen.retain(|_, ts| *ts >= horizon);
+        Ok(out)
+    }
+
+    /// The newest rendered event timestamp.
+    #[must_use]
+    pub fn high_water(&self) -> chrono::DateTime<chrono::Utc> {
+        self.high_water
+    }
+}
+
+/// Render the `--live` backlog (newest-first input, oldest-first
+/// output) and return the rendering plus the high-water timestamp the
+/// follow loop should start from. The interactive print loop itself
+/// lives in `main.rs` (library code stays print-free; binaries own
+/// the terminal).
+///
+/// # Errors
+///
+/// Substrate errors.
+pub async fn live_backlog(
+    kernel: &Kernel,
+    limit: u32,
+    module: Option<&str>,
+) -> Result<(String, chrono::DateTime<chrono::Utc>)> {
+    let mut backlog = kernel.recent_telemetry(limit).await?;
+    backlog.reverse();
+    let mut out = String::new();
+    let mut high_water = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+    for e in &backlog {
+        if e.valid_from > high_water {
+            high_water = e.valid_from;
+        }
+        if let Some(line) = render_event(e, module) {
+            out.push_str(&line);
+        }
+    }
+    Ok((out, high_water))
+}
+
+/// True when the substrate has never been bootstrapped — callers
+/// render the bootstrap hint instead of erroring.
+///
+/// # Errors
+///
+/// Substrate errors.
+pub async fn substrate_is_bare(kernel: &Kernel) -> Result<bool> {
+    Ok(kernel.find_type_opt("node_kernel_module").await?.is_none())
+}
+
+/// `superx kernel agents` — discovered agents with their capture
+/// sources.
+///
+/// # Errors
+///
+/// Substrate errors. An unseeded metamodel renders the bootstrap
+/// hint.
+pub async fn run_agents(kernel: &Kernel) -> Result<String> {
+    if kernel.find_type_opt("node_agent").await?.is_none()
+        || kernel.find_type_opt("attr_agent_descriptor").await?.is_none()
+    {
+        return Ok(
+            "substrate has no registry yet — run `superx kernel bootstrap` first\n".to_string(),
+        );
+    }
+    let agents = kernel
+        .list_named_entities("node_agent", "attr_agent_descriptor")
+        .await?;
+    let sources = kernel
+        .list_named_entities("node_source", "attr_source_descriptor")
+        .await?;
+
+    let mut out = String::new();
+    for agent in &agents {
+        let Some(name) = payload_str(&agent.payload, "name") else { continue };
+        let probe = payload_str(&agent.payload, "probe").unwrap_or_else(|| "-".to_string());
+        let agent_sources: Vec<String> = sources
+            .iter()
+            .filter(|s| payload_str(&s.payload, "agent").as_deref() == Some(&name))
+            .filter_map(|s| payload_str(&s.payload, "locator"))
+            .collect();
+        out.push_str(&format!(
+            "{name}  (probe: {probe}, {} source(s))\n",
+            agent_sources.len(),
+        ));
+        for locator in agent_sources {
+            out.push_str(&format!("    {locator}\n"));
+        }
+    }
+    out.push_str(&format!("\n{} agent(s)\n", agents.len()));
+    Ok(out)
+}
+
+/// Events per `--live` tick; anything beyond arrives next tick.
+// skill-allow: §9-const — render page bound, not behavior policy
+const LIVE_PAGE_SIZE: u32 = 500;
+
+/// Poll-interval parameter for `--live`, on the CLI app's registry
+/// entity.
+pub const STATS_POLL_PARAM: &str = "attr_stats_poll_interval_secs";
+
+/// Interval seed when the parameter is unset — written to the
+/// substrate on first use so the effective value is recorded state.
+// skill-allow: §9-const — seed value; recorded as a substrate parameter on first use
+const DEFAULT_STATS_POLL_SECS: i64 = 1;
+
+/// Resolve the `--live` poll interval (seconds), seeding the default
+/// into the substrate on first use. Public for the binary's follow
+/// loop.
+///
+/// # Errors
+///
+/// Substrate errors.
+pub async fn live_poll_interval_secs(kernel: &Kernel) -> Result<u64> {
+    use superx_kernel::types::Value;
+    let Some(status) = kernel.detailed_status(NodeKind::Contribution, "app_cli").await? else {
+        return Ok(u64::try_from(DEFAULT_STATS_POLL_SECS).unwrap_or(1));
+    };
+    if let Some(Value::Number(n)) = kernel
+        .get_parameter(status.entity_id.clone(), STATS_POLL_PARAM)
+        .await?
+    {
+        let secs = n.to_int().unwrap_or(DEFAULT_STATS_POLL_SECS);
+        return Ok(u64::try_from(secs).unwrap_or(1).max(1));
+    }
+    kernel
+        .set_parameter(
+            status.entity_id,
+            STATS_POLL_PARAM,
+            Value::Number(DEFAULT_STATS_POLL_SECS.into()),
+        )
+        .await?;
+    Ok(u64::try_from(DEFAULT_STATS_POLL_SECS).unwrap_or(1))
+}
+
+/// Render one event line, applying the `--module` substring filter
+/// against the event name and payload. `None` = filtered out.
+fn render_event(e: &superx_kernel::TelemetryRecord, module: Option<&str>) -> Option<String> {
+    let payload = serde_json::to_string(&e.payload).unwrap_or_else(|_| format!("{:?}", e.payload));
+    if let Some(needle) = module {
+        if !e.lifecycle_event.contains(needle) && !payload.contains(needle) {
+            return None;
+        }
+    }
+    Some(format!(
+        "{}  {:<24} {}\n",
+        e.valid_from.format("%Y-%m-%d %H:%M:%S%.3f"),
+        e.lifecycle_event,
+        payload,
+    ))
+}
+
+fn payload_str(payload: &superx_kernel::types::Value, key: &str) -> Option<String> {
+    match payload {
+        superx_kernel::types::Value::Object(o) => match o.get(key) {
+            Some(superx_kernel::types::Value::String(s)) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

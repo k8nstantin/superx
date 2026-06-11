@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait              = { workspace = true }
+chrono                   = { workspace = true }
 clap                     = { workspace = true }
 linkme                   = { workspace = true }
 serde_json               = { workspace = true }
@@ -22,7 +23,7 @@ superx-kernel            = { path = "../superx-kernel" }
 superx-kernel-bootstrap  = { path = "../superx-kernel-bootstrap" }
 superx-kernel-capture    = { path = "../superx-kernel-capture" }
 superx-kernel-discovery  = { path = "../superx-kernel-discovery" }
-tokio                    = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio                    = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 
 [dev-dependencies]
 surrealdb = { workspace = true }

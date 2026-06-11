@@ -72,6 +72,35 @@ impl Kernel {
             .take(0)?;
         Ok(rows)
     }
+
+    /// Read `telemetry_stream` rows strictly newer than `after`,
+    /// oldest first (the natural rendering order for a live tail),
+    /// bounded by `limit`. The newer-than-last-seen primitive behind
+    /// `superx kernel stats --live`. Pure SELECT — no mutation, no
+    /// telemetry emission.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces engine errors verbatim via [`crate::KernelError::Db`].
+    pub async fn telemetry_since(
+        &self,
+        after: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<TelemetryRecord>> {
+        let rows: Vec<TelemetryRecord> = self
+            .db()
+            .query(
+                "SELECT * FROM telemetry_stream \
+                 WHERE valid_from > $after \
+                 ORDER BY valid_from ASC \
+                 LIMIT $limit",
+            )
+            .bind(("after", after))
+            .bind(("limit", limit))
+            .await?
+            .take(0)?;
+        Ok(rows)
+    }
 }
 
 /// Shared internal: write one row to telemetry_stream with the
