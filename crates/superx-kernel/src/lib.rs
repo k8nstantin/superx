@@ -72,5 +72,5 @@ pub use registry::{
     KERNEL_MODULES,
 };
 pub use schema::SCHEMA_DDL;
-pub use substrate::Kernel;
+pub use substrate::{Kernel, NamedEntity};
 pub use telemetry::TelemetryRecord;

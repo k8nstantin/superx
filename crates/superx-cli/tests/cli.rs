@@ -84,18 +84,23 @@ async fn modules_list_hints_before_bootstrap() -> Result<(), Box<dyn Error>> {
 async fn bootstrap_then_modules_list_shows_inventory() -> Result<(), Box<dyn Error>> {
     let kernel = fresh_kernel().await?;
 
-    let boot_out = run_bootstrap(&kernel).await?;
-    // The orchestrator and the CLI app itself are in this test
-    // binary's inventory.
-    assert!(boot_out.contains("bootstrap"), "boot report: {boot_out}");
-    assert!(boot_out.contains("app_cli"), "boot report: {boot_out}");
+    let (report, boot_out) = run_bootstrap(&kernel).await?;
+    // The FVP inventory in this binary: orchestrator, CLI app,
+    // discovery, capture, and the claude-code driver.
+    for name in ["bootstrap", "app_cli", "discovery", "capture", "driver_claude_code"] {
+        assert!(boot_out.contains(name), "boot report missing {name}: {boot_out}");
+    }
     assert!(boot_out.contains("active"), "boot report: {boot_out}");
+    assert!(
+        superx_cli::capture_is_active(&report),
+        "capture must boot Active for the FVP foreground hold",
+    );
 
     let list_out = run_modules_list(&kernel).await?;
     assert!(list_out.contains("bootstrap"), "list: {list_out}");
     assert!(list_out.contains("app_cli"), "list: {list_out}");
     assert!(list_out.contains("app"), "category shown: {list_out}");
-    assert!(list_out.contains("2 registered"), "count line: {list_out}");
+    assert!(list_out.contains("5 registered"), "count line: {list_out}");
     Ok(())
 }
 

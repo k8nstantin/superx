@@ -13,7 +13,8 @@
 >   `crates/superx-kernel-bootstrap` (F6 boot orchestrator),
 >   `crates/superx-cli` (F7 `superx` operator binary),
 >   `crates/superx-kernel-discovery` (F8 agent-discovery probe framework),
->   `crates/superx-driver-claude-code` (F9 Claude Code discovery driver)
+>   `crates/superx-driver-claude-code` (F9 Claude Code discovery driver + F10 transcript watcher),
+>   `crates/superx-kernel-capture` (F10 telemetry capture loop)
 
 ## Status (implemented surface)
 

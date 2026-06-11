@@ -11,7 +11,9 @@ rust-version .workspace = true
 [dependencies]
 async-trait             = { workspace = true }
 linkme                  = { workspace = true }
+serde_json              = { workspace = true }
 superx-kernel           = { path = "../superx-kernel" }
+superx-kernel-capture   = { path = "../superx-kernel-capture" }
 superx-kernel-discovery = { path = "../superx-kernel-discovery" }
 
 [dev-dependencies]

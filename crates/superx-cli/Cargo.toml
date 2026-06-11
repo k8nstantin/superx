@@ -13,13 +13,16 @@ name = "superx"
 path = "src/main.rs"
 
 [dependencies]
-async-trait             = { workspace = true }
-clap                    = { workspace = true }
-linkme                  = { workspace = true }
-serde_json              = { workspace = true }
-superx-kernel           = { path = "../superx-kernel" }
-superx-kernel-bootstrap = { path = "../superx-kernel-bootstrap" }
-tokio                   = { workspace = true, features = ["macros", "rt-multi-thread"] }
+async-trait              = { workspace = true }
+clap                     = { workspace = true }
+linkme                   = { workspace = true }
+serde_json               = { workspace = true }
+superx-driver-claude-code = { path = "../superx-driver-claude-code" }
+superx-kernel            = { path = "../superx-kernel" }
+superx-kernel-bootstrap  = { path = "../superx-kernel-bootstrap" }
+superx-kernel-capture    = { path = "../superx-kernel-capture" }
+superx-kernel-discovery  = { path = "../superx-kernel-discovery" }
+tokio                    = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 
 [dev-dependencies]
 surrealdb = { workspace = true }
