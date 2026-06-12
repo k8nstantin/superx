@@ -129,6 +129,30 @@ static BOOTSTRAP_REGISTRATION: &'static (dyn KernelModule + Sync) = &BootstrapMo
 /// panic, dependency cycles, unknown dependencies — never abort the
 /// boot; they are isolated into that module's [`BootEntry`] outcome.
 pub async fn bootstrap(kernel: &Kernel) -> Result<BootReport> {
+    // 0. One system_boot event per REAL boot. This is the only place
+    //    it is emitted — SELECT-only commands also connect, and
+    //    readers must not mutate the stream they observe.
+    {
+        let mut payload = superx_kernel::types::Object::new();
+        payload.insert(
+            "service_account".to_string(),
+            superx_kernel::types::Value::String("superx_kernel".to_string()),
+        );
+        payload.insert(
+            "endpoint".to_string(),
+            superx_kernel::types::Value::String(
+                kernel.endpoint().unwrap_or("(direct handle)").to_string(),
+            ),
+        );
+        kernel
+            .log_telemetry(
+                "system_boot",
+                superx_kernel::types::Value::Object(payload),
+                None,
+            )
+            .await?;
+    }
+
     // 1. Kernel metamodel.
     for t in REQUIRED_METAMODEL_TYPES {
         kernel
