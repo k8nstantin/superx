@@ -344,3 +344,35 @@ async fn json_rendering_is_plain_and_parseable() -> Result<(), Box<dyn Error>> {
     assert!(parsed > 0, "at least one JSON event line: {out}");
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_refusal_is_detected_and_hint_is_actionable() -> Result<(), Box<dyn Error>> {
+    // A real authentication refusal from a substrate whose deployed
+    // password differs from what the connector sends.
+    let db = connect("mem://").await?;
+    db.use_ns("superx").use_db("kernel").await?;
+    let ddl = SCHEMA_DDL.replace("$SUPERX_KERNEL_PASSWORD", "the-deployed-password");
+    db.query(ddl).await?.check()?;
+    let err = db
+        .signin(Database {
+            namespace: "superx".to_string(),
+            database: "kernel".to_string(),
+            username: "superx_kernel".to_string(),
+            password: "a-different-password".to_string(),
+        })
+        .await
+        .expect_err("mismatched password must be refused");
+    let kernel_err = superx_kernel::KernelError::Db(err);
+    assert!(superx_cli::is_auth_error(&kernel_err), "got: {kernel_err}");
+
+    // Non-auth errors are not misclassified.
+    let not_auth = superx_kernel::KernelError::NotFound("x".to_string());
+    assert!(!superx_cli::is_auth_error(&not_auth));
+
+    // The hint names the env var, the deploy step, and the endpoint.
+    let hint = superx_cli::auth_failure_hint("ws://127.0.0.1:8000");
+    for needle in ["SUPERX_KERNEL_PASSWORD", "deploy-schema.sh", "ws://127.0.0.1:8000", "EVERY terminal"] {
+        assert!(hint.contains(needle), "hint missing '{needle}': {hint}");
+    }
+    Ok(())
+}

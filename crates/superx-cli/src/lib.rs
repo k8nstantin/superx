@@ -361,6 +361,36 @@ pub async fn substrate_is_bare(kernel: &Kernel) -> Result<bool> {
     Ok(kernel.find_type_opt("node_kernel_module").await?.is_none())
 }
 
+/// True when a connect failure is an authentication refusal — the
+/// case the binary turns into an actionable hint instead of the
+/// engine's opaque "There was a problem with authentication".
+#[must_use]
+pub fn is_auth_error(e: &superx_kernel::KernelError) -> bool {
+    matches!(e, superx_kernel::KernelError::Db(_))
+        && e.to_string().to_lowercase().contains("authentication")
+}
+
+/// The operator-facing explanation for an authentication refusal.
+/// Every cause we have seen in real testing is listed; the first one
+/// is by far the most common (each terminal needs the export).
+#[must_use]
+pub fn auth_failure_hint(endpoint: &str) -> String {
+    format!(
+        "superx: authentication with the substrate at {endpoint} was refused.\n\
+         \n\
+         Almost always this means SUPERX_KERNEL_PASSWORD in THIS terminal does\n\
+         not match the password bound when the schema was deployed:\n\
+         \n\
+           1. export SUPERX_KERNEL_PASSWORD='<same value used at deploy time>'\n\
+              (required in EVERY terminal; when unset, a v0.1 dev default is\n\
+              used, which only works if the schema was also deployed with it)\n\
+           2. If the schema was never deployed on this server, run\n\
+              ./scripts/deploy-schema.sh first (see README).\n\
+           3. Sessions/tokens expire after 1h (v0.1 schema DURATION) —\n\
+              long-running processes must be restarted after expiry."
+    )
+}
+
 /// `superx kernel agents` — discovered agents with their capture
 /// sources.
 ///
