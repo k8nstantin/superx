@@ -133,6 +133,11 @@ pub enum KernelCommand {
         /// agent name.
         #[arg(long)]
         module: Option<String>,
+
+        /// Emit one plain JSON object per event (for piping into jq
+        /// etc.) instead of the human-readable key=value rendering.
+        #[arg(long)]
+        json: bool,
     },
 
     /// List discovered agents and their capture sources.
@@ -213,12 +218,17 @@ pub async fn run_modules_list(kernel: &Kernel) -> Result<String> {
 /// # Errors
 ///
 /// Substrate errors.
-pub async fn run_stats(kernel: &Kernel, limit: u32, module: Option<&str>) -> Result<String> {
+pub async fn run_stats(
+    kernel: &Kernel,
+    limit: u32,
+    module: Option<&str>,
+    format: RenderFormat,
+) -> Result<String> {
     let events = kernel.recent_telemetry(limit).await?;
     let mut out = String::new();
     let mut shown = 0usize;
     for e in &events {
-        let Some(line) = render_event(e, module) else { continue };
+        let Some(line) = render_event(e, module, format) else { continue };
         out.push_str(&line);
         shown += 1;
     }
@@ -240,6 +250,7 @@ pub async fn run_stats(kernel: &Kernel, limit: u32, module: Option<&str>) -> Res
 pub struct LiveTail {
     high_water: chrono::DateTime<chrono::Utc>,
     overlap: chrono::Duration,
+    format: RenderFormat,
     /// Row ids already rendered, with their valid_from for pruning.
     seen: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
 }
@@ -250,10 +261,15 @@ impl LiveTail {
     /// how far behind the watermark each poll re-reads —
     /// conventionally 2× the poll interval.
     #[must_use]
-    pub fn new(after: chrono::DateTime<chrono::Utc>, overlap: chrono::Duration) -> Self {
+    pub fn new(
+        after: chrono::DateTime<chrono::Utc>,
+        overlap: chrono::Duration,
+        format: RenderFormat,
+    ) -> Self {
         Self {
             high_water: after,
             overlap,
+            format,
             seen: std::collections::HashMap::new(),
         }
     }
@@ -284,7 +300,7 @@ impl LiveTail {
             if e.valid_from > self.high_water {
                 self.high_water = e.valid_from;
             }
-            if let Some(line) = render_event(e, module) {
+            if let Some(line) = render_event(e, module, self.format) {
                 out.push_str(&line);
             }
         }
@@ -318,6 +334,7 @@ pub async fn live_backlog(
     kernel: &Kernel,
     limit: u32,
     module: Option<&str>,
+    format: RenderFormat,
 ) -> Result<(String, chrono::DateTime<chrono::Utc>)> {
     let mut backlog = kernel.recent_telemetry(limit).await?;
     backlog.reverse();
@@ -327,7 +344,7 @@ pub async fn live_backlog(
         if e.valid_from > high_water {
             high_water = e.valid_from;
         }
-        if let Some(line) = render_event(e, module) {
+        if let Some(line) = render_event(e, module, format) {
             out.push_str(&line);
         }
     }
@@ -429,21 +446,81 @@ pub async fn live_poll_interval_secs(kernel: &Kernel) -> Result<u64> {
     Ok(u64::try_from(DEFAULT_STATS_POLL_SECS).unwrap_or(1))
 }
 
-/// Render one event line, applying the `--module` substring filter
-/// against the event name and payload. `None` = filtered out.
-fn render_event(e: &superx_kernel::TelemetryRecord, module: Option<&str>) -> Option<String> {
-    let payload = serde_json::to_string(&e.payload).unwrap_or_else(|_| format!("{:?}", e.payload));
+/// How `stats` renders each event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderFormat {
+    /// `TS  EVENT  key=value key=value` — the operator-facing default.
+    #[default]
+    Human,
+    /// One plain (untagged) JSON object per line — for jq pipelines.
+    Json,
+}
+
+/// Convert a substrate [`Value`](superx_kernel::types::Value) into
+/// plain (untagged) `serde_json::Value` — `{"agent": "claude_code"}`
+/// instead of serde's externally-tagged
+/// `{"Object":{"agent":{"String":"claude_code"}}}`.
+fn value_to_plain(v: &superx_kernel::types::Value) -> serde_json::Value {
+    use superx_kernel::types::Value as V;
+    match v {
+        V::None | V::Null => serde_json::Value::Null,
+        V::Bool(b) => serde_json::Value::Bool(*b),
+        V::Number(n) => n
+            .to_int()
+            .map(serde_json::Value::from)
+            .unwrap_or_else(|| serde_json::Value::String(format!("{n:?}"))),
+        V::String(s) => serde_json::Value::String(s.clone()),
+        V::Array(a) => serde_json::Value::Array(a.iter().map(value_to_plain).collect()),
+        V::Object(o) => serde_json::Value::Object(
+            o.iter().map(|(k, v)| (k.clone(), value_to_plain(v))).collect(),
+        ),
+        other => serde_json::Value::String(format!("{other:?}")),
+    }
+}
+
+/// Render one event line in the requested format, applying the
+/// `--module` substring filter against the event name and the plain
+/// payload text. `None` = filtered out.
+fn render_event(
+    e: &superx_kernel::TelemetryRecord,
+    module: Option<&str>,
+    format: RenderFormat,
+) -> Option<String> {
+    let plain = value_to_plain(&e.payload);
+    let plain_text = plain.to_string();
     if let Some(needle) = module {
-        if !e.lifecycle_event.contains(needle) && !payload.contains(needle) {
+        if !e.lifecycle_event.contains(needle) && !plain_text.contains(needle) {
             return None;
         }
     }
-    Some(format!(
-        "{}  {:<24} {}\n",
-        e.valid_from.format("%Y-%m-%d %H:%M:%S%.3f"),
-        e.lifecycle_event,
-        payload,
-    ))
+    match format {
+        RenderFormat::Json => {
+            let line = serde_json::json!({
+                "ts": e.valid_from.to_rfc3339(),
+                "event": e.lifecycle_event,
+                "payload": plain,
+            });
+            Some(format!("{line}\n"))
+        }
+        RenderFormat::Human => {
+            let fields = match &plain {
+                serde_json::Value::Object(map) => map
+                    .iter()
+                    .map(|(k, v)| match v {
+                        serde_json::Value::String(s) => format!("{k}={s}"),
+                        other => format!("{k}={other}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                other => other.to_string(),
+            };
+            Some(format!(
+                "{}  {:<24} {fields}\n",
+                e.valid_from.format("%Y-%m-%d %H:%M:%S%.3f"),
+                e.lifecycle_event,
+            ))
+        }
+    }
 }
 
 fn payload_str(payload: &superx_kernel::types::Value, key: &str) -> Option<String> {
