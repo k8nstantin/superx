@@ -43,12 +43,22 @@ const SERVICE_PASSWORD_DEV_DEFAULT: &str = "superx-kernel-v01-dev-x9KmP2nQ7tR3vW
 #[derive(Clone)]
 pub struct Kernel {
     db: Surreal<Any>,
+    /// The connection URL this kernel signed in over; `None` for
+    /// [`Kernel::from_db`] constructions (tests hand the kernel an
+    /// already-connected handle). Recorded so boot telemetry can
+    /// state where the substrate lives.
+    endpoint: Option<String>,
 }
 
 impl Kernel {
     /// Connect to an operator-provisioned SurrealDB and sign in as
-    /// the `superx_kernel` service account. Emits one `system_boot`
-    /// telemetry event on success.
+    /// the `superx_kernel` service account.
+    ///
+    /// Pure connect + signin — **no telemetry is emitted**. SELECT-only
+    /// commands (`stats`, `agents`, `modules list`) connect through
+    /// here too, and readers must not mutate the stream they observe;
+    /// the one `system_boot` event per real boot is emitted by the
+    /// bootstrap orchestrator.
     ///
     /// `endpoint` is a SurrealDB connection URL — `ws://host:port`,
     /// `wss://host:port`, `http://host:port`, `https://host:port`,
@@ -83,9 +93,10 @@ impl Kernel {
         })
         .await?;
 
-        let kernel = Self { db };
-        kernel.emit_system_boot(namespace, database, endpoint).await?;
-        Ok(kernel)
+        Ok(Self {
+            db,
+            endpoint: Some(endpoint.to_string()),
+        })
     }
 
     /// Wrap an already-authenticated [`Surreal<Any>`] connection.
@@ -96,7 +107,13 @@ impl Kernel {
     /// code paths go through [`Kernel::connect_service`].
     #[must_use]
     pub fn from_db(db: Surreal<Any>) -> Self {
-        Self { db }
+        Self { db, endpoint: None }
+    }
+
+    /// The connection URL this kernel signed in over, if known.
+    #[must_use]
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
     }
 
     /// Underlying SurrealDB handle. Read-only access for kernel
@@ -389,32 +406,6 @@ impl Kernel {
         RecordId::new(table, surrealdb::types::Uuid::from(Uuid::now_v7()))
     }
 
-    /// Emit one `system_boot` telemetry event right after signin.
-    /// Called from `connect_service` so the firehose lights up the
-    /// moment the kernel is alive — observable to any subscriber
-    /// before any kernel module has registered.
-    async fn emit_system_boot(
-        &self,
-        namespace: &str,
-        database: &str,
-        endpoint: &str,
-    ) -> Result<()> {
-        let mut payload = surrealdb::types::Object::new();
-        payload.insert("namespace".to_string(), Value::String(namespace.to_string()));
-        payload.insert("database".to_string(), Value::String(database.to_string()));
-        payload.insert("endpoint".to_string(), Value::String(endpoint.to_string()));
-        payload.insert("service_account".to_string(), Value::String(SERVICE_USERNAME.to_string()));
-
-        // Use log_telemetry from the telemetry module — same crate.
-        crate::telemetry::log_telemetry_inner(
-            &self.db,
-            self.new_record_id("telemetry_stream"),
-            "system_boot",
-            Value::Object(payload),
-            None,
-        )
-        .await
-    }
 }
 
 /// One row of [`Kernel::list_named_entities`]: an entity plus the

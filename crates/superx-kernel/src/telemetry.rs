@@ -104,10 +104,9 @@ impl Kernel {
 }
 
 /// Shared internal: write one row to telemetry_stream with the
-/// given id. Used by `Kernel::log_telemetry` (operates via the
-/// `Kernel` API) and by `Kernel::emit_system_boot` (called from
-/// inside `connect_service` before the public `log_telemetry` is
-/// usable in the obvious way). Same write shape either path.
+/// given id. Today only `Kernel::log_telemetry` goes through here;
+/// kept as the single write-shape chokepoint for any future
+/// crate-internal emitter.
 pub(crate) async fn log_telemetry_inner(
     db: &Surreal<Any>,
     id: RecordId,

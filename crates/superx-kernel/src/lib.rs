@@ -3,10 +3,11 @@
 //! What the kernel does, and only what it does:
 //!
 //! 1. **Bootstrap-as-init** — [`Kernel::connect_service`] signs in to
-//!    the substrate as the `superx_kernel` EDITOR service account and
-//!    emits one `system_boot` telemetry event. That's it — NOT the
-//!    orchestration of other kernel modules (which is what
-//!    `superx-kernel-bootstrap` does).
+//!    the substrate as the `superx_kernel` EDITOR service account.
+//!    Pure connect — no telemetry; readers must not mutate the stream
+//!    they observe. The one `system_boot` event per real boot is
+//!    emitted by `superx-kernel-bootstrap` (which also orchestrates
+//!    the other kernel modules).
 //!
 //! 2. **Storage** — typed verbs over the SurrealDB substrate:
 //!    [`Kernel::create_entity`], [`Kernel::create_relation`],

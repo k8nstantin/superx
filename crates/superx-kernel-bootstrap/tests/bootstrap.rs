@@ -257,6 +257,36 @@ async fn boot_walks_the_full_inventory_with_failure_isolation() -> Result<(), Bo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn system_boot_is_emitted_once_per_boot() -> Result<(), Box<dyn Error>> {
+    let kernel = fresh_kernel().await?;
+
+    // Before any boot: connecting/reading alone must not emit.
+    let events = kernel.recent_telemetry(100).await?;
+    assert_eq!(
+        events.iter().filter(|e| e.lifecycle_event == "system_boot").count(),
+        0,
+        "readers must not mutate the stream they observe",
+    );
+
+    bootstrap(&kernel).await?;
+    let events = kernel.recent_telemetry(200).await?;
+    assert_eq!(
+        events.iter().filter(|e| e.lifecycle_event == "system_boot").count(),
+        1,
+        "exactly one system_boot per boot",
+    );
+
+    bootstrap(&kernel).await?;
+    let events = kernel.recent_telemetry(400).await?;
+    assert_eq!(
+        events.iter().filter(|e| e.lifecycle_event == "system_boot").count(),
+        2,
+        "one more per re-boot",
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reboot_is_idempotent() -> Result<(), Box<dyn Error>> {
     let kernel = fresh_kernel().await?;
     let first = bootstrap(&kernel).await?;
