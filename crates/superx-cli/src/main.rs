@@ -16,12 +16,20 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> superx_kernel::Result<()> {
-    let kernel = Kernel::connect_service(
+    let kernel = match Kernel::connect_service(
         &cli.connection.endpoint,
         &cli.connection.namespace,
         &cli.connection.database,
     )
-    .await?;
+    .await
+    {
+        Ok(kernel) => kernel,
+        Err(e) if superx_cli::is_auth_error(&e) => {
+            eprintln!("{}", superx_cli::auth_failure_hint(&cli.connection.endpoint));
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
 
     match cli.command {
         Command::Kernel(KernelCommand::Bootstrap) => {
