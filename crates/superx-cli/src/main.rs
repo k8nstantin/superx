@@ -39,13 +39,18 @@ async fn run(cli: Cli) -> superx_kernel::Result<()> {
         Command::Kernel(KernelCommand::Modules(ModulesCommand::List)) => {
             print!("{}", superx_cli::run_modules_list(&kernel).await?);
         }
-        Command::Kernel(KernelCommand::Stats { limit, live, module }) => {
+        Command::Kernel(KernelCommand::Stats { limit, live, module, json }) => {
+            let format = if json {
+                superx_cli::RenderFormat::Json
+            } else {
+                superx_cli::RenderFormat::Human
+            };
             if live {
-                run_stats_live(&kernel, limit, module.as_deref()).await?;
+                run_stats_live(&kernel, limit, module.as_deref(), format).await?;
             } else {
                 print!(
                     "{}",
-                    superx_cli::run_stats(&kernel, limit, module.as_deref()).await?
+                    superx_cli::run_stats(&kernel, limit, module.as_deref(), format).await?
                 );
             }
         }
@@ -64,6 +69,7 @@ async fn run_stats_live(
     kernel: &superx_kernel::Kernel,
     limit: u32,
     module: Option<&str>,
+    format: superx_cli::RenderFormat,
 ) -> superx_kernel::Result<()> {
     // Fresh-substrate guard — without it a never-bootstrapped
     // substrate dies with a raw error after the follow header prints.
@@ -72,14 +78,14 @@ async fn run_stats_live(
         return Ok(());
     }
 
-    let (backlog, high_water) = superx_cli::live_backlog(kernel, limit, module).await?;
+    let (backlog, high_water) = superx_cli::live_backlog(kernel, limit, module, format).await?;
     print!("{backlog}");
     println!("--- following (ctrl-c to stop) ---");
 
     let interval = superx_cli::live_poll_interval_secs(kernel).await?;
     let overlap =
         chrono::Duration::seconds(i64::try_from(interval).unwrap_or(1).saturating_mul(2));
-    let mut tail = superx_cli::LiveTail::new(high_water, overlap);
+    let mut tail = superx_cli::LiveTail::new(high_water, overlap, format);
 
     // One ctrl-c future for the whole loop — re-registering it per
     // select! iteration would swallow a SIGINT that lands mid-tick.

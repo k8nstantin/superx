@@ -7,7 +7,7 @@ use clap::Parser;
 use surrealdb::engine::any::connect;
 use surrealdb::opt::auth::Database;
 
-use superx_cli::{run_bootstrap, run_modules_list, run_stats, Cli, Command, KernelCommand};
+use superx_cli::{run_bootstrap, run_modules_list, run_stats, Cli, Command, KernelCommand, RenderFormat};
 use superx_driver_claude_code::{ClaudeCodeDriver, DRIVER_NAME, PROJECTS_ROOT_PARAM};
 use superx_kernel::types::Value;
 use superx_kernel::{Kernel, KernelModule, NodeKind, SCHEMA_DDL};
@@ -73,10 +73,11 @@ fn parses_kernel_bootstrap() {
 fn parses_stats_with_limit() {
     let cli = Cli::try_parse_from(["superx", "kernel", "stats", "-n", "7"]).expect("must parse");
     match cli.command {
-        Command::Kernel(KernelCommand::Stats { limit, live, module }) => {
+        Command::Kernel(KernelCommand::Stats { limit, live, module, json }) => {
             assert_eq!(limit, 7);
             assert!(!live);
             assert!(module.is_none());
+            assert!(!json, "human rendering is the default");
         }
         other => panic!("expected stats, got {other:?}"),
     }
@@ -163,7 +164,7 @@ async fn stats_renders_boot_telemetry() -> Result<(), Box<dyn Error>> {
     let kernel = fresh_kernel().await?;
     run_bootstrap(&kernel).await?;
 
-    let out = run_stats(&kernel, 50, None).await?;
+    let out = run_stats(&kernel, 50, None, RenderFormat::Human).await?;
     // Boot leaves module_starting / module_active events behind.
     assert!(out.contains("module_starting"), "stats: {out}");
     assert!(out.contains("module_active"), "stats: {out}");
@@ -176,7 +177,7 @@ async fn stats_respects_limit() -> Result<(), Box<dyn Error>> {
     let kernel = fresh_kernel().await?;
     run_bootstrap(&kernel).await?;
 
-    let out = run_stats(&kernel, 1, None).await?;
+    let out = run_stats(&kernel, 1, None, RenderFormat::Human).await?;
     assert!(out.contains("1 event(s)"), "stats: {out}");
     Ok(())
 }
@@ -186,8 +187,8 @@ async fn stats_module_filter_narrows_output() -> Result<(), Box<dyn Error>> {
     let kernel = fresh_kernel().await?;
     run_bootstrap(&kernel).await?;
 
-    let all = run_stats(&kernel, 100, None).await?;
-    let filtered = run_stats(&kernel, 100, Some("driver_claude_code")).await?;
+    let all = run_stats(&kernel, 100, None, RenderFormat::Human).await?;
+    let filtered = run_stats(&kernel, 100, Some("driver_claude_code"), RenderFormat::Human).await?;
     assert!(filtered.len() < all.len(), "filter must narrow output");
     assert!(
         filtered.contains("driver_claude_code"),
@@ -210,6 +211,7 @@ async fn live_tail_renders_each_event_exactly_once() -> Result<(), Box<dyn Error
     let mut tail = superx_cli::LiveTail::new(
         chrono::DateTime::<chrono::Utc>::MIN_UTC,
         chrono::Duration::seconds(3600),
+        RenderFormat::Human,
     );
 
     // First tick from the epoch sees the boot backlog.
@@ -302,5 +304,43 @@ async fn agents_hints_before_bootstrap() -> Result<(), Box<dyn Error>> {
     let kernel = bare_kernel().await?;
     let out = superx_cli::run_agents(&kernel).await?;
     assert!(out.contains("run `superx kernel bootstrap` first"), "got: {out}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn human_rendering_is_flat_key_value() -> Result<(), Box<dyn Error>> {
+    let kernel = fresh_kernel().await?;
+    run_bootstrap(&kernel).await?;
+
+    let out = run_stats(&kernel, 50, None, RenderFormat::Human).await?;
+    assert!(
+        !out.contains("{\"Object\"") && !out.contains("{\"String\""),
+        "no serde-tagged noise in human output: {out}",
+    );
+    // Lifecycle events carry name=… in their payloads.
+    assert!(out.contains("name=") || out.contains("service_account="), "k=v pairs: {out}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_rendering_is_plain_and_parseable() -> Result<(), Box<dyn Error>> {
+    let kernel = fresh_kernel().await?;
+    run_bootstrap(&kernel).await?;
+
+    let out = run_stats(&kernel, 10, None, RenderFormat::Json).await?;
+    let mut parsed = 0;
+    for line in out.lines() {
+        if !line.starts_with('{') {
+            continue; // trailing count line
+        }
+        let v: serde_json::Value = serde_json::from_str(line)?;
+        assert!(v.get("ts").is_some() && v.get("event").is_some() && v.get("payload").is_some());
+        assert!(
+            v["payload"].get("Object").is_none(),
+            "payload must be plain, not tagged: {line}",
+        );
+        parsed += 1;
+    }
+    assert!(parsed > 0, "at least one JSON event line: {out}");
     Ok(())
 }
