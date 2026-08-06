@@ -1,0 +1,9 @@
+[package]
+name = "superx"
+description = "The SuperX operator binary — CLI for the agentic OS kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

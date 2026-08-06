@@ -1,0 +1,126 @@
+# SuperX Blueprint — The Agentic OS (Reset of 2026-08-06)
+
+> **Status: v1.0 — decisions D1–D4 locked by the operator 2026-08-06.**
+> This document lands with the G0 reset PR; merging that PR is the
+> operator's approval of the reset. The complete v1 FVP is preserved at
+> the tag `archive/pre-reset-2026-08-06`. This is the living canon —
+> it replaces `ARCHITECTURE.md` (retired with v1).
+
+## 1. Mission
+
+SuperX is an **agentic operating system** written in Rust.
+
+- **SurrealDB is the OS's filesystem.** Every fact the OS knows —
+  agents, telemetry, state, configuration, the module registry itself —
+  lives in the substrate. If it isn't in SurrealDB, the OS doesn't know
+  it. No sidecar config files, no in-memory-only state that matters.
+- **Telemetry capture is the kernel's core capability.** From the moment
+  the OS boots, it captures all telemetry emitted by every agent on the
+  system. This is not a module, not an option, not a plugin — it is
+  what the kernel *is*. An agentic OS that cannot see its agents is not
+  an OS.
+- **Everything else is a module.** Data fusion, graphify, and every
+  future capability arrive as modules loaded on top of the kernel. The
+  kernel has zero knowledge of any module's domain.
+
+## 2. What the kernel does (and nothing else)
+
+1. **Substrate access** — typed verbs over SurrealDB. Append-only:
+   SELECT + CREATE only, no verb ever issues UPDATE / DELETE / DDL.
+   "Current state" is computed, never mutated (SCD-2).
+2. **Boot** — `superx boot` connects to the substrate, registers
+   modules, brings them up with failure isolation, and starts the
+   telemetry engine. Boot always completes; a failed module never
+   takes the OS down.
+3. **Agent telemetry capture** — the engine that discovers agents on
+   the machine, tails whatever they emit, writes typed telemetry rows,
+   and checkpoints with cursors so restarts are lossless. Runs from
+   boot until shutdown.
+4. **CLI** — the operator interface: `boot`, `status`, `agents`,
+   `stats [--live]`. The CLI is part of the kernel deliverable, not an
+   app bolted on later.
+5. **Module system** — modules register with the kernel, declare
+   dependencies, and get lifecycle management (starting / active /
+   failed / skipped). The registry lives in the substrate like
+   everything else.
+
+**Agent adapters.** The capture *engine* is kernel-core. Knowing how a
+*specific* agent emits telemetry (Claude Code writes JSONL transcripts;
+another agent may expose OTLP, logs, or an API) is adapter knowledge.
+Adapters are the one plugin interface the kernel itself defines — small,
+per-agent, and hot-swappable without touching the engine.
+
+## 3. What carries forward from v1 (proven mechanics, not code)
+
+The v1 codebase is archived wholesale; no file survives on `main`. But
+these v1 mechanics were verified live and are carried forward as
+*design decisions*, re-implemented clean:
+
+- Append-only substrate with SCD-2 (`valid_from`, latest-wins reads).
+- Types-as-data metamodel: new entity/attr types arrive by INSERT,
+  never by schema migration.
+- Cursor-checkpointed capture: poll → emit telemetry → write cursor;
+  restart-lossless; errors become telemetry, never panics.
+- Service-account discipline: the kernel signs in as a minimal-privilege
+  user, never root; the operator owns the schema and applies it once.
+- Module lifecycle with failure isolation and topological boot order.
+- Tolerant parsing: unknown telemetry shapes are captured raw, not
+  dropped.
+
+## 4. What is retired
+
+- The 6-crate L0–L3 layering (kernel / kernel-modules / drivers / apps).
+  v2 starts as **one workspace, two crates**: `superx-kernel` (lib) and
+  `superx` (bin, the CLI). Crates are extracted only when a module
+  graduates and proves the seam.
+- The F-phase roadmap, the 2026-06 quality backlog, and all 20 open
+  pre-reset GitHub issues (they reference retired concepts).
+- `ARCHITECTURE.md` (v42.15, 88 KB) — the historical vision document.
+  This blueprint replaces it as the living canon. Bloat was a named
+  failure mode; this document stays under 300 lines or it gets split.
+
+## 5. The new FVP
+
+> The operator runs `superx boot`. Every agent on the machine that
+> emits observable telemetry appears within seconds. `superx stats
+> --live` streams their activity as it happens. Adding a new agent
+> adapter touches zero engine code.
+
+Measured by: at least **two** agent adapters working day one (so the
+adapter seam is proven, not aspirational), lossless restart mid-stream,
+and the whole workspace green at the gates.
+
+## 6. Phase plan (each phase = one branch, one PR, one day max)
+
+| # | Scope | Exit criterion |
+|---|---|---|
+| G0 | Reset PR: archive tag, wipe to skeleton, this blueprint, fresh README | `main` = blueprint + empty 2-crate workspace, gates green |
+| G1 | Schema design session (operator + model, §11) → `SUPERX_SCHEMA.md` v2 + `schema/kernel.surql` v2; operator applies under root | Schema deployed and locked |
+| G2 | Kernel substrate verbs + telemetry primitive + tests | Verbs green on kv-mem |
+| G3 | Module system + boot orchestrator | Fake-module boot tests green |
+| G4 | Capture engine + agent adapter #1 (Claude Code) | Live rows on a real machine |
+| G5 | Agent adapter #2: **Claude Desktop** (decided 2026-08-06) | Two adapters, zero engine edits |
+| G6 | CLI complete: `boot`, `status`, `agents`, `stats --live` — **FVP** | The demo sentence above, live |
+| G7+ | First modules: data fusion, graphify | Module seam proven |
+
+## 7. Decisions record
+
+| # | Decision | Outcome (operator, 2026-08-06) |
+|---|---|---|
+| D1 | Reset mechanics | **Same repo**; v1 preserved at tag `archive/pre-reset-2026-08-06` |
+| D2 | Where capture lives | **In-kernel**; only per-agent adapters are pluggable |
+| D3 | FVP adapter #2 (Claude Code is #1) | **Claude Desktop** |
+| D4 | Zero-trust skill fate | **Rewritten from scratch** against this blueprint; lands in the G0 PR |
+| D5 | Dead `feat/ingest-rust-codebase` branch (one unmerged pre-reset commit) | *Pending* — recommend delete; the commit targets deleted code |
+| D6 | v1 GitHub issues (20 open, all pre-reset) | *Pending* — recommend close with a comment pointing here |
+
+## 8. Binding rules (unchanged from v1, restated)
+
+Trunk-based development: single trunk `main`, always releasable, short-
+lived branches, one PR at a time, all-or-nothing branches. Gates:
+`cargo test --workspace` + `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` + `python3 tools/skill_audit.py`
+(CI-enforced as required checks). Schema changes are operator-approved,
+per-change, schema-first (`SUPERX_SCHEMA.md` before code). The kernel
+authenticates as a service account, never root. No hardcoded policy —
+constants flow through substrate parameters.

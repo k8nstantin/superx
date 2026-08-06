@@ -500,7 +500,7 @@ def audit_all_rules() -> List[Violation]:
 #       Per skill §8 "every step emits a typed telemetry event."
 #
 #   D3 (architecture sync)  — every crate dir under crates/ must have a
-#       corresponding mention in ARCHITECTURE.md. Catches new crates / new
+#       corresponding mention in BLUEPRINT.md. Catches new crates / new
 #       top-level modules added without spec update (§3).
 #
 # (#6 PR-body skill-checklist is enforced by the CI workflow, not here.)
@@ -638,12 +638,12 @@ def detect_telemetry_gaps() -> List[Violation]:
     return out
 
 
-ARCH_DOC = REPO_ROOT / "ARCHITECTURE.md"
+ARCH_DOC = REPO_ROOT / "BLUEPRINT.md"
 
 
 def detect_arch_drift() -> List[Violation]:
     """[D3] Every crate dir under crates/ must be mentioned in
-    ARCHITECTURE.md. Catches new crates added without spec update (§3)."""
+    BLUEPRINT.md. Catches new crates added without spec update (§3)."""
     out: List[Violation] = []
     if not CRATES_DIR.exists():
         return out
@@ -657,7 +657,7 @@ def detect_arch_drift() -> List[Violation]:
         id="D3",
         section="§3",
         description=(
-            "crate under crates/ not referenced in ARCHITECTURE.md — "
+            "crate under crates/ not referenced in BLUEPRINT.md — "
             "every crate must have a corresponding architecture entry"
         ),
         pattern="",
@@ -668,7 +668,7 @@ def detect_arch_drift() -> List[Violation]:
         if not crate_dir.is_dir():
             continue
         crate_name = crate_dir.name
-        # Crate must be mentioned somewhere in ARCHITECTURE.md (any form:
+        # Crate must be mentioned somewhere in BLUEPRINT.md (any form:
         # crate name with or without backticks).
         if crate_name in arch_text:
             continue
@@ -678,7 +678,7 @@ def detect_arch_drift() -> List[Violation]:
             file=cargo_toml.relative_to(REPO_ROOT) if cargo_toml.exists()
                 else crate_dir.relative_to(REPO_ROOT),
             line=1,
-            snippet=f"crate `{crate_name}` not mentioned in ARCHITECTURE.md",
+            snippet=f"crate `{crate_name}` not mentioned in BLUEPRINT.md",
         ))
 
     return out
@@ -917,7 +917,7 @@ def print_rules_only() -> None:
     # own scanners over multi-file structure).
     print(f"  [D1] structural — duplicate UUID literals across files")
     print(f"  [D2] structural — kernel verb without log_telemetry call")
-    print(f"  [D3] structural — crate not referenced in ARCHITECTURE.md")
+    print(f"  [D3] structural — crate not referenced in BLUEPRINT.md")
     print(f"  [{DDL_BYPASS_RULE.id}] {DDL_BYPASS_RULE.section} — {DDL_BYPASS_RULE.description}")
     print(f"      scope=all-files  marker=(none — DDL is unconditionally forbidden outside schema/*.surql)")
     print()
