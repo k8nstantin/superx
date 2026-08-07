@@ -287,6 +287,104 @@ impl Kernel {
         Ok(id)
     }
 
+    /// Find an entity by the `name` key of its latest descriptor-style
+    /// attribute. The substrate names entities through `state_ledger`
+    /// payloads, not entity columns — this is the canonical
+    /// found-by-name lookup used by the module registry
+    /// (`attr_module_descriptor`) and agent/source/session discovery
+    /// (`attr_agent_descriptor`, …).
+    ///
+    /// A candidate row matching the name is only accepted if the
+    /// target's **current** descriptor still carries that name — a
+    /// renamed entity's old name must not resolve forever (v1 defect,
+    /// fixed by design here).
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::NotFound`] if either type uid doesn't resolve;
+    /// [`KernelError::Db`] for engine errors.
+    pub async fn find_entity_by_name(
+        &self,
+        entity_type_uid: &str,
+        attr_type_uid: &str,
+        name: &str,
+    ) -> Result<Option<RecordId>> {
+        let entity_type = self.find_type(entity_type_uid).await?;
+        let attr_type = self.find_type(attr_type_uid).await?;
+
+        #[derive(SurrealValue)]
+        struct TargetRow {
+            target: RecordId,
+            valid_from: DateTime<Utc>,
+        }
+        let rows: Vec<TargetRow> = self
+            .db
+            .query(
+                "SELECT target, valid_from FROM state_ledger \
+                 WHERE type = $attr_type \
+                   AND target.type = $entity_type \
+                   AND payload.name = $name \
+                 ORDER BY valid_from DESC LIMIT 1",
+            )
+            .bind(("attr_type", attr_type))
+            .bind(("entity_type", entity_type))
+            .bind(("name", name.to_string()))
+            .await?
+            .take(0)?;
+
+        let Some(candidate) = rows.into_iter().next().map(|r| r.target) else {
+            return Ok(None);
+        };
+        // Verify against the target's CURRENT descriptor: a stale name
+        // (superseded by a rename) does not resolve.
+        let current = self.current_state(candidate.clone(), attr_type_uid).await?;
+        let still_named = matches!(
+            current,
+            Some(Value::Object(ref obj))
+                if matches!(obj.get("name"), Some(Value::String(s)) if s == name)
+        );
+        Ok(still_named.then_some(candidate))
+    }
+
+    /// Enumerate every entity of a type together with the latest
+    /// payload of its descriptor-style attribute. Entities with no
+    /// descriptor row yet are omitted (they have no name to list).
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::NotFound`] if the entity type uid doesn't
+    /// resolve; [`KernelError::Db`] for engine errors.
+    pub async fn list_named_entities(
+        &self,
+        entity_type_uid: &str,
+        attr_type_uid: &str,
+    ) -> Result<Vec<NamedEntity>> {
+        let entity_type = self.find_type(entity_type_uid).await?;
+
+        #[derive(SurrealValue)]
+        struct IdOnly {
+            id: RecordId,
+        }
+        let entities: Vec<IdOnly> = self
+            .db
+            .query("SELECT id FROM entity WHERE type = $type")
+            .bind(("type", entity_type))
+            .await?
+            .take(0)?;
+
+        let mut out = Vec::with_capacity(entities.len());
+        for e in entities {
+            let Some(payload) = self.current_state(e.id.clone(), attr_type_uid).await? else {
+                continue;
+            };
+            out.push(NamedEntity {
+                entity_id: e.id,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+
     /// Recover the latest `state_ledger.payload` for a
     /// `(target, type_uid)` chain. Returns `None` if no row has been
     /// written yet for that pair.
@@ -336,6 +434,16 @@ impl Kernel {
     pub(crate) fn new_record_id(&self, table: &'static str) -> RecordId {
         RecordId::new(table, surrealdb::types::Uuid::from(Uuid::now_v7()))
     }
+}
+
+/// One row of [`Kernel::list_named_entities`]: an entity plus the
+/// latest payload of its descriptor-style attribute.
+#[derive(Debug, Clone)]
+pub struct NamedEntity {
+    /// The entity's substrate identity.
+    pub entity_id: RecordId,
+    /// The latest descriptor payload (e.g. `{name, locator, adapter}`).
+    pub payload: Value,
 }
 
 // ─────────────────────────────────────────────────────────────────────

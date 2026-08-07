@@ -36,8 +36,13 @@
 //!
 //! [`BLUEPRINT.md`]: https://github.com/k8nstantin/superx/blob/main/BLUEPRINT.md
 
+pub mod boot;
 pub mod error;
+pub mod lifecycle;
 pub mod logging;
+pub mod metamodel;
+pub mod parameters;
+pub mod registry;
 pub mod schema;
 pub mod substrate;
 pub mod telemetry;
@@ -49,7 +54,14 @@ pub mod telemetry;
 /// across the workspace.
 pub use surrealdb::types;
 
+pub use boot::{boot, BootEntry, BootReport};
 pub use error::{KernelError, Result};
+pub use lifecycle::LifecycleState;
+pub use metamodel::{MetamodelType, REQUIRED_METAMODEL_TYPES};
+pub use registry::{
+    KernelModule, KernelModuleDescriptor, ModuleStatus, NodeKind, RegistryStatus,
+    KERNEL_MODULES,
+};
 pub use schema::SCHEMA_DDL;
-pub use substrate::Kernel;
+pub use substrate::{Kernel, NamedEntity};
 pub use telemetry::TelemetryRecord;

@@ -26,6 +26,20 @@ pub enum KernelError {
     /// row by uid and no row with that uid exists in the substrate.
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// A substrate payload was read back but is semantically invalid —
+    /// e.g. an `attr_lifecycle_state` row carries an unknown state
+    /// tag, or a parameter payload is missing its `value` key. This
+    /// indicates a corrupt or foreign write; the offending row must be
+    /// inspected, never silently coerced into a default value.
+    #[error("corrupt substrate state: {0}")]
+    Corrupt(String),
+
+    /// A module or adapter failed in its own domain logic. Carried
+    /// through [`crate::KernelModule::startup`] so boot records the
+    /// failure verbatim in the module's lifecycle.
+    #[error("module error: {0}")]
+    Module(String),
 }
 
 pub type Result<T> = std::result::Result<T, KernelError>;

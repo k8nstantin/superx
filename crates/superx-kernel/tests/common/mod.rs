@@ -4,13 +4,14 @@
 //! (password placeholder substituted), signed in as `superx_kernel`.
 //! In production the schema is applied once by the operator under root
 //! (skill §11); tests stand in for that step here.
+#![allow(dead_code)] // skill-allow: allow — shared test fixture; each test binary links a subset of these helpers
 
 use std::error::Error;
 
 use surrealdb::engine::any::connect;
 use surrealdb::opt::auth::Database;
 
-use superx_kernel::{Kernel, SCHEMA_DDL};
+use superx_kernel::{Kernel, REQUIRED_METAMODEL_TYPES, SCHEMA_DDL};
 
 const TEST_PASSWORD: &str = "test-kernel-password-for-mem-engine";
 const TEST_NS: &str = "superx";
@@ -31,4 +32,18 @@ pub async fn fresh_kernel() -> Result<Kernel, Box<dyn Error>> {
     })
     .await?;
     Ok(Kernel::from_db(db))
+}
+
+/// [`fresh_kernel`] + every `REQUIRED_METAMODEL_TYPES` row seeded —
+/// registry / lifecycle / parameter verbs resolve types through
+/// `find_type`, so they must exist first. In production that seeding
+/// is `boot()`'s job; tests stand in for it here.
+pub async fn fresh_seeded_kernel() -> Result<Kernel, Box<dyn Error>> {
+    let kernel = fresh_kernel().await?;
+    for t in REQUIRED_METAMODEL_TYPES {
+        kernel
+            .ensure_type_definition(t.uid, t.category, t.memory_tier)
+            .await?;
+    }
+    Ok(kernel)
 }

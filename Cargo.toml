@@ -15,7 +15,12 @@ superx-kernel = { path = "crates/superx-kernel" }
 # wire protocol the operator-provisioned standalone server speaks.
 surrealdb = { version = "3", default-features = false, features = ["protocol-ws", "kv-mem"] }
 
+async-trait = "0.1"
 chrono    = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+# Compile-time inventory — modules/adapters register descriptors via
+# #[distributed_slice]; the kernel iterates, nothing enumerates.
+linkme    = "0.3"
+serde     = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio     = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 uuid      = { version = "1", features = ["v7", "serde"] }
