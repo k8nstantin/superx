@@ -33,12 +33,18 @@ SuperX is an **agentic operating system** written in Rust.
    telemetry engine. Boot always completes; a failed module never
    takes the OS down.
 3. **Agent telemetry capture** — the engine that discovers agents on
-   the machine, tails whatever they emit, writes typed telemetry rows,
-   and checkpoints with cursors so restarts are lossless. Runs from
-   boot until shutdown.
+   the machine, tails whatever they emit, writes typed telemetry rows
+   **and first-class conversation rows** (`message` table — every
+   session with every agent, very detailed, raw event preserved), and
+   checkpoints with cursors so restarts are lossless. Runs from boot
+   until shutdown; captures everything by default (operator decision
+   2026-08-07 — no per-agent grant gate; OS-level file prompts are the
+   permission surface).
 4. **CLI** — the operator interface: `boot`, `status`, `agents`,
-   `stats [--live]`. The CLI is part of the kernel deliverable, not an
-   app bolted on later.
+   `actions [--live]` (the telemetry stream), `sessions` (list
+   conversations), `read <session> [--live]` (render a conversation,
+   historical then follow). The CLI is part of the kernel deliverable,
+   not an app bolted on later.
 5. **Module system** — modules register with the kernel, declare
    dependencies, and get lifecycle management (starting / active /
    failed / skipped). The registry lives in the substrate like
@@ -88,14 +94,18 @@ these v1 mechanics were verified live and are carried forward as
 
 ## 5. The new FVP
 
-> The operator runs `superx boot`. Every agent on the machine that
-> emits observable telemetry appears within seconds. `superx stats
-> --live` streams their activity as it happens. Adding a new agent
-> adapter touches zero engine code.
+> The operator runs `superx boot`. Every coding agent on the machine
+> is discovered and stored in the substrate. Detailed telemetry AND
+> full conversations stream in from Claude Code, Gemini CLI, and
+> Claude Desktop. `superx actions --live` shows what agents are doing;
+> `superx read <session> --live` lets the operator read any
+> conversation — historical first, then live as it continues. Adding a
+> new agent adapter touches zero engine code.
 
-Measured by: at least **two** agent adapters working day one (so the
-adapter seam is proven, not aspirational), lossless restart mid-stream,
-and the whole workspace green at the gates.
+Measured by: **three** agent adapters working day one (Claude Code,
+Gemini CLI, Claude Desktop), conversations readable end-to-end,
+lossless restart mid-stream, and the whole workspace green at the
+gates.
 
 ## 6. Phase plan (each phase = one branch, one PR, one day max)
 
@@ -105,9 +115,9 @@ and the whole workspace green at the gates.
 | G1 | Schema design session (operator + model, §11) → `SUPERX_SCHEMA.md` v2 + `schema/kernel.surql` v2; operator applies under root | Schema deployed and locked |
 | G2 | Kernel substrate verbs + telemetry primitive + tests | Verbs green on kv-mem |
 | G3 | Module system + boot orchestrator | Fake-module boot tests green |
-| G4 | Capture engine + agent adapter #1 (Claude Code) | Live rows on a real machine |
-| G5 | Agent adapter #2: **Claude Desktop** (decided 2026-08-06) | Two adapters, zero engine edits |
-| G6 | CLI complete: `boot`, `status`, `agents`, `stats --live` — **FVP** | The demo sentence above, live |
+| G4 | Capture engine + agent adapter #1 (Claude Code): telemetry + conversations | Live message + action rows on a real machine |
+| G5 | Agent adapters #2 + #3: **Gemini CLI**, **Claude Desktop** (amended 2026-08-07) | Three adapters, zero engine edits |
+| G6 | CLI complete: `boot`, `status`, `agents`, `actions --live`, `sessions`, `read` — **FVP** | The demo sentence above, live |
 | G7+ | First modules: data fusion, graphify | Module seam proven |
 
 ## 7. Decisions record
@@ -116,10 +126,14 @@ and the whole workspace green at the gates.
 |---|---|---|
 | D1 | Reset mechanics | **Same repo**; v1 preserved at tag `archive/pre-reset-2026-08-06` |
 | D2 | Where capture lives | **In-kernel**; only per-agent adapters are pluggable |
-| D3 | FVP adapter #2 (Claude Code is #1) | **Claude Desktop** |
+| D3 | FVP adapters (Claude Code is #1) | **Claude Desktop** (2026-08-06); **amended 2026-08-07**: + Gemini CLI — three adapters, Gemini CLI second |
 | D4 | Zero-trust skill fate | **Rewritten from scratch** against this blueprint; lands in the G0 PR |
-| D5 | Dead `feat/ingest-rust-codebase` branch (one unmerged pre-reset commit) | *Pending* — recommend delete; the commit targets deleted code |
-| D6 | v1 GitHub issues (20 open, all pre-reset) | *Pending* — recommend close with a comment pointing here |
+| D5 | Dead `feat/ingest-rust-codebase` branch (one unmerged pre-reset commit) | **Deleted** 2026-08-06 |
+| D6 | v1 GitHub issues (23 open, all pre-reset) | **Closed** 2026-08-06 with pointers here |
+| D7 | Conversation storage (2026-08-07) | **Dedicated `message` table** — first-class, readable historical + live; raw source event always preserved |
+| D8 | Capture consent (2026-08-07) | **Capture everything by default** — no per-agent grant gate; OS file prompts are the permission surface |
+| D9 | Agent storage (2026-08-07) | **Agents stay entities** (`node_agent`); entity row id = agent_id; new agent properties are data writes, never schema migrations |
+| D10 | CLI viewing surface (2026-08-07) | `actions [--live]` + `sessions` + `read <session> [--live]` |
 
 ## 8. Binding rules (unchanged from v1, restated)
 

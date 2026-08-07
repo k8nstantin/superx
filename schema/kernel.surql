@@ -186,10 +186,53 @@ DEFINE TABLE telemetry_stream SCHEMAFULL
 DEFINE FIELD lifecycle_event ON TABLE telemetry_stream TYPE string;
 DEFINE FIELD payload         ON TABLE telemetry_stream TYPE any;
 DEFINE FIELD subject         ON TABLE telemetry_stream TYPE option<record<entity>>;
+-- The agent this event concerns (v2.1) — direct per-agent queries over
+-- the actions firehose. `subject` is the emitter (module / agent /
+-- source); `agent` is always the agent, resolved by the adapter.
+DEFINE FIELD agent           ON TABLE telemetry_stream TYPE option<record<entity>>
+    ASSERT $value = NONE OR $value.type.uid = 'node_agent';
 DEFINE FIELD valid_from      ON TABLE telemetry_stream TYPE datetime;
 
 DEFINE INDEX idx_telemetry_valid_from ON TABLE telemetry_stream
     FIELDS valid_from;
+
+DEFINE INDEX idx_telemetry_agent ON TABLE telemetry_stream
+    FIELDS agent, valid_from;
+
+
+-- =========================================================================
+-- message — conversations, first-class (v2.1, operator session 2026-08-07)
+-- =========================================================================
+-- One row per conversation event captured from an agent's session.
+-- `content` is the extracted readable text (empty when the event has
+-- none); `raw` preserves the full original source event — capture is
+-- very detailed by design. `role` is deliberately un-ASSERTed:
+-- adapters store source-native labels and tolerance beats constraint
+-- at the capture boundary. Sessions are node_session entities;
+-- their metadata lives in state_ledger like everything else.
+DEFINE TABLE message SCHEMAFULL
+    PERMISSIONS
+        FOR select FULL
+        FOR create FULL
+        FOR update NONE
+        FOR delete NONE;
+
+DEFINE FIELD session     ON TABLE message TYPE record<entity>
+    ASSERT $value.type.uid = 'node_session';
+DEFINE FIELD agent       ON TABLE message TYPE record<entity>
+    ASSERT $value.type.uid = 'node_agent';
+DEFINE FIELD role        ON TABLE message TYPE string;
+DEFINE FIELD content     ON TABLE message TYPE string;
+DEFINE FIELD raw         ON TABLE message TYPE option<object> FLEXIBLE;
+DEFINE FIELD seq         ON TABLE message TYPE option<int>;
+DEFINE FIELD emitted_at  ON TABLE message TYPE option<datetime>;
+DEFINE FIELD valid_from  ON TABLE message TYPE datetime;
+
+DEFINE INDEX idx_message_session ON TABLE message
+    FIELDS session, valid_from;
+
+DEFINE INDEX idx_message_agent ON TABLE message
+    FIELDS agent, valid_from;
 
 
 -- =========================================================================
