@@ -7,3 +7,5 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+superx-kernel.workspace = true
+tracing.workspace = true

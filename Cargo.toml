@@ -19,3 +19,11 @@ chrono    = { version = "0.4", default-features = false, features = ["serde", "s
 thiserror = "2"
 tokio     = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 uuid      = { version = "1", features = ["v7", "serde"] }
+
+# Kernel self-log — rolling file log independent of the substrate
+# (boot diagnostics must survive substrate unavailability).
+tracing            = "0.1"
+tracing-appender   = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+tempfile = "3"

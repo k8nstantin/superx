@@ -80,13 +80,21 @@ impl Kernel {
 
         let db = connect(endpoint).await?;
         db.use_ns(namespace).use_db(database).await?;
-        db.signin(Database {
-            namespace: namespace.to_string(),
-            database: database.to_string(),
-            username: SERVICE_USERNAME.to_string(),
-            password,
-        })
-        .await?;
+        if let Err(e) = db
+            .signin(Database {
+                namespace: namespace.to_string(),
+                database: database.to_string(),
+                username: SERVICE_USERNAME.to_string(),
+                password,
+            })
+            .await
+        {
+            tracing::error!(endpoint, namespace, database, error = %e,
+                "substrate signin refused for superx_kernel");
+            return Err(e.into());
+        }
+        tracing::info!(endpoint, namespace, database,
+            "substrate connected; signed in as superx_kernel");
 
         Ok(Self {
             db,
