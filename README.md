@@ -9,24 +9,56 @@ moment the OS boots it captures everything every agent on the machine
 emits. Every other capability (data fusion, graphify, …) arrives as a
 module on top of the kernel.
 
-## Status — reset in progress (G0)
+## Status — FVP complete
 
-The project was reset from line zero on **2026-08-06**. The complete
-v1 First Viable Product (F0–F11, PRs #96–#110, all gates green) is
-preserved at the tag
-[`archive/pre-reset-2026-08-06`](../../tree/archive/pre-reset-2026-08-06).
-
-The living canon is [`BLUEPRINT.md`](BLUEPRINT.md) — mission, kernel
-spec, phase plan (G0–G7), and the decisions record. Schema truth lives
-in [`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md) (G1 design, 2026-08-06).
+The project was reset from line zero on **2026-08-06** (v1 preserved
+at [`archive/pre-reset-2026-08-06`](../../tree/archive/pre-reset-2026-08-06));
+the **v2 First Viable Product shipped 2026-08-07**. The living canon
+is [`BLUEPRINT.md`](BLUEPRINT.md); schema truth is
+[`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md) (v2.1).
 
 | Phase | Scope | Status |
 |---|---|---|
 | G0 | Reset: archive tag, skeleton workspace, blueprint, skill v2 | done (#111) |
-| G1 | Schema design session → `SUPERX_SCHEMA.md` v2, operator applies | done (#112) |
-| G2 | Kernel substrate verbs + telemetry primitive | this PR |
-| G3–G6 | Module system → capture engine → adapters → CLI | planned |
+| G1 | Schema v2 + v2.1 (conversations first-class) | done (#112, #115) |
+| G2 | Kernel substrate verbs + telemetry primitive | done (#113) |
+| G3 | Module system + in-kernel boot orchestrator | done (#116) |
+| G4 | Capture engine + Claude Code adapter | done (#117) |
+| G5 | Gemini CLI + Claude Desktop adapters | done (#118) |
+| G6 | CLI: boot / status / agents / actions / sessions / read — **FVP** | this PR |
 | G7+ | First modules (data fusion, graphify) | planned |
+
+## FVP test protocol (the live demo)
+
+Prerequisite: the schema is deployed (section below) and the SurrealDB
+server is running. `SUPERX_KERNEL_PASSWORD` must be exported in every
+terminal with the value used at deploy time.
+
+```bash
+# Terminal 1 — boot the OS: discovers every coding agent on the
+# machine (Claude Code, Gemini CLI, Claude Desktop), backfills
+# conversation history, then captures live. Ctrl-c to stop.
+superx boot
+
+# Terminal 2 — watch what agents are doing, as it happens.
+superx actions --live
+
+# Inspect what the OS knows.
+superx status                      # module + adapter lifecycle
+superx agents                      # discovered agents, agent_ids, counts
+superx sessions                    # every captured conversation
+superx sessions --agent gemini_cli # per-agent
+
+# Read a conversation — full history, then follow it live.
+superx read <session-name-or-suffix> --live
+
+# Query per agent (agent_id = the entity id shown by `superx agents`).
+superx actions --agent claude_code -n 50
+```
+
+Working in Claude Code or Gemini CLI while `boot` runs streams new
+messages into the substrate within seconds; `read --live` shows the
+conversation as it continues.
 
 ## Deploy the substrate schema (operator one-shot)
 

@@ -269,8 +269,9 @@ impl Kernel {
     // ─────────────────────────────────────────────────────────────────
 
     /// Find the entity id of a registered module by (kind, name);
-    /// `None` if not yet registered.
-    pub(crate) async fn find_module_by_name(
+    /// `None` if not yet registered. Public: parameters hang off
+    /// module entities, so callers (CLI, tests) resolve them here.
+    pub async fn find_module_by_name(
         &self,
         kind: NodeKind,
         name: &str,
