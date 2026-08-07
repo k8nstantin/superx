@@ -17,15 +17,30 @@ preserved at the tag
 [`archive/pre-reset-2026-08-06`](../../tree/archive/pre-reset-2026-08-06).
 
 The living canon is [`BLUEPRINT.md`](BLUEPRINT.md) — mission, kernel
-spec, phase plan (G0–G7), and the decisions record. Schema truth will
-live in `SUPERX_SCHEMA.md` once the G1 design session produces it.
+spec, phase plan (G0–G7), and the decisions record. Schema truth lives
+in [`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md) (G1 design, 2026-08-06).
 
 | Phase | Scope | Status |
 |---|---|---|
-| G0 | Reset: archive tag, skeleton workspace, blueprint, skill v2 | this PR |
-| G1 | Schema design session → `SUPERX_SCHEMA.md` v2, operator applies | next |
+| G0 | Reset: archive tag, skeleton workspace, blueprint, skill v2 | done (#111) |
+| G1 | Schema design session → `SUPERX_SCHEMA.md` v2, operator applies | this PR |
 | G2–G6 | Kernel verbs → module system → capture engine → adapters → CLI | planned |
 | G7+ | First modules (data fusion, graphify) | planned |
+
+## Deploy the substrate schema (operator one-shot)
+
+```bash
+# 1. Start a SurrealDB server on a FRESH v2 path
+export SUPERX_ROOT_PASSWORD='<strong root password>'
+surreal start --user root --pass "$SUPERX_ROOT_PASSWORD" rocksdb:./db/superx-v2.db &
+
+# 2. Apply the kernel schema once, under root
+export SUPERX_KERNEL_PASSWORD='<kernel service-account password>'
+./scripts/deploy-schema.sh
+```
+
+From that moment the schema is locked (skill §7) and all kernel code
+signs in as the `superx_kernel` service account — never root.
 
 ## Development gates (binding)
 

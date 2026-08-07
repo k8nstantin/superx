@@ -138,9 +138,10 @@ Putting logic in the wrong layer is a §3 violation.
   The operator applies the DDL under root; the model codes against the
   locked schema afterward.
 - Schema designs include: typed field lists, `record<table>` FKs with
-  their `ASSERT` constraints, the SCD-2 triad (`is_current` /
-  `valid_from` / `valid_to`), the UUIDv7 row-id contract (kernel-set,
-  never auto-generated), and a migration plan if the table exists.
+  their `ASSERT` constraints, the SCD-2 ordering contract
+  (`valid_from`, latest-wins; no mutable currency flags — append-only
+  forbids them), the UUIDv7 row-id contract (kernel-set, never
+  auto-generated), and a migration plan if the table exists.
 - Session authorization is scoped to the specific change designed in
   that session — nothing adjacent.
 
