@@ -3463,6 +3463,7 @@ dependencies = [
  "chrono",
  "linkme",
  "serde",
+ "serde_json",
  "surrealdb",
  "tempfile",
  "thiserror",
