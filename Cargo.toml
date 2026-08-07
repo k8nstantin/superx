@@ -16,6 +16,7 @@ superx-kernel = { path = "crates/superx-kernel" }
 surrealdb = { version = "3", default-features = false, features = ["protocol-ws", "kv-mem"] }
 
 async-trait = "0.1"
+clap      = { version = "4", features = ["derive", "env"] }
 chrono    = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
 # Compile-time inventory — modules/adapters register descriptors via
 # #[distributed_slice]; the kernel iterates, nothing enumerates.

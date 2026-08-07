@@ -7,5 +7,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono.workspace = true
+clap.workspace = true
 superx-kernel.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
+
+[dev-dependencies]
+surrealdb.workspace = true
+tempfile.workspace = true
