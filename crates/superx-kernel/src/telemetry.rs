@@ -23,6 +23,9 @@ pub struct TelemetryRecord {
     /// Who emitted this event — a module, agent, or source entity;
     /// `None` for system-level events with no attributable emitter.
     pub subject: Option<RecordId>,
+    /// The agent this event concerns (v2.1) — direct per-agent
+    /// queries over the actions firehose.
+    pub agent: Option<RecordId>,
     pub valid_from: DateTime<Utc>,
 }
 
@@ -45,15 +48,60 @@ impl Kernel {
         payload: Value,
         subject: Option<RecordId>,
     ) -> Result<RecordId> {
+        self.log_telemetry_for_agent(event, payload, subject, None)
+            .await
+    }
+
+    /// Append one row to `telemetry_stream` carrying both the emitter
+    /// (`subject`) and the agent the event concerns (`agent`, v2.1) —
+    /// the capture path's verb, making every action row directly
+    /// queryable by agent_id.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces engine refusals verbatim via [`crate::KernelError::Db`]
+    /// (e.g. an `agent` that is not a `node_agent` entity).
+    pub async fn log_telemetry_for_agent(
+        &self,
+        event: &str,
+        payload: Value,
+        subject: Option<RecordId>,
+        agent: Option<RecordId>,
+    ) -> Result<RecordId> {
         let id = self.new_record_id("telemetry_stream");
         let row = TelemetryRow {
             lifecycle_event: event.to_string(),
             payload,
             subject,
+            agent,
             valid_from: Utc::now(),
         };
         let _: Option<TelemetryRow> = self.db().create(id.clone()).content(row).await?;
         Ok(id)
+    }
+
+    /// Read an agent's telemetry rows, newest first — "query the data
+    /// for a specific agent" over the actions firehose.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces engine errors verbatim via [`crate::KernelError::Db`].
+    pub async fn agent_telemetry(
+        &self,
+        agent: RecordId,
+        limit: u32,
+    ) -> Result<Vec<TelemetryRecord>> {
+        let rows: Vec<TelemetryRecord> = self
+            .db()
+            .query(
+                "SELECT * FROM telemetry_stream WHERE agent = $agent \
+                 ORDER BY valid_from DESC LIMIT $limit",
+            )
+            .bind(("agent", agent))
+            .bind(("limit", limit))
+            .await?
+            .take(0)?;
+        Ok(rows)
     }
 
     /// Read the most-recent `telemetry_stream` rows, newest first.
@@ -111,5 +159,6 @@ struct TelemetryRow {
     lifecycle_event: String,
     payload: Value,
     subject: Option<RecordId>,
+    agent: Option<RecordId>,
     valid_from: DateTime<Utc>,
 }

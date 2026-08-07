@@ -36,10 +36,14 @@
 //!
 //! [`BLUEPRINT.md`]: https://github.com/k8nstantin/superx/blob/main/BLUEPRINT.md
 
+pub mod adapters;
 pub mod boot;
+pub mod capture;
+pub mod cursor;
 pub mod error;
 pub mod lifecycle;
 pub mod logging;
+pub mod message;
 pub mod metamodel;
 pub mod parameters;
 pub mod registry;
@@ -55,7 +59,12 @@ pub mod telemetry;
 pub use surrealdb::types;
 
 pub use boot::{boot, BootEntry, BootReport};
+pub use capture::{
+    AgentAdapter, DiscoveredSource, SourceRef, TickReport, ADAPTERS,
+};
+pub use cursor::Cursor;
 pub use error::{KernelError, Result};
+pub use message::{MessageRecord, NewMessage};
 pub use lifecycle::LifecycleState;
 pub use metamodel::{MetamodelType, REQUIRED_METAMODEL_TYPES};
 pub use registry::{
