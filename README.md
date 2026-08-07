@@ -23,8 +23,9 @@ in [`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md) (G1 design, 2026-08-06).
 | Phase | Scope | Status |
 |---|---|---|
 | G0 | Reset: archive tag, skeleton workspace, blueprint, skill v2 | done (#111) |
-| G1 | Schema design session → `SUPERX_SCHEMA.md` v2, operator applies | this PR |
-| G2–G6 | Kernel verbs → module system → capture engine → adapters → CLI | planned |
+| G1 | Schema design session → `SUPERX_SCHEMA.md` v2, operator applies | done (#112) |
+| G2 | Kernel substrate verbs + telemetry primitive | this PR |
+| G3–G6 | Module system → capture engine → adapters → CLI | planned |
 | G7+ | First modules (data fusion, graphify) | planned |
 
 ## Deploy the substrate schema (operator one-shot)
