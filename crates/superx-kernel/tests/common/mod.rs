@@ -34,6 +34,55 @@ pub async fn fresh_kernel() -> Result<Kernel, Box<dyn Error>> {
     Ok(Kernel::from_db(db))
 }
 
+/// Pin every linked adapter's root parameter to an empty directory so
+/// no test ever reads REAL machine data (un-parameterized adapters
+/// fall back to `$HOME` locations that exist on dev machines). Each
+/// test then re-points its own adapter at its fixture — parameters
+/// supersede, latest wins.
+pub async fn isolate_adapters(
+    kernel: &Kernel,
+    empty_root: &std::path::Path,
+) -> Result<(), Box<dyn Error>> {
+    use superx_kernel::registry::KernelModule as _;
+    use superx_kernel::types::Value;
+    std::fs::create_dir_all(empty_root)?;
+    let root = Value::String(empty_root.to_string_lossy().to_string());
+
+    let cc = kernel
+        .register_module(&superx_kernel::adapters::claude_code::ClaudeCodeAdapter.descriptor())
+        .await?;
+    kernel
+        .set_parameter(
+            cc,
+            superx_kernel::adapters::claude_code::PROJECTS_ROOT_PARAM,
+            root.clone(),
+        )
+        .await?;
+    let gm = kernel
+        .register_module(&superx_kernel::adapters::gemini_cli::GeminiCliAdapter.descriptor())
+        .await?;
+    kernel
+        .set_parameter(
+            gm,
+            superx_kernel::adapters::gemini_cli::ROOT_PARAM,
+            root.clone(),
+        )
+        .await?;
+    let cd = kernel
+        .register_module(
+            &superx_kernel::adapters::claude_desktop::ClaudeDesktopAdapter.descriptor(),
+        )
+        .await?;
+    kernel
+        .set_parameter(
+            cd,
+            superx_kernel::adapters::claude_desktop::LOGS_ROOT_PARAM,
+            root,
+        )
+        .await?;
+    Ok(())
+}
+
 /// [`fresh_kernel`] + every `REQUIRED_METAMODEL_TYPES` row seeded —
 /// registry / lifecycle / parameter verbs resolve types through
 /// `find_type`, so they must exist first. In production that seeding

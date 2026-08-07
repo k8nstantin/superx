@@ -7,3 +7,5 @@
 //! touches zero engine code (BLUEPRINT.md §5).
 
 pub mod claude_code;
+pub mod claude_desktop;
+pub mod gemini_cli;

@@ -17,6 +17,18 @@ use superx_kernel::registry::{KernelModule as _, NodeKind};
 use superx_kernel::types::Value;
 use superx_kernel::Kernel;
 
+/// Only this adapter's sources — the other adapters linked into this
+/// test binary fall back to real machine paths when un-parameterized.
+async fn cc_sources(
+    kernel: &Kernel,
+) -> Result<Vec<(usize, superx_kernel::SourceRef)>, Box<dyn Error>> {
+    let all = discover_paired(kernel).await?;
+    Ok(all
+        .into_iter()
+        .filter(|(_, s)| s.name.starts_with("claude_code/"))
+        .collect())
+}
+
 const FIXTURE_LINES: &str = concat!(
     r#"{"type":"user","message":{"role":"user","content":"hello superx"},"origin":{"kind":"human"},"promptSource":"typed","sessionId":"sess-1","timestamp":"2026-08-07T10:00:00.000Z","cwd":"/tmp/proj"}"#,
     "\n",
@@ -31,7 +43,11 @@ const FIXTURE_LINES: &str = concat!(
 
 /// Fixture tree + registered adapter + projects-root parameter.
 async fn arrange(kernel: &Kernel, root: &std::path::Path) -> Result<(), Box<dyn Error>> {
-    let project = root.join("-tmp-proj");
+    common::isolate_adapters(kernel, &root.join("isolated-empty")).await?;
+    // Projects live one level down so the isolation dir is never
+    // mistaken for a project.
+    let projects = root.join("projects");
+    let project = projects.join("-tmp-proj");
     fs::create_dir_all(&project)?;
     fs::write(project.join("sess-1.jsonl"), FIXTURE_LINES)?;
 
@@ -40,7 +56,7 @@ async fn arrange(kernel: &Kernel, root: &std::path::Path) -> Result<(), Box<dyn 
         .set_parameter(
             entity,
             PROJECTS_ROOT_PARAM,
-            Value::String(root.to_string_lossy().to_string()),
+            Value::String(projects.to_string_lossy().to_string()),
         )
         .await?;
     Ok(())
@@ -52,7 +68,7 @@ async fn history_backfill_extracts_conversation() -> Result<(), Box<dyn Error>> 
     let tmp = tempfile::tempdir()?;
     arrange(&kernel, tmp.path()).await?;
 
-    let sources = discover_paired(&kernel).await?;
+    let sources = cc_sources(&kernel).await?;
     assert_eq!(sources.len(), 1, "one project dir → one source");
     let report = capture_tick(&kernel, &sources).await?;
     assert!(report.errors.is_empty(), "no capture errors: {:?}", report.errors);
@@ -82,9 +98,16 @@ async fn history_backfill_extracts_conversation() -> Result<(), Box<dyn Error>> 
         .expect("agent entity exists");
     assert_eq!(kernel.agent_messages(agent.clone(), 10).await?.len(), 3);
 
-    // Telemetry: discovery + per-message pulses + sidecar + raw.
-    let recent = kernel.recent_telemetry(50).await?;
-    let count = |name: &str| recent.iter().filter(|e| e.lifecycle_event == name).count();
+    // Telemetry: discovery + per-message pulses + sidecar + raw —
+    // scoped to THIS agent (the other linked adapters discover their
+    // own agents too).
+    let recent = kernel.recent_telemetry(100).await?;
+    let count = |name: &str| {
+        recent
+            .iter()
+            .filter(|e| e.lifecycle_event == name && e.agent.as_ref() == Some(&agent))
+            .count()
+    };
     assert_eq!(count("agent_discovered"), 1);
     assert_eq!(count("source_discovered"), 1);
     assert_eq!(count("session_discovered"), 1);
@@ -104,7 +127,7 @@ async fn cursor_resume_captures_only_new_lines() -> Result<(), Box<dyn Error>> {
     let tmp = tempfile::tempdir()?;
     arrange(&kernel, tmp.path()).await?;
 
-    let sources = discover_paired(&kernel).await?;
+    let sources = cc_sources(&kernel).await?;
     let first = capture_tick(&kernel, &sources).await?;
     assert_eq!(first.total(), 5);
 
@@ -113,7 +136,7 @@ async fn cursor_resume_captures_only_new_lines() -> Result<(), Box<dyn Error>> {
     assert_eq!(quiet.total(), 0, "cursor prevents re-capture");
 
     // Append one line → exactly one new event.
-    let transcript = tmp.path().join("-tmp-proj").join("sess-1.jsonl");
+    let transcript = tmp.path().join("projects").join("-tmp-proj").join("sess-1.jsonl");
     let mut f = fs::OpenOptions::new().append(true).open(&transcript)?;
     writeln!(
         f,
@@ -138,8 +161,8 @@ async fn discovery_is_idempotent_and_continuous() -> Result<(), Box<dyn Error>> 
     let tmp = tempfile::tempdir()?;
     arrange(&kernel, tmp.path()).await?;
 
-    let first = discover_paired(&kernel).await?;
-    let again = discover_paired(&kernel).await?;
+    let first = cc_sources(&kernel).await?;
+    let again = cc_sources(&kernel).await?;
     assert_eq!(first.len(), again.len());
     assert_eq!(
         first[0].1.entity_id, again[0].1.entity_id,
@@ -148,8 +171,8 @@ async fn discovery_is_idempotent_and_continuous() -> Result<(), Box<dyn Error>> 
 
     // A project created AFTER first discovery is picked up (fixes
     // v1's one-shot discovery).
-    fs::create_dir_all(tmp.path().join("-tmp-late-project"))?;
-    let third = discover_paired(&kernel).await?;
+    fs::create_dir_all(tmp.path().join("projects").join("-tmp-late-project"))?;
+    let third = cc_sources(&kernel).await?;
     assert_eq!(third.len(), 2, "late project discovered without restart");
     Ok(())
 }
