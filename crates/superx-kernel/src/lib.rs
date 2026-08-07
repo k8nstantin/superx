@@ -21,6 +21,10 @@
 //!    this verb. Reads emit nothing — readers must not mutate the
 //!    stream they observe.
 //!
+//! Plus the **kernel self-log** ([`logging::init`]) — a rolling file
+//! log in a local `logs/` directory, independent of the substrate, so
+//! boot diagnostics survive substrate unavailability.
+//!
 //! Landing in later phases: the module system + boot orchestration
 //! (G3), the capture engine + agent adapters (G4–G5), the CLI surface
 //! (G6).
@@ -33,6 +37,7 @@
 //! [`BLUEPRINT.md`]: https://github.com/k8nstantin/superx/blob/main/BLUEPRINT.md
 
 pub mod error;
+pub mod logging;
 pub mod schema;
 pub mod substrate;
 pub mod telemetry;

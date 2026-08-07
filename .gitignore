@@ -7,6 +7,9 @@
 /db
 **/db/superx.db
 
+# Kernel self-log (runtime output, never committed)
+/logs
+
 # OS / editor noise
 .DS_Store
 .idea/

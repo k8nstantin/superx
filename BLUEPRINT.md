@@ -44,6 +44,13 @@ SuperX is an **agentic operating system** written in Rust.
    failed / skipped). The registry lives in the substrate like
    everything else.
 
+**Self-log.** The kernel keeps its own rolling log file in a local
+`logs/` directory (override: `SUPERX_LOG_DIR`), independent of the
+substrate — boot diagnostics and signin failures must be observable
+when the database is down. Substrate telemetry remains the audit log
+of record; the self-log is the layer below it. (Operator directive,
+2026-08-07.)
+
 **Agent adapters.** The capture *engine* is kernel-core. Knowing how a
 *specific* agent emits telemetry (Claude Code writes JSONL transcripts;
 another agent may expose OTLP, logs, or an API) is adapter knowledge.
