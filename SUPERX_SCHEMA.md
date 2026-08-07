@@ -1,9 +1,11 @@
-# SUPERX_SCHEMA.md — Substrate Schema, Source of Truth (v2)
+# SUPERX_SCHEMA.md — Substrate Schema, Source of Truth (v2.1)
 
-> **Status: G1 design — locked on apply.** Designed operator + model on
-> 2026-08-06 per skill §11 (schema-first, code-after). The DDL lives in
+> **Status: locked on apply.** v2 designed operator + model on
+> 2026-08-06; **v2.1** (conversations first-class: `message` table +
+> per-agent query fields) designed operator + model on 2026-08-07 —
+> both per skill §11 (schema-first, code-after). The DDL lives in
 > [`schema/kernel.surql`](schema/kernel.surql); the operator applies it
-> once under root via [`scripts/deploy-schema.sh`](scripts/deploy-schema.sh).
+> under root via [`scripts/deploy-schema.sh`](scripts/deploy-schema.sh).
 > From that moment the schema is locked: every change requires a fresh
 > per-change `Operator-approved:` PR marker (skill §7, CI-enforced).
 
@@ -44,7 +46,7 @@
 Root is operator-only, used exactly once per substrate to apply this
 schema. The kernel signs in as `superx_kernel` forever after (skill §10/§13).
 
-## 3. Tables (7)
+## 3. Tables (8)
 
 Every table is SCHEMAFULL, global (single-operator OS, no tenancy), and
 carries `valid_from: datetime` set by the kernel at insert.
@@ -128,11 +130,34 @@ lifecycle transition. Global, unscoped.
 | `lifecycle_event` | `string` | event name (`transcript_event`, `module_active`, …) |
 | `payload` | `any` | event body, tolerant by design |
 | `subject` | `option<record<entity>>` | who emitted this — module, agent, or source; no type ASSERT |
+| `agent` | `option<record<entity>>` | *(v2.1)* the agent this event concerns; ASSERT `node_agent` when present — direct per-agent queries |
 
-Index on `valid_from` backs the stats/live poll path. Event rows are
-never superseded — `valid_from` here is the event timestamp.
+Index on `valid_from` backs the stats/live poll path; `(agent,
+valid_from)` backs per-agent action queries. Event rows are never
+superseded — `valid_from` here is the event timestamp.
 
-## 4. Indexes (5)
+### 3.8 `message` — conversations, first-class *(v2.1)*
+One row per conversation event captured from an agent session —
+readable historically and live. The agent's row id **is** the
+agent_id; per-agent reads are one indexed query
+(`SELECT * FROM message WHERE agent = $agent_id ORDER BY valid_from`).
+
+| field | type | constraint |
+|---|---|---|
+| `session` | `record<entity>` | ASSERT type `node_session` — the conversation |
+| `agent` | `record<entity>` | ASSERT type `node_agent` — who the conversation is with |
+| `role` | `string` | source-native label (`user`, `assistant`, `tool`, …); deliberately un-ASSERTed — tolerance beats constraint at the capture boundary |
+| `content` | `string` | extracted readable text; empty when the event has none |
+| `raw` | `option<object> FLEXIBLE` | the full original source event — capture is very detailed by design |
+| `seq` | `option<int>` | source ordering (e.g. JSONL line number) |
+| `emitted_at` | `option<datetime>` | the source's own timestamp, best effort |
+
+Sessions are `node_session` entities (metamodel data, seeded at boot);
+session metadata (project path, title, …) lives in `state_ledger` like
+everything else. `telemetry_stream` remains the actions firehose;
+`message` is the conversations record.
+
+## 4. Indexes (8)
 
 | index | table | fields | kind |
 |---|---|---|---|
@@ -141,10 +166,30 @@ never superseded — `valid_from` here is the event timestamp.
 | `idx_state_ledger_chain` | state_ledger | target, type, valid_from | — |
 | `idx_cursor_chain` | cursor | subject, cursor_type, valid_from | — |
 | `idx_telemetry_valid_from` | telemetry_stream | valid_from | — |
+| `idx_telemetry_agent` *(v2.1)* | telemetry_stream | agent, valid_from | — |
+| `idx_message_session` *(v2.1)* | message | session, valid_from | — |
+| `idx_message_agent` *(v2.1)* | message | agent, valid_from | — |
 
 The UNIQUE pair makes `ensure_*` find-then-create verbs race-safe
 (cross-process double-creates surface as engine refusals — skill §12).
-The three read-path indexes fix v1's measured full-scan behavior.
+The read-path indexes fix v1's measured full-scan behavior; the three
+v2.1 indexes back conversation rendering and per-agent queries.
+
+## 5a. Deltas in v2.1 (operator session 2026-08-07)
+
+1. New `message` table — conversations first-class, readable
+   historical + live (operator directive: capture all conversations,
+   very detailed).
+2. `telemetry_stream.agent` added (`option<record<entity>>`, ASSERT
+   `node_agent` when present) — all data queryable by agent_id.
+3. Three new indexes (see §4).
+4. Decision: **agents stay entities** (type `node_agent`); the entity
+   row id is the agent_id. A dedicated agent table was considered and
+   rejected — every future agent property would become a §7 schema
+   migration instead of a data write.
+5. Decision: **capture everything by default** — no per-agent grant
+   gate; "requesting perms where needed" is the OS-level file prompts.
+   A future exclusion mechanism, if wanted, is a substrate parameter.
 
 ## 5. Deltas from v1 (`archive/pre-reset-2026-08-06`)
 
@@ -167,8 +212,16 @@ All operator-decided 2026-08-06 unless noted:
 
 ## 6. Migration plan
 
-None — fresh substrate. The v1 substrate data (default
+From v1: none — fresh substrate. The v1 substrate data (default
 `./db/superx.db`) is orphaned by the reset: it holds v1-schema rows the
 v2 kernel never reads. Recommended: point the v2 server at a fresh path
 (e.g. `rocksdb:./db/superx-v2.db`) and archive or delete the old
 directory at the operator's convenience. Nothing in v2 migrates v1 rows.
+
+From v2 → v2.1: **purely additive** (one new table, one new optional
+field, three indexes). If v2 was never applied, a fresh
+`./scripts/deploy-schema.sh` run covers everything. If v2 is already
+live, the operator applies just the v2.1 statements (the
+`telemetry_stream.agent` field + `idx_telemetry_agent` + the whole
+`message` section) under root; existing rows are untouched (`agent` is
+`option`).
