@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use superx_kernel::Kernel;
 
-use crate::ConnectionArgs;
+use crate::Config;
 
 /// Env var that always wins over the credentials file.
 pub const PASSWORD_ENV: &str = "SUPERX_KERNEL_PASSWORD";
@@ -114,12 +114,10 @@ use superx_kernel::provision::server_reachable;
 fn spawn_server(
     bind: &str,
     data_dir: &Path,
+    log_dir: &Path,
     root_password: Option<&str>,
 ) -> Result<(), String> {
-    let log_path = data_dir
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("surreal-server.log");
+    let log_path = log_dir.join("surreal-server.log");
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
     }
@@ -159,26 +157,34 @@ async fn wait_ready(endpoint: &str) -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(SERVER_POLL_MS)).await;
     }
     Err(format!(
-        "server did not become ready within {SERVER_READY_TIMEOUT_SECS}s — see the \
-         surreal-server.log next to the datastore"
+        "server did not become ready within {SERVER_READY_TIMEOUT_SECS}s — see \
+         surreal-server.log in the logs directory"
     ))
 }
 
 /// The full `--initialize` flow: provision when needed, then hand off
 /// to the background OS and RETURN THE TERMINAL (issue #124).
-pub async fn initialize(conn: &ConnectionArgs, data_dir: &Path) -> Result<(), String> {
+pub async fn initialize(config: &Config) -> Result<(), String> {
+    // The params file is the instance's visible contract — write the
+    // effective values on first touch (issue #125).
+    if !crate::config::params_path(&config.home).exists() {
+        let path = crate::config::save_params(config)?;
+        crate::emit(&format!("params written to {}\n", path.display()));
+    }
+    let data_dir = &config.data_dir;
+
     // Already provisioned and reachable? Straight to background boot.
     if let Some(pw) = resolve_password(data_dir) {
         if let Ok(kernel) = Kernel::connect_service_with_password(
-            &conn.endpoint,
-            &conn.namespace,
-            &conn.database,
+            &config.endpoint,
+            &config.namespace,
+            &config.database,
             &pw,
         )
         .await
         {
             crate::emit("instance already initialized\n");
-            return start_background_os(&kernel, conn, data_dir).await;
+            return start_background_os(&kernel, config).await;
         }
     }
 
@@ -191,24 +197,24 @@ pub async fn initialize(conn: &ConnectionArgs, data_dir: &Path) -> Result<(), St
         prompt_password()?
     };
 
-    let bind = bind_from_endpoint(&conn.endpoint);
-    if server_reachable(&conn.endpoint).await {
-        crate::emit(&format!("server already running at {}\n", conn.endpoint));
+    let bind = bind_from_endpoint(&config.endpoint);
+    if server_reachable(&config.endpoint).await {
+        crate::emit(&format!("server already running at {}\n", config.endpoint));
     } else {
         crate::emit(&format!(
             "starting SurrealDB at {} (datastore {})\n",
             bind,
             data_dir.display()
         ));
-        spawn_server(&bind, data_dir, fresh.then_some(password.as_str()))?;
-        wait_ready(&conn.endpoint).await?;
+        spawn_server(&bind, data_dir, &config.log_dir, fresh.then_some(password.as_str()))?;
+        wait_ready(&config.endpoint).await?;
     }
 
     crate::emit("applying the kernel schema…\n");
     superx_kernel::provision::apply_schema_as_root(
-        &conn.endpoint,
-        &conn.namespace,
-        &conn.database,
+        &config.endpoint,
+        &config.namespace,
+        &config.database,
         &password,
         &password, // one password for root + service at this phase (D11)
     )
@@ -222,14 +228,14 @@ pub async fn initialize(conn: &ConnectionArgs, data_dir: &Path) -> Result<(), St
     ));
 
     let kernel = Kernel::connect_service_with_password(
-        &conn.endpoint,
-        &conn.namespace,
-        &conn.database,
+        &config.endpoint,
+        &config.namespace,
+        &config.database,
         &password,
     )
     .await
     .map_err(|e| format!("service signin after provisioning failed: {e}"))?;
-    start_background_os(&kernel, conn, data_dir).await
+    start_background_os(&kernel, config).await
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -287,25 +293,33 @@ pub fn write_pidfile(data_dir: &Path, pid: u32) -> Result<(), String> {
 /// `superx boot --daemonized` with the effective connection args,
 /// detached in its own process group, output to
 /// `logs/superx-daemon.log`.
-fn spawn_daemon(conn: &ConnectionArgs, data_dir: &Path) -> Result<u32, String> {
+fn spawn_daemon(config: &Config) -> Result<u32, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let log_dir = Path::new(superx_kernel::logging::DEFAULT_LOG_DIR);
-    std::fs::create_dir_all(log_dir).map_err(|e| format!("create {log_dir:?}: {e}"))?;
-    let log_path = log_dir.join("superx-daemon.log");
+    std::fs::create_dir_all(&config.log_dir)
+        .map_err(|e| format!("create {:?}: {e}", config.log_dir))?;
+    let log_path = config.log_dir.join("superx-daemon.log");
     let log = std::fs::File::create(&log_path).map_err(|e| format!("open {log_path:?}: {e}"))?;
     let log_err = log.try_clone().map_err(|e| format!("clone log handle: {e}"))?;
 
+    // Fully explicit flags: the child's config is frozen at spawn
+    // time, immune to params-file edits mid-flight.
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("boot")
         .arg("--daemonized")
+        .arg("--home")
+        .arg(&config.home)
         .arg("--endpoint")
-        .arg(&conn.endpoint)
+        .arg(&config.endpoint)
         .arg("--namespace")
-        .arg(&conn.namespace)
+        .arg(&config.namespace)
         .arg("--database")
-        .arg(&conn.database)
+        .arg(&config.database)
         .arg("--data-dir")
-        .arg(data_dir)
+        .arg(&config.data_dir)
+        .arg("--log-dir")
+        .arg(&config.log_dir)
+        .arg("--log-filter")
+        .arg(&config.log_filter)
         .stdout(log)
         .stderr(log_err)
         .stdin(std::process::Stdio::null());
@@ -351,23 +365,19 @@ async fn wait_for_boot(
 
 /// Hand off to the background OS: guard against duplicates, spawn,
 /// wait for its boot, render the summary. The terminal returns.
-pub async fn start_background_os(
-    kernel: &Kernel,
-    conn: &ConnectionArgs,
-    data_dir: &Path,
-) -> Result<(), String> {
-    if let Some(pid) = read_live_pid(data_dir) {
+pub async fn start_background_os(kernel: &Kernel, config: &Config) -> Result<(), String> {
+    if let Some(pid) = read_live_pid(&config.data_dir) {
         crate::emit(&format!(
             "OS already running in background (pid {pid}) — `superx stop` to stop it\n"
         ));
         return Ok(());
     }
     let since = chrono::Utc::now();
-    let pid = spawn_daemon(conn, data_dir)?;
-    write_pidfile(data_dir, pid)?;
+    let pid = spawn_daemon(config)?;
+    write_pidfile(&config.data_dir, pid)?;
     crate::emit(&format!("booting in background (pid {pid})…\n"));
     wait_for_boot(kernel, since, pid).await?;
-    crate::emit(&crate::run_status(kernel, data_dir).await?);
+    crate::emit(&crate::run_status(kernel, &config.data_dir).await?);
     crate::emit(&format!(
         "OS running in background (pid {pid}) — capture is live.\n\
          confirm with: superx agents · superx sessions · superx actions --live\n\
