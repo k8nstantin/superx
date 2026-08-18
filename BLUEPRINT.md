@@ -121,6 +121,7 @@ gates.
 | G5 | Agent adapters #2 + #3: **Gemini CLI**, **Claude Desktop** (amended 2026-08-07) | Three adapters, zero engine edits |
 | G6 | CLI complete: `boot`, `status`, `agents`, `actions --live`, `sessions`, `read` — **FVP** | The demo sentence above, live |
 | G7+ | First modules: data fusion, graphify | Module seam proven |
+| **R1** | **v1.0.0 released** (2026-08-18): FVP + one-command background initialize + params file + logs | Tagged from `main`; operator-QA'd live |
 
 ## 7. Decisions record
 
@@ -139,6 +140,9 @@ gates.
 | D11 | One-command init (2026-08-18, issue #120) | `superx --initialize` prompts for ONE password (any accepted at this phase) serving both database root and the service account; root is used once in-process to apply the schema and never stored |
 | D12 | Credential persistence (2026-08-18) | Service password saved to a `0600` `superx-credentials` file beside the datastore so query commands need no exports; env var still wins |
 | D13 | Git discipline (2026-08-18) | Every change ties to a GitHub issue; branches + PRs reference it |
+| D14 | Session lookup (2026-08-18, #122) | Sessions identified `<agent>/<uuid7>`; `read` matches any unique fragment; source id rides as `src=` |
+| D15 | Background OS (2026-08-18, #124) | `--initialize` returns the terminal: OS runs detached (pidfile, daemon log); `superx stop`; duplicate-capture guards; shutdown honored between source polls |
+| D16 | Instance config (2026-08-18, #125) | `params/superx.json` controls all bootstrap config inside the `<home>/{params,logs,db}` layout; precedence flag > env > file > fallback; `superx logs` surfaces the self-log. Released as **v1.0.0** |
 
 ## 8. Binding rules (unchanged from v1, restated)
 
