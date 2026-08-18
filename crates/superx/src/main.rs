@@ -7,22 +7,44 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use superx::{Cli, Command, Parser as _};
+use superx::{Cli, Command, Config, Parser as _};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // The guard must live until the process exits — dropping it
-    // flushes the self-log and stops the writer thread.
-    let _log_guard = match superx_kernel::logging::init_default() {
-        Ok(guard) => guard,
+    let cli = Cli::parse();
+
+    // Resolve the instance config FIRST (flag > env > params file >
+    // fallback) — the log location itself is a parameter.
+    let params = match superx::config::load_params(&cli.home) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("superx: cannot initialize the kernel self-log: {e}");
+            eprintln!("superx: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let config = superx::config::resolve(
+        cli.home.clone(),
+        &params,
+        cli.conn.endpoint.clone(),
+        cli.conn.namespace.clone(),
+        cli.conn.database.clone(),
+        cli.data_dir.clone(),
+        cli.log_dir.clone(),
+        cli.log_filter.clone(),
+    );
 
-    let cli = Cli::parse();
-    match run(cli).await {
+    // The guard must live until the process exits — dropping it
+    // flushes the self-log and stops the writer thread.
+    let _log_guard =
+        match superx_kernel::logging::init_with_filter(&config.log_dir, &config.log_filter) {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("superx: cannot initialize the kernel self-log: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    match run(cli, config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "command failed");
@@ -32,24 +54,45 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), String> {
+async fn run(cli: Cli, config: Config) -> Result<(), String> {
     if cli.initialize {
-        return superx::initialize::initialize(&cli.conn, &cli.data_dir).await;
+        return superx::initialize::initialize(&config).await;
     }
     let Some(command) = cli.command else {
         return Err("nothing to do — pass a command or --initialize (see --help)".to_string());
     };
-    // `stop` must work without a reachable substrate.
+    // `stop` and `logs` must work without a reachable substrate.
     if matches!(command, Command::Stop) {
-        superx::emit(&superx::run_stop(&cli.data_dir).await?);
+        superx::emit(&superx::run_stop(&config.data_dir).await?);
         return Ok(());
     }
-    let kernel = superx::connect(&cli.conn, &cli.data_dir).await?;
+    if let Command::Logs { lines, follow, daemon } = command {
+        let (text, path, mut seen) = superx::run_logs(&config, lines, daemon)?;
+        superx::emit(&text);
+        if !follow {
+            return Ok(());
+        }
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {} // skill-allow: §9-duration — log-follow cadence, pre-substrate viewer
+                _ = tokio::signal::ctrl_c() => return Ok(()),
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let len = text.len() as u64;
+            if len > seen {
+                superx::emit(&text[seen as usize..]);
+                seen = len;
+            } else if len < seen {
+                seen = 0; // rotated
+            }
+        }
+    }
+    let kernel = superx::connect(&config).await?;
 
     match command {
         Command::Boot { daemonized } => {
             if !daemonized {
-                if let Some(pid) = superx::initialize::read_live_pid(&cli.data_dir) {
+                if let Some(pid) = superx::initialize::read_live_pid(&config.data_dir) {
                     return Err(format!(
                         "the OS is already running in background (pid {pid}) — \
                          `superx stop` first if you want a foreground boot"
@@ -58,9 +101,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
             superx::run_boot(&kernel).await
         }
-        Command::Stop => unreachable!("handled above"),
+        Command::Stop | Command::Logs { .. } => unreachable!("handled above"),
         Command::Status => {
-            superx::emit(&superx::run_status(&kernel, &cli.data_dir).await?);
+            superx::emit(&superx::run_status(&kernel, &config.data_dir).await?);
             Ok(())
         }
         Command::Agents => {

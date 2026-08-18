@@ -10,9 +10,11 @@ use chrono::{DateTime, Utc};
 use superx_kernel::types::Value;
 use superx_kernel::{Kernel, MessageRecord, NodeKind, TelemetryRecord};
 
+pub mod config;
 pub mod initialize;
 
 pub use clap::Parser;
+pub use config::Config;
 
 /// Poll cadence for the `--live` tails, on the `kernel` registry
 /// entity.
@@ -31,13 +33,22 @@ const READ_BACKLOG_LIMIT: u32 = 10_000; // skill-allow: §9-const — render pag
 pub struct Cli {
     /// Provision this instance end-to-end (prompt for the root
     /// password, create the database + schema, initialize everything)
-    /// and start gathering data. Idempotent: an initialized instance
-    /// boots straight away.
+    /// and start gathering data in the background. Idempotent: an
+    /// initialized instance boots straight away.
     #[arg(long, global = true)]
     pub initialize: bool,
-    /// Where the instance's datastore lives.
-    #[arg(long, global = true, env = "SUPERX_DATA_DIR", default_value = "./db/superx-v2.db")] // skill-allow: §9-default — env-overridable
-    pub data_dir: std::path::PathBuf,
+    /// The instance home: holds params/superx.json, logs/, db/.
+    #[arg(long, global = true, env = "SUPERX_HOME", default_value = ".")] // skill-allow: §9-default — the instance anchor itself
+    pub home: std::path::PathBuf,
+    /// Where the instance's datastore lives (default from params file).
+    #[arg(long, global = true, env = "SUPERX_DATA_DIR")]
+    pub data_dir: Option<std::path::PathBuf>,
+    /// Log directory (default from params file).
+    #[arg(long, global = true, env = "SUPERX_LOG_DIR")]
+    pub log_dir: Option<std::path::PathBuf>,
+    /// Log verbosity, EnvFilter syntax (default from params file).
+    #[arg(long, global = true, env = "SUPERX_LOG")]
+    pub log_filter: Option<String>,
     #[command(flatten)]
     pub conn: ConnectionArgs,
     #[command(subcommand)]
@@ -46,15 +57,15 @@ pub struct Cli {
 
 #[derive(Debug, clap::Args)]
 pub struct ConnectionArgs {
-    /// SurrealDB connection URL.
-    #[arg(long, global = true, env = "SUPERX_ENDPOINT", default_value = "ws://127.0.0.1:8000")] // skill-allow: §9-default — env-overridable
-    pub endpoint: String,
-    /// SurrealDB namespace.
-    #[arg(long, global = true, env = "SUPERX_NAMESPACE", default_value = "superx")] // skill-allow: §9-default — env-overridable
-    pub namespace: String,
-    /// SurrealDB database.
-    #[arg(long, global = true, env = "SUPERX_DATABASE", default_value = "kernel")] // skill-allow: §9-default — env-overridable
-    pub database: String,
+    /// SurrealDB connection URL (default from params file).
+    #[arg(long, global = true, env = "SUPERX_ENDPOINT")]
+    pub endpoint: Option<String>,
+    /// SurrealDB namespace (default from params file).
+    #[arg(long, global = true, env = "SUPERX_NAMESPACE")]
+    pub namespace: Option<String>,
+    /// SurrealDB database (default from params file).
+    #[arg(long, global = true, env = "SUPERX_DATABASE")]
+    pub database: Option<String>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -70,6 +81,19 @@ pub enum Command {
     },
     /// Stop the background OS started by --initialize.
     Stop,
+    /// Show the OS's own log (the self-log; --daemon for the
+    /// background process output).
+    Logs {
+        /// How many trailing lines to show.
+        #[arg(short = 'n', long, default_value_t = 40)] // skill-allow: §9-default — render page size, flag-overridable
+        lines: usize,
+        /// Keep following as new lines arrive.
+        #[arg(long)]
+        follow: bool,
+        /// Show the daemon stdout/stderr log instead of the self-log.
+        #[arg(long)]
+        daemon: bool,
+    },
     /// Module + adapter lifecycle status.
     Status,
     /// Discovered agents with their session and source counts.
@@ -107,17 +131,17 @@ pub enum Command {
 /// Connect + signin with an actionable hint on auth refusal. The
 /// password comes from `SUPERX_KERNEL_PASSWORD` or the instance
 /// credentials file written by `--initialize`.
-pub async fn connect(conn: &ConnectionArgs, data_dir: &std::path::Path) -> Result<Kernel, String> {
-    let Some(password) = initialize::resolve_password(data_dir) else {
+pub async fn connect(config: &Config) -> Result<Kernel, String> {
+    let Some(password) = initialize::resolve_password(&config.data_dir) else {
         return Err(format!(
             "no credentials: export {} or run `superx --initialize` first",
             initialize::PASSWORD_ENV
         ));
     };
     superx_kernel::Kernel::connect_service_with_password(
-        &conn.endpoint,
-        &conn.namespace,
-        &conn.database,
+        &config.endpoint,
+        &config.namespace,
+        &config.database,
         &password,
     )
         .await
@@ -128,12 +152,40 @@ pub async fn connect(conn: &ConnectionArgs, data_dir: &std::path::Path) -> Resul
                     "{msg}\nhint: the password must match the one used at initialize/deploy \
                      time — re-run `superx --initialize`, or export SUPERX_KERNEL_PASSWORD, \
                      and confirm the server at {} is this instance's",
-                    conn.endpoint
+                    config.endpoint
                 )
             } else {
                 msg
             }
         })
+}
+
+/// `superx logs` body (no substrate needed): tail of today's self-log
+/// or the daemon log. Returns (rendered text, the file path, its
+/// current length) so `--follow` can resume.
+pub fn run_logs(
+    config: &Config,
+    lines: usize,
+    daemon: bool,
+) -> Result<(String, std::path::PathBuf, u64), String> {
+    let path = if daemon {
+        config.log_dir.join("superx-daemon.log")
+    } else {
+        config.log_dir.join(format!(
+            "superx.log.{}",
+            chrono::Utc::now().format("%Y-%m-%d")
+        ))
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("no log at {} ({e}) — has the OS run today?", path.display()))?;
+    let len = text.len() as u64;
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    let mut out = all[start..].join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    Ok((out, path, len))
 }
 
 /// `superx boot` body: boot, render the report, start the capture

@@ -65,6 +65,17 @@ pub fn init_default() -> Result<WorkerGuard> {
 /// global subscriber is already installed (the self-log is
 /// initialized exactly once, by the binary's entry point).
 pub fn init(log_dir: &Path) -> Result<WorkerGuard> {
+    let filter = std::env::var(LOG_FILTER_ENV).unwrap_or_else(|_| DEFAULT_FILTER.to_string());
+    init_with_filter(log_dir, &filter)
+}
+
+/// [`init`] with the verbosity filter supplied by the caller —
+/// the CLI resolves it (flag > env > params file) before calling.
+///
+/// # Errors
+///
+/// As for [`init`].
+pub fn init_with_filter(log_dir: &Path, filter: &str) -> Result<WorkerGuard> {
     std::fs::create_dir_all(log_dir).map_err(|e| {
         KernelError::Config(format!(
             "cannot create log directory {}: {e}",
@@ -75,8 +86,7 @@ pub fn init(log_dir: &Path) -> Result<WorkerGuard> {
     let appender = tracing_appender::rolling::daily(log_dir, LOG_FILE_PREFIX);
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
-    let filter = EnvFilter::try_from_env(LOG_FILTER_ENV)
-        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+    let filter = EnvFilter::new(filter);
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
