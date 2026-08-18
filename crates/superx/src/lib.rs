@@ -10,6 +10,8 @@ use chrono::{DateTime, Utc};
 use superx_kernel::types::Value;
 use superx_kernel::{Kernel, MessageRecord, NodeKind, TelemetryRecord};
 
+pub mod initialize;
+
 pub use clap::Parser;
 
 /// Poll cadence for the `--live` tails, on the `kernel` registry
@@ -27,22 +29,31 @@ const READ_BACKLOG_LIMIT: u32 = 10_000; // skill-allow: §9-const — render pag
     about = "SuperX — the agentic OS. Boots, discovers coding agents, captures their telemetry and conversations."
 )]
 pub struct Cli {
+    /// Provision this instance end-to-end (prompt for the root
+    /// password, create the database + schema, initialize everything)
+    /// and start gathering data. Idempotent: an initialized instance
+    /// boots straight away.
+    #[arg(long, global = true)]
+    pub initialize: bool,
+    /// Where the instance's datastore lives.
+    #[arg(long, global = true, env = "SUPERX_DATA_DIR", default_value = "./db/superx-v2.db")] // skill-allow: §9-default — env-overridable
+    pub data_dir: std::path::PathBuf,
     #[command(flatten)]
     pub conn: ConnectionArgs,
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, clap::Args)]
 pub struct ConnectionArgs {
     /// SurrealDB connection URL.
-    #[arg(long, env = "SUPERX_ENDPOINT", default_value = "ws://127.0.0.1:8000")] // skill-allow: §9-default — env-overridable
+    #[arg(long, global = true, env = "SUPERX_ENDPOINT", default_value = "ws://127.0.0.1:8000")] // skill-allow: §9-default — env-overridable
     pub endpoint: String,
     /// SurrealDB namespace.
-    #[arg(long, env = "SUPERX_NAMESPACE", default_value = "superx")] // skill-allow: §9-default — env-overridable
+    #[arg(long, global = true, env = "SUPERX_NAMESPACE", default_value = "superx")] // skill-allow: §9-default — env-overridable
     pub namespace: String,
     /// SurrealDB database.
-    #[arg(long, env = "SUPERX_DATABASE", default_value = "kernel")] // skill-allow: §9-default — env-overridable
+    #[arg(long, global = true, env = "SUPERX_DATABASE", default_value = "kernel")] // skill-allow: §9-default — env-overridable
     pub database: String,
 }
 
@@ -84,17 +95,30 @@ pub enum Command {
     },
 }
 
-/// Connect + signin with an actionable hint on auth refusal.
-pub async fn connect(conn: &ConnectionArgs) -> Result<Kernel, String> {
-    superx_kernel::Kernel::connect_service(&conn.endpoint, &conn.namespace, &conn.database)
+/// Connect + signin with an actionable hint on auth refusal. The
+/// password comes from `SUPERX_KERNEL_PASSWORD` or the instance
+/// credentials file written by `--initialize`.
+pub async fn connect(conn: &ConnectionArgs, data_dir: &std::path::Path) -> Result<Kernel, String> {
+    let Some(password) = initialize::resolve_password(data_dir) else {
+        return Err(format!(
+            "no credentials: export {} or run `superx --initialize` first",
+            initialize::PASSWORD_ENV
+        ));
+    };
+    superx_kernel::Kernel::connect_service_with_password(
+        &conn.endpoint,
+        &conn.namespace,
+        &conn.database,
+        &password,
+    )
         .await
         .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("authentication") || msg.contains("credentials") {
                 format!(
-                    "{msg}\nhint: export SUPERX_KERNEL_PASSWORD with the same value used at \
-                     schema-deploy time, and confirm the schema was applied \
-                     (./scripts/deploy-schema.sh) against {}",
+                    "{msg}\nhint: the password must match the one used at initialize/deploy \
+                     time — re-run `superx --initialize`, or export SUPERX_KERNEL_PASSWORD, \
+                     and confirm the server at {} is this instance's",
                     conn.endpoint
                 )
             } else {
@@ -188,8 +212,8 @@ pub async fn run_agents(kernel: &Kernel) -> Result<String, String> {
             .filter(|s| payload_str(&s.payload, "name").is_some_and(|n| n.starts_with(&prefix)))
             .count();
         out.push_str(&format!(
-            "{name:<16} agent_id={:?}  sources={n_sources}  sessions={n_sessions}\n",
-            a.entity_id
+            "{name:<16} agent_id={}  sources={n_sources}  sessions={n_sessions}\n",
+            short_record_id(&a.entity_id)
         ));
     }
     Ok(out)
@@ -445,6 +469,18 @@ fn elide(s: &str, max: usize) -> String {
         let cut: String = s.chars().take(max).collect();
         format!("{cut}…")
     }
+}
+
+/// Compact `table:uuid` rendering for display (RecordId has no
+/// Display; its Debug nests wrappers).
+#[must_use]
+pub fn short_record_id(id: &superx_kernel::types::RecordId) -> String {
+    let dbg = format!("{:?}", id.key);
+    let inner = dbg
+        .rfind('(')
+        .and_then(|start| dbg[start + 1..].find(')').map(|end| &dbg[start + 1..start + 1 + end]))
+        .unwrap_or(&dbg);
+    format!("{:?}:{inner}", id.table).replace("Table(\"", "").replace("\")", "")
 }
 
 fn payload_str(payload: &Value, key: &str) -> Option<String> {

@@ -77,7 +77,24 @@ impl Kernel {
                  used at schema-deploy time (scripts/deploy-schema.sh)"
             ))
         })?;
+        Self::connect_service_with_password(endpoint, namespace, database, &password).await
+    }
 
+    /// [`Kernel::connect_service`] with the password supplied by the
+    /// caller instead of the environment — the CLI resolves it from
+    /// env or the instance credentials file written by
+    /// `superx --initialize`.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::Db`] as for [`Kernel::connect_service`].
+    pub async fn connect_service_with_password(
+        endpoint: &str,
+        namespace: &str,
+        database: &str,
+        password: &str,
+    ) -> Result<Self> {
+        let password = password.to_string();
         let db = connect(endpoint).await?;
         db.use_ns(namespace).use_db(database).await?;
         if let Err(e) = db

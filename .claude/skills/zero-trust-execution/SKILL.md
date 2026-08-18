@@ -63,6 +63,8 @@ Halt and ask the operator when any of these holds:
 - All work happens on a topic branch (`feat/`, `fix/`, `chore/`,
   `docs/`); every change ships as a PR against `main`. Never commit to
   `main` directly; never force-push `main`.
+- Every change ties to a GitHub issue (operator directive 2026-08-18);
+  branch names carry the issue number and PRs reference/close it.
 - Branches are short-lived (hours, never overnight). One open branch +
   one open PR at a time — sequential, never parallel.
 - Each branch is atomic: it lands fully working (gates green,
@@ -161,6 +163,12 @@ Putting logic in the wrong layer is a §3 violation.
 - If any code path appears to need root: STOP and hand it to the
   operator. Using root to get past an engine refusal is banned in all
   forms, including "just for this test" and "just for this migration."
+- One narrow carve-out (operator-directed, 2026-08-18, issue #120):
+  `superx --initialize` is the operator's provisioning tool. It
+  prompts the operator for the root password interactively, uses it
+  once in-process (`superx_kernel::provision`) to apply the locked
+  schema, and never stores it. No runtime path may call into the
+  provision module.
 
 ### §14 No Data-Type Conversions — Types Flow End-to-End
 - A `record<table>` is a `Thing` everywhere. A `uuid` is a `Uuid`

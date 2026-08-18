@@ -30,17 +30,18 @@ is [`BLUEPRINT.md`](BLUEPRINT.md); schema truth is
 
 ## FVP test protocol (the live demo)
 
-Prerequisite: the schema is deployed (section below) and the SurrealDB
-server is running. `SUPERX_KERNEL_PASSWORD` must be exported in every
-terminal with the value used at deploy time.
-
 ```bash
-# Terminal 1 — boot the OS: discovers every coding agent on the
-# machine (Claude Code, Gemini CLI, Claude Desktop), backfills
-# conversation history, then captures live. Ctrl-c to stop.
-superx boot
+# Terminal 1 — ONE command: prompts you to create the instance
+# password (any password will do at this phase), starts a local
+# SurrealDB, applies the schema, boots the OS, discovers every coding
+# agent on the machine (Claude Code, Gemini CLI, Claude Desktop),
+# backfills conversation history, then captures live. Ctrl-c to stop.
+# Re-running an initialized instance skips provisioning and boots.
+superx --initialize
 
-# Terminal 2 — watch what agents are doing, as it happens.
+# Terminal 2 — watch what agents are doing, as it happens. No
+# exports needed: commands read the instance credentials file written
+# by --initialize (env SUPERX_KERNEL_PASSWORD still wins if set).
 superx actions --live
 
 # Inspect what the OS knows.
@@ -60,11 +61,11 @@ Working in Claude Code or Gemini CLI while `boot` runs streams new
 messages into the substrate within seconds; `read --live` shows the
 conversation as it continues.
 
-## Deploy the substrate schema (operator one-shot)
+## Manual provisioning (alternative to `--initialize`)
 
 ```bash
 # 1. Start a SurrealDB server on a FRESH v2 path
-export SUPERX_ROOT_PASSWORD='<strong root password>'
+export SUPERX_ROOT_PASSWORD='<root password>'
 surreal start --user root --pass "$SUPERX_ROOT_PASSWORD" rocksdb:./db/superx-v2.db &
 
 # 2. Apply the kernel schema once, under root
@@ -72,8 +73,10 @@ export SUPERX_KERNEL_PASSWORD='<kernel service-account password>'
 ./scripts/deploy-schema.sh
 ```
 
-From that moment the schema is locked (skill §7) and all kernel code
-signs in as the `superx_kernel` service account — never root.
+Either way the schema is locked from first apply (skill §7) and all
+kernel runtime code signs in as the `superx_kernel` service account —
+never root (`--initialize` uses the root password once, in-process,
+and never stores it).
 
 ## Development gates (binding)
 
