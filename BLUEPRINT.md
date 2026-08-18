@@ -40,11 +40,13 @@ SuperX is an **agentic operating system** written in Rust.
    until shutdown; captures everything by default (operator decision
    2026-08-07 — no per-agent grant gate; OS-level file prompts are the
    permission surface).
-4. **CLI** — the operator interface: `boot`, `status`, `agents`,
-   `actions [--live]` (the telemetry stream), `sessions` (list
-   conversations), `read <session> [--live]` (render a conversation,
-   historical then follow). The CLI is part of the kernel deliverable,
-   not an app bolted on later.
+4. **CLI** — the operator interface: `--initialize` (one-command
+   provisioning: prompt for the instance password, create the
+   database + schema, boot, capture — idempotent per instance),
+   `boot`, `status`, `agents`, `actions [--live]` (the telemetry
+   stream), `sessions` (list conversations), `read <session>
+   [--live]` (render a conversation, historical then follow). The CLI
+   is part of the kernel deliverable, not an app bolted on later.
 5. **Module system** — modules register with the kernel, declare
    dependencies, and get lifecycle management (starting / active /
    failed / skipped). The registry lives in the substrate like
@@ -134,6 +136,9 @@ gates.
 | D8 | Capture consent (2026-08-07) | **Capture everything by default** — no per-agent grant gate; OS file prompts are the permission surface |
 | D9 | Agent storage (2026-08-07) | **Agents stay entities** (`node_agent`); entity row id = agent_id; new agent properties are data writes, never schema migrations |
 | D10 | CLI viewing surface (2026-08-07) | `actions [--live]` + `sessions` + `read <session> [--live]` |
+| D11 | One-command init (2026-08-18, issue #120) | `superx --initialize` prompts for ONE password (any accepted at this phase) serving both database root and the service account; root is used once in-process to apply the schema and never stored |
+| D12 | Credential persistence (2026-08-18) | Service password saved to a `0600` `superx-credentials` file beside the datastore so query commands need no exports; env var still wins |
+| D13 | Git discipline (2026-08-18) | Every change ties to a GitHub issue; branches + PRs reference it |
 
 ## 8. Binding rules (unchanged from v1, restated)
 

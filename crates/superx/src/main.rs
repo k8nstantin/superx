@@ -33,9 +33,16 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
-    let kernel = superx::connect(&cli.conn).await?;
+    if cli.initialize {
+        let kernel = superx::initialize::initialize(&cli.conn, &cli.data_dir).await?;
+        return superx::run_boot(&kernel).await;
+    }
+    let Some(command) = cli.command else {
+        return Err("nothing to do — pass a command or --initialize (see --help)".to_string());
+    };
+    let kernel = superx::connect(&cli.conn, &cli.data_dir).await?;
 
-    match cli.command {
+    match command {
         Command::Boot => superx::run_boot(&kernel).await,
         Command::Status => {
             superx::emit(&superx::run_status(&kernel).await?);

@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
+rpassword.workspace = true
 superx-kernel.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true

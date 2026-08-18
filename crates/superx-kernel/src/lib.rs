@@ -46,6 +46,7 @@ pub mod logging;
 pub mod message;
 pub mod metamodel;
 pub mod parameters;
+pub mod provision;
 pub mod registry;
 pub mod schema;
 pub mod substrate;
