@@ -64,7 +64,7 @@ async fn signal_lines_become_events_noise_skipped() -> Result<(), Box<dyn Error>
     let sources = desktop_sources(&kernel).await?;
     assert_eq!(sources.len(), 1, "main.log only (no rotated/duplicate files)");
 
-    let report = capture_tick(&kernel, &sources).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(
         report.total(),
@@ -97,8 +97,8 @@ async fn rotation_resets_offset_and_resumes() -> Result<(), Box<dyn Error>> {
     arrange(&kernel, tmp.path()).await?;
 
     let sources = desktop_sources(&kernel).await?;
-    assert_eq!(capture_tick(&kernel, &sources).await?.total(), 3);
-    assert_eq!(capture_tick(&kernel, &sources).await?.total(), 0, "cursor holds");
+    assert_eq!(capture_tick(&kernel, &sources, None).await?.total(), 3);
+    assert_eq!(capture_tick(&kernel, &sources, None).await?.total(), 0, "cursor holds");
 
     // Simulate rotation: a fresh, shorter active file.
     fs::write(
@@ -106,7 +106,7 @@ async fn rotation_resets_offset_and_resumes() -> Result<(), Box<dyn Error>> {
         "2026-08-07 11:00:00 [info] Starting app v1.0.2340\n",
     )?;
     assert_eq!(
-        capture_tick(&kernel, &sources).await?.total(),
+        capture_tick(&kernel, &sources, None).await?.total(),
         1,
         "shrunken file re-captured from zero"
     );
@@ -116,6 +116,6 @@ async fn rotation_resets_offset_and_resumes() -> Result<(), Box<dyn Error>> {
         .append(true)
         .open(tmp.path().join("main.log"))?;
     writeln!(f, "2026-08-07 11:00:01 [info] beforeQuit handler fired, going down")?;
-    assert_eq!(capture_tick(&kernel, &sources).await?.total(), 1);
+    assert_eq!(capture_tick(&kernel, &sources, None).await?.total(), 1);
     Ok(())
 }

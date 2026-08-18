@@ -48,3 +48,38 @@ fn surql_password_escaping() {
     assert_eq!(escape_surql("it's"), "it\\'s");
     assert_eq!(escape_surql(r"back\slash"), r"back\\slash");
 }
+
+#[test]
+fn pidfile_sits_beside_the_datastore() {
+    let p = superx::initialize::pid_path(std::path::Path::new("./db/superx-v2.db"));
+    assert_eq!(p, std::path::PathBuf::from("./db/superx.pid"));
+}
+
+#[test]
+fn live_pid_roundtrip_and_stale_cleanup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("db").join("instance.db");
+
+    // No pidfile yet.
+    assert!(superx::initialize::read_live_pid(&data_dir).is_none());
+
+    // Our own (alive) pid roundtrips.
+    let me = std::process::id();
+    superx::initialize::write_pidfile(&data_dir, me).expect("write");
+    assert_eq!(superx::initialize::read_live_pid(&data_dir), Some(me));
+
+    // A dead pid is stale: read yields None AND the file is cleaned up.
+    let dead = std::process::Command::new("true")
+        .spawn()
+        .and_then(|mut c| {
+            let pid = c.id();
+            c.wait().map(|_| pid)
+        })
+        .expect("spawn/wait true");
+    superx::initialize::write_pidfile(&data_dir, dead).expect("write");
+    assert!(superx::initialize::read_live_pid(&data_dir).is_none());
+    assert!(
+        !superx::initialize::pid_path(&data_dir).exists(),
+        "stale pidfile removed"
+    );
+}

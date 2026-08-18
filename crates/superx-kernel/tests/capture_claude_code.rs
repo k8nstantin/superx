@@ -70,7 +70,7 @@ async fn history_backfill_extracts_conversation() -> Result<(), Box<dyn Error>> 
 
     let sources = cc_sources(&kernel).await?;
     assert_eq!(sources.len(), 1, "one project dir → one source");
-    let report = capture_tick(&kernel, &sources).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
     assert!(report.errors.is_empty(), "no capture errors: {:?}", report.errors);
     assert_eq!(report.total(), 5, "all five lines captured");
 
@@ -128,11 +128,11 @@ async fn cursor_resume_captures_only_new_lines() -> Result<(), Box<dyn Error>> {
     arrange(&kernel, tmp.path()).await?;
 
     let sources = cc_sources(&kernel).await?;
-    let first = capture_tick(&kernel, &sources).await?;
+    let first = capture_tick(&kernel, &sources, None).await?;
     assert_eq!(first.total(), 5);
 
     // Nothing new → nothing captured.
-    let quiet = capture_tick(&kernel, &sources).await?;
+    let quiet = capture_tick(&kernel, &sources, None).await?;
     assert_eq!(quiet.total(), 0, "cursor prevents re-capture");
 
     // Append one line → exactly one new event.
@@ -142,7 +142,7 @@ async fn cursor_resume_captures_only_new_lines() -> Result<(), Box<dyn Error>> {
         f,
         r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"follow-up"}}]}},"sessionId":"sess-1","timestamp":"2026-08-07T10:00:03.000Z"}}"#
     )?;
-    let second = capture_tick(&kernel, &sources).await?;
+    let second = capture_tick(&kernel, &sources, None).await?;
     assert_eq!(second.total(), 1, "only the appended line");
 
     let session = kernel

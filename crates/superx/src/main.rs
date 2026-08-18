@@ -34,18 +34,33 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<(), String> {
     if cli.initialize {
-        let kernel = superx::initialize::initialize(&cli.conn, &cli.data_dir).await?;
-        return superx::run_boot(&kernel).await;
+        return superx::initialize::initialize(&cli.conn, &cli.data_dir).await;
     }
     let Some(command) = cli.command else {
         return Err("nothing to do — pass a command or --initialize (see --help)".to_string());
     };
+    // `stop` must work without a reachable substrate.
+    if matches!(command, Command::Stop) {
+        superx::emit(&superx::run_stop(&cli.data_dir).await?);
+        return Ok(());
+    }
     let kernel = superx::connect(&cli.conn, &cli.data_dir).await?;
 
     match command {
-        Command::Boot => superx::run_boot(&kernel).await,
+        Command::Boot { daemonized } => {
+            if !daemonized {
+                if let Some(pid) = superx::initialize::read_live_pid(&cli.data_dir) {
+                    return Err(format!(
+                        "the OS is already running in background (pid {pid}) — \
+                         `superx stop` first if you want a foreground boot"
+                    ));
+                }
+            }
+            superx::run_boot(&kernel).await
+        }
+        Command::Stop => unreachable!("handled above"),
         Command::Status => {
-            superx::emit(&superx::run_status(&kernel).await?);
+            superx::emit(&superx::run_status(&kernel, &cli.data_dir).await?);
             Ok(())
         }
         Command::Agents => {

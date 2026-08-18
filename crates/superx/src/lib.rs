@@ -59,9 +59,17 @@ pub struct ConnectionArgs {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// Boot the OS: register modules, discover agents, start the
-    /// capture loop, hold foreground until ctrl-c.
-    Boot,
+    /// Boot the OS in the foreground (debugging): register modules,
+    /// discover agents, run capture until ctrl-c. Normal operation
+    /// uses `--initialize`, which runs the OS in the background.
+    Boot {
+        /// Internal: this process IS the background OS (pidfile owned
+        /// by the parent). Skips the duplicate-capture guard.
+        #[arg(long, hide = true)]
+        daemonized: bool,
+    },
+    /// Stop the background OS started by --initialize.
+    Stop,
     /// Module + adapter lifecycle status.
     Status,
     /// Discovered agents with their session and source counts.
@@ -129,7 +137,8 @@ pub async fn connect(conn: &ConnectionArgs, data_dir: &std::path::Path) -> Resul
 }
 
 /// `superx boot` body: boot, render the report, start the capture
-/// loop, block until ctrl-c.
+/// loop, block until ctrl-c (or SIGINT from `superx stop` when
+/// daemonized).
 pub async fn run_boot(kernel: &Kernel) -> Result<(), String> {
     let report = superx_kernel::boot(kernel).await.map_err(|e| e.to_string())?;
     emit(&render_boot_report(&report));
@@ -155,9 +164,44 @@ pub async fn run_boot(kernel: &Kernel) -> Result<(), String> {
     }
 }
 
+/// `superx stop` body: SIGINT the background OS, wait for exit.
+pub async fn run_stop(data_dir: &std::path::Path) -> Result<String, String> {
+    let Some(pid) = initialize::read_live_pid(data_dir) else {
+        return Ok("OS is not running\n".to_string());
+    };
+    let ok = std::process::Command::new("kill")
+        .arg("-INT")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return Err(format!("could not signal pid {pid}"));
+    }
+    // Graceful shutdown: the loop stops between source polls, so this
+    // normally lands in seconds even mid-backfill.
+    for i in 0..300 {
+        if !initialize::pid_alive(pid) {
+            let _removed = std::fs::remove_file(initialize::pid_path(data_dir));
+            return Ok(format!("OS stopped (pid {pid})\n"));
+        }
+        if i == 50 {
+            emit("waiting for the current source poll to finish…\n");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await; // skill-allow: §9-duration — stop-poll cadence, bounded loop
+    }
+    Err(format!(
+        "OS (pid {pid}) is still shutting down — check `superx status` shortly"
+    ))
+}
+
 /// `superx status` body.
-pub async fn run_status(kernel: &Kernel) -> Result<String, String> {
+pub async fn run_status(kernel: &Kernel, data_dir: &std::path::Path) -> Result<String, String> {
     let mut out = String::new();
+    match initialize::read_live_pid(data_dir) {
+        Some(pid) => out.push_str(&format!("OS: running in background (pid {pid})\n")),
+        None => out.push_str("OS: not running (`superx --initialize` starts it)\n"),
+    }
     for (kind, title) in [
         (NodeKind::KernelModule, "kernel modules"),
         (NodeKind::Adapter, "adapters"),
