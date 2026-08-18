@@ -87,7 +87,8 @@ pub enum Command {
     },
     /// Render one conversation, oldest first.
     Read {
-        /// Session name (`claude_code/<id>`) or unique suffix of one.
+        /// Session name (`claude_code/<id>`) or any unique fragment
+        /// of one (id prefix works).
         session: String,
         /// Keep following the conversation as it continues.
         #[arg(long)]
@@ -240,7 +241,12 @@ pub async fn run_sessions(kernel: &Kernel, agent: Option<&str>) -> Result<String
             .session_message_count(s.entity_id.clone())
             .await
             .map_err(|e| e.to_string())?;
-        out.push_str(&format!("{name:<60} {count:>6} messages\n"));
+        let agent_prefix = name.split('/').next().unwrap_or("?");
+        let source_id = name.split_once('/').map_or("", |(_, rest)| rest);
+        out.push_str(&format!(
+            "{agent_prefix}/{:<40} src={source_id:<40} {count:>6} messages\n",
+            record_uuid(&s.entity_id)
+        ));
         shown += 1;
     }
     if shown == 0 {
@@ -249,7 +255,9 @@ pub async fn run_sessions(kernel: &Kernel, agent: Option<&str>) -> Result<String
     Ok(out)
 }
 
-/// Resolve a session by exact name or unique suffix.
+/// Resolve a session by exact name, or by any UNIQUE fragment of one
+/// (prefix, suffix, or middle — users paste whatever part of the id
+/// they have; issue #122).
 pub async fn resolve_session(
     kernel: &Kernel,
     query: &str,
@@ -261,8 +269,15 @@ pub async fn resolve_session(
     let matches: Vec<_> = sessions
         .iter()
         .filter(|s| {
-            payload_str(&s.payload, "name")
-                .is_some_and(|n| n == query || n.ends_with(query))
+            let Some(name) = payload_str(&s.payload, "name") else {
+                return false;
+            };
+            let agent_prefix = name.split('/').next().unwrap_or("?");
+            let identity = format!("{agent_prefix}/{}", record_uuid(&s.entity_id));
+            name == query
+                || identity == query
+                || name.contains(query)
+                || identity.contains(query)
         })
         .collect();
     match matches.len() {
@@ -471,16 +486,21 @@ fn elide(s: &str, max: usize) -> String {
     }
 }
 
-/// Compact `table:uuid` rendering for display (RecordId has no
-/// Display; its Debug nests wrappers).
+/// The bare UUIDv7 of a record id (RecordId has no Display; its
+/// Debug nests wrappers).
+#[must_use]
+pub fn record_uuid(id: &superx_kernel::types::RecordId) -> String {
+    let dbg = format!("{:?}", id.key);
+    dbg.rfind('(')
+        .and_then(|start| dbg[start + 1..].find(')').map(|end| dbg[start + 1..start + 1 + end].to_string()))
+        .unwrap_or(dbg)
+}
+
+/// Compact `table:uuid` rendering for display.
 #[must_use]
 pub fn short_record_id(id: &superx_kernel::types::RecordId) -> String {
-    let dbg = format!("{:?}", id.key);
-    let inner = dbg
-        .rfind('(')
-        .and_then(|start| dbg[start + 1..].find(')').map(|end| &dbg[start + 1..start + 1 + end]))
-        .unwrap_or(&dbg);
-    format!("{:?}:{inner}", id.table).replace("Table(\"", "").replace("\")", "")
+    let table = format!("{:?}", id.table).replace("Table(\"", "").replace("\")", "");
+    format!("{table}:{}", record_uuid(id))
 }
 
 fn payload_str(payload: &Value, key: &str) -> Option<String> {

@@ -60,9 +60,17 @@ async fn resolve_session_by_suffix_and_ambiguity() -> Result<(), Box<dyn Error>>
     let kernel = fresh_kernel().await?;
     seed_conversation(&kernel).await?;
 
-    // Exact and suffix both resolve.
+    // Exact, suffix, prefix, and middle fragments all resolve.
     assert!(superx::resolve_session(&kernel, "claude_code/sess-42").await.is_ok());
     assert!(superx::resolve_session(&kernel, "sess-42").await.is_ok());
+    assert!(superx::resolve_session(&kernel, "claude_code/se").await.is_ok());
+    assert!(superx::resolve_session(&kernel, "ess-4").await.is_ok());
+
+    // The uuid7 identity resolves too — by full id and by fragment.
+    let id = superx::resolve_session(&kernel, "sess-42").await?;
+    let uuid = superx::record_uuid(&id);
+    assert_eq!(superx::resolve_session(&kernel, &uuid).await?, id);
+    assert_eq!(superx::resolve_session(&kernel, &uuid[..13]).await?, id);
 
     // Unknown fails with guidance.
     let err = superx::resolve_session(&kernel, "nope").await.unwrap_err();
@@ -94,8 +102,13 @@ async fn sessions_lists_with_counts_and_agent_filter() -> Result<(), Box<dyn Err
     seed_conversation(&kernel).await?;
 
     let all = superx::run_sessions(&kernel, None).await?;
-    assert!(all.contains("claude_code/sess-42"));
+    // Identity is <agent>/<uuid7>; the source-native id rides along.
+    assert!(all.contains("claude_code/"), "{all}");
+    assert!(all.contains("src=sess-42"), "{all}");
     assert!(all.contains("2 messages"), "{all}");
+    let session = superx::resolve_session(&kernel, "sess-42").await.expect("by source id");
+    let uuid = superx::record_uuid(&session);
+    assert!(all.contains(&uuid), "listing shows the uuid7 identity: {all}");
 
     let filtered = superx::run_sessions(&kernel, Some("gemini_cli")).await?;
     assert!(filtered.contains("no sessions"), "{filtered}");
