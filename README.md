@@ -9,57 +9,79 @@ moment the OS boots it captures everything every agent on the machine
 emits. Every other capability (data fusion, graphify, …) arrives as a
 module on top of the kernel.
 
-## Status — FVP complete
+## v1.0.0 — Capabilities
 
-The project was reset from line zero on **2026-08-06** (v1 preserved
-at [`archive/pre-reset-2026-08-06`](../../tree/archive/pre-reset-2026-08-06));
-the **v2 First Viable Product shipped 2026-08-07**. The living canon
-is [`BLUEPRINT.md`](BLUEPRINT.md); schema truth is
-[`SUPERX_SCHEMA.md`](SUPERX_SCHEMA.md) (v2.1).
+SuperX v1.0.0 is the first release of the agentic OS (reset 2026-08-06 →
+release 2026-08-18; v1-era code preserved at
+[`archive/pre-reset-2026-08-06`](../../tree/archive/pre-reset-2026-08-06)).
 
-| Phase | Scope | Status |
-|---|---|---|
-| G0 | Reset: archive tag, skeleton workspace, blueprint, skill v2 | done (#111) |
-| G1 | Schema v2 + v2.1 (conversations first-class) | done (#112, #115) |
-| G2 | Kernel substrate verbs + telemetry primitive | done (#113) |
-| G3 | Module system + in-kernel boot orchestrator | done (#116) |
-| G4 | Capture engine + Claude Code adapter | done (#117) |
-| G5 | Gemini CLI + Claude Desktop adapters | done (#118) |
-| G6 | CLI: boot / status / agents / actions / sessions / read — **FVP** | this PR |
-| G7+ | First modules (data fusion, graphify) | planned |
+- **One-command initialize** — `superx --initialize` prompts you to
+  create the instance password (any password accepted at this phase),
+  starts a local SurrealDB, applies the locked schema, saves
+  credentials (`0600`), boots the OS **in the background**, and
+  returns your terminal. Idempotent per instance; `superx stop` shuts
+  the OS down; `superx status` shows the pid + module lifecycle.
+- **Three agent adapters, built from real machine data** — Claude Code
+  (full conversations, history backfill + live), Gemini CLI
+  (conversations with re-emission dedupe and byte-capped backfill),
+  Claude Desktop (honest telemetry — it stores no conversations
+  locally). Adding an adapter touches zero engine code.
+- **Conversations first-class** — sessions identified
+  `<agent>/<uuid7>` (source id as `src=`); `superx read <any-unique-
+  fragment> --live` renders history then follows live.
+- **Everything queryable by agent_id** — `agents`, `sessions`,
+  `actions [--agent] [--live]` over an append-only SCD-2 substrate
+  (SurrealDB), UUIDv7 row ids, minimal-privilege service account.
+- **Configured, not hardcoded** — `params/superx.json` controls all
+  bootstrap config (precedence: flag > env > file > fallback) inside
+  the instance layout below; runtime tunables live in the substrate
+  as parameters. `superx logs [--follow]` surfaces the OS's own log.
+- **Engineering substrate** — failure-isolated module boot, cursor-
+  checkpointed lossless restarts, tolerant parsing (unknown shapes
+  captured raw, never dropped), kernel self-log, 56 tests, three
+  CI-enforced gates.
 
-## FVP test protocol (the live demo)
+## Instance layout
 
-```bash
-# Terminal 1 — ONE command: prompts you to create the instance
-# password (any password will do at this phase), starts a local
-# SurrealDB, applies the schema, boots the OS, discovers every coding
-# agent on the machine (Claude Code, Gemini CLI, Claude Desktop),
-# backfills conversation history, then captures live. Ctrl-c to stop.
-# Re-running an initialized instance skips provisioning and boots.
-superx --initialize
-
-# Terminal 2 — watch what agents are doing, as it happens. No
-# exports needed: commands read the instance credentials file written
-# by --initialize (env SUPERX_KERNEL_PASSWORD still wins if set).
-superx actions --live
-
-# Inspect what the OS knows.
-superx status                      # module + adapter lifecycle
-superx agents                      # discovered agents, agent_ids, counts
-superx sessions                    # every captured conversation
-superx sessions --agent gemini_cli # per-agent
-
-# Read a conversation — full history, then follow it live.
-superx read <session-name-or-suffix> --live
-
-# Query per agent (agent_id = the entity id shown by `superx agents`).
-superx actions --agent claude_code -n 50
+```
+<home>/                     # --home flag / SUPERX_HOME env, default "."
+  params/superx.json        # THE parameter file — all bootstrap config
+  logs/superx.log.<date>    # kernel self-log     (superx logs)
+  logs/superx-daemon.log    # background OS output (superx logs --daemon)
+  logs/surreal-server.log   # database server output
+  db/superx-v2.db/          # datastore (rocksdb)
+  db/superx-credentials     # service password, 0600
+  db/superx.pid             # background OS pid
 ```
 
-Working in Claude Code or Gemini CLI while `boot` runs streams new
-messages into the substrate within seconds; `read --live` shows the
-conversation as it continues.
+## Quick start / QA protocol
+
+```bash
+# ONE command: prompts for a password, provisions everything, boots
+# the OS in the background, and RETURNS YOUR TERMINAL.
+superx --initialize
+
+# Confirm data is being gathered (no exports needed — credentials are
+# read from the instance):
+superx status                  # OS: running (pid N) + module lifecycle
+superx agents                  # discovered agents + agent_ids + counts
+superx sessions | head         # captured conversations
+superx actions --live          # watch agents act, as it happens
+superx read <fragment> --live  # read a conversation, history then live
+superx logs -n 40              # the OS's own log (--follow to tail)
+
+# Lifecycle:
+superx stop                    # graceful shutdown (lands in seconds,
+                               # even mid-backfill)
+superx --initialize            # boots straight back — no re-prompt
+```
+
+The first minutes after a fresh initialize are history backfill (your
+full Claude Code history; Gemini chat files capped at 8 MiB each,
+announced via `backfill_capped` events). Claude Desktop shows zero
+sessions by design — its conversations are cloud-side; its telemetry
+is captured. `superx boot` (foreground) remains for debugging and
+refuses while the background OS runs.
 
 ## Manual provisioning (alternative to `--initialize`)
 
