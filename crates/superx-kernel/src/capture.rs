@@ -293,10 +293,20 @@ async fn discover_one(
 }
 
 /// One capture pass over every (adapter, source) pair. Errors become
-/// `capture_error` telemetry and the pass continues.
-pub async fn capture_tick(kernel: &Kernel, sources: &[(usize, SourceRef)]) -> Result<TickReport> {
+/// `capture_error` telemetry and the pass continues. A shutdown signal
+/// is honored BETWEEN sources so a long backfill pass never blocks a
+/// graceful stop for more than one source poll (issue #124).
+pub async fn capture_tick(
+    kernel: &Kernel,
+    sources: &[(usize, SourceRef)],
+    shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> Result<TickReport> {
     let mut report = TickReport::default();
     for (adapter_idx, source) in sources {
+        if shutdown.is_some_and(|s| *s.borrow()) {
+            tracing::info!("shutdown requested — stopping mid-pass");
+            break;
+        }
         let adapter = ADAPTERS[*adapter_idx];
         match adapter.poll(kernel, source).await {
             Ok(n) => {
@@ -358,8 +368,12 @@ pub async fn run_loop(
     let interval = poll_interval_secs(kernel).await?;
     tracing::info!(interval_secs = interval, "capture loop starting");
     loop {
+        if *shutdown.borrow() {
+            tracing::info!("capture loop shutting down");
+            return Ok(());
+        }
         let sources = discover_paired(kernel).await?;
-        let report = capture_tick(kernel, &sources).await?;
+        let report = capture_tick(kernel, &sources, Some(&shutdown)).await?;
         if report.total() > 0 {
             tracing::info!(events = report.total(), "capture tick");
         }

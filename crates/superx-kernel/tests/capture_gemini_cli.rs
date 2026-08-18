@@ -63,7 +63,7 @@ async fn conversation_extracted_with_dedupe_and_tools() -> Result<(), Box<dyn Er
 
     let sources = gemini_sources(&kernel).await?;
     assert_eq!(sources.len(), 1, "one project slug → one source");
-    let report = capture_tick(&kernel, &sources).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 
     let session = kernel
@@ -113,7 +113,7 @@ async fn backfill_cap_skips_oversized_history() -> Result<(), Box<dyn Error>> {
     writeln!(f, r#"{{"id":"u-9","type":"user","content":[{{"text":"tail msg"}}]}}"#)?;
 
     let sources = gemini_sources(&kernel).await?;
-    let report = capture_tick(&kernel, &sources).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
     assert!(report.errors.is_empty());
 
     // The oversized head was skipped: telemetry says so, and the
