@@ -83,3 +83,24 @@ fn live_pid_roundtrip_and_stale_cleanup() {
         "stale pidfile removed"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_on_uninitialized_instance_points_at_initialize() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::env::remove_var("SUPERX_KERNEL_PASSWORD");
+    let params = superx::config::Params::default();
+    let config = superx::config::resolve(
+        tmp.path().to_path_buf(),
+        &params,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let err = superx::run_start(&config)
+        .await
+        .expect_err("uninitialized start must error");
+    assert!(err.contains("--initialize"), "{err}");
+}

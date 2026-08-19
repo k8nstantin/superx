@@ -79,8 +79,14 @@ pub enum Command {
         #[arg(long, hide = true)]
         daemonized: bool,
     },
-    /// Stop the background OS started by --initialize.
+    /// Start the background OS on an already-initialized instance
+    /// (no provisioning, no prompt).
+    Start,
+    /// Stop the background OS started by --initialize or start.
     Stop,
+    /// Restart the background OS: stop (if running), then start —
+    /// one command to pick up a freshly built binary.
+    Restart,
     /// Show the OS's own log (the self-log; --daemon for the
     /// background process output).
     Logs {
@@ -214,6 +220,23 @@ pub async fn run_boot(kernel: &Kernel) -> Result<(), String> {
         Ok(Err(e)) => Err(e.to_string()),
         Err(e) => Err(format!("capture task: {e}")),
     }
+}
+
+/// `superx start` body: background-boot an already-initialized
+/// instance. Provisioning belongs to `--initialize`; this connects
+/// with existing credentials and hands off to the (duplicate-guarded)
+/// background starter.
+pub async fn run_start(config: &Config) -> Result<(), String> {
+    if initialize::resolve_password(&config.data_dir).is_none() {
+        return Err(
+            "this instance is not initialized — run `superx --initialize` first".to_string(),
+        );
+    }
+    let kernel = connect(config).await.map_err(|e| {
+        format!("{e}
+hint: is the database server up? `superx --initialize` also restarts it")
+    })?;
+    initialize::start_background_os(&kernel, config).await
 }
 
 /// `superx stop` body: SIGINT the background OS, wait for exit.
