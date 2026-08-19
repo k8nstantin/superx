@@ -332,8 +332,10 @@ fn spawn_daemon(config: &Config) -> Result<u32, String> {
     Ok(child.id())
 }
 
-/// Watch the substrate for the daemon's boot: a `system_boot` event
-/// newer than `since`. Returns once seen or errs on timeout/death.
+/// Watch the substrate for the daemon's boot COMPLETION: a
+/// `boot_complete` event newer than `since` (system_boot only marks
+/// the start of the walk — issue #139). Returns once seen or errs on
+/// timeout/death.
 async fn wait_for_boot(
     kernel: &Kernel,
     since: chrono::DateTime<chrono::Utc>,
@@ -352,7 +354,7 @@ async fn wait_for_boot(
             .telemetry_since(since, 50)
             .await
             .map_err(|e| e.to_string())?;
-        if events.iter().any(|e| e.lifecycle_event == "system_boot") {
+        if events.iter().any(|e| e.lifecycle_event == "boot_complete") {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(SERVER_POLL_MS)).await;
