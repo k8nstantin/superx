@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SuperX</title>
+<style>
+  body{font-family:ui-monospace,Menlo,monospace;background:#0b0e14;color:#d6deeb;margin:3rem auto;max-width:52rem;padding:0 1rem}
+  h1{font-size:1.4rem} .ok{color:#7fd962} pre{background:#11151f;padding:1rem;border-radius:8px;overflow:auto}
+  a{color:#82aaff}
+</style>
+</head>
+<body>
+<h1>⚙ SuperX <span class="ok">— the agentic OS is running</span></h1>
+<p>This is the UI module's placeholder (epic #141 P4). The dashboard arrives in P6.
+Live status from <a href="/api/status">/api/status</a>:</p>
+<pre id="status">loading…</pre>
+<script>
+fetch('/api/status').then(r=>r.json()).then(j=>{
+  document.getElementById('status').textContent = JSON.stringify(j, null, 2);
+}).catch(e=>{document.getElementById('status').textContent = String(e)});
+</script>
+</body>
+</html>
