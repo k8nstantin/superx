@@ -9,6 +9,8 @@
 
 # Kernel self-log (runtime output, never committed)
 /logs
+# Per-module instance dirs (epic #141) — runtime, never tracked.
+/modules
 
 # OS / editor noise
 .DS_Store
