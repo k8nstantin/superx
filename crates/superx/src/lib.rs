@@ -178,6 +178,9 @@ pub async fn connect(config: &Config) -> Result<Kernel, String> {
         &password,
     )
         .await
+        // Query-path kernels carry the instance home too, so module
+        // CLIs can reach their own dirs (issue #170: attach).
+        .map(|kernel| kernel.with_home(config.home.clone()))
         .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("authentication") || msg.contains("credentials") {

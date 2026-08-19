@@ -11,6 +11,7 @@
 //! own log (`target: "entities"`), own CLI (`superx entities …`).
 
 pub mod cli;
+pub mod documents;
 pub mod edges;
 pub mod graph;
 pub mod nodes;

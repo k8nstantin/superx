@@ -17,6 +17,8 @@ pub const SEEDED_TYPES: &[(&str, &str, &str)] = &[
     ("rag", "entity", "a retrieval source agents consult"),
     ("model", "entity", "an integrated model"),
     ("document", "entity", "a file-backed content node"),
+    ("repo", "entity", "a source-code repository (url, branch, host in attributes)"),
+    ("credential", "entity", "an authentication secret REFERENCE (kind, env var, keychain item in attributes — not the raw secret)"),
     ("text", "entity", "an inline content node: description, comment, instructions"),
     ("contains", "relation", "parent contains child (product -> component)"),
     ("linked", "relation", "generic association"),
@@ -25,6 +27,7 @@ pub const SEEDED_TYPES: &[(&str, &str, &str)] = &[
     ("describes", "relation", "text describes an entity"),
     ("comments", "relation", "text comments on an entity"),
     ("instructs", "relation", "text instructs a task"),
+    ("authenticates", "relation", "credential authenticates the source (repo, jira, any service)"),
 ];
 
 /// One row of the registry, as read back for rendering.
