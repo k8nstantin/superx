@@ -745,6 +745,7 @@ DDL_ALLOWED_SUFFIXES = (
 # schema/<name>.surql under its crate directory. This regex matches
 # those paths.
 DDL_PER_CRATE_SCHEMA_RX = re.compile(r"^crates/[^/]+/schema/[^/]+\.surql$")
+DDL_TEST_FIXTURE_RX = re.compile(r"^crates/[^/]+/tests/fixtures/[^/]+\.surql$")
 
 DDL_BYPASS_RULE = Rule(
     id="X1",
@@ -786,6 +787,9 @@ def _is_ddl_allowed_path(path: Path) -> bool:
     if rel.endswith(DDL_ALLOWED_SUFFIXES):
         return True
     if DDL_PER_CRATE_SCHEMA_RX.match(rel):
+        return True
+    # Test fixtures simulating operator actions (mem engine only).
+    if DDL_TEST_FIXTURE_RX.match(rel):
         return True
     return any(rel.startswith(p) for p in DDL_ALLOWED_DIR_PREFIXES)
 
