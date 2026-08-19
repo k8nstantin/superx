@@ -42,23 +42,13 @@ pub struct SessionView {
     pub session_id: String,
     pub agent: String,
     pub src: String,
-    pub messages: i64,
+    /// TOTAL activity for the session — messages + action events
+    /// (issue #187).
+    pub actions: i64,
     /// RFC3339 timestamp of the session's newest message.
     pub last_active: Option<String>,
 }
 
-/// One row of a session's merged activity (issue #172): a `message`
-/// row or a `telemetry_stream` event belonging to the session,
-/// rendered and ordered by capture time.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct SessionEvent {
-    pub kind: String, // "message" | "action"
-    /// Source-native role for message rows (`user`, `assistant`, …).
-    pub role: Option<String>,
-    pub rendered: String,
-    pub valid_from: String,
-}
 
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]

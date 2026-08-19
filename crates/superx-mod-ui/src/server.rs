@@ -54,6 +54,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/agents", get(api_agents))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/{id}/activity", get(api_session_activity))
+        .route("/api/activity", get(api_activity))
         .route("/api/actions", get(api_actions))
         .route("/api/charts/summary", get(api_charts))
         .route("/api/events", get(api_events))
@@ -90,15 +91,7 @@ async fn sse_poller(kernel: Kernel, tx: broadcast::Sender<String>) {
                 if a.valid_from > high {
                     high = a.valid_from;
                 }
-                let ev = SseEvent {
-                    kind: "action".into(),
-                    rendered: superx_ops::render_event(a).trim_end().to_string(),
-                    role: None,
-                    agent_id: a.agent.as_ref().map(superx_ops::record_uuid),
-                    session_id: None,
-                    session_src: crate::activity::session_key_of(&a.payload),
-                    valid_from: a.valid_from.to_rfc3339(),
-                };
+                let ev = crate::activity::action_event(a);
                 if let Ok(json) = serde_json::to_string(&ev) {
                     let _receivers = tx.send(json);
                 }
@@ -109,15 +102,7 @@ async fn sse_poller(kernel: Kernel, tx: broadcast::Sender<String>) {
                 if m.valid_from > high {
                     high = m.valid_from;
                 }
-                let ev = SseEvent {
-                    kind: "message".into(),
-                    rendered: superx_ops::render_message(m).trim_end().to_string(),
-                    role: Some(m.role.clone()),
-                    agent_id: Some(superx_ops::record_uuid(&m.agent)),
-                    session_id: Some(superx_ops::record_uuid(&m.session)),
-                    session_src: None,
-                    valid_from: m.valid_from.to_rfc3339(),
-                };
+                let ev = crate::activity::message_event(m);
                 if let Ok(json) = serde_json::to_string(&ev) {
                     let _receivers = tx.send(json);
                 }
@@ -262,10 +247,15 @@ async fn api_sessions(
             }
         }
         let src = name.split_once('/').map_or("", |(_, r)| r).to_string();
+        // TOTAL activity — messages + the session's action events
+        // (issue #187: the list counts everything the feed shows).
         let count = kernel
             .session_message_count(s.entity_id.clone())
             .await
-            .unwrap_or(0);
+            .unwrap_or(0)
+            + crate::activity::session_action_count(kernel, s.entity_id.clone())
+                .await
+                .unwrap_or(0);
         let last_active = kernel
             .session_last_activity(s.entity_id.clone())
             .await
@@ -278,7 +268,7 @@ async fn api_sessions(
             session_id: uuid,
             agent,
             src,
-            messages: count,
+            actions: count,
             last_active,
         });
     }
@@ -295,12 +285,13 @@ const ACTIVITY_BACKLOG_DEFAULT: u32 = 500; // skill-allow: §9-const — render 
 const ACTIVITY_BACKLOG_MAX: u32 = 2000; // skill-allow: §9-const — render page bound
 
 /// Everything the OS captured for one session — messages + actions,
-/// merged chronologically (issue #172).
+/// merged chronologically (issue #172). Same row shape as the SSE
+/// bridge and the global feed (issue #187).
 async fn api_session_activity(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(q): Query<ActivityQuery>,
-) -> Response<Vec<SessionEvent>> {
+) -> Response<Vec<SseEvent>> {
     let kernel = &state.kernel;
     let session = match superx_ops::resolve_session(kernel, &id).await {
         Ok(s) => s,
@@ -311,6 +302,23 @@ async fn api_session_activity(
         .unwrap_or(ACTIVITY_BACKLOG_DEFAULT)
         .min(ACTIVITY_BACKLOG_MAX);
     match crate::activity::session_activity(kernel, session, limit).await {
+        Ok(events) => Response::ok(events),
+        Err(e) => Response::err(e.to_string()),
+    }
+}
+
+/// The GLOBAL feed backlog — everything the OS captured, merged
+/// chronologically (issue #187): the Activity page's history.
+async fn api_activity(
+    State(state): State<AppState>,
+    Query(q): Query<ActivityQuery>,
+) -> Response<Vec<SseEvent>> {
+    let kernel = &state.kernel;
+    let limit = q
+        .limit
+        .unwrap_or(ACTIVITY_BACKLOG_DEFAULT)
+        .min(ACTIVITY_BACKLOG_MAX);
+    match crate::activity::global_activity(kernel, limit).await {
         Ok(events) => Response::ok(events),
         Err(e) => Response::err(e.to_string()),
     }

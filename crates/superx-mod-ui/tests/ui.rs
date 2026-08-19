@@ -191,6 +191,50 @@ async fn session_activity_merges_messages_and_actions_for_one_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn global_activity_includes_everything_including_no_session_events() {
+    use superx_kernel::types::Value;
+    use superx_mod_ui::activity::global_activity;
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-glob").await;
+    kernel
+        .log_message(superx_kernel::NewMessage {
+            session: session.clone(),
+            agent: agent.clone(),
+            role: "user".to_string(),
+            content: "hello global".to_string(),
+            raw: None,
+            seq: None,
+            emitted_at: None,
+        })
+        .await
+        .expect("message");
+    kernel
+        .log_telemetry("system_boot", Value::String("global".to_string()), None)
+        .await
+        .expect("boot");
+
+    let events = global_activity(&kernel, 100).await.expect("global");
+    // The global feed carries the message, its session, AND the
+    // no-session OS event — everyone and everything, one place.
+    assert!(
+        events.iter().any(|e| e.kind == "message" && e.rendered.contains("hello global")),
+        "{events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| e.kind == "action" && e.rendered.contains("system_boot")),
+        "{events:#?}"
+    );
+    // Chronological, and message rows carry their session id for
+    // client-side attribution.
+    assert!(events.windows(2).all(|w| w[0].valid_from <= w[1].valid_from));
+    assert!(events
+        .iter()
+        .filter(|e| e.kind == "message")
+        .all(|e| e.session_id.is_some()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_activity_keeps_the_newest_rows_when_truncated() {
     use superx_mod_ui::activity::session_activity;
 
