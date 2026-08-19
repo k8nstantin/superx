@@ -2,6 +2,7 @@
 //! provisioning flow needs a real server + TTY and is QA'd live per
 //! the README protocol.
 
+use superx_kernel::KernelModule as _;
 use superx::initialize::{bind_from_endpoint, credentials_path, resolve_password, save_credentials};
 use superx_kernel::provision::escape_surql;
 
@@ -103,4 +104,32 @@ async fn start_on_uninitialized_instance_points_at_initialize() {
         .await
         .expect_err("uninitialized start must error");
     assert!(err.contains("--initialize"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn schema_version_stamp_roundtrip() {
+    // The upgrade gate's memory: absent → stamp → read back.
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("kernel").await.expect("nsdb");
+    let ddl = superx_kernel::SCHEMA_DDL.replace("$SUPERX_KERNEL_PASSWORD", "t");
+    db.query(ddl).await.expect("ddl").check().expect("ok");
+    let kernel = superx_kernel::Kernel::from_db(db);
+    for t in superx_kernel::REQUIRED_METAMODEL_TYPES {
+        kernel
+            .ensure_type_definition(t.uid, t.category, t.memory_tier)
+            .await
+            .expect("seed");
+    }
+    assert!(superx::initialize::stamped_schema_version(&kernel).await.is_none());
+
+    // The kernel entity appears at registration (boot does this).
+    kernel
+        .register_module(&superx_kernel::boot::KernelCore.descriptor())
+        .await
+        .expect("register kernel");
+    superx::initialize::stamp_schema_version(&kernel).await;
+    assert_eq!(
+        superx::initialize::stamped_schema_version(&kernel).await.as_deref(),
+        Some(superx_kernel::schema::SCHEMA_VERSION)
+    );
 }

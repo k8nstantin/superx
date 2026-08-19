@@ -91,3 +91,49 @@ pub async fn provision_module_schema(
         .map_err(|e| KernelError::Config(format!("module schema statement refused: {e}")))?;
     Ok(())
 }
+
+/// Is this a benign "already exists" refusal (idempotent re-apply)?
+#[must_use]
+pub fn is_already_exists(message: &str) -> bool {
+    message.contains("already exists")
+}
+
+/// Tolerantly (re-)apply the FULL kernel schema: statements refused
+/// with "already exists" are skipped as idempotent; any other refusal
+/// fails loudly. The self-upgrade path for existing substrates
+/// (issue #158) — operator-invoked via `superx upgrade` or the
+/// start-time version gate.
+///
+/// # Errors
+///
+/// [`KernelError::Config`] on refused root signin or a non-benign
+/// schema refusal.
+pub async fn upgrade_kernel_schema(
+    endpoint: &str,
+    root_password: &str,
+    kernel_password: &str,
+) -> Result<(usize, usize)> {
+    let db = connect(endpoint).await?;
+    db.signin(Root {
+        username: "root".to_string(), // skill-allow: §13-username — operator-invoked upgrade carve-out (issue #158)
+        password: root_password.to_string(),
+    })
+    .await
+    .map_err(|e| KernelError::Config(format!("root signin refused: {e}")))?;
+    db.use_ns("superx").use_db("kernel").await?;
+    let ddl = SCHEMA_DDL.replace("$SUPERX_KERNEL_PASSWORD", &escape_surql(kernel_password));
+    let mut resp = db.query(ddl).await?;
+    let errors = resp.take_errors();
+    let mut skipped = 0usize;
+    for (index, error) in errors {
+        let message = error.to_string();
+        if is_already_exists(&message) {
+            skipped += 1;
+        } else {
+            return Err(KernelError::Config(format!(
+                "schema upgrade statement {index} refused: {message}"
+            )));
+        }
+    }
+    Ok((resp.num_statements(), skipped))
+}

@@ -83,6 +83,12 @@ async fn run(cli: Cli, config: Config) -> Result<(), String> {
     if matches!(command, Command::Start) {
         return superx::run_start(&config).await;
     }
+    if matches!(command, Command::Upgrade) {
+        let kernel = superx::connect(&config).await?;
+        superx::initialize::ensure_schema_current(&kernel, &config).await?;
+        superx::emit("substrate is current — `superx restart` to pick it up\n");
+        return Ok(());
+    }
     if matches!(command, Command::Restart) {
         if superx::initialize::read_live_pid(&config.data_dir).is_some() {
             superx::emit(&superx::run_stop(&config.data_dir).await?);
@@ -126,7 +132,8 @@ async fn run(cli: Cli, config: Config) -> Result<(), String> {
             }
             superx::run_boot(&kernel).await
         }
-        Command::Start | Command::Stop | Command::Restart | Command::Logs { .. } => {
+        Command::Start | Command::Stop | Command::Restart | Command::Upgrade
+        | Command::Logs { .. } => {
             unreachable!("handled above")
         }
         Command::Status => {

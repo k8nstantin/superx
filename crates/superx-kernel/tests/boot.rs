@@ -171,3 +171,31 @@ async fn reboot_is_idempotent_no_duplicate_entities() -> Result<(), Box<dyn Erro
     assert_eq!(before, names.len(), "no duplicate registry entities");
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boot_survives_a_broken_ledger() -> Result<(), Box<dyn Error>> {
+    // Issue #158 end-to-end: an incompatible ledger → boot must still
+    // bring the core up. The whole point of being modular.
+    let kernel = common::fresh_kernel().await?;
+    kernel
+        .db()
+        .query(include_str!("fixtures/ledger_sabotage.surql"))
+        .await?
+        .check()?;
+
+    let report = boot::boot(&kernel).await?;
+    assert!(
+        report.active_count() > 0,
+        "core modules active despite the missing ledger: {:?}",
+        report
+            .entries
+            .iter()
+            .map(|e| (&e.name, e.outcome.short_tag()))
+            .collect::<Vec<_>>()
+    );
+    assert!(matches!(
+        outcome_of(&report, "kernel"),
+        LifecycleState::Active { .. }
+    ));
+    Ok(())
+}

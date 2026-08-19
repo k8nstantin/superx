@@ -190,6 +190,25 @@ pub async fn run_module_cli(
 /// `superx status` body.
 pub async fn run_status(kernel: &Kernel, data_dir: &Path) -> Result<String, String> {
     let mut out = String::new();
+    // Boot honesty (issue #158): a running pidfile must never mask a
+    // dead OS — if nothing is active, say so at the top, loudly.
+    let mut any = 0usize;
+    let mut active = 0usize;
+    for kind in [NodeKind::KernelModule, NodeKind::Adapter] {
+        if let Ok(list) = kernel.list_with_status(kind).await {
+            for s in &list {
+                any += 1;
+                if s.lifecycle.short_tag() == "active" {
+                    active += 1;
+                }
+            }
+        }
+    }
+    if any > 0 && active == 0 {
+        out.push_str(
+            "⚠ BOOT UNHEALTHY: 0 modules active — the OS is up but doing nothing.\n  Check `superx logs -n 40` and run `superx upgrade`, then `superx restart`.\n",
+        );
+    }
     match read_live_pid(data_dir) {
         Some(pid) => out.push_str(&format!("OS: running in background (pid {pid})\n")),
         None => out.push_str("OS: not running (`superx --initialize` starts it)\n"),
