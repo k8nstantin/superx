@@ -1,0 +1,24 @@
+[package]
+name = "superx-mod-runner"
+description = "The scheduler: schedules entities, follows the graph, executes task nodes with agents (epic #189)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+linkme.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+superx-kernel = { path = "../superx-kernel" }
+superx-ops = { path = "../superx-ops" }
+tokio = { workspace = true, features = ["process", "time", "macros"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+superx-mod-entities = { path = "../superx-mod-entities" }
+surrealdb.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

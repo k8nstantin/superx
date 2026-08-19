@@ -15,6 +15,7 @@ serde_json.workspace = true
 superx-kernel.workspace = true
 superx-mod-entities.workspace = true
 superx-mod-hello.workspace = true
+superx-mod-runner.workspace = true
 superx-mod-ui.workspace = true
 superx-ops.workspace = true
 tokio = { workspace = true, features = ["signal"] }

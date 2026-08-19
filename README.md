@@ -96,6 +96,29 @@ to a repo also finds how to authenticate, all in one graph. Long-form text is it
 history, comments thread. Every change is an INSERT; nothing is ever
 lost. Agents executing task nodes from the graph is the next epic.
 
+## The runner module — schedule the graph, agents execute it
+
+Schedule any entity; the runner follows its graph (epic #189). Provision
+once (`superx modules provision runner`, restart), set the executor
+command, and the OS starts directing work — and capturing its own
+agents doing it:
+
+```sh
+superx runner plan <product-uuid>        # dry run: the execution waves
+superx runner schedule <product-uuid> --in 10s --every 1d
+superx runner queue
+superx runner runs                       # firing history per task
+superx runner cancel <schedule-uuid>
+```
+
+Tasks execute when their `depends_on` targets are done — independent
+tasks in parallel (`attr_runner_max_parallel`). The agent command is
+the `attr_runner_agent_cmd` parameter (e.g. `claude -p`); unset means
+dispatch refuses loudly. Results write back into the graph as
+`task —produced→ text` nodes; every run pins the instruction version
+it dispatched, and mid-run graph edits steer everything not yet
+dispatched (D27).
+
 ## Instance layout
 
 ```

@@ -30,6 +30,9 @@ pub struct NodeMeta {
     pub entity_type: String,
     pub name: String,
     pub content: Option<String>,
+    pub attributes: Option<Value>,
+    /// `valid_from` of the current state row — the version stamp.
+    pub version: String,
 }
 
 /// Batch-resolve current metadata for a set of anchors, keyed by
@@ -46,28 +49,48 @@ pub async fn current_meta(
     if ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let mut resp = db
-        .query(
-            "SELECT id, entity_type,              (SELECT name, content, valid_from FROM entity_state               WHERE entity = $parent.id ORDER BY valid_from DESC LIMIT 1) AS state              FROM $ids",
-        )
-        .bind(("ids", ids.to_vec()))
-        .await?;
-    let rows: Vec<Value> = resp.take(0)?;
-    Ok(rows.iter().filter_map(parse_meta).collect())
-}
-
-fn parse_meta(row: &Value) -> Option<(String, NodeMeta)> {
-    let id = obj_record(row, "id")?;
-    let entity_type = obj_str(row, "entity_type")?;
-    let state = match obj_get(row, "state") {
-        Some(Value::Array(a)) => a.first().cloned(),
-        _ => None,
-    };
-    let (name, content) = match &state {
-        Some(s) => (obj_str(s, "name").unwrap_or_default(), obj_str(s, "content")),
-        None => (String::new(), None),
-    };
-    Some((record_uuid(&id), NodeMeta { entity_type, name, content }))
+    // One request, 2N statements: an anchor read + a plain-equality
+    // state-chain read per id, reduced to the newest version in Rust
+    // with parsed datetimes. Probed alternatives all intermittently
+    // returned [] for existing rows on the mem engine when combined
+    // with in-batch reduction ($parent.id correlation, and
+    // ORDER BY … LIMIT 1 both with and without the index); the plain
+    // equality read is the deterministic form.
+    let mut statements = String::new();
+    for i in 0..ids.len() {
+        statements.push_str(&format!(
+            "SELECT id, entity_type FROM $id{i};\
+             SELECT name, content, attributes, valid_from \
+             FROM entity_state WHERE entity = $id{i};"
+        ));
+    }
+    let mut query = db.query(statements);
+    for (i, id) in ids.iter().enumerate() {
+        query = query.bind((format!("id{i}"), id.clone()));
+    }
+    let mut resp = query.await?;
+    let mut out = std::collections::HashMap::new();
+    for i in 0..ids.len() {
+        let anchors: Vec<Value> = resp.take(i * 2)?;
+        let states: Vec<Value> = resp.take(i * 2 + 1)?;
+        let Some(anchor) = anchors.first() else { continue };
+        let Some(id) = obj_record(anchor, "id") else { continue };
+        let Some(entity_type) = obj_str(anchor, "entity_type") else { continue };
+        let (name, content, attributes, version) = match newest_by_valid_from(&states) {
+            Some(s) => (
+                obj_str(s, "name").unwrap_or_default(),
+                obj_str(s, "content"),
+                obj_get(s, "attributes"),
+                obj_display(s, "valid_from").unwrap_or_default(),
+            ),
+            None => (String::new(), None, None, String::new()),
+        };
+        out.insert(
+            record_uuid(&id),
+            NodeMeta { entity_type, name, content, attributes, version },
+        );
+    }
+    Ok(out)
 }
 
 /// Validate a type name against the registry for a category.
@@ -304,6 +327,17 @@ fn parse_state(row: &Value) -> Option<StateRow> {
         content: obj_str(row, "content"),
         attributes: obj_get(row, "attributes"),
         valid_from: obj_display(row, "valid_from").unwrap_or_default(),
+    })
+}
+
+/// The newest row of a small state set, compared as PARSED datetimes
+/// (the #179 rule — lexical RFC3339 comparison is a trap).
+fn newest_by_valid_from(rows: &[Value]) -> Option<&Value> {
+    rows.iter().max_by_key(|r| {
+        obj_display(r, "valid_from")
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
     })
 }
 
