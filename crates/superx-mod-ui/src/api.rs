@@ -91,6 +91,46 @@ pub struct NameCount {
     pub value: i64,
 }
 
+/// The Status page's aggregation (issue #228): substrate totals plus
+/// a bounded walk over the newest raw messages — what the agents
+/// actually DID. Window-scoped figures carry `window_messages` so the
+/// UI can label them honestly.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct StatsSummary {
+    pub agents: i64,
+    pub sessions_total: i64,
+    pub sessions_active: i64,
+    pub modules_total: i64,
+    pub modules_active: i64,
+    pub events_total: i64,
+    pub messages_total: i64,
+    pub output_tokens_total: i64,
+    /// Lines of code written by Write/Edit tools across the window.
+    pub lines_written: i64,
+    /// Total tool invocations across the window.
+    pub tools_window: i64,
+    /// The raw-message window the walk covered (newest N).
+    pub window_messages: u32,
+    pub events_per_minute: Vec<TimeCount>,
+    pub message_roles: Vec<NameCount>,
+    pub boot_durations: Vec<TimeCount>,
+    /// Tool invocations by tool name, window-scoped, descending.
+    pub tools: Vec<NameCount>,
+    /// Busiest sessions in the window, by message count.
+    pub top_sessions: Vec<SessionStat>,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct SessionStat {
+    pub identity: String,
+    pub session_id: String,
+    pub messages: i64,
+    pub lines_written: i64,
+    pub output_tokens: i64,
+}
+
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct SseEvent {

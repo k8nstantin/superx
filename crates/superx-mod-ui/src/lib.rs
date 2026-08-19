@@ -22,6 +22,7 @@ use superx_kernel::{
 pub mod activity;
 pub mod api;
 mod server;
+pub mod stats;
 
 pub const MODULE_NAME: &str = "ui";
 
@@ -67,6 +68,31 @@ pub const CONTEXT_WINDOW_PARAM: &str = "attr_ui_context_window_tokens";
 
 /// Default context window when the parameter is unset.
 pub const DEFAULT_CONTEXT_WINDOW: i64 = 1_000_000; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
+/// Raw-message window for the Status page's stats walk (issue #228).
+pub const STATS_WINDOW_PARAM: &str = "attr_ui_stats_window_messages";
+
+/// Default stats window when the parameter is unset.
+pub const DEFAULT_STATS_WINDOW: u32 = 500; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
+/// Resolve the stats window: parameter on the module entity, else
+/// default.
+pub async fn resolved_stats_window(kernel: &Kernel) -> u32 {
+    let Ok(Some(entity)) = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+    else {
+        return DEFAULT_STATS_WINDOW;
+    };
+    match kernel.get_parameter(entity, STATS_WINDOW_PARAM).await {
+        Ok(Some(Value::Number(n))) => n
+            .to_int()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_STATS_WINDOW),
+        _ => DEFAULT_STATS_WINDOW,
+    }
+}
 
 /// Resolve the context-window size: parameter on the module entity,
 /// else default.
