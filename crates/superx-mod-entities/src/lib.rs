@@ -11,8 +11,11 @@
 //! own log (`target: "entities"`), own CLI (`superx entities …`).
 
 pub mod cli;
+pub mod edges;
+pub mod graph;
 pub mod nodes;
 pub mod registry;
+pub mod texts;
 
 use async_trait::async_trait;
 use superx_kernel::{

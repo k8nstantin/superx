@@ -257,3 +257,119 @@ async fn fragment_resolution_unique_ambiguous_none() {
     let none = nodes::resolve_entity(&db, "zzzzzz").await;
     assert!(none.unwrap_err().to_string().contains("no entity matches"));
 }
+
+// ---------------------------------------------------------------- E3 --
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn link_refusals_and_edge_history() {
+    use superx_mod_entities::{edges, nodes};
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    let part = nodes::create_entity(&db, "product", "Frame", None, None).await.expect("c");
+
+    let uid = edges::link(&db, &product, &part, "contains").await.expect("link");
+
+    let dup = edges::link(&db, &product, &part, "contains").await;
+    assert!(dup.unwrap_err().to_string().contains("already linked"));
+
+    let self_link = edges::link(&db, &product, &product, "linked").await;
+    assert!(self_link.unwrap_err().to_string().contains("itself"));
+
+    let bad_rel = edges::link(&db, &product, &part, "product").await;
+    assert!(bad_rel.unwrap_err().to_string().contains("entity type, not relation"));
+
+    // Retract, then relink: THREE rows total on the wire, TWO chains,
+    // and the current state is active again under a NEW edge_uid.
+    let retracted = edges::unlink(&db, &product, &part, "contains").await.expect("unlink");
+    assert_eq!(retracted, uid, "retraction lands on the same chain");
+    let relinked = edges::link(&db, &product, &part, "contains").await.expect("relink");
+    assert_ne!(relinked, uid, "a new link is a new chain");
+
+    let current = edges::expand(&db, std::slice::from_ref(&product), false).await.expect("expand");
+    let actives: Vec<_> = current.iter().filter(|e| e.active).collect();
+    assert_eq!(actives.len(), 1, "one active edge after retract+relink");
+    let mut resp = db.query("SELECT count() AS c FROM edge GROUP ALL").await.expect("count");
+    let rows: Vec<Value> = resp.take(0).expect("rows");
+    let total = rows.first().and_then(|v| match v {
+        Value::Object(o) => match o.get("c") { Some(Value::Number(n)) => n.to_int(), _ => None },
+        _ => None,
+    });
+    assert_eq!(total, Some(3), "full link/unlink/relink history preserved");
+
+    let second_unlink = edges::unlink(&db, &product, &part, "consults").await;
+    assert!(second_unlink.unwrap_err().to_string().contains("no active consults link"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn traversal_handles_cycles_and_depth() {
+    use superx_mod_entities::{edges, graph, nodes};
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    // product -> a -> b -> product (cycle), plus a tail below b.
+    let product = nodes::create_entity(&db, "product", "Root", None, None).await.expect("r");
+    let a = nodes::create_entity(&db, "product", "A", None, None).await.expect("a");
+    let b = nodes::create_entity(&db, "product", "B", None, None).await.expect("b");
+    let tail = nodes::create_entity(&db, "task", "Deep task", None, None).await.expect("t");
+    edges::link(&db, &product, &a, "contains").await.expect("l1");
+    edges::link(&db, &a, &b, "contains").await.expect("l2");
+    edges::link(&db, &b, &product, "linked").await.expect("cycle edge");
+    edges::link(&db, &b, &tail, "contains").await.expect("l3");
+
+    let full = graph::subgraph(&db, &product, 10, false).await.expect("bfs");
+    assert_eq!(full.nodes.len(), 4, "cycle terminated by visited set");
+    assert_eq!(full.edges.len(), 4, "all active edges reported");
+    assert!(!full.truncated_at_depth);
+
+    let shallow = graph::subgraph(&db, &product, 1, false).await.expect("bfs");
+    assert_eq!(shallow.nodes.len(), 2, "depth 1 = root + first hop");
+    assert!(shallow.truncated_at_depth);
+
+    let rendered = graph::render_tree(&full, &product);
+    assert!(rendered.contains("contains"), "tree labels rels: {rendered}");
+    assert!(rendered.contains("cycle"), "cycle annotated: {rendered}");
+
+    // Retract the cycle edge: traversal follows only ACTIVE edges.
+    edges::unlink(&db, &b, &product, "linked").await.expect("retract");
+    let after = graph::subgraph(&db, &product, 10, false).await.expect("bfs");
+    assert_eq!(after.edges.len(), 3, "inactive chain is history, not topology");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_evolves_comment_multiplies() {
+    use superx_mod_entities::{nodes, texts};
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+
+    let (text1, created) = texts::set_role_text(&db, &product, "describes", "First description.")
+        .await
+        .expect("describe");
+    assert!(created);
+    let (text2, created_again) =
+        texts::set_role_text(&db, &product, "describes", "Better description.")
+            .await
+            .expect("re-describe");
+    assert!(!created_again, "same text node evolves");
+    assert_eq!(
+        superx_ops::record_uuid(&text1),
+        superx_ops::record_uuid(&text2)
+    );
+    let history = nodes::state_history(&db, &text1).await.expect("history");
+    assert_eq!(history.len(), 2, "description evolution is the text node's history");
+    assert_eq!(history[1].content.as_deref(), Some("Better description."));
+
+    let c1 = texts::add_comment(&db, &product, "looks good").await.expect("c1");
+    let c2 = texts::add_comment(&db, &product, "ship it").await.expect("c2");
+    assert_ne!(superx_ops::record_uuid(&c1), superx_ops::record_uuid(&c2));
+
+    // Thread: comment on a comment.
+    texts::add_comment(&db, &c1, "replying to the first comment").await.expect("thread");
+
+    let notes = texts::annotations(&db, &product).await.expect("notes");
+    assert_eq!(notes.len(), 3, "one describes + two comments on the product");
+    assert!(notes.iter().any(|n| n.content == "Better description."));
+}
