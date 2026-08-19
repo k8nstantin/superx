@@ -145,6 +145,31 @@ impl Kernel {
         Ok(rows)
     }
 
+    /// Read messages strictly newer than `after` across ALL sessions,
+    /// oldest first — the firehose-side live primitive behind the UI's
+    /// SSE bridge (epic #141 P5).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::KernelError::Db`] for engine errors.
+    pub async fn messages_since(
+        &self,
+        after: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<MessageRecord>> {
+        let rows: Vec<MessageRecord> = self
+            .db()
+            .query(
+                "SELECT * FROM message WHERE valid_from > $after \
+                 ORDER BY valid_from ASC LIMIT $limit",
+            )
+            .bind(("after", after))
+            .bind(("limit", limit))
+            .await?
+            .take(0)?;
+        Ok(rows)
+    }
+
     /// Count of message rows per session for a list of sessions —
     /// cheap enough for the `superx sessions` listing.
     ///
