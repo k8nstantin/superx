@@ -47,11 +47,15 @@ pub struct SessionView {
     pub last_active: Option<String>,
 }
 
+/// One row of a session's merged activity (issue #172): a `message`
+/// row or a `telemetry_stream` event belonging to the session,
+/// rendered and ordered by capture time.
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
-pub struct MessageView {
-    pub session_id: String,
-    pub role: String,
+pub struct SessionEvent {
+    pub kind: String, // "message" | "action"
+    /// Source-native role for message rows (`user`, `assistant`, …).
+    pub role: Option<String>,
     pub rendered: String,
     pub valid_from: String,
 }
@@ -93,7 +97,15 @@ pub struct NameCount {
 pub struct SseEvent {
     pub kind: String, // "action" | "message"
     pub rendered: String,
+    /// Source-native role for message events (`user`, `assistant`, …);
+    /// `None` on actions.
+    pub role: Option<String>,
     pub agent_id: Option<String>,
     pub session_id: Option<String>,
+    /// The source-session key stamped on per-session action events
+    /// (`payload.session`, issue #172) — lets clients attribute an
+    /// action to its session (`SessionView.src` matches). `None` on
+    /// messages (they carry `session_id`) and on global events.
+    pub session_src: Option<String>,
     pub valid_from: String,
 }
