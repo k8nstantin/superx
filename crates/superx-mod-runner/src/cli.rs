@@ -13,6 +13,7 @@ const USAGE: &str = "usage: superx runner <command>\n\
   cancel <schedule-fragment>\n\
   plan <entity-fragment>       DRY RUN: the execution waves the graph implies\n\
   runs [<schedule-fragment>]   firing history: task · status · versions\n\
+  config [agent_cmd <cmd…> | max_parallel <n> | tick_secs <n> | plan_depth <n>]\n\
 set attr_runner_agent_cmd (substrate parameter) to enable dispatch — unset refuses loudly";
 
 /// Route a `superx runner …` invocation.
@@ -28,6 +29,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("cancel") => cancel_cmd(kernel, &args[1..]).await,
         Some("plan") => plan_cmd(kernel, &args[1..]).await,
         Some("runs") => runs_cmd(kernel, &args[1..]).await,
+        Some("config") => config_cmd(kernel, &args[1..]).await,
         _ => Err(KernelError::Module(USAGE.to_string())),
     }
 }
@@ -123,6 +125,51 @@ async fn plan_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let graph = crate::plan::fetch_graph(kernel, fragment, depth).await?;
     let plan = crate::plan::compute_waves(&graph)?;
     Ok(crate::plan::render_plan(&plan))
+}
+
+async fn config_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    use superx_kernel::types::Value;
+    let entity = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await?
+        .ok_or_else(|| KernelError::Module("runner not registered — boot the OS once first".to_string()))?;
+    match args.first().map(String::as_str) {
+        None => {
+            let cmd = crate::daemon::resolved_agent_cmd(kernel).await;
+            Ok(format!(
+                "runner config (substrate parameters):\n  agent_cmd:    {}\n  max_parallel: {}\n  tick_secs:    {}\n  plan_depth:   {}\n",
+                cmd.unwrap_or_else(|| "(unset — dispatch refuses; set it to enable execution)".to_string()),
+                crate::daemon::resolved_max_parallel(kernel).await,
+                crate::daemon::resolved_tick_secs(kernel).await,
+                crate::plan::resolved_plan_depth(kernel).await,
+            ))
+        }
+        Some("agent_cmd") => {
+            let value = args[1..].join(" ");
+            if value.is_empty() {
+                return Err(usage());
+            }
+            kernel
+                .set_parameter(entity, crate::daemon::AGENT_CMD_PARAM, Value::String(value.clone()))
+                .await?;
+            Ok(format!("agent_cmd = {value}\n"))
+        }
+        Some(knob @ ("max_parallel" | "tick_secs" | "plan_depth")) => {
+            let n: i64 = args
+                .get(1)
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n > 0)
+                .ok_or_else(usage)?;
+            let param = match knob {
+                "max_parallel" => crate::daemon::MAX_PARALLEL_PARAM,
+                "tick_secs" => crate::daemon::TICK_PARAM,
+                _ => crate::plan::PLAN_DEPTH_PARAM,
+            };
+            kernel.set_parameter(entity, param, Value::Number(n.into())).await?;
+            Ok(format!("{knob} = {n}\n"))
+        }
+        _ => Err(usage()),
+    }
 }
 
 async fn runs_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {

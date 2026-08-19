@@ -61,10 +61,8 @@ async fn run_loop(kernel: Kernel) {
 
         for row in due {
             let config = FiringConfig {
-                agent_cmd: resolved_string(&kernel, AGENT_CMD_PARAM).await,
-                max_parallel: resolved_u64(&kernel, MAX_PARALLEL_PARAM, DEFAULT_MAX_PARALLEL as u64)
-                    .await
-                    .max(1) as usize,
+                agent_cmd: resolved_agent_cmd(&kernel).await,
+                max_parallel: resolved_max_parallel(&kernel).await,
                 plan_depth: plan::resolved_plan_depth(&kernel).await,
             };
             let exchange = CliExchange { kernel: kernel.clone() };
@@ -90,6 +88,21 @@ fn is_due(run_at: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(run_at)
         .map(|t| t.with_timezone(&Utc) <= Utc::now())
         .unwrap_or(false)
+}
+
+/// Resolved executor command (public for `runner config`).
+pub async fn resolved_agent_cmd(kernel: &Kernel) -> Option<String> {
+    resolved_string(kernel, AGENT_CMD_PARAM).await
+}
+
+/// Resolved parallel ceiling (public for `runner config`).
+pub async fn resolved_max_parallel(kernel: &Kernel) -> usize {
+    resolved_u64(kernel, MAX_PARALLEL_PARAM, DEFAULT_MAX_PARALLEL as u64).await.max(1) as usize
+}
+
+/// Resolved tick cadence (public for `runner config`).
+pub async fn resolved_tick_secs(kernel: &Kernel) -> u64 {
+    resolved_u64(kernel, TICK_PARAM, DEFAULT_TICK_SECS).await.max(1)
 }
 
 async fn resolved_u64(kernel: &Kernel, param: &str, fallback: u64) -> u64 {
