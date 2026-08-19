@@ -60,6 +60,32 @@ pub async fn resolved_url(kernel: &Kernel) -> String {
     format!("http://127.0.0.1:{}", resolved_port(kernel).await)
 }
 
+/// Context-window size parameter (tokens) on the ui module's registry
+/// entity — the denominator of the Sessions list's context bar
+/// (issue #202).
+pub const CONTEXT_WINDOW_PARAM: &str = "attr_ui_context_window_tokens";
+
+/// Default context window when the parameter is unset.
+pub const DEFAULT_CONTEXT_WINDOW: i64 = 1_000_000; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
+/// Resolve the context-window size: parameter on the module entity,
+/// else default.
+pub async fn resolved_context_window(kernel: &Kernel) -> i64 {
+    let Ok(Some(entity)) = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+    else {
+        return DEFAULT_CONTEXT_WINDOW;
+    };
+    match kernel.get_parameter(entity, CONTEXT_WINDOW_PARAM).await {
+        Ok(Some(Value::Number(n))) => n
+            .to_int()
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW),
+        _ => DEFAULT_CONTEXT_WINDOW,
+    }
+}
+
 #[async_trait]
 impl KernelModule for UiModule {
     fn descriptor(&self) -> KernelModuleDescriptor {

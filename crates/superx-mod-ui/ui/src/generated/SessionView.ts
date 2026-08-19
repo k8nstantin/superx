@@ -13,6 +13,12 @@ actions: bigint,
  */
 context_tokens: bigint | null, 
 /**
+ * `context_tokens` as a percentage of the instance's context
+ * window (`attr_ui_context_window_tokens`), clamped to 100 —
+ * drives the Sessions list's context bar (issue #202).
+ */
+context_pct: bigint | null, 
+/**
  * Cumulative output tokens across the session (issue #200).
  */
 output_tokens: bigint | null, 
