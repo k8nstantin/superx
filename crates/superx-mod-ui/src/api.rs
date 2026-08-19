@@ -43,6 +43,8 @@ pub struct SessionView {
     pub agent: String,
     pub src: String,
     pub messages: i64,
+    /// RFC3339 timestamp of the session's newest message.
+    pub last_active: Option<String>,
 }
 
 #[derive(Debug, Serialize, TS)]
