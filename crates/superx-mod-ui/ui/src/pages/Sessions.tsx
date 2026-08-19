@@ -34,11 +34,11 @@ const LIVENESS_RANK: Record<Liveness, number> = { active: 0, paused: 1, ended: 2
 
 function LivenessDot({ state }: { state: Liveness }) {
   const styles: Record<Liveness, React.CSSProperties> = {
-    // The recording light: bright red, pulsing glow.
-    active: { background: '#ff3b30', boxShadow: '0 0 6px 2px rgba(255,59,48,0.7)', animation: 'sx-glow 1.4s ease-in-out infinite' },
+    // Alive: green, pulsing glow.
+    active: { background: '#30d158', boxShadow: '0 0 6px 2px rgba(48,209,88,0.7)', animation: 'sx-glow 1.4s ease-in-out infinite' },
     paused: { background: '#fdd835' },
-    // Ended: same red family, dimmed flat — no glow.
-    ended: { background: '#8b2e2e', opacity: 0.55 },
+    // Stopped: flat red, no glow.
+    ended: { background: '#e03131' },
     unknown: { background: '#555' },
   }
   return (
@@ -79,7 +79,7 @@ function SessionList({ onOpen }: { onOpen: (id: string) => void }) {
   })
   return (
     <Card withBorder>
-      <style>{'@keyframes sx-glow { 0%, 100% { box-shadow: 0 0 4px 1px rgba(255,59,48,0.5); } 50% { box-shadow: 0 0 10px 4px rgba(255,59,48,0.9); } }'}</style>
+      <style>{'@keyframes sx-glow { 0%, 100% { box-shadow: 0 0 4px 1px rgba(48,209,88,0.5); } 50% { box-shadow: 0 0 10px 4px rgba(48,209,88,0.9); } }'}</style>
       <Title order={5} mb="xs">
         Captured conversations
       </Title>
