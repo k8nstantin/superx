@@ -2,7 +2,7 @@ name: website
 on:
   push:
     branches: [main]
-    paths: ["website/**", ".github/workflows/website.yml"]
+    paths: ["superx-mod-website/**", ".github/workflows/website.yml"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -22,6 +22,6 @@ jobs:
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: website
+          path: superx-mod-website
       - id: deployment
         uses: actions/deploy-pages@v4
