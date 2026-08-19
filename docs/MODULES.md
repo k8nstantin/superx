@@ -1,12 +1,28 @@
 # Contributing a SuperX Module
 
+> ## ⛔ THE KERNEL IS OFF LIMITS
+>
+> **A module writes code in `crates/superx-mod-<name>/` and NOWHERE
+> ELSE.** The kernel — `crates/superx-kernel/` (engine, capture,
+> adapters, verbs, everything) and `schema/` — has **exactly one
+> author: the operator.** Not "ask first": module builders never
+> write kernel code, kernel diffs, or kernel reverts, period. If your
+> module seems to need a kernel change, **file an issue describing
+> the need and STOP** — the operator authors any kernel change
+> personally. CI fails any PR that touches `crates/superx-kernel/`
+> without an operator-written approval marker. Imagine every module
+> builder patching the kernel for their own convenience — that mess
+> is what this rule prevents.
+
 A module is a **self-contained mini-app** on the SuperX kernel. It gets
 the full facility set, all keyed by its unique name: own schema + data
 objects (in its OWN database), own dir, own log, own CLI, own
 substrate parameters, a UUIDv7 identity, live enable/disable, and a
 first-class row in the kernel's module ledger. Modules depend on the
 kernel ONLY — never on each other; everything cross-module flows
-through the substrate and the telemetry firehose.
+through the substrate and the telemetry firehose. **Modules consume
+the kernel; they never modify it** (see the banner above — it is the
+first and last rule of this contract).
 
 The reference implementation is
 [`crates/superx-mod-hello`](../crates/superx-mod-hello) — copy it.
@@ -18,6 +34,9 @@ The full-scale example is the UI module
 1. **Crate**: `crates/superx-mod-<name>/`, depending on `superx-kernel`
    (and `superx-ops` if you render CLI-style output). Use the kernel's
    re-exported `superx_kernel::types` — no direct surrealdb dependency.
+   **Every file you create or edit lives under this crate.** The
+   kernel is off limits (banner above): you call its verbs, you never
+   change them.
 2. **Register** (compiled-in v1 contract):
 
    ```rust
@@ -65,8 +84,13 @@ The full-scale example is the UI module
    `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
    `python3 tools/skill_audit.py` — all green before any PR.
 10. **Process**: GitHub issue → branch `feat/<issue>-…` → PR
-    `closes #<issue>`. PRs touching `crates/*/schema/*.surql` need an
-    `Operator-approved:` marker in the body.
+    `closes #<issue>`. One session = one lane = its own module, its
+    own branch, its own PR — nobody touches another lane's branch or
+    module. PRs touching `crates/*/schema/*.surql` need an
+    `Operator-approved:` marker in the body; PRs touching
+    `crates/superx-kernel/` fail CI without one — and per the rule
+    above, a module builder should never be authoring that PR in the
+    first place: **kernel changes are operator-authored, always.**
 
 ## Same-kind modules coexist
 
@@ -86,3 +110,9 @@ superx logs --module <n>            # its own log (also under <home>/modules/<n>
 ```
 
 > Real-world examples: `superx-mod-ui` (a module owning a server + port parameter) and `superx-mod-entities` (a module owning a four-table schema, native graph edges, and a rich CLI).
+
+## The boundary, one more time
+
+Build the module. **Stay in the module.** The kernel is not yours —
+not to improve, not to fix, not to revert. Need something from it?
+File an issue and stop; the operator is the kernel's only author.
