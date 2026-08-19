@@ -52,15 +52,15 @@ superx ui url                 # → http://127.0.0.1:5150 (attr_ui_port paramete
 ```
 
 Open it: **Status** (stat cards, module table, live charts — events/min,
-per-agent activity, message roles, boot durations), **Activity** (every
-captured action + message streaming via SSE, each row attributed to its
-session — who is doing what; filter + pause), **Sessions** (the top-level
-grouping: open a session to see EVERYTHING captured for it — messages
-and actions merged chronologically, historical then live, auto-scrolling),
-**Console** (run the read CLI commands from the browser; history
-persisted in the UI's own db). Dev flow: `npm run dev` in
-`crates/superx-mod-ui/ui` proxies `/api` to the running OS;
-`npm run build` + restart ships it.
+per-agent activity, message roles, boot durations), **Activity** (THE
+feed, global scope: everything the OS captures — history then live,
+every row attributed to its session, chronological + auto-scrolling,
+filter + pause), **Sessions** (the same exact feed, by session: rows
+show total activity counts and liveness; click a session to open its
+feed — messages and actions together, historical then live), **Console**
+(run the read CLI commands from the browser; history persisted in the
+UI's own db). Dev flow: `npm run dev` in `crates/superx-mod-ui/ui`
+proxies `/api` to the running OS; `npm run build` + restart ships it.
 
 Modules are how SuperX grows — see [`docs/MODULES.md`](docs/MODULES.md)
 to contribute one (the framework supports several modules of the same

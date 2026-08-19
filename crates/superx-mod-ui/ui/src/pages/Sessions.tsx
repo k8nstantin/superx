@@ -1,15 +1,16 @@
-import { useEffect, useRef, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Badge, Button, Card, Group, ScrollArea, Switch, Table, Text, Title, Tooltip } from '@mantine/core'
-import { fetchSessionActivity, fetchSessions } from '../api'
+import { Badge, Button, Card, Group, ScrollArea, Table, Text, Title, Tooltip } from '@mantine/core'
+import { fetchAgents, fetchSessionActivity, fetchSessions } from '../api'
 import { useSse } from '../useSse'
-import type { SessionEvent } from '../generated/SessionEvent'
+import { Feed, MAX_FEED_ROWS, mergeFeed } from '../Feed'
+import type { SseEvent } from '../generated/SseEvent'
 import type { SessionView } from '../generated/SessionView'
 
 export default function SessionsPage() {
   const [selected, setSelected] = useState<SessionView | null>(null)
   return selected ? (
-    <SessionActivityView session={selected} onBack={() => setSelected(null)} />
+    <SessionFeed session={selected} onBack={() => setSelected(null)} />
   ) : (
     <SessionList onOpen={setSelected} />
   )
@@ -76,13 +77,13 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
     if (rank !== 0) return rank
     const recency = (b.last_active ?? '').localeCompare(a.last_active ?? '')
     if (recency !== 0) return recency
-    return Number(b.messages) - Number(a.messages)
+    return Number(b.actions) - Number(a.actions)
   })
   return (
     <Card withBorder>
       <style>{'@keyframes sx-glow { 0%, 100% { box-shadow: 0 0 4px 1px rgba(48,209,88,0.5); } 50% { box-shadow: 0 0 10px 4px rgba(48,209,88,0.9); } }'}</style>
       <Title order={5} mb="xs">
-        Sessions — every conversation, grouping all its activity
+        Sessions — click one to open its feed
       </Title>
       <ScrollArea h={600}>
         <Table striped highlightOnHover>
@@ -93,13 +94,12 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
               <Table.Th>Session</Table.Th>
               <Table.Th>Source id</Table.Th>
               <Table.Th>Last active</Table.Th>
-              <Table.Th>Messages</Table.Th>
-              <Table.Th />
+              <Table.Th>Actions</Table.Th>
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
             {rows.map((s) => (
-              <Table.Tr key={s.session_id}>
+              <Table.Tr key={s.session_id} onClick={() => onOpen(s)} style={{ cursor: 'pointer' }}>
                 <Table.Td>
                   <LivenessDot state={liveness(s.last_active)} />
                 </Table.Td>
@@ -121,12 +121,7 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
                     <Text size="xs">{relativeTime(s.last_active)}</Text>
                   </Tooltip>
                 </Table.Td>
-                <Table.Td>{String(s.messages)}</Table.Td>
-                <Table.Td>
-                  <Button size="compact-xs" variant="light" onClick={() => onOpen(s)}>
-                    open
-                  </Button>
-                </Table.Td>
+                <Table.Td>{String(s.actions)}</Table.Td>
               </Table.Tr>
             ))}
           </Table.Tbody>
@@ -136,65 +131,44 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
   )
 }
 
-// Live-row retention cap — matches Activity's MAX_ROWS; the backlog
-// endpoint re-serves older rows on refetch.
-const MAX_LIVE_ROWS = 500
-
-// A stable identity for one captured event: capture timestamp (ns
-// precision) + kind + rendered text. Used to dedupe rows that arrive
-// both over SSE and in a backlog refetch.
-const eventKey = (r: SessionEvent) => `${r.valid_from}|${r.kind}|${r.rendered}`
-
-// One session's FULL activity (issue #172): messages + actions merged
-// chronologically — historical backlog, then live, auto-scrolling.
-function SessionActivityView({ session, onBack }: { session: SessionView; onBack: () => void }) {
-  const [live, setLive] = useState(true)
-  const [kind, setKind] = useState<'all' | 'message' | 'action'>('all')
-  const [liveRows, setLiveRows] = useState<SessionEvent[]>([])
+// THE feed, scoped to one session (issue #187): same exact rendering,
+// controls, and auto-scroll as the global Activity feed.
+function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => void }) {
+  const [paused, setPaused] = useState(false)
+  const [liveRows, setLiveRows] = useState<SseEvent[]>([])
   const backlog = useQuery({
     queryKey: ['activity', session.session_id],
     queryFn: () => fetchSessionActivity(session.session_id),
   })
+  const sessions = useQuery({ queryKey: ['sessions'], queryFn: () => fetchSessions(), refetchInterval: 10000 })
+  const agents = useQuery({ queryKey: ['agents'], queryFn: fetchAgents, refetchInterval: 30000 })
 
-  useSse((e) => {
-    const mine =
-      e.kind === 'message' ? e.session_id === session.session_id : e.session_src === session.src
-    if (!mine) return
-    setLiveRows((prev) =>
-      [...prev, { kind: e.kind, role: e.role, rendered: e.rendered, valid_from: e.valid_from }].slice(
-        -MAX_LIVE_ROWS,
-      ),
+  // agent_id → name, for the live filter's agent scope below.
+  const agentName = useMemo(
+    () => new Map((agents.data ?? []).map((a) => [a.agent_id, a.name])),
+    [agents.data],
+  )
+
+  useSse((batch) => {
+    // Same scoping as the server-side backlog query: actions match by
+    // source key AND agent — source keys alone collide across agents
+    // on fallback keys like `unknown-session` (review finding). An
+    // agent the directory doesn't know yet is accepted rather than
+    // dropped (staleness must not lose legitimate rows).
+    const mine = batch.filter((e) =>
+      e.kind === 'message'
+        ? e.session_id === session.session_id
+        : e.session_src === session.src &&
+          (e.agent_id == null || (agentName.get(e.agent_id) ?? session.agent) === session.agent),
     )
-  }, !live)
+    if (mine.length) setLiveRows((prev) => [...prev, ...mine].slice(-MAX_FEED_ROWS))
+  }, paused)
 
-  // Merge backlog + live: dedupe (an event can arrive over SSE and
-  // again in a backlog refetch — the backlog copy wins), then re-sort
-  // by capture time (the SSE poller emits each tick's actions before
-  // its messages, so arrival order alone is not chronological).
-  const seen = new Map<string, SessionEvent>()
-  for (const r of [...(backlog.data ?? []), ...liveRows]) {
-    if (!seen.has(eventKey(r))) seen.set(eventKey(r), r)
-  }
-  const rows = [...seen.values()]
-    .sort((a, b) => a.valid_from.localeCompare(b.valid_from))
-    .filter((r) => kind === 'all' || r.kind === kind)
-
-  // Pinned-to-bottom auto-scroll: follow new rows unless the user has
-  // scrolled up; resume following when they return near the bottom.
-  const viewport = useRef<HTMLDivElement>(null)
-  const following = useRef(true)
-  useEffect(() => {
-    if (following.current && viewport.current) {
-      viewport.current.scrollTo({ top: viewport.current.scrollHeight })
-    }
-  }, [rows.length])
-
-  const roleColor = (role: string | null) =>
-    role === 'user' ? 'teal' : role === 'assistant' ? 'indigo' : 'gray'
+  const rows = useMemo(() => mergeFeed(backlog.data ?? [], liveRows), [backlog.data, liveRows])
 
   return (
-    <Card withBorder>
-      <Group justify="space-between" mb="xs">
+    <Feed
+      header={
         <Group>
           <Button size="compact-xs" variant="default" onClick={onBack}>
             ← sessions
@@ -203,63 +177,14 @@ function SessionActivityView({ session, onBack }: { session: SessionView; onBack
             {session.agent}/{session.session_id}
           </Title>
         </Group>
-        <Group>
-          {(['all', 'message', 'action'] as const).map((k) => (
-            <Badge
-              key={k}
-              variant={kind === k ? 'filled' : 'outline'}
-              style={{ cursor: 'pointer' }}
-              onClick={() => setKind(k)}
-            >
-              {k}
-            </Badge>
-          ))}
-          <Switch label="live" checked={live} onChange={(e) => setLive(e.currentTarget.checked)} />
-        </Group>
-      </Group>
-      <ScrollArea
-        h={580}
-        viewportRef={viewport}
-        onScrollPositionChange={({ y }) => {
-          const v = viewport.current
-          if (v) following.current = y + v.clientHeight >= v.scrollHeight - 40
-        }}
-      >
-        {backlog.isLoading && (
-          <Text c="dimmed" size="sm">
-            loading captured activity…
-          </Text>
-        )}
-        {backlog.isError && (
-          <Text c="red.4" size="sm">
-            could not load this session's activity: {String(backlog.error)}
-          </Text>
-        )}
-        {!backlog.isLoading && !backlog.isError && rows.length === 0 && (
-          <Text c="dimmed" size="sm">
-            nothing captured for this session yet
-          </Text>
-        )}
-        {rows.map((r, i) => (
-          <Text
-            key={`${r.valid_from}-${i}`}
-            size="sm"
-            ff="monospace"
-            mb={2}
-            c={r.kind === 'action' ? 'dimmed' : undefined}
-          >
-            <Badge
-              size="xs"
-              mr={6}
-              variant={r.kind === 'action' ? 'outline' : 'light'}
-              color={r.kind === 'message' ? roleColor(r.role) : 'indigo'}
-            >
-              {r.kind === 'message' ? (r.role ?? 'message') : 'action'}
-            </Badge>
-            {r.rendered}
-          </Text>
-        ))}
-      </ScrollArea>
-    </Card>
+      }
+      rows={rows}
+      sessions={sessions.data ?? []}
+      agents={agents.data ?? []}
+      paused={paused}
+      onPausedChange={setPaused}
+      loading={backlog.isLoading}
+      error={backlog.isError ? String(backlog.error) : null}
+    />
   )
 }
