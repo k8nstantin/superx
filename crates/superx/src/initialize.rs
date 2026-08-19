@@ -239,55 +239,12 @@ pub async fn initialize(config: &Config) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Background OS lifecycle (issue #124): pidfile + daemon spawn + the
-// wait-for-boot observation loop. The parent never boots — it spawns
-// `superx boot --daemonized` and watches the substrate for the child's
-// system_boot (readers don't write).
+// Background OS lifecycle (issue #124): daemon spawn + the
+// wait-for-boot observation loop. Pidfile utilities moved to
+// superx-ops (P3) and are re-exported to keep paths stable.
 // ─────────────────────────────────────────────────────────────────────
 
-/// The background OS pidfile: sibling of the datastore.
-#[must_use]
-pub fn pid_path(data_dir: &Path) -> PathBuf {
-    data_dir
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("superx.pid")
-}
-
-/// Is this pid alive? (`kill -0` probe.)
-#[must_use]
-pub fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// The running background OS's pid, if the pidfile exists AND the
-/// process is alive. A stale pidfile (dead process) is removed.
-#[must_use]
-pub fn read_live_pid(data_dir: &Path) -> Option<u32> {
-    let path = pid_path(data_dir);
-    let pid: u32 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
-    if pid_alive(pid) {
-        Some(pid)
-    } else {
-        let _removed = std::fs::remove_file(&path); // stale — clean up
-        None
-    }
-}
-
-pub fn write_pidfile(data_dir: &Path, pid: u32) -> Result<(), String> {
-    let path = pid_path(data_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
-    }
-    std::fs::write(&path, format!("{pid}\n")).map_err(|e| format!("write {path:?}: {e}"))
-}
+pub use superx_ops::{pid_alive, pid_path, read_live_pid, write_pidfile};
 
 /// Spawn this same binary as the background OS:
 /// `superx boot --daemonized` with the effective connection args,
