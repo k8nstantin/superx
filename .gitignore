@@ -36,3 +36,6 @@ history.txt
 
 # Instance parameter file (runtime config, never committed)
 /params
+
+# Frontend third-party deps (never committed)
+node_modules/

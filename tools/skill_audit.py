@@ -126,8 +126,8 @@ def iter_rust_files(scope: str) -> Iterator[Path]:
     if not CRATES_DIR.exists():
         return
     for path in sorted(CRATES_DIR.rglob("*.rs")):
-        # Always skip target/.
-        if "target" in path.parts:
+        # Always skip target/ and third-party/build trees.
+        if any(part in ("target", "node_modules", "dist") for part in path.parts):
             continue
         if scope == "production" and is_test_file(path):
             continue
@@ -822,6 +822,8 @@ def detect_unauthorized_ddl_in_code() -> List[Violation]:
     """
     violations: List[Violation] = []
     for path in sorted(REPO_ROOT.rglob("*")):
+        if any(part in ("target", "node_modules", "dist", ".git") for part in path.parts):
+            continue
         if not path.is_file():
             continue
         if _is_ddl_allowed_path(path):
