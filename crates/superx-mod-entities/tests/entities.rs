@@ -133,3 +133,127 @@ async fn cli_usage_and_unprovisioned_honesty() {
     let honest = EntitiesModule.cli(&kernel, &["types".to_string()]).await;
     assert!(honest.is_err());
 }
+
+// ---------------------------------------------------------------- E2 --
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_chain_is_append_only() {
+    use superx_mod_entities::nodes;
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let anchor = nodes::create_entity(&db, "product", "Widget X", None, None)
+        .await
+        .expect("create");
+
+    nodes::update_entity(&db, &anchor, Some("Widget X2".into()), None, None)
+        .await
+        .expect("update");
+
+    let current = nodes::current_state(&db, &anchor).await.expect("query").expect("state");
+    assert_eq!(current.name, "Widget X2");
+
+    let history = nodes::state_history(&db, &anchor).await.expect("history");
+    assert_eq!(history.len(), 2, "update appended, never replaced");
+    assert_eq!(history[0].name, "Widget X");
+    assert_eq!(history[1].name, "Widget X2");
+
+    // The anchor is still exactly one immutable row.
+    let mut resp = db
+        .query("SELECT count() AS c FROM entity GROUP ALL")
+        .await
+        .expect("count");
+    let rows: Vec<Value> = resp.take(0).expect("rows");
+    let anchors = rows.first().and_then(|v| match v {
+        Value::Object(o) => match o.get("c") {
+            Some(Value::Number(n)) => n.to_int(),
+            _ => None,
+        },
+        _ => None,
+    });
+    assert_eq!(anchors, Some(1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_carries_unset_fields_forward() {
+    use superx_mod_entities::nodes;
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let attrs = superx_kernel::message::value_from_json(&serde_json::json!({"sku": "W-1"}));
+    let anchor = nodes::create_entity(&db, "task", "QA login", Some("check the login flow".into()), Some(attrs))
+        .await
+        .expect("create");
+
+    // Rename only — content and attributes must survive.
+    nodes::update_entity(&db, &anchor, Some("QA login flow".into()), None, None)
+        .await
+        .expect("update");
+    let current = nodes::current_state(&db, &anchor).await.expect("query").expect("state");
+    assert_eq!(current.name, "QA login flow");
+    assert_eq!(current.content.as_deref(), Some("check the login flow"));
+    assert!(current.attributes.is_some(), "attributes carried forward");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_refuses_wrong_type_category() {
+    use superx_mod_entities::nodes;
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let unknown = nodes::create_entity(&db, "widget", "X", None, None).await;
+    assert!(unknown.unwrap_err().to_string().contains("unknown type"));
+
+    let relation = nodes::create_entity(&db, "contains", "X", None, None).await;
+    assert!(relation.unwrap_err().to_string().contains("relation type, not entity"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_shows_current_labels_and_filters() {
+    use superx_mod_entities::nodes;
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    nodes::create_entity(&db, "task", "Build widget", None, None).await.expect("t");
+    nodes::update_entity(&db, &product, Some("Widget v2".into()), None, None).await.expect("u");
+
+    let all = nodes::list_entities(&db, None).await.expect("list");
+    assert_eq!(all.len(), 2, "one row per entity, not per version");
+    assert!(all.iter().any(|r| r.name == "Widget v2"), "list shows CURRENT label");
+    assert!(!all.iter().any(|r| r.name == "Widget"), "stale label absent");
+
+    let tasks = nodes::list_entities(&db, Some("task")).await.expect("filtered");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].entity_type, "task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fragment_resolution_unique_ambiguous_none() {
+    use superx_mod_entities::nodes;
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let a = nodes::create_entity(&db, "product", "A", None, None).await.expect("a");
+    let b = nodes::create_entity(&db, "product", "B", None, None).await.expect("b");
+    let a_uuid = superx_ops::record_uuid(&a);
+    let b_uuid = superx_ops::record_uuid(&b);
+
+    let hit = nodes::resolve_entity(&db, &a_uuid).await.expect("unique");
+    assert_eq!(superx_ops::record_uuid(&hit), a_uuid);
+
+    // uuid7 ids minted in the same instant share their time prefix.
+    let shared: String = a_uuid
+        .chars()
+        .zip(b_uuid.chars())
+        .take_while(|(x, y)| x == y)
+        .map(|(x, _)| x)
+        .collect();
+    if !shared.is_empty() {
+        let ambiguous = nodes::resolve_entity(&db, &shared).await;
+        assert!(ambiguous.unwrap_err().to_string().contains("ambiguous"));
+    }
+
+    let none = nodes::resolve_entity(&db, "zzzzzz").await;
+    assert!(none.unwrap_err().to_string().contains("no entity matches"));
+}
