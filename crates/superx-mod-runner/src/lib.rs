@@ -7,7 +7,11 @@
 //! on this per the epic's authoritative spec.
 
 pub mod cli;
+pub mod daemon;
+pub mod exec;
 pub mod plan;
+pub mod recurrence;
+pub mod run;
 pub mod schedule;
 
 use async_trait::async_trait;
@@ -44,9 +48,12 @@ impl KernelModule for RunnerModule {
             Ok(_) => tracing::info!(target: "runner", "schedule substrate ready"),
             Err(e) => tracing::warn!(
                 target: "runner",
-                "own db unavailable — scheduling disabled until provisioned: {e}"
+                "own db unavailable — scheduling idle until provisioned: {e}"
             ),
         }
+        // The loop lives regardless: it re-checks enablement and
+        // provisioning every tick (live provision/enable, D27 spirit).
+        crate::daemon::spawn_once(kernel.clone());
         Ok(())
     }
 

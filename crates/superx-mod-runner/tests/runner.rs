@@ -204,3 +204,310 @@ async fn non_tasks_never_execute_and_external_deps_warn() {
     assert_eq!(plan1.warnings.len(), 1, "{:?}", plan1.warnings);
     assert!(plan1.warnings[0].contains("treated satisfied"));
 }
+
+// ------------------------------------------------------------ R3/R4 --
+// The firing engine against REAL entity graphs and stub executor
+// scripts (spec #193/#194 acceptance floors).
+
+mod firing {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use superx_kernel::types::RecordId;
+    use superx_mod_entities::{edges, graph, nodes, texts};
+    use superx_mod_runner::exec::{fire, Exchange, FiringConfig, UNSET_CMD_DETAIL};
+    use superx_mod_runner::{run, schedule};
+
+    use super::{entities_db, fresh_db};
+
+    /// Test exchange over a real entities mem db; optionally rewrites
+    /// a task's instructs text after the first graph read (D27).
+    struct FixtureExchange {
+        edb: superx_kernel::Db,
+        root: RecordId,
+        graph_reads: AtomicUsize,
+        instruct_edit: Option<(RecordId, String)>,
+        edited: AtomicBool,
+    }
+
+    impl FixtureExchange {
+        fn new(edb: superx_kernel::Db, root: RecordId) -> Self {
+            Self { edb, root, graph_reads: AtomicUsize::new(0), instruct_edit: None, edited: AtomicBool::new(false) }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Exchange for FixtureExchange {
+        async fn graph(&self, _root: &str, depth: usize) -> superx_kernel::Result<superx_mod_runner::plan::Graph> {
+            let reads = self.graph_reads.fetch_add(1, Ordering::SeqCst);
+            if reads >= 1 && !self.edited.swap(true, Ordering::SeqCst) {
+                if let Some((task, new_text)) = &self.instruct_edit {
+                    texts::set_role_text(&self.edb, task, "instructs", new_text).await?;
+                }
+            }
+            let sub = graph::subgraph(&self.edb, &self.root, depth, false).await?;
+            let json = graph::to_json(&sub, &self.root);
+            Ok(serde_json::from_value(json).expect("contract parses"))
+        }
+
+        async fn write_back(&self, task_uid: &str, output: &str) -> superx_kernel::Result<String> {
+            let task = nodes::resolve_entity(&self.edb, task_uid).await?;
+            let text = nodes::create_entity(&self.edb, "text", "result", Some(output.to_string()), None).await?;
+            edges::link(&self.edb, &task, &text, "produced").await?;
+            Ok(superx_ops::record_uuid(&text))
+        }
+    }
+
+    fn stub_script(body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = std::env::temp_dir().join(format!("sx-stub-{}.sh", uuid::Uuid::now_v7()));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path.to_string_lossy().to_string()
+    }
+
+    async fn due_row(db: &superx_kernel::Db, entity: &RecordId) -> schedule::ScheduleRow {
+        let uid = schedule::create_schedule(db, &superx_ops::record_uuid(entity), chrono::Utc::now(), "none")
+            .await
+            .expect("schedule");
+        schedule::chain_current(db, &uid).await.expect("read").expect("row")
+    }
+
+    fn config(cmd: Option<String>) -> FiringConfig {
+        FiringConfig { agent_cmd: cmd, max_parallel: 2, plan_depth: 10 }
+    }
+
+    async fn all_run_rows(db: &superx_kernel::Db) -> Vec<(String, String, String)> {
+        // (task, status, valid_from) in insertion order.
+        let mut resp = db
+            .query("SELECT task, status, valid_from FROM run ORDER BY valid_from ASC")
+            .await
+            .expect("query");
+        let rows: Vec<superx_kernel::types::Value> = resp.take(0).expect("take");
+        rows.iter()
+            .filter_map(|r| match r {
+                superx_kernel::types::Value::Object(o) => Some((
+                    match o.get("task") { Some(superx_kernel::types::Value::String(s)) => s.clone(), _ => return None },
+                    match o.get("status") { Some(superx_kernel::types::Value::String(s)) => s.clone(), _ => return None },
+                    match o.get("valid_from") { Some(superx_kernel::types::Value::Datetime(d)) => d.to_string(), _ => return None },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chain_executes_in_order_with_writeback_and_version_pin() {
+        let edb = entities_db().await;
+        let rdb = fresh_db().await;
+        let kernel = superx_kernel::Kernel::from_db(rdb.clone());
+
+        let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
+        let t1 = nodes::create_entity(&edb, "task", "first", None, None).await.expect("t1");
+        let t2 = nodes::create_entity(&edb, "task", "second", None, None).await.expect("t2");
+        edges::link(&edb, &product, &t1, "contains").await.expect("c1");
+        edges::link(&edb, &product, &t2, "contains").await.expect("c2");
+        edges::link(&edb, &t2, &t1, "depends_on").await.expect("d");
+        let (instruct, _) = texts::set_role_text(&edb, &t1, "instructs", "do the first thing").await.expect("i");
+        let instruct_version = nodes::current_state(&edb, &instruct).await.expect("q").expect("s").valid_from;
+
+        let exchange = FixtureExchange::new(edb.clone(), product.clone());
+        let due = due_row(&rdb, &product).await;
+        let script = stub_script("echo \"did it\"");
+        let report = fire(&kernel, &rdb, &exchange, &config(Some(script)), &due).await.expect("fire");
+        assert_eq!((report.done, report.failed, report.cancelled), (2, 0, false));
+
+        // Dependency chronology: t1's done row precedes t2's dispatch.
+        let rows = all_run_rows(&rdb).await;
+        let t1_uuid = superx_ops::record_uuid(&t1);
+        let t2_uuid = superx_ops::record_uuid(&t2);
+        let t1_done = rows.iter().position(|(t, s, _)| *t == t1_uuid && s == "done").expect("t1 done");
+        let t2_dispatched = rows.iter().position(|(t, s, _)| *t == t2_uuid && s == "dispatched").expect("t2 dispatched");
+        assert!(t1_done < t2_dispatched, "{rows:?}");
+
+        // The instruct version rode the run chain (D27 pin).
+        let runs = run::current_runs(&rdb, None).await.expect("runs");
+        let t1_run = runs.iter().find(|r| r.task == t1_uuid).expect("t1 run");
+        assert_eq!(t1_run.status, "done");
+        assert_eq!(t1_run.instruct_version.as_deref(), Some(instruct_version.as_str()));
+        assert!(t1_run.output_ref.is_some());
+
+        // The result is IN THE GRAPH: task —produced→ text with output.
+        let produced = edges::expand(&edb, std::slice::from_ref(&t1), false)
+            .await
+            .expect("expand")
+            .into_iter()
+            .find(|e| e.rel_type == "produced" && e.active)
+            .expect("produced edge");
+        let text = nodes::current_state(&edb, &produced.to).await.expect("q").expect("s");
+        assert!(text.content.as_deref().unwrap_or("").contains("did it"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_wave_overlaps() {
+        let edb = entities_db().await;
+        let rdb = fresh_db().await;
+        let kernel = superx_kernel::Kernel::from_db(rdb.clone());
+
+        let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
+        for name in ["a", "b"] {
+            let t = nodes::create_entity(&edb, "task", name, None, None).await.expect("t");
+            edges::link(&edb, &product, &t, "contains").await.expect("c");
+        }
+        let log = std::env::temp_dir().join(format!("sx-log-{}", uuid::Uuid::now_v7()));
+        let script = stub_script(&format!(
+            "echo S >> {log}\nsleep 0.4\necho E >> {log}\necho out",
+            log = log.to_string_lossy()
+        ));
+        let exchange = FixtureExchange::new(edb.clone(), product.clone());
+        let due = due_row(&rdb, &product).await;
+        let report = fire(&kernel, &rdb, &exchange, &config(Some(script)), &due).await.expect("fire");
+        assert_eq!(report.done, 2);
+
+        let marks = std::fs::read_to_string(&log).expect("log");
+        let seq: Vec<&str> = marks.lines().collect();
+        assert_eq!(seq.len(), 4, "{seq:?}");
+        assert_eq!(seq[0], "S");
+        assert_eq!(seq[1], "S", "both started before either ended (parallel): {seq:?}");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failure_blocks_dependents() {
+        let edb = entities_db().await;
+        let rdb = fresh_db().await;
+        let kernel = superx_kernel::Kernel::from_db(rdb.clone());
+
+        let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
+        let t1 = nodes::create_entity(&edb, "task", "breaks", None, None).await.expect("t1");
+        let t2 = nodes::create_entity(&edb, "task", "after", None, None).await.expect("t2");
+        edges::link(&edb, &product, &t1, "contains").await.expect("c1");
+        edges::link(&edb, &product, &t2, "contains").await.expect("c2");
+        edges::link(&edb, &t2, &t1, "depends_on").await.expect("d");
+
+        let script = stub_script("echo boom >&2\nexit 1");
+        let exchange = FixtureExchange::new(edb.clone(), product.clone());
+        let due = due_row(&rdb, &product).await;
+        let report = fire(&kernel, &rdb, &exchange, &config(Some(script)), &due).await.expect("fire");
+        assert_eq!((report.done, report.failed), (0, 1));
+
+        let runs = run::current_runs(&rdb, None).await.expect("runs");
+        assert_eq!(runs.len(), 1, "the dependent never dispatched: {runs:?}");
+        assert_eq!(runs[0].status, "failed");
+        let detail = runs[0].detail.as_deref().unwrap_or("");
+        assert!(detail.contains("exit") && detail.contains("boom"), "{detail}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unset_agent_cmd_fails_loudly() {
+        let edb = entities_db().await;
+        let rdb = fresh_db().await;
+        let kernel = superx_kernel::Kernel::from_db(rdb.clone());
+        let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
+        let t = nodes::create_entity(&edb, "task", "t", None, None).await.expect("t");
+        edges::link(&edb, &product, &t, "contains").await.expect("c");
+
+        let exchange = FixtureExchange::new(edb.clone(), product.clone());
+        let due = due_row(&rdb, &product).await;
+        let report = fire(&kernel, &rdb, &exchange, &config(None), &due).await.expect("fire");
+        assert_eq!(report.failed, 1);
+        let runs = run::current_runs(&rdb, None).await.expect("runs");
+        assert_eq!(runs[0].detail.as_deref(), Some(UNSET_CMD_DETAIL));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_between_waves_stops_dispatch() {
+        let edb = entities_db().await;
+        let rdb = fresh_db().await;
+        let kernel = superx_kernel::Kernel::from_db(rdb.clone());
+        let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
+        let t1 = nodes::create_entity(&edb, "task", "slow", None, None).await.expect("t1");
+        let t2 = nodes::create_entity(&edb, "task", "never", None, None).await.expect("t2");
+        edges::link(&edb, &product, &t1, "contains").await.expect("c1");
+        edges::link(&edb, &product, &t2, "contains").await.expect("c2");
+        edges::link(&edb, &t2, &t1, "depends_on").await.expect("d");
+
+        let script = stub_script("sleep 0.4\necho out");
+        let exchange = FixtureExchange::new(edb.clone(), product.clone());
+        let due = due_row(&rdb, &product).await;
+
+        // Cancel while wave 1 is in flight.
+        let rdb2 = rdb.clone();
+        let uid = due.uid.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            schedule::cancel_schedule(&rdb2, &uid).await.expect("cancel");
+        });
+        let report = fire(&kernel, &rdb, &exchange, &config(Some(script)), &due).await.expect("fire");
+        canceller.await.expect("join");
+
+        assert!(report.cancelled);
+        assert_eq!(report.done, 1, "in-flight task finishes and records (D27)");
+        let runs = run::current_runs(&rdb, None).await.expect("runs");
+        assert_eq!(runs.len(), 1, "wave 2 never dispatched: {runs:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn instruct_edit_between_waves_pins_new_version() {
+        let edb = entities_db().await;
+        let rdb = fresh_db().await;
+        let kernel = superx_kernel::Kernel::from_db(rdb.clone());
+        let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
+        let t1 = nodes::create_entity(&edb, "task", "one", None, None).await.expect("t1");
+        let t2 = nodes::create_entity(&edb, "task", "two", None, None).await.expect("t2");
+        edges::link(&edb, &product, &t1, "contains").await.expect("c1");
+        edges::link(&edb, &product, &t2, "contains").await.expect("c2");
+        edges::link(&edb, &t2, &t1, "depends_on").await.expect("d");
+        let (i2, _) = texts::set_role_text(&edb, &t2, "instructs", "old orders").await.expect("i2");
+        let old_version = nodes::current_state(&edb, &i2).await.expect("q").expect("s").valid_from;
+
+        let mut exchange = FixtureExchange::new(edb.clone(), product.clone());
+        exchange.instruct_edit = Some((t2.clone(), "NEW orders".to_string()));
+        let script = stub_script("echo out");
+        let due = due_row(&rdb, &product).await;
+        let report = fire(&kernel, &rdb, &exchange, &config(Some(script)), &due).await.expect("fire");
+        assert_eq!(report.done, 2);
+
+        let runs = run::current_runs(&rdb, None).await.expect("runs");
+        let t2_run = runs.iter().find(|r| r.task == superx_ops::record_uuid(&t2)).expect("t2");
+        let pinned = t2_run.instruct_version.as_deref().expect("pinned");
+        assert_ne!(pinned, old_version, "the run pins the CURRENT instruct version (D27)");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recurrence_re_enqueues_and_cancel_stops_it() {
+        let edb = entities_db().await;
+        let rdb = fresh_db().await;
+        let kernel = superx_kernel::Kernel::from_db(rdb.clone());
+        let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
+
+        let uid = schedule::create_schedule(&rdb, &superx_ops::record_uuid(&product), chrono::Utc::now(), "every:2s")
+            .await
+            .expect("schedule");
+        let due = schedule::chain_current(&rdb, &uid).await.expect("q").expect("row");
+        let exchange = FixtureExchange::new(edb.clone(), product.clone());
+        fire(&kernel, &rdb, &exchange, &config(None), &due).await.expect("fire");
+
+        superx_mod_runner::recurrence::re_enqueue(&kernel, &rdb, &due).await;
+        let current = schedule::chain_current(&rdb, &uid).await.expect("q").expect("row");
+        assert_eq!(current.status, "scheduled", "re-enqueued");
+        let history = schedule::schedule_history(&rdb, &uid).await.expect("h");
+        assert_eq!(
+            history.iter().map(|r| r.status.as_str()).collect::<Vec<_>>(),
+            vec!["scheduled", "fired", "scheduled"],
+            "the chain IS the perpetual history"
+        );
+
+        schedule::cancel_schedule(&rdb, &uid).await.expect("cancel");
+        superx_mod_runner::recurrence::re_enqueue(&kernel, &rdb, &due).await;
+        let current = schedule::chain_current(&rdb, &uid).await.expect("q").expect("row");
+        assert_eq!(current.status, "cancelled", "cancel beats recurrence");
+
+        // 'none' rests at fired.
+        let uid2 = schedule::create_schedule(&rdb, "e", chrono::Utc::now(), "none").await.expect("s2");
+        let due2 = schedule::chain_current(&rdb, &uid2).await.expect("q").expect("row");
+        schedule::append_status(&rdb, &due2, "fired").await.expect("fired");
+        superx_mod_runner::recurrence::re_enqueue(&kernel, &rdb, &due2).await;
+        let current = schedule::chain_current(&rdb, &uid2).await.expect("q").expect("row");
+        assert_eq!(current.status, "fired");
+    }
+}

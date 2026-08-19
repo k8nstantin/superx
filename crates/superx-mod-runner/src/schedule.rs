@@ -86,7 +86,7 @@ pub async fn cancel_schedule(db: &Db, uid: &str) -> Result<()> {
             "schedule {uid} is already cancelled"
         )));
     }
-    insert_row(db, uid, &current.entity, &current.run_at, &current.recurrence, "cancelled").await
+    append_status(db, &current, "cancelled").await
 }
 
 async fn insert_row(
@@ -111,6 +111,16 @@ async fn insert_row(
     .await?
     .check()?;
     Ok(())
+}
+
+/// Append a status row on an existing chain, carrying the intent
+/// fields forward (fired/cancelled transitions).
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn append_status(db: &Db, current: &ScheduleRow, status: &str) -> Result<()> {
+    insert_row(db, &current.uid, &current.entity, &current.run_at, &current.recurrence, status).await
 }
 
 /// Chain-current rows across ALL schedules (latest per uid), soonest

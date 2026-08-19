@@ -12,7 +12,8 @@ const USAGE: &str = "usage: superx runner <command>\n\
   queue                        chain-current schedules, soonest first\n\
   cancel <schedule-fragment>\n\
   plan <entity-fragment>       DRY RUN: the execution waves the graph implies\n\
-(the executor loop lands in R3 #193; recurrence firing in R4 #194)";
+  runs [<schedule-fragment>]   firing history: task · status · versions\n\
+set attr_runner_agent_cmd (substrate parameter) to enable dispatch — unset refuses loudly";
 
 /// Route a `superx runner …` invocation.
 ///
@@ -26,6 +27,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("queue") => queue_cmd(kernel).await,
         Some("cancel") => cancel_cmd(kernel, &args[1..]).await,
         Some("plan") => plan_cmd(kernel, &args[1..]).await,
+        Some("runs") => runs_cmd(kernel, &args[1..]).await,
         _ => Err(KernelError::Module(USAGE.to_string())),
     }
 }
@@ -121,6 +123,31 @@ async fn plan_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let graph = crate::plan::fetch_graph(kernel, fragment, depth).await?;
     let plan = crate::plan::compute_waves(&graph)?;
     Ok(crate::plan::render_plan(&plan))
+}
+
+async fn runs_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let schedule_uid = match args.first() {
+        Some(fragment) => Some(crate::schedule::resolve_schedule(&db, fragment).await?),
+        None => None,
+    };
+    let rows = crate::run::current_runs(&db, schedule_uid.as_deref()).await?;
+    if rows.is_empty() {
+        return Ok("no runs yet\n".to_string());
+    }
+    let mut out = format!("runs ({}):\n", rows.len());
+    for r in rows {
+        out.push_str(&format!(
+            "  {}  firing {}  task {}  {}{}{}\n",
+            r.valid_from,
+            &r.firing[..r.firing.len().min(13)],
+            &r.task[..r.task.len().min(13)],
+            r.status,
+            r.output_ref.map(|o| format!("  → {o}")).unwrap_or_default(),
+            r.detail.map(|d| format!("  ({d})")).unwrap_or_default(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Resolve an entity fragment to (uuid, name) through the entities
