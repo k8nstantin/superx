@@ -13,7 +13,11 @@ SuperX is an **agentic operating system** written in Rust.
 - **SurrealDB is the OS's filesystem.** Every fact the OS knows —
   agents, telemetry, state, configuration, the module registry itself —
   lives in the substrate. If it isn't in SurrealDB, the OS doesn't know
-  it. No sidecar config files, no in-memory-only state that matters.
+  it. No sidecar config files, no in-memory-only state that matters —
+  with one deliberately narrow bootstrap-scope exception (D12/D16):
+  what must be known BEFORE the substrate is reachable lives in the
+  `<home>/{params,logs,db}` instance layout (`params/superx.json`,
+  the credentials file, the pidfile, the logs).
 - **Telemetry capture is the kernel's core capability.** From the moment
   the OS boots, it captures all telemetry emitted by every agent on the
   system. This is not a module, not an option, not a plugin — it is
@@ -41,12 +45,15 @@ SuperX is an **agentic operating system** written in Rust.
    2026-08-07 — no per-agent grant gate; OS-level file prompts are the
    permission surface).
 4. **CLI** — the operator interface: `--initialize` (one-command
-   provisioning: prompt for the instance password, create the
-   database + schema, boot, capture — idempotent per instance),
-   `boot`, `status`, `agents`, `actions [--live]` (the telemetry
-   stream), `sessions` (list conversations), `read <session>
-   [--live]` (render a conversation, historical then follow). The CLI
-   is part of the kernel deliverable, not an app bolted on later.
+   provisioning + background boot, idempotent per instance; the
+   terminal returns), `stop` / `status` (background-OS lifecycle,
+   pidfile-backed), `agents`, `actions [--agent] [--live]` (the
+   telemetry stream), `sessions` (list conversations), `read
+   <session-fragment> [--live]` (render a conversation, historical
+   then follow), `logs [--follow] [--daemon]` (the OS's own log).
+   `boot` remains as the foreground debug mode. All bootstrap config
+   resolves flag > env > `params/superx.json` > fallback. The CLI is
+   part of the kernel deliverable, not an app bolted on later.
 5. **Module system** — modules register with the kernel, declare
    dependencies, and get lifecycle management (starting / active /
    failed / skipped). The registry lives in the substrate like
