@@ -1,0 +1,11 @@
+[package]
+name = "superx-ops"
+description = "SuperX shared operations: command runners, renderers, and instance utilities consumed by the CLI and by modules (e.g. the UI) — kernel-only dependencies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+superx-kernel = { path = "../superx-kernel" }

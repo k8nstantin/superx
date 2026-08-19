@@ -3603,6 +3603,7 @@ dependencies = [
  "serde_json",
  "superx-kernel",
  "superx-mod-hello",
+ "superx-ops",
  "surrealdb",
  "tempfile",
  "tokio",
@@ -3639,6 +3640,14 @@ dependencies = [
  "surrealdb",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "superx-ops"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "superx-kernel",
 ]
 
 [[package]]
