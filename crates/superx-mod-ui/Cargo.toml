@@ -12,6 +12,8 @@ async-stream = "0.3"
 axum.workspace = true
 futures-core = "0.3"
 linkme.workspace = true
+mime_guess = "2"
+rust-embed = "8"
 serde.workspace = true
 serde_json.workspace = true
 superx-kernel = { path = "../superx-kernel" }
