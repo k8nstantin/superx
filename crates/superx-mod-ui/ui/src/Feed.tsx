@@ -61,7 +61,7 @@ const SESSION_COLORS = [
   '#c98500', // ochre
   '#d55181', // magenta
   '#008300', // green
-  '#9085e9', // violet
+  '#CC66FF', // violet — brand accent-bright
   '#e66767', // red
 ] as const
 

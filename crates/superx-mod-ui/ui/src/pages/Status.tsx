@@ -3,7 +3,7 @@ import { AreaChart, BarChart, DonutChart } from '@mantine/charts'
 import { Card, Grid, Group, Table, Text, Title, Badge, SimpleGrid } from '@mantine/core'
 import { fetchCharts, fetchStatus } from '../api'
 
-const AGENT_COLORS = ['indigo.6', 'teal.6', 'orange.6', 'grape.6', 'cyan.6']
+const AGENT_COLORS = ['pelican.3', 'pelican.5', 'teal.5', 'orange.5', 'cyan.5']
 
 export default function StatusPage() {
   const status = useQuery({ queryKey: ['status'], queryFn: fetchStatus, refetchInterval: 5000 })
@@ -32,7 +32,7 @@ export default function StatusPage() {
               h={180}
               data={c?.events_per_minute ?? []}
               dataKey="t"
-              series={[{ name: 'value', label: 'events', color: 'indigo.6' }]}
+              series={[{ name: 'value', label: 'events', color: 'pelican.4' }]}
               withDots={false}
             />
           </Card>
@@ -62,7 +62,7 @@ export default function StatusPage() {
               h={180}
               data={(c?.message_roles ?? []).map((r) => ({ role: r.name, count: Number(r.value) }))}
               dataKey="role"
-              series={[{ name: 'count', color: 'teal.6' }]}
+              series={[{ name: 'count', color: 'pelican.3' }]}
             />
           </Card>
         </Grid.Col>
