@@ -97,13 +97,22 @@ function identityOf(e: SseEvent, d: Directory): { label: string; key: string } |
   return null // a global OS event — no session
 }
 
-const roleColor = (role: string | null) =>
-  role === 'user' ? 'teal' : role === 'assistant' ? 'indigo' : 'gray'
-
 // The label a row wears — the same string its badge shows, and the
 // vocabulary of the filter chips (operator directive: filter by the
 // labels actually visible — user, assistant, tool, action, …).
 const rowLabel = (r: SseEvent) => (r.kind === 'message' ? (r.role ?? 'message') : 'action')
+
+// ONE fixed color per label, solid, identical in every view (issue
+// #204): the operator picks these once and they never vary. Unknown
+// roles fall back to gray.
+const LABEL_COLORS: Record<string, string> = {
+  user: 'green',
+  assistant: 'blue',
+  tool: 'orange',
+  action: 'gray',
+  system: 'gray',
+}
+const labelColor = (label: string) => LABEL_COLORS[label] ?? 'gray'
 
 export function Feed({
   header,
@@ -207,8 +216,9 @@ export function Feed({
               <Badge
                 size="xs"
                 mr={4}
-                variant={r.kind === 'action' ? 'outline' : 'light'}
-                color={r.kind === 'message' ? roleColor(r.role) : 'indigo'}
+                variant="filled"
+                autoContrast
+                color={labelColor(rowLabel(r))}
               >
                 {rowLabel(r)}
               </Badge>
