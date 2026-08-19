@@ -170,6 +170,32 @@ impl Kernel {
         Ok(rows)
     }
 
+    /// The timestamp of a session's most recent message — the
+    /// liveness signal behind the UI's session dots (issue #162).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::KernelError::Db`] for engine errors.
+    pub async fn session_last_activity(
+        &self,
+        session: RecordId,
+    ) -> Result<Option<DateTime<Utc>>> {
+        #[derive(SurrealValue)]
+        struct Row {
+            valid_from: DateTime<Utc>,
+        }
+        let rows: Vec<Row> = self
+            .db()
+            .query(
+                "SELECT valid_from FROM message WHERE session = $sess \
+                 ORDER BY valid_from DESC LIMIT 1",
+            )
+            .bind(("sess", session))
+            .await?
+            .take(0)?;
+        Ok(rows.into_iter().next().map(|r| r.valid_from))
+    }
+
     /// Count of message rows per session for a list of sessions —
     /// cheap enough for the `superx sessions` listing.
     ///

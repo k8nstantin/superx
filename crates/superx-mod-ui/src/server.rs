@@ -262,6 +262,12 @@ async fn api_sessions(
             .session_message_count(s.entity_id.clone())
             .await
             .unwrap_or(0);
+        let last_active = kernel
+            .session_last_activity(s.entity_id.clone())
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.to_rfc3339());
         let uuid = superx_ops::record_uuid(&s.entity_id);
         out.push(SessionView {
             identity: format!("{agent}/{uuid}"),
@@ -269,6 +275,7 @@ async fn api_sessions(
             agent,
             src,
             messages: count,
+            last_active,
         });
     }
     Json(out)
