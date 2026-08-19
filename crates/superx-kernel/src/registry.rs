@@ -11,6 +11,8 @@ use linkme::distributed_slice;
 use serde::{Deserialize, Serialize};
 use surrealdb::types::{Array, Object, RecordId, SurrealValue, Value};
 
+use chrono::{DateTime, Utc};
+
 use crate::error::Result;
 use crate::metamodel::MetamodelType;
 use crate::substrate::Kernel;
@@ -170,6 +172,19 @@ pub struct RegistryStatus {
     pub lifecycle: crate::lifecycle::LifecycleState,
 }
 
+/// One row of the module registration ledger (`module` table, schema
+/// v2.2): SuperX's first-class record of every module.
+#[derive(Debug, Clone, SurrealValue)]
+pub struct ModuleRecord {
+    pub id: RecordId,
+    pub uid: String,
+    pub entity: RecordId,
+    pub kind: String,
+    pub version: String,
+    pub provisioned: bool,
+    pub valid_from: DateTime<Utc>,
+}
+
 /// Enabled / disabled flag persisted on `attr_module_status`. Distinct
 /// from lifecycle — status is the operator's intent, lifecycle is the
 /// runtime reality.
@@ -216,7 +231,76 @@ impl Kernel {
             }
         };
         self.write_descriptor(entity_id.clone(), descriptor).await?;
+        // v2.2: append to the module registration ledger, carrying the
+        // prior provisioned fact forward (registration never
+        // un-provisions).
+        let provisioned = self
+            .latest_module_record(descriptor.name)
+            .await?
+            .map(|r| r.provisioned)
+            .unwrap_or(false);
+        self.append_module_record(descriptor, entity_id.clone(), provisioned)
+            .await?;
         Ok(entity_id)
+    }
+
+    /// Append one row to the module registration ledger (`module`
+    /// table). Called on every registration and on provisioning
+    /// changes — append-only, current = latest per uid.
+    pub async fn append_module_record(
+        &self,
+        descriptor: &KernelModuleDescriptor,
+        entity: RecordId,
+        provisioned: bool,
+    ) -> Result<RecordId> {
+        let id = self.new_record_id("module");
+        let row = ModuleLedgerRow {
+            uid: descriptor.name.to_string(),
+            entity,
+            kind: descriptor.kind.as_str().to_string(),
+            version: descriptor.version.to_string(),
+            provisioned,
+            valid_from: Utc::now(),
+        };
+        let _: Option<ModuleLedgerRow> = self.db().create(id.clone()).content(row).await?;
+        Ok(id)
+    }
+
+    /// The latest ledger row for a module uid, if any.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::KernelError::Db`] for engine errors.
+    pub async fn latest_module_record(&self, uid: &str) -> Result<Option<ModuleRecord>> {
+        let rows: Vec<ModuleRecord> = self
+            .db()
+            .query(
+                "SELECT * FROM module WHERE uid = $uid \
+                 ORDER BY valid_from DESC LIMIT 1",
+            )
+            .bind(("uid", uid.to_string()))
+            .await?
+            .take(0)?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// A module's full ledger history, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::KernelError::Db`] for engine errors.
+    pub async fn module_history(&self, uid: &str, limit: u32) -> Result<Vec<ModuleRecord>> {
+        let rows: Vec<ModuleRecord> = self
+            .db()
+            .query(
+                "SELECT * FROM module WHERE uid = $uid \
+                 ORDER BY valid_from ASC LIMIT $limit",
+            )
+            .bind(("uid", uid.to_string()))
+            .bind(("limit", limit))
+            .await?
+            .take(0)?;
+        Ok(rows)
     }
 
     /// List every registered module/adapter of the given kind with
@@ -406,4 +490,14 @@ impl Kernel {
             lifecycle,
         }))
     }
+}
+
+#[derive(Debug, SurrealValue)]
+struct ModuleLedgerRow {
+    uid: String,
+    entity: RecordId,
+    kind: String,
+    version: String,
+    provisioned: bool,
+    valid_from: DateTime<Utc>,
 }

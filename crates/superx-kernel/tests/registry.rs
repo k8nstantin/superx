@@ -106,3 +106,41 @@ async fn set_module_status_roundtrip_and_not_found() -> Result<(), Box<dyn Error
     assert!(err.to_string().contains("not found"));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_ledger_tracks_registrations_and_provisioning() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let desc = descriptor("ledgered", "0.1.0");
+
+    // First registration → one ledger row, unprovisioned.
+    let entity = kernel.register_module(&desc).await?;
+    let first = kernel
+        .latest_module_record("ledgered")
+        .await?
+        .expect("ledger row after registration");
+    assert_eq!(first.uid, "ledgered");
+    assert_eq!(first.entity, entity);
+    assert_eq!(first.kind, "kernel_module");
+    assert!(!first.provisioned);
+
+    // Provisioning fact appends a provisioned=true row.
+    kernel
+        .append_module_record(&desc, entity.clone(), true)
+        .await?;
+    assert!(kernel
+        .latest_module_record("ledgered")
+        .await?
+        .expect("row")
+        .provisioned);
+
+    // Re-registration (a reboot) carries the provisioned fact forward
+    // and preserves history append-only.
+    let v2 = descriptor("ledgered", "0.2.0");
+    kernel.register_module(&v2).await?;
+    let latest = kernel.latest_module_record("ledgered").await?.expect("row");
+    assert!(latest.provisioned, "registration never un-provisions");
+    assert_eq!(latest.version, "0.2.0", "version tracks the binary");
+    let history = kernel.module_history("ledgered", 10).await?;
+    assert_eq!(history.len(), 3, "every change is a row: register, provision, re-register");
+    Ok(())
+}
