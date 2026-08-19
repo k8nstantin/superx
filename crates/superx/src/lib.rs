@@ -87,6 +87,12 @@ pub enum Command {
     /// Restart the background OS: stop (if running), then start —
     /// one command to pick up a freshly built binary.
     Restart,
+    /// Manage modules: list, enable, disable (live effect on the
+    /// running OS within one capture tick).
+    Modules {
+        #[command(subcommand)]
+        action: ModulesAction,
+    },
     /// Show the OS's own log (the self-log; --daemon for the
     /// background process output).
     Logs {
@@ -132,6 +138,16 @@ pub enum Command {
         #[arg(long)]
         live: bool,
     },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum ModulesAction {
+    /// Compiled-in inventory × substrate state.
+    List,
+    /// Enable a module (starts/resumes within one tick on a running OS).
+    Enable { name: String },
+    /// Disable a module (pauses/stops within one tick on a running OS).
+    Disable { name: String },
 }
 
 /// Connect + signin with an actionable hint on auth refusal. The
@@ -267,6 +283,74 @@ pub async fn run_stop(data_dir: &std::path::Path) -> Result<String, String> {
     }
     Err(format!(
         "OS (pid {pid}) is still shutting down — check `superx status` shortly"
+    ))
+}
+
+/// `superx modules list` body: the compiled-in inventory joined with
+/// substrate state (operator intent + lifecycle).
+pub async fn run_modules_list(kernel: &Kernel) -> Result<String, String> {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<26} {:<14} {:<9} {:<9} {}\n",
+        "MODULE", "KIND", "INTENT", "LIFECYCLE", "VERSION"
+    ));
+    for module in superx_kernel::KERNEL_MODULES {
+        let desc = module.descriptor();
+        let (intent, lifecycle) = match kernel.detailed_status(desc.kind, desc.name).await {
+            Ok(Some(status)) => {
+                let intent = match kernel
+                    .module_status(desc.kind, desc.name)
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(superx_kernel::ModuleStatus::Disabled) => "disabled",
+                    _ => "enabled",
+                };
+                (intent, status.lifecycle.short_tag().to_string())
+            }
+            _ => ("enabled", "never-booted".to_string()),
+        };
+        out.push_str(&format!(
+            "{:<26} {:<14} {:<9} {:<9} v{}\n",
+            desc.name,
+            desc.kind.type_uid().trim_start_matches("node_"),
+            intent,
+            lifecycle,
+            desc.version
+        ));
+    }
+    Ok(out)
+}
+
+/// `superx modules enable|disable` body. Resolves the module in the
+/// compiled-in inventory (so typos fail fast), writes intent, reports
+/// when it takes effect.
+pub async fn run_modules_set(
+    kernel: &Kernel,
+    name: &str,
+    enable: bool,
+) -> Result<String, String> {
+    let Some(desc) = superx_kernel::KERNEL_MODULES
+        .iter()
+        .map(|m| m.descriptor())
+        .find(|d| d.name == name)
+    else {
+        return Err(format!(
+            "no compiled-in module named '{name}' — see `superx modules list`"
+        ));
+    };
+    let status = if enable {
+        superx_kernel::ModuleStatus::Enabled
+    } else {
+        superx_kernel::ModuleStatus::Disabled
+    };
+    kernel
+        .set_module_status(desc.kind, name, status)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{name} {} — takes effect on the running OS within one capture tick\n",
+        if enable { "enabled" } else { "disabled" }
     ))
 }
 

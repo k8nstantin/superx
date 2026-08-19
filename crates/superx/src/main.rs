@@ -119,6 +119,19 @@ async fn run(cli: Cli, config: Config) -> Result<(), String> {
             superx::emit(&superx::run_status(&kernel, &config.data_dir).await?);
             Ok(())
         }
+        Command::Modules { action } => {
+            let text = match action {
+                superx::ModulesAction::List => superx::run_modules_list(&kernel).await?,
+                superx::ModulesAction::Enable { name } => {
+                    superx::run_modules_set(&kernel, &name, true).await?
+                }
+                superx::ModulesAction::Disable { name } => {
+                    superx::run_modules_set(&kernel, &name, false).await?
+                }
+            };
+            superx::emit(&text);
+            Ok(())
+        }
         Command::Agents => {
             superx::emit(&superx::run_agents(&kernel).await?);
             Ok(())

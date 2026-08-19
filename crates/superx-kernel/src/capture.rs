@@ -23,7 +23,7 @@ use linkme::distributed_slice;
 use surrealdb::types::{Object, RecordId, Value};
 
 use crate::error::Result;
-use crate::registry::{KernelModule, KernelModuleDescriptor, NodeKind, KERNEL_MODULES};
+use crate::registry::{KernelModule, KernelModuleDescriptor, ModuleStatus, NodeKind, KERNEL_MODULES};
 use crate::substrate::Kernel;
 
 /// Capture-loop interval parameter (seconds), on the capture module's
@@ -307,6 +307,12 @@ pub async fn capture_tick(
             tracing::info!("shutdown requested — stopping mid-pass");
             break;
         }
+        // Operator disable is honored mid-pass too — a long backfill
+        // must not outrun intent (issue #142).
+        if !module_enabled(kernel, NodeKind::KernelModule, MODULE_NAME).await? {
+            tracing::info!("capture disabled by operator — stopping mid-pass");
+            break;
+        }
         let adapter = ADAPTERS[*adapter_idx];
         match adapter.poll(kernel, source).await {
             Ok(n) => {
@@ -341,13 +347,24 @@ pub async fn capture_tick(
     Ok(report)
 }
 
+/// Is a module currently enabled by operator intent? Unregistered or
+/// never-written status counts as enabled (installed = enabled).
+pub async fn module_enabled(kernel: &Kernel, kind: NodeKind, name: &str) -> Result<bool> {
+    Ok(kernel.module_status(kind, name).await? != Some(ModuleStatus::Disabled))
+}
+
 /// Pair every discovered source with its adapter's index in
 /// [`ADAPTERS`] (sources are matched to adapters by descriptor
 /// `adapter` name at discovery time; this keeps the pairing explicit
-/// and testable).
+/// and testable). Adapters the operator has DISABLED are skipped —
+/// enable/disable takes live effect here, one tick after the write
+/// (issue #142).
 pub async fn discover_paired(kernel: &Kernel) -> Result<Vec<(usize, SourceRef)>> {
     let mut out = Vec::new();
     for (idx, adapter) in ADAPTERS.iter().enumerate() {
+        if !module_enabled(kernel, NodeKind::Adapter, adapter.name()).await? {
+            continue;
+        }
         if let Ok(sources) = discover_one(kernel, *adapter).await {
             for s in sources {
                 out.push((idx, s));
@@ -367,13 +384,36 @@ pub async fn run_loop(
 ) -> Result<()> {
     let interval = poll_interval_secs(kernel).await?;
     tracing::info!(interval_secs = interval, "capture loop starting");
+    let mut was_enabled = true;
     loop {
         if *shutdown.borrow() {
             tracing::info!("capture loop shutting down");
             return Ok(());
         }
-        let sources = discover_paired(kernel).await?;
-        let report = capture_tick(kernel, &sources, Some(&shutdown)).await?;
+        // Operator intent, honored live: a disabled capture module
+        // pauses the whole engine (lifecycle + telemetry record the
+        // transition); re-enabling resumes on the next tick.
+        let enabled = module_enabled(kernel, NodeKind::KernelModule, MODULE_NAME).await?;
+        if enabled != was_enabled {
+            if enabled {
+                tracing::info!("capture resumed by operator");
+                kernel
+                    .mark_active(NodeKind::KernelModule, MODULE_NAME, 0)
+                    .await?;
+            } else {
+                tracing::info!("capture paused by operator");
+                kernel
+                    .mark_disabled(NodeKind::KernelModule, MODULE_NAME)
+                    .await?;
+            }
+            was_enabled = enabled;
+        }
+        let report = if enabled {
+            let sources = discover_paired(kernel).await?;
+            capture_tick(kernel, &sources, Some(&shutdown)).await?
+        } else {
+            TickReport::default()
+        };
         if report.total() > 0 {
             tracing::info!(events = report.total(), "capture tick");
         }
