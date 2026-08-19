@@ -146,3 +146,57 @@ async fn actions_renders_and_filters_by_agent() -> Result<(), Box<dyn Error>> {
     assert!(missing.is_err(), "unknown agent errors with guidance");
     Ok(())
 }
+
+#[test]
+fn no_text_events_render_tool_summaries() {
+    // Claude Code shape: assistant tool_use block with a description.
+    let raw = superx_kernel::message::json_to_object(&serde_json::json!({
+        "message": {"content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "git push", "description": "Commit and push G3"}},
+            {"type": "thinking", "thinking": "hmm"}
+        ]}
+    }));
+    let m = fake_message("assistant", "", Some(raw));
+    let line = superx::render_message(&m);
+    assert!(line.contains("⚙ Bash — Commit and push G3"), "{line}");
+    assert!(line.contains("… thinking"), "{line}");
+    assert!(!line.contains("no text"), "{line}");
+
+    // Gemini shape: top-level toolCalls with status.
+    let raw = superx_kernel::message::json_to_object(&serde_json::json!({
+        "toolCalls": [{"name": "run_shell_command", "status": "success"}]
+    }));
+    let m = fake_message("assistant", "", Some(raw));
+    let line = superx::render_message(&m);
+    assert!(line.contains("⚙ run_shell_command [success]"), "{line}");
+
+    // Truly opaque rows keep the placeholder.
+    let m = fake_message("assistant", "", None);
+    assert!(superx::render_message(&m).contains("(no text — see raw)"));
+}
+
+fn fake_message(
+    role: &str,
+    content: &str,
+    raw: Option<superx_kernel::types::Object>,
+) -> superx_kernel::MessageRecord {
+    use superx_kernel::types::RecordId;
+    let id = RecordId::new("message", superx_kernel::types::Uuid::from(uuid_v7()));
+    let ent = |t: &'static str| RecordId::new(t, superx_kernel::types::Uuid::from(uuid_v7()));
+    superx_kernel::MessageRecord {
+        id,
+        session: ent("entity"),
+        agent: ent("entity"),
+        role: role.to_string(),
+        content: content.to_string(),
+        raw,
+        seq: None,
+        emitted_at: None,
+        valid_from: chrono::Utc::now(),
+    }
+}
+
+fn uuid_v7() -> uuid::Uuid {
+    uuid::Uuid::now_v7()
+}

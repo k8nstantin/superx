@@ -508,7 +508,9 @@ pub async fn live_poll_secs(kernel: &Kernel) -> u64 {
 // ─────────────────────────────────────────────────────────────────────
 
 /// `[hh:mm:ss] role: content` — multiline content indented under the
-/// role line; empty content shown as the raw kind marker.
+/// role line. Empty content renders a compact tool-call/thinking
+/// summary from the preserved raw event (issue #135); the placeholder
+/// remains only for truly opaque rows.
 #[must_use]
 pub fn render_message(m: &MessageRecord) -> String {
     let ts = m
@@ -516,11 +518,90 @@ pub fn render_message(m: &MessageRecord) -> String {
         .unwrap_or(m.valid_from)
         .format("%Y-%m-%d %H:%M:%S");
     let content = if m.content.is_empty() {
-        "(no text — see raw)".to_string()
+        m.raw
+            .as_ref()
+            .and_then(summarize_raw)
+            .unwrap_or_else(|| "(no text — see raw)".to_string())
     } else {
         m.content.replace('\n', "\n    ")
     };
     format!("[{ts}] {:>9}: {content}\n", m.role)
+}
+
+/// Compact summary of a no-text event from its raw payload: tool
+/// calls render as `⚙ name — hint`, thinking as `… thinking`.
+/// Understands both captured shapes: Anthropic-style
+/// `message.content[]` blocks (Claude Code) and top-level
+/// `toolCalls[]` (Gemini CLI). Returns `None` when nothing
+/// summarizable is present.
+#[must_use]
+pub fn summarize_raw(raw: &superx_kernel::types::Object) -> Option<String> {
+    const HINT_MAX: usize = 60; // skill-allow: §9-const — render truncation bound
+    const LINE_MAX: usize = 160; // skill-allow: §9-const — render truncation bound
+    let mut parts: Vec<String> = Vec::new();
+
+    let obj_str = |o: &superx_kernel::types::Object, key: &str| -> Option<String> {
+        match o.get(key) {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        }
+    };
+
+    // Anthropic-style blocks: raw.message.content[]
+    if let Some(Value::Object(msg)) = raw.get("message") {
+        if let Some(Value::Array(blocks)) = msg.get("content") {
+            for b in blocks.iter() {
+                let Value::Object(block) = b else { continue };
+                match block.get("type") {
+                    Some(Value::String(k)) if k == "tool_use" => {
+                        let name = obj_str(block, "name").unwrap_or_else(|| "tool".into());
+                        let hint = match block.get("input") {
+                            Some(Value::Object(input)) => [
+                                "description",
+                                "command",
+                                "file_path",
+                                "prompt",
+                                "pattern",
+                                "query",
+                            ]
+                            .iter()
+                            .find_map(|k| obj_str(input, k)),
+                            _ => None,
+                        };
+                        parts.push(match hint {
+                            Some(h) => format!("⚙ {name} — {}", elide(&h, HINT_MAX)),
+                            None => format!("⚙ {name}"),
+                        });
+                    }
+                    Some(Value::String(k)) if k == "thinking" => {
+                        parts.push("… thinking".to_string());
+                    }
+                    Some(Value::String(k)) if k == "tool_result" => {
+                        parts.push("⚙ result".to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Gemini-style: raw.toolCalls[]
+    if let Some(Value::Array(calls)) = raw.get("toolCalls") {
+        for c in calls.iter() {
+            let Value::Object(call) = c else { continue };
+            let name = obj_str(call, "name").unwrap_or_else(|| "tool".into());
+            match obj_str(call, "status") {
+                Some(s) => parts.push(format!("⚙ {name} [{s}]")),
+                None => parts.push(format!("⚙ {name}")),
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(elide(&parts.join("; "), LINE_MAX))
+    }
 }
 
 /// `[hh:mm:ss] event  key=val…` with a compact payload summary.
