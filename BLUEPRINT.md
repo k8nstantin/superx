@@ -135,6 +135,7 @@ gates.
 | G6 | CLI complete: `boot`, `status`, `agents`, `actions --live`, `sessions`, `read` — **FVP** | The demo sentence above, live |
 | G7+ | First modules: data fusion, graphify | Module seam proven |
 | **R1** | **v1.0.0 released** (2026-08-18): FVP + one-command background initialize + params file + logs | Tagged from `main`; operator-QA'd live |
+| **G7** | **Module framework + UI module shipped** (2026-08-19, epic #141): full facility contract (D17/D18), module ledger (v2.2), `superx-mod-hello` reference, `superx-mod-ui` dashboard (Status/Activity/Sessions/Console on Mantine), docs/MODULES.md | Every facility live-QA'd; contribution path documented |
 
 ## 7. Decisions record
 

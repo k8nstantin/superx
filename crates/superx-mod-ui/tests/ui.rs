@@ -60,5 +60,5 @@ fn descriptor_and_facilities() {
     let d = UiModule.descriptor();
     assert_eq!(d.name, MODULE_NAME);
     assert!(UiModule.needs_dir());
-    assert!(superx_mod_ui::PLACEHOLDER_HTML.contains("SuperX"));
+    assert!(UiModule.schema_ddl().is_some(), "owns data objects");
 }

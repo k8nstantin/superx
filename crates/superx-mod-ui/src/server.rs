@@ -18,6 +18,13 @@ use tokio::sync::broadcast;
 
 use crate::api::*;
 
+/// The built dashboard (Vite output). Debug builds read from disk
+/// (iterate with `npm run build` without recompiling Rust); release
+/// builds embed the files in the binary.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "ui/dist/"]
+struct Assets;
+
 /// Commands the UI may execute — the read surface only. Lifecycle
 /// (stop/restart) is deliberately excluded until UI v1.1
 /// (operator-decided): this server lives INSIDE the daemon.
@@ -43,7 +50,6 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         events: events.clone(),
     };
     let app = Router::new()
-        .route("/", get(index))
         .route("/api/status", get(api_status))
         .route("/api/agents", get(api_agents))
         .route("/api/sessions", get(api_sessions))
@@ -52,6 +58,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/charts/summary", get(api_charts))
         .route("/api/events", get(api_events))
         .route("/api/command", post(api_command))
+        .fallback(get(static_assets))
         .with_state(state);
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -116,8 +123,27 @@ async fn sse_poller(kernel: Kernel, tx: broadcast::Sender<String>) {
     }
 }
 
-async fn index() -> Html<&'static str> {
-    Html(crate::PLACEHOLDER_HTML)
+/// Serve the dashboard: exact asset when it exists, index.html as the
+/// SPA fallback for everything else.
+async fn static_assets(uri: axum::http::Uri) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    let serve = |name: &str| {
+        Assets::get(name).map(|f| {
+            let mime = mime_guess::from_path(name).first_or_octet_stream();
+            (
+                [(axum::http::header::CONTENT_TYPE, mime.to_string())],
+                f.data.into_owned(),
+            )
+                .into_response()
+        })
+    };
+    serve(path)
+        .or_else(|| serve("index.html"))
+        .unwrap_or_else(|| {
+            (StatusCode::NOT_FOUND, Html("dashboard not built — run npm run build in crates/superx-mod-ui/ui")).into_response()
+        })
 }
 
 async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {

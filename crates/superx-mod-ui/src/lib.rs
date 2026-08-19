@@ -30,9 +30,6 @@ pub const PORT_PARAM: &str = "attr_ui_port";
 /// Default port when the parameter is unset.
 pub const DEFAULT_PORT: u16 = 5150; // skill-allow: §9-const — bootstrap fallback, param-overridable
 
-/// The placeholder page (P4); replaced by the built dashboard in P6.
-pub const PLACEHOLDER_HTML: &str = include_str!("../ui/dist/index.html");
-
 /// The UI module's own schema (command history, preferences) —
 /// provisioned into `superx/ui` by `superx modules provision ui`.
 pub const SCHEMA_DDL: &str = include_str!("../schema/ui.surql");

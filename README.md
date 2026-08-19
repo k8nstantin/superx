@@ -41,6 +41,28 @@ release 2026-08-18; v1-era code preserved at
   captured raw, never dropped), kernel self-log, 56 tests, three
   CI-enforced gates.
 
+## The UI
+
+The OS serves its own dashboard — the first module on the module
+framework:
+
+```bash
+superx modules provision ui   # once: the UI's own database (command history…)
+superx ui url                 # → http://127.0.0.1:5150 (attr_ui_port parameter)
+```
+
+Open it: **Status** (stat cards, module table, live charts — events/min,
+per-agent activity, message roles, boot durations), **Activity** (every
+captured action + message streaming via SSE, filter + pause),
+**Sessions** (browse conversations, read historical + live), **Console**
+(run the read CLI commands from the browser; history persisted in the
+UI's own db). Dev flow: `npm run dev` in `crates/superx-mod-ui/ui`
+proxies `/api` to the running OS; `npm run build` + restart ships it.
+
+Modules are how SuperX grows — see [`docs/MODULES.md`](docs/MODULES.md)
+to contribute one (the framework supports several modules of the same
+kind side by side: your UI and a contributed one on different ports).
+
 ## Instance layout
 
 ```
