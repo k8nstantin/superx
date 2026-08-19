@@ -58,6 +58,11 @@ export function sessionIdentity(
 const roleColor = (role: string | null) =>
   role === 'user' ? 'teal' : role === 'assistant' ? 'indigo' : 'gray'
 
+// The label a row wears — the same string its badge shows, and the
+// vocabulary of the filter chips (operator directive: filter by the
+// labels actually visible — user, assistant, tool, action, …).
+const rowLabel = (r: SseEvent) => (r.kind === 'message' ? (r.role ?? 'message') : 'action')
+
 export function Feed({
   header,
   rows,
@@ -77,30 +82,35 @@ export function Feed({
   loading?: boolean
   error?: string | null
 }) {
-  const [kind, setKind] = useState<'all' | 'message' | 'action'>('all')
-  const visible = rows.filter((r) => kind === 'all' || r.kind === kind)
+  const [label, setLabel] = useState<string>('all')
+  // Chips are the DISTINCT labels present in the feed right now.
+  const labels = [...new Set(rows.map(rowLabel))].sort()
+  const visible = rows.filter((r) => label === 'all' || rowLabel(r) === label)
 
-  // Pinned-to-bottom auto-scroll: follow new rows unless the user has
-  // scrolled up; resume following when they return near the bottom.
+  // Pinned-to-bottom auto-scroll: a sentinel below the last row is
+  // scrolled into view on every change while following; the user
+  // scrolling up releases the pin, returning near the bottom restores
+  // it.
   const viewport = useRef<HTMLDivElement>(null)
+  const bottom = useRef<HTMLDivElement>(null)
   const following = useRef(true)
   useEffect(() => {
-    if (following.current && viewport.current) {
-      viewport.current.scrollTo({ top: viewport.current.scrollHeight })
+    if (following.current) {
+      bottom.current?.scrollIntoView({ block: 'end' })
     }
-  }, [visible.length])
+  }, [visible.length, loading])
 
   return (
     <Card withBorder>
       <Group justify="space-between" mb="xs">
         {header}
-        <Group>
-          {(['all', 'message', 'action'] as const).map((k) => (
+        <Group gap="xs">
+          {['all', ...labels].map((k) => (
             <Badge
               key={k}
-              variant={kind === k ? 'filled' : 'outline'}
+              variant={label === k ? 'filled' : 'outline'}
               style={{ cursor: 'pointer' }}
-              onClick={() => setKind(k)}
+              onClick={() => setLabel(k)}
             >
               {k}
             </Badge>
@@ -117,7 +127,7 @@ export function Feed({
         viewportRef={viewport}
         onScrollPositionChange={({ y }) => {
           const v = viewport.current
-          if (v) following.current = y + v.clientHeight >= v.scrollHeight - 40
+          if (v) following.current = y + v.clientHeight >= v.scrollHeight - 80
         }}
       >
         {loading && (
@@ -162,6 +172,7 @@ export function Feed({
             </Text>
           )
         })}
+        <div ref={bottom} />
       </ScrollArea>
     </Card>
   )
