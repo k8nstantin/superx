@@ -118,6 +118,7 @@ static KERNEL_CORE_REGISTRATION: &'static (dyn KernelModule + Sync) = &KernelCor
 /// [`BootEntry`] outcome.
 pub async fn boot(kernel: &Kernel) -> Result<BootReport> {
     tracing::info!("boot starting");
+    let boot_started = Instant::now();
 
     // 1. One system_boot event per REAL boot — the only place it is
     //    emitted; readers must not mutate the stream they observe.
@@ -344,15 +345,36 @@ pub async fn boot(kernel: &Kernel) -> Result<BootReport> {
                 .unwrap_or(LifecycleState::Enabled),
         });
     }
-    tracing::info!(
-        active = entries
-            .iter()
-            .filter(|e| matches!(e.outcome, LifecycleState::Active { .. }))
-            .count(),
-        total = entries.len(),
-        "boot complete"
-    );
-    Ok(BootReport { entries })
+    let report = BootReport { entries };
+    let active = report.active_count();
+    let total = report.entries.len();
+    let duration_ms =
+        i64::try_from(boot_started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    tracing::info!(active, total, duration_ms, "boot complete");
+
+    // The end-of-walk marker: `--initialize`/`start` wait for THIS
+    // (not system_boot, which marks the start) so the status summary
+    // never races the module walk (issue #139). Also the substrate's
+    // honest boot-duration record.
+    {
+        let mut payload = surrealdb::types::Object::new();
+        payload.insert(
+            "active".to_string(),
+            surrealdb::types::Value::Number((active as i64).into()),
+        );
+        payload.insert(
+            "total".to_string(),
+            surrealdb::types::Value::Number((total as i64).into()),
+        );
+        payload.insert(
+            "duration_ms".to_string(),
+            surrealdb::types::Value::Number(duration_ms.into()),
+        );
+        kernel
+            .log_telemetry("boot_complete", surrealdb::types::Value::Object(payload), None)
+            .await?;
+    }
+    Ok(report)
 }
 
 /// Run one module's `startup()` in its own task so a panic is caught

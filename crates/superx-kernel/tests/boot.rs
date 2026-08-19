@@ -138,14 +138,19 @@ async fn boot_isolates_failures_and_continues() -> Result<(), Box<dyn Error>> {
         LifecycleState::Disabled
     ));
 
-    // The boot emitted exactly one system_boot event.
-    let boots: usize = kernel
-        .recent_telemetry(200)
-        .await?
+    // The boot emitted exactly one system_boot (start marker) and one
+    // boot_complete (end-of-walk marker, with the duration record).
+    let recent = kernel.recent_telemetry(200).await?;
+    let count = |name: &str| recent.iter().filter(|e| e.lifecycle_event == name).count();
+    assert_eq!(count("system_boot"), 1, "one system_boot per real boot");
+    assert_eq!(count("boot_complete"), 1, "one boot_complete per real boot");
+    let done = recent
         .iter()
-        .filter(|e| e.lifecycle_event == "system_boot")
-        .count();
-    assert_eq!(boots, 1, "one system_boot per real boot");
+        .find(|e| e.lifecycle_event == "boot_complete")
+        .expect("boot_complete present");
+    let payload = format!("{:?}", done.payload);
+    assert!(payload.contains("active"), "{payload}");
+    assert!(payload.contains("duration_ms"), "{payload}");
     Ok(())
 }
 
