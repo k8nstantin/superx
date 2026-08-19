@@ -94,6 +94,31 @@ pub trait KernelModule: Send + Sync + 'static {
     async fn shutdown(&self, _kernel: &Kernel) -> Result<()> {
         Ok(())
     }
+
+    /// The module's own schema DDL, applied into its OWN database
+    /// (`superx/<name>`) by `superx modules provision <name>` — the
+    /// kernel schema stays locked (§7). `None` = the module owns no
+    /// data objects. The DDL may contain a
+    /// `$SUPERX_MODULE_PASSWORD` placeholder for its own service
+    /// account (`superx_mod_<name>`).
+    fn schema_ddl(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Does this module need its own instance directory
+    /// (`<home>/modules/<name>/`)? Created on boot when true.
+    fn needs_dir(&self) -> bool {
+        false
+    }
+
+    /// The module's own CLI: `superx <name> [args…]` routes here.
+    /// Default: the module has no CLI.
+    async fn cli(&self, _kernel: &Kernel, _args: &[String]) -> Result<String> {
+        Err(crate::error::KernelError::Module(format!(
+            "module '{}' has no CLI",
+            self.descriptor().name
+        )))
+    }
 }
 
 /// Compile-time inventory of every registered kernel module / adapter

@@ -92,9 +92,12 @@ these v1 mechanics were verified live and are carried forward as
 ## 4. What is retired
 
 - The 6-crate L0–L3 layering (kernel / kernel-modules / drivers / apps).
-  v2 starts as **one workspace, two crates**: `superx-kernel` (lib) and
+  v2 started as **one workspace, two crates**: `superx-kernel` (lib) and
   `superx` (bin, the CLI). Crates are extracted only when a module
-  graduates and proves the seam.
+  graduates and proves the seam — the first graduate is
+  `superx-mod-hello`, the reference module (epic #141): the template
+  contributors copy, exercising every facility of the module contract
+  (own schema/db, own dir, own log, own CLI).
 - The F-phase roadmap, the 2026-06 quality backlog, and all 20 open
   pre-reset GitHub issues (they reference retired concepts).
 - `ARCHITECTURE.md` (v42.15, 88 KB) — the historical vision document.

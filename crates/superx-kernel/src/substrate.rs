@@ -44,6 +44,13 @@ pub struct Kernel {
     /// already-connected handle). Recorded so boot telemetry can
     /// state where the substrate lives.
     endpoint: Option<String>,
+    /// The service password, retained so module-own-db connections
+    /// (`superx_mod_<name>`, same password under the D11 single-
+    /// password phase) can be opened on demand. Never logged.
+    service_password: Option<String>,
+    /// The instance home (`<home>/…` layout) when known — anchors
+    /// module dirs. Set by the CLI via [`Kernel::with_home`].
+    home: Option<std::path::PathBuf>,
 }
 
 impl Kernel {
@@ -95,6 +102,7 @@ impl Kernel {
         password: &str,
     ) -> Result<Self> {
         let password = password.to_string();
+        let retained_password = password.clone();
         let db = connect(endpoint).await?;
         db.use_ns(namespace).use_db(database).await?;
         if let Err(e) = db
@@ -116,6 +124,8 @@ impl Kernel {
         Ok(Self {
             db,
             endpoint: Some(endpoint.to_string()),
+            service_password: Some(retained_password),
+            home: None,
         })
     }
 
@@ -127,7 +137,74 @@ impl Kernel {
     /// go through [`Kernel::connect_service`].
     #[must_use]
     pub fn from_db(db: Surreal<Any>) -> Self {
-        Self { db, endpoint: None }
+        Self {
+            db,
+            endpoint: None,
+            service_password: None,
+            home: None,
+        }
+    }
+
+    /// Attach the instance home so module facilities (own dirs) can
+    /// anchor to the layout. Chainable after connect.
+    #[must_use]
+    pub fn with_home(mut self, home: std::path::PathBuf) -> Self {
+        self.home = Some(home);
+        self
+    }
+
+    /// This module's own directory (`<home>/modules/<name>/`),
+    /// created on demand.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::Config`] when the kernel has no instance home
+    /// (test handles) or creation fails.
+    pub fn module_dir(&self, module_name: &str) -> Result<std::path::PathBuf> {
+        let Some(home) = &self.home else {
+            return Err(KernelError::Config(
+                "no instance home attached — module dirs need a real instance".into(),
+            ));
+        };
+        let dir = home.join("modules").join(module_name);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| KernelError::Config(format!("create {dir:?}: {e}")))?;
+        Ok(dir)
+    }
+
+    /// Open this module's OWN database (`superx/<name>`) as its own
+    /// service account (`superx_mod_<name>`; D11 single-password
+    /// phase). The module must be provisioned first
+    /// (`superx modules provision <name>`).
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::Config`] on test handles (no endpoint/password);
+    /// [`KernelError::Db`] when signin is refused (typically:
+    /// unprovisioned).
+    pub async fn module_db(&self, module_name: &str) -> Result<Surreal<Any>> {
+        let (Some(endpoint), Some(password)) = (&self.endpoint, &self.service_password)
+        else {
+            return Err(KernelError::Config(
+                "module_db needs a connected instance (endpoint + credentials)".into(),
+            ));
+        };
+        let db = connect(endpoint).await?;
+        db.use_ns("superx").use_db(module_name).await?;
+        db.signin(Database {
+            namespace: "superx".to_string(),
+            database: module_name.to_string(),
+            username: format!("superx_mod_{module_name}"),
+            password: password.clone(),
+        })
+        .await
+        .map_err(|e| {
+            KernelError::Config(format!(
+                "module '{module_name}' db signin refused ({e}) — run \
+                 `superx modules provision {module_name}` first"
+            ))
+        })?;
+        Ok(db)
     }
 
     /// The connection URL this kernel signed in over, if known.
