@@ -6,16 +6,27 @@ use superx_kernel::types::Value;
 use superx_kernel::{Kernel, KernelError, NodeKind, Result};
 use superx_ops::record_uuid;
 
-use crate::{nodes, registry, MODULE_NAME};
+use crate::{edges, graph, nodes, registry, texts, MODULE_NAME};
+
+/// Traversal depth ceiling parameter on the module's registry entity.
+pub const MAX_DEPTH_PARAM: &str = "attr_entities_max_depth";
+const DEFAULT_MAX_DEPTH: usize = 5; // skill-allow: §9-const — bootstrap fallback, param-overridable (attr_entities_max_depth)
 
 const USAGE: &str = "usage: superx entities <command>\n\
-  create --type <type> [--content <text>] [--attrs <json>] <name…>\n\
+  create --type <type> [--describe <text>] [--content <text>] [--attrs <json>] <name…>\n\
   update <uuid-fragment> [--name <name>] [--content <text>] [--attrs <json>]\n\
   show <uuid-fragment> [--history]\n\
   list [--type <type>]\n\
-  types                                          list the type registry\n\
+  link <from-fragment> <to-fragment> --rel <relation-type>\n\
+  unlink <from-fragment> <to-fragment> --rel <relation-type>\n\
+  describe <uuid-fragment> <text…>     set/evolve the describing text node\n\
+  instruct <uuid-fragment> <text…>     set/evolve the instructing text node\n\
+  comment <uuid-fragment> <text…>      add a comment text node (threads: comment a comment)\n\
+  tree <uuid-fragment> [--depth <n>] [--reverse]\n\
+  graph <uuid-fragment> [--json]       export the reachable subgraph\n\
+  types                                list the type registry\n\
   types add <name> --category entity|relation [--description <text>]\n\
-(edges + traversal — link/tree/graph/… — land in epic #166 phases E3–E4)";
+(documents/attach land in epic #166 phase E4)";
 
 /// Route a `superx entities …` invocation.
 ///
@@ -30,6 +41,13 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("update") => update_cmd(kernel, &args[1..]).await,
         Some("show") => show_cmd(kernel, &args[1..]).await,
         Some("list") => list_cmd(kernel, &args[1..]).await,
+        Some("link") => link_cmd(kernel, &args[1..], true).await,
+        Some("unlink") => link_cmd(kernel, &args[1..], false).await,
+        Some("describe") => role_text_cmd(kernel, &args[1..], "describes").await,
+        Some("instruct") => role_text_cmd(kernel, &args[1..], "instructs").await,
+        Some("comment") => comment_cmd(kernel, &args[1..]).await,
+        Some("tree") => tree_cmd(kernel, &args[1..]).await,
+        Some("graph") => graph_cmd(kernel, &args[1..]).await,
         _ => Err(KernelError::Module(USAGE.to_string())),
     }
 }
@@ -37,6 +55,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
 async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
     let mut entity_type = None;
+    let mut describe = None;
     let mut content = None;
     let mut attrs = None;
     let mut name_words: Vec<String> = Vec::new();
@@ -45,6 +64,10 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         match args[i].as_str() {
             "--type" => {
                 entity_type = Some(next_value(args, i)?);
+                i += 2;
+            }
+            "--describe" => {
+                describe = Some(next_value(args, i)?);
                 i += 2;
             }
             "--content" => {
@@ -71,6 +94,11 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let anchor = nodes::create_entity(&db, &entity_type, &name, content, attributes).await?;
     let uuid = record_uuid(&anchor);
     emit(kernel, "entity_created", &uuid, &entity_type, &name).await;
+    if let Some(text) = describe {
+        let (text_node, _) = texts::set_role_text(&db, &anchor, "describes", &text).await?;
+        emit(kernel, "entity_created", &record_uuid(&text_node), "text", "describes-text").await;
+        emit_link(kernel, &uuid, &record_uuid(&text_node), "describes", "entities_linked").await;
+    }
     Ok(format!("{uuid}\n"))
 }
 
@@ -136,6 +164,18 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     } else if let Some(current) = nodes::current_state(&db, &anchor).await? {
         out.push_str(&render_state(&current, "  "));
     }
+    let notes = texts::annotations(&db, &anchor).await?;
+    if !notes.is_empty() {
+        out.push_str("texts:\n");
+        for note in notes {
+            out.push_str(&format!(
+                "  [{}] ({}) {}\n",
+                note.rel_type,
+                record_uuid(&note.text_id),
+                note.content
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -160,6 +200,153 @@ async fn list_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         ));
     }
     Ok(out)
+}
+
+async fn link_cmd(kernel: &Kernel, args: &[String], create: bool) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let (from_frag, to_frag) = match (args.first(), args.get(1)) {
+        (Some(f), Some(t)) => (f.clone(), t.clone()),
+        _ => return Err(usage()),
+    };
+    let rel = match (args.get(2).map(String::as_str), args.get(3)) {
+        (Some("--rel"), Some(r)) => r.clone(),
+        _ => return Err(usage()),
+    };
+    let from = nodes::resolve_entity(&db, &from_frag).await?;
+    let to = nodes::resolve_entity(&db, &to_frag).await?;
+    let (from_uuid, to_uuid) = (record_uuid(&from), record_uuid(&to));
+    if create {
+        edges::link(&db, &from, &to, &rel).await?;
+        emit_link(kernel, &from_uuid, &to_uuid, &rel, "entities_linked").await;
+        Ok(format!("{from_uuid} -[{rel}]-> {to_uuid}\n"))
+    } else {
+        edges::unlink(&db, &from, &to, &rel).await?;
+        emit_link(kernel, &from_uuid, &to_uuid, &rel, "entities_unlinked").await;
+        Ok(format!("{from_uuid} -[{rel}]-x {to_uuid} (retracted; history kept)\n"))
+    }
+}
+
+async fn role_text_cmd(kernel: &Kernel, args: &[String], role: &str) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let fragment = args.first().ok_or_else(usage)?;
+    let text = args[1..].join(" ");
+    if text.is_empty() {
+        return Err(usage());
+    }
+    let target = nodes::resolve_entity(&db, fragment).await?;
+    let (node, created) = texts::set_role_text(&db, &target, role, &text).await?;
+    let node_uuid = record_uuid(&node);
+    if created {
+        emit(kernel, "entity_created", &node_uuid, "text", "").await;
+        emit_link(kernel, &record_uuid(&target), &node_uuid, role, "entities_linked").await;
+        Ok(format!("{role} text created: {node_uuid}\n"))
+    } else {
+        emit(kernel, "entity_updated", &node_uuid, "text", "").await;
+        Ok(format!("{role} text evolved (new version): {node_uuid}\n"))
+    }
+}
+
+async fn comment_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let fragment = args.first().ok_or_else(usage)?;
+    let text = args[1..].join(" ");
+    if text.is_empty() {
+        return Err(usage());
+    }
+    let target = nodes::resolve_entity(&db, fragment).await?;
+    let node = texts::add_comment(&db, &target, &text).await?;
+    let node_uuid = record_uuid(&node);
+    emit(kernel, "entity_created", &node_uuid, "text", "comment").await;
+    emit_link(kernel, &record_uuid(&target), &node_uuid, "comments", "entities_linked").await;
+    Ok(format!("comment added: {node_uuid}\n"))
+}
+
+async fn tree_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let fragment = args.first().ok_or_else(usage)?;
+    let reverse = args.iter().any(|a| a == "--reverse");
+    let depth = match args.iter().position(|a| a == "--depth") {
+        Some(i) => args
+            .get(i + 1)
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&d| d > 0)
+            .ok_or_else(usage)?,
+        None => resolved_max_depth(kernel).await,
+    };
+    let root = nodes::resolve_entity(&db, fragment).await?;
+    let sub = graph::subgraph(&db, &root, depth, reverse).await?;
+    Ok(graph::render_tree(&sub, &root))
+}
+
+async fn graph_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let fragment = args.first().ok_or_else(usage)?;
+    let root = nodes::resolve_entity(&db, fragment).await?;
+    let depth = resolved_max_depth(kernel).await;
+    let sub = graph::subgraph(&db, &root, depth, false).await?;
+    if args.iter().any(|a| a == "--json") {
+        let json = serde_json::json!({
+            "root": record_uuid(&root),
+            "truncated_at_depth": sub.truncated_at_depth,
+            "nodes": sub.nodes.iter().map(|n| serde_json::json!({
+                "uid": record_uuid(&n.id),
+                "type": n.entity_type,
+                "name": n.name,
+                "content": n.content,
+                "depth": n.depth,
+            })).collect::<Vec<_>>(),
+            "edges": sub.edges.iter().map(|e| serde_json::json!({
+                "edge_uid": e.edge_uid,
+                "from": e.from,
+                "to": e.to,
+                "rel": e.rel_type,
+            })).collect::<Vec<_>>(),
+        });
+        Ok(format!("{json:#}\n"))
+    } else {
+        Ok(format!(
+            "subgraph of {}: {} nodes, {} active edges{}\n(use --json for the full export)\n",
+            record_uuid(&root),
+            sub.nodes.len(),
+            sub.edges.len(),
+            if sub.truncated_at_depth { " (depth-truncated)" } else { "" }
+        ))
+    }
+}
+
+/// Resolve the traversal ceiling: substrate parameter, else the
+/// marked bootstrap fallback (ui-module resolved_port pattern).
+async fn resolved_max_depth(kernel: &Kernel) -> usize {
+    let Ok(Some(entity)) = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+    else {
+        return DEFAULT_MAX_DEPTH;
+    };
+    match kernel.get_parameter(entity, MAX_DEPTH_PARAM).await {
+        Ok(Some(Value::Number(n))) => n
+            .to_int()
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|&d| d > 0)
+            .unwrap_or(DEFAULT_MAX_DEPTH),
+        _ => DEFAULT_MAX_DEPTH,
+    }
+}
+
+async fn emit_link(kernel: &Kernel, from: &str, to: &str, rel: &str, event: &str) {
+    let payload = superx_kernel::message::value_from_json(&serde_json::json!({
+        "from": from,
+        "to": to,
+        "rel": rel,
+    }));
+    let subject = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+        .ok()
+        .flatten();
+    if let Err(e) = kernel.log_telemetry(event, payload, subject).await {
+        tracing::warn!(target: "entities", "telemetry write failed: {e}");
+    }
 }
 
 async fn types_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
