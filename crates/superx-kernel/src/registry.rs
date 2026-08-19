@@ -264,6 +264,30 @@ impl Kernel {
         }
     }
 
+    /// Write the operator's enable/disable intent for a registered
+    /// module (the management-CLI verb, issue #142). The running OS
+    /// reconciles within one capture tick: disabled modules pause,
+    /// re-enabled ones resume.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::KernelError::NotFound`] if the module isn't
+    /// registered; [`crate::KernelError::Db`] for engine errors.
+    pub async fn set_module_status(
+        &self,
+        kind: NodeKind,
+        name: &str,
+        status: ModuleStatus,
+    ) -> Result<RecordId> {
+        let Some(entity_id) = self.find_module_by_name(kind, name).await? else {
+            return Err(crate::error::KernelError::NotFound(format!(
+                "{} not registered: {name}",
+                kind.type_uid()
+            )));
+        };
+        self.write_status(entity_id, status).await
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Internal helpers
     // ─────────────────────────────────────────────────────────────────

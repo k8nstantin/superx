@@ -4,7 +4,7 @@ mod common;
 
 use std::error::Error;
 
-use superx_kernel::{KernelModuleDescriptor, NodeKind};
+use superx_kernel::{KernelModuleDescriptor, ModuleStatus, NodeKind};
 
 fn descriptor(name: &'static str, version: &'static str) -> KernelModuleDescriptor {
     KernelModuleDescriptor {
@@ -76,5 +76,33 @@ async fn adapters_and_modules_are_separate_namespaces() -> Result<(), Box<dyn Er
         .expect("module exists")
         .entity_id;
     assert_ne!(adapter_id, module_id, "kinds have distinct entities");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_module_status_roundtrip_and_not_found() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    kernel.register_module(&descriptor("togglable", "0.1.0")).await?;
+
+    kernel
+        .set_module_status(NodeKind::KernelModule, "togglable", ModuleStatus::Disabled)
+        .await?;
+    assert_eq!(
+        kernel.module_status(NodeKind::KernelModule, "togglable").await?,
+        Some(ModuleStatus::Disabled)
+    );
+    kernel
+        .set_module_status(NodeKind::KernelModule, "togglable", ModuleStatus::Enabled)
+        .await?;
+    assert_eq!(
+        kernel.module_status(NodeKind::KernelModule, "togglable").await?,
+        Some(ModuleStatus::Enabled)
+    );
+
+    let err = kernel
+        .set_module_status(NodeKind::KernelModule, "ghost", ModuleStatus::Disabled)
+        .await
+        .expect_err("unregistered module errors");
+    assert!(err.to_string().contains("not found"));
     Ok(())
 }

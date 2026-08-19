@@ -235,6 +235,16 @@ impl Kernel {
             .await
     }
 
+    /// Mark a registered module `Disabled` — the running OS honored an
+    /// operator disable (issue #142).
+    pub async fn mark_disabled(&self, kind: NodeKind, name: &str) -> Result<()> {
+        let entity_id = self.find_or_error(kind, name).await?;
+        self.write_lifecycle(entity_id.clone(), &LifecycleState::Disabled)
+            .await?;
+        self.emit_lifecycle_event(entity_id, name, "module_disabled", None)
+            .await
+    }
+
     /// Mark a registered module `Skipped` — boot chose not to start it
     /// because a dependency failed.
     pub async fn mark_skipped(&self, kind: NodeKind, name: &str, reason: &str) -> Result<()> {

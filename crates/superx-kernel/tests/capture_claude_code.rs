@@ -192,3 +192,29 @@ async fn adapter_absent_when_no_param_and_no_home_dir() -> Result<(), Box<dyn Er
     assert_eq!(status.entity_id, entity);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_adapter_is_skipped_live_and_resumes() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+
+    assert_eq!(cc_sources(&kernel).await?.len(), 1, "enabled → discovered");
+
+    // Operator disables the adapter — discovery skips it next pass.
+    kernel
+        .set_module_status(NodeKind::Adapter, ADAPTER_NAME, superx_kernel::ModuleStatus::Disabled)
+        .await?;
+    assert_eq!(
+        cc_sources(&kernel).await?.len(),
+        0,
+        "disabled adapter contributes no sources"
+    );
+
+    // Re-enable — it resumes.
+    kernel
+        .set_module_status(NodeKind::Adapter, ADAPTER_NAME, superx_kernel::ModuleStatus::Enabled)
+        .await?;
+    assert_eq!(cc_sources(&kernel).await?.len(), 1, "re-enabled → back");
+    Ok(())
+}
