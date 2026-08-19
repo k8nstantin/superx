@@ -11,6 +11,7 @@
 //! own log (`target: "entities"`), own CLI (`superx entities …`).
 
 pub mod cli;
+pub mod nodes;
 pub mod registry;
 
 use async_trait::async_trait;

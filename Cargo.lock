@@ -3776,7 +3776,9 @@ version = "1.0.0"
 dependencies = [
  "async-trait",
  "linkme",
+ "serde_json",
  "superx-kernel",
+ "superx-ops",
  "surrealdb",
  "tokio",
  "tracing",
