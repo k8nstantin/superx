@@ -200,3 +200,22 @@ fn fake_message(
 fn uuid_v7() -> uuid::Uuid {
     uuid::Uuid::now_v7()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_cli_routing() -> Result<(), Box<dyn Error>> {
+    let kernel = fresh_kernel().await?;
+
+    // Unknown module → guidance.
+    let err = superx::run_module_cli(&kernel, &["nope".to_string()])
+        .await
+        .expect_err("unknown module");
+    assert!(err.contains("modules list"), "{err}");
+
+    // Known module (hello is compiled into this binary) routes to its
+    // own CLI — usage error proves the hook fired.
+    let err = superx::run_module_cli(&kernel, &["hello".to_string()])
+        .await
+        .expect_err("hello usage");
+    assert!(err.contains("usage: superx hello greet"), "{err}");
+    Ok(())
+}

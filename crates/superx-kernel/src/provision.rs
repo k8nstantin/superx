@@ -58,3 +58,36 @@ pub async fn apply_schema_as_root(
         .map_err(|e| KernelError::Config(format!("schema statement refused: {e}")))?;
     Ok(())
 }
+
+/// Provision one MODULE's own database (`superx/<name>`): apply its
+/// schema DDL under a one-shot root session, substituting the
+/// module's service-account password (`$SUPERX_MODULE_PASSWORD`;
+/// D11 single-password phase). Same operator-invoked carve-out as
+/// [`apply_schema_as_root`] — no runtime path calls this.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] / [`KernelError::Config`] as for
+/// [`apply_schema_as_root`].
+pub async fn provision_module_schema(
+    endpoint: &str,
+    module_name: &str,
+    root_password: &str,
+    module_password: &str,
+    ddl: &str,
+) -> Result<()> {
+    let db = connect(endpoint).await?;
+    db.signin(Root {
+        username: "root".to_string(), // skill-allow: §13-username — operator-invoked provisioning carve-out (epic #141)
+        password: root_password.to_string(),
+    })
+    .await
+    .map_err(|e| KernelError::Config(format!("root signin refused: {e}")))?;
+    db.use_ns("superx").use_db(module_name).await?;
+    let ddl = ddl.replace("$SUPERX_MODULE_PASSWORD", &escape_surql(module_password));
+    db.query(ddl)
+        .await?
+        .check()
+        .map_err(|e| KernelError::Config(format!("module schema statement refused: {e}")))?;
+    Ok(())
+}

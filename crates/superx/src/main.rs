@@ -34,15 +34,29 @@ async fn main() -> ExitCode {
     );
 
     // The guard must live until the process exits — dropping it
-    // flushes the self-log and stops the writer thread.
-    let _log_guard =
-        match superx_kernel::logging::init_with_filter(&config.log_dir, &config.log_filter) {
-            Ok(guard) => guard,
-            Err(e) => {
-                eprintln!("superx: cannot initialize the kernel self-log: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    // flushes the self-log and stops the writer thread. Module-target
+    // events additionally route to each module's own log file
+    // (lazy-created under <home>/modules/<name>/logs/).
+    let module_names: &'static [&'static str] = {
+        let names: Vec<&'static str> = superx_kernel::KERNEL_MODULES
+            .iter()
+            .map(|m| m.descriptor().name)
+            .collect();
+        Box::leak(names.into_boxed_slice())
+    };
+    let modules_root = config.home.join("modules");
+    let _log_guard = match superx_kernel::logging::init_instance(
+        &config.log_dir,
+        &config.log_filter,
+        &modules_root,
+        module_names,
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("superx: cannot initialize the kernel self-log: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     match run(cli, config).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -119,6 +133,10 @@ async fn run(cli: Cli, config: Config) -> Result<(), String> {
             superx::emit(&superx::run_status(&kernel, &config.data_dir).await?);
             Ok(())
         }
+        Command::Module(argv) => {
+            superx::emit(&superx::run_module_cli(&kernel, &argv).await?);
+            Ok(())
+        }
         Command::Modules { action } => {
             let text = match action {
                 superx::ModulesAction::List => superx::run_modules_list(&kernel).await?,
@@ -127,6 +145,9 @@ async fn run(cli: Cli, config: Config) -> Result<(), String> {
                 }
                 superx::ModulesAction::Disable { name } => {
                     superx::run_modules_set(&kernel, &name, false).await?
+                }
+                superx::ModulesAction::Provision { name } => {
+                    superx::run_modules_provision(&config, &kernel, &name).await?
                 }
             };
             superx::emit(&text);

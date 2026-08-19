@@ -13,6 +13,10 @@ use superx_kernel::{Kernel, MessageRecord, NodeKind, TelemetryRecord};
 pub mod config;
 pub mod initialize;
 
+// Modules are compiled in (epic #141 v1 contract): an explicit link
+// reference per module crate keeps its linkme registration alive.
+use superx_mod_hello as _;
+
 pub use clap::Parser;
 pub use config::Config;
 
@@ -129,6 +133,9 @@ pub enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// A module's own CLI: `superx <module-name> [args…]`.
+    #[command(external_subcommand)]
+    Module(Vec<String>),
     /// Render one conversation, oldest first.
     Read {
         /// Session name (`claude_code/<id>`) or any unique fragment
@@ -148,6 +155,9 @@ pub enum ModulesAction {
     Enable { name: String },
     /// Disable a module (pauses/stops within one tick on a running OS).
     Disable { name: String },
+    /// Provision a module's OWN database (its schema + service
+    /// account) — operator one-shot per module.
+    Provision { name: String },
 }
 
 /// Connect + signin with an actionable hint on auth refusal. The
@@ -291,28 +301,34 @@ pub async fn run_stop(data_dir: &std::path::Path) -> Result<String, String> {
 pub async fn run_modules_list(kernel: &Kernel) -> Result<String, String> {
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<26} {:<14} {:<9} {:<9} {}\n",
-        "MODULE", "KIND", "INTENT", "LIFECYCLE", "VERSION"
+        "{:<26} {:<38} {:<14} {:<9} {:<9} {}\n",
+        "MODULE", "MODULE_ID", "KIND", "INTENT", "LIFECYCLE", "VERSION"
     ));
     for module in superx_kernel::KERNEL_MODULES {
         let desc = module.descriptor();
-        let (intent, lifecycle) = match kernel.detailed_status(desc.kind, desc.name).await {
-            Ok(Some(status)) => {
-                let intent = match kernel
-                    .module_status(desc.kind, desc.name)
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
-                    Some(superx_kernel::ModuleStatus::Disabled) => "disabled",
-                    _ => "enabled",
-                };
-                (intent, status.lifecycle.short_tag().to_string())
-            }
-            _ => ("enabled", "never-booted".to_string()),
-        };
+        let (module_id, intent, lifecycle) =
+            match kernel.detailed_status(desc.kind, desc.name).await {
+                Ok(Some(status)) => {
+                    let intent = match kernel
+                        .module_status(desc.kind, desc.name)
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        Some(superx_kernel::ModuleStatus::Disabled) => "disabled",
+                        _ => "enabled",
+                    };
+                    (
+                        record_uuid(&status.entity_id),
+                        intent,
+                        status.lifecycle.short_tag().to_string(),
+                    )
+                }
+                _ => ("-".to_string(), "enabled", "never-booted".to_string()),
+            };
         out.push_str(&format!(
-            "{:<26} {:<14} {:<9} {:<9} v{}\n",
+            "{:<26} {:<38} {:<14} {:<9} {:<9} v{}\n",
             desc.name,
+            module_id,
             desc.kind.type_uid().trim_start_matches("node_"),
             intent,
             lifecycle,
@@ -322,23 +338,38 @@ pub async fn run_modules_list(kernel: &Kernel) -> Result<String, String> {
     Ok(out)
 }
 
+/// Resolve a module by NAME or by a fragment of its UUIDv7 module id
+/// (operator directive: each module is referenced by its own uuid7).
+pub async fn resolve_module(
+    kernel: &Kernel,
+    query: &str,
+) -> Result<superx_kernel::KernelModuleDescriptor, String> {
+    for module in superx_kernel::KERNEL_MODULES {
+        let desc = module.descriptor();
+        if desc.name == query {
+            return Ok(desc);
+        }
+        if let Ok(Some(status)) = kernel.detailed_status(desc.kind, desc.name).await {
+            if record_uuid(&status.entity_id).contains(query) {
+                return Ok(desc);
+            }
+        }
+    }
+    Err(format!(
+        "no compiled-in module matches '{query}' (name or uuid fragment) — see `superx modules list`"
+    ))
+}
+
 /// `superx modules enable|disable` body. Resolves the module in the
-/// compiled-in inventory (so typos fail fast), writes intent, reports
-/// when it takes effect.
+/// compiled-in inventory by name or uuid7 fragment, writes intent,
+/// reports when it takes effect.
 pub async fn run_modules_set(
     kernel: &Kernel,
     name: &str,
     enable: bool,
 ) -> Result<String, String> {
-    let Some(desc) = superx_kernel::KERNEL_MODULES
-        .iter()
-        .map(|m| m.descriptor())
-        .find(|d| d.name == name)
-    else {
-        return Err(format!(
-            "no compiled-in module named '{name}' — see `superx modules list`"
-        ));
-    };
+    let desc = resolve_module(kernel, name).await?;
+    let name = desc.name;
     let status = if enable {
         superx_kernel::ModuleStatus::Enabled
     } else {
@@ -352,6 +383,84 @@ pub async fn run_modules_set(
         "{name} {} — takes effect on the running OS within one capture tick\n",
         if enable { "enabled" } else { "disabled" }
     ))
+}
+
+/// `superx modules provision <name>` body: apply the module's own
+/// schema into its own database under the operator path (D11
+/// single-password phase — the stored password IS the root password).
+pub async fn run_modules_provision(
+    config: &Config,
+    kernel: &Kernel,
+    name: &str,
+) -> Result<String, String> {
+    let desc = resolve_module(kernel, name).await?;
+    let name = desc.name;
+    let module = superx_kernel::KERNEL_MODULES
+        .iter()
+        .find(|m| m.descriptor().name == name)
+        .expect("resolved from inventory");
+    let Some(ddl) = module.schema_ddl() else {
+        return Ok(format!("module '{name}' owns no data objects — nothing to provision\n"));
+    };
+    let Some(password) = initialize::resolve_password(&config.data_dir) else {
+        return Err("no credentials — run `superx --initialize` first".to_string());
+    };
+    superx_kernel::provision::provision_module_schema(
+        &config.endpoint,
+        name,
+        &password,
+        &password, // D11: one password serves root + all service accounts this phase
+        ddl,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    // Record the fact on the module's registry entity + firehose.
+    if let Ok(Some(entity)) = kernel
+        .find_module_by_name(module.descriptor().kind, name)
+        .await
+    {
+        let _ignored = kernel
+            .set_parameter(
+                entity,
+                "attr_provisioned",
+                superx_kernel::types::Value::Bool(true),
+            )
+            .await;
+    }
+    kernel
+        .log_telemetry(
+            "module_provisioned",
+            superx_kernel::types::Value::String(name.to_string()),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "module '{name}' provisioned: own database superx/{name} + service account superx_mod_{name}\n"
+    ))
+}
+
+/// A module's own CLI: route `superx <module-name> [args…]` to the
+/// module's `cli()` hook.
+pub async fn run_module_cli(
+    kernel: &Kernel,
+    argv: &[String],
+) -> Result<String, String> {
+    let Some(name) = argv.first() else {
+        return Err("empty module command".to_string());
+    };
+    let Some(module) = superx_kernel::KERNEL_MODULES
+        .iter()
+        .find(|m| m.descriptor().name == *name)
+    else {
+        return Err(format!(
+            "unknown command or module '{name}' — `superx --help` / `superx modules list`"
+        ));
+    };
+    module
+        .cli(kernel, &argv[1..])
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// `superx status` body.
