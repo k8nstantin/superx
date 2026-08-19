@@ -9,6 +9,8 @@
 
 # Kernel self-log (runtime output, never committed)
 /logs
+# Per-module instance dirs (epic #141) — runtime, never tracked.
+/modules
 
 # OS / editor noise
 .DS_Store
@@ -39,3 +41,6 @@ history.txt
 
 # Frontend third-party deps (never committed)
 node_modules/
+
+# Parallel-session git worktrees (Claude Code) — never stage or audit.
+.claude/worktrees/

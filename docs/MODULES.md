@@ -84,3 +84,5 @@ superx modules provision <n>        # apply the module's own schema (operator pa
 superx <n> …                        # the module's own CLI
 superx logs --module <n>            # its own log (also under <home>/modules/<n>/logs/)
 ```
+
+> Real-world examples: `superx-mod-ui` (a module owning a server + port parameter) and `superx-mod-entities` (a module owning a four-table schema, native graph edges, and a rich CLI).

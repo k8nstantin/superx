@@ -1,0 +1,2 @@
+2026-08-19T13:51:44.638560Z  WARN own db unavailable — graph verbs disabled until provisioned: configuration error: module 'entities' db signin refused (There was a problem with authentication) — run `superx modules provision entities` first
+2026-08-19T13:51:46.078334Z  INFO type registry seeded seeded=16

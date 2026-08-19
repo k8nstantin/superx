@@ -66,6 +66,36 @@ Modules are how SuperX grows — see [`docs/MODULES.md`](docs/MODULES.md)
 to contribute one (the framework supports several modules of the same
 kind side by side: your UI and a contributed one on different ports).
 
+## The entities module — the product graph
+
+Typed entities as graph nodes, native SurrealDB edges, full append-only
+history (epic #166). Provision once (`superx modules provision entities`,
+then restart), then:
+
+```sh
+superx entities create --type product --describe "What this product is." Widget X
+superx entities create --type task Build the widget
+superx entities link <product-uuid> <task-uuid> --rel linked
+superx entities instruct <task-uuid> Read the description; build each component.
+superx entities comment <task-uuid> Priority: high.
+superx entities tree <product-uuid>          # the whole product, one view
+superx entities graph <product-uuid> --json  # subgraph export (nodes + edges)
+superx entities attach <product-uuid> ./spec.pdf
+superx entities create --type repo --attrs '{"url":"git@github.com:org/widget.git","branch":"main"}' Widget repo
+superx entities create --type credential --attrs '{"kind":"ssh","keychain":"widget-deploy-key"}' Widget deploy key
+superx entities show <task-uuid>             # state + instructs/comments inline
+superx entities types add review --category relation
+```
+
+Nodes: product · task · rag · model · document · text · repo ·
+credential (extensible at runtime). A credential node stores a secret
+REFERENCE (env var / keychain item) in its attributes, linked
+`repo —authenticates→ credential` — so an agent following a task edge
+to a repo also finds how to authenticate, all in one graph. Long-form text is itself a node linked by role edges
+(describes / comments / instructs) — descriptions evolve with their own
+history, comments thread. Every change is an INSERT; nothing is ever
+lost. Agents executing task nodes from the graph is the next epic.
+
 ## Instance layout
 
 ```
