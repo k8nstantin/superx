@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SuperX — the agentic OS</title>
+    <meta name="description" content="SuperX watches every agent on your machine — then it puts them to work. Rust + SurrealDB, append-only history, pluggable modules." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container header__inner">
+        <a class="wordmark" href="#top"><span class="wordmark__text">superx</span></a>
+        <nav class="site-nav">
+          <a href="#concept">Concept</a>
+          <a href="#capabilities">Capabilities</a>
+          <a href="#install">Install</a>
+          <a href="#modules">Modules</a>
+          <a class="ghost" href="https://github.com/k8nstantin/superx">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <section class="hero" id="top">
+      <div class="container hero__grid">
+        <div class="hero__content">
+          <p class="eyebrow">v1.0.0 · agentic OS · Rust + SurrealDB</p>
+          <h1 class="hero__title">The <span class="grad">agentic OS</span>.</h1>
+          <p class="hero__subtitle">
+            SuperX watches every agent on your machine — every conversation,
+            every action, live. Then it puts them to work: model the work as a
+            graph, schedule it, and agents execute it while the OS records
+            them doing it. Nothing is ever lost — every change is an insert.
+          </p>
+          <div class="button-group">
+            <a class="btn btn-primary" href="#install">Install</a>
+            <a class="btn btn-secondary" href="https://github.com/k8nstantin/superx">Source on GitHub</a>
+          </div>
+        </div>
+        <div class="hero__terminal">
+          <div class="terminal">
+            <div class="terminal__chrome">
+              <span class="dot dot--r"></span><span class="dot dot--y"></span><span class="dot dot--g"></span>
+            </div>
+            <div class="terminal__body"><pre>$ superx --initialize
+OS: running in background (pid 14908)
+UI: http://127.0.0.1:5150
+kernel modules:
+  capture   active    runner    active
+  kernel    active    entities  active
+  ui        active    website   active
+adapters:
+  claude_code · gemini_cli · claude_desktop
+OS running in background — capture is live.</pre></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="concept">
+      <div class="container">
+        <div class="block__head">
+          <p class="kicker">Concept</p>
+          <h2>Capture everything. Then direct it.</h2>
+        </div>
+        <div class="two-col">
+          <p>
+            Coding agents already run on your machine — Claude Code, Gemini
+            CLI, Claude Desktop. SuperX boots, discovers them, and captures
+            <em>everything</em> they emit: full conversations, tool calls,
+            telemetry, historical and live. The substrate is append-only
+            SurrealDB — every fact is an insert, every identity a uuid7, so
+            the history of your agents is a permanent, queryable log.
+          </p>
+          <p>
+            Then the loop closes. You model work as a <strong>graph of
+            entities</strong> — products contain components, tasks carry
+            instructions, tasks consult RAGs, repos link credentials. The
+            <strong>runner</strong> schedules the graph: independent tasks in
+            parallel, dependencies in order, each executed by a spawned agent
+            — whose session SuperX captures on its own dashboard. The OS
+            directs work and watches itself do it.
+          </p>
+        </div>
+        <div class="loop" aria-label="the loop">
+          <span class="loop__step">capture everything</span><span class="loop__arrow">→</span>
+          <span class="loop__step">model work as a graph</span><span class="loop__arrow">→</span>
+          <span class="loop__step">schedule the graph</span><span class="loop__arrow">→</span>
+          <span class="loop__step">agents execute</span><span class="loop__arrow">→</span>
+          <span class="loop__step">results land in the graph</span><span class="loop__arrow">↺</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="block alt" id="capabilities">
+      <div class="container">
+        <div class="block__head">
+          <p class="kicker">Capabilities</p>
+          <h2>What it does</h2>
+        </div>
+        <div class="features-grid">
+          <div class="feature"><div class="feature__icon">◉</div>
+            <h3>Total capture</h3>
+            <p>Every conversation and action from Claude Code, Gemini CLI, and Claude Desktop — backfilled history plus a live stream, sessions identified <code>agent/uuid7</code>.</p></div>
+          <div class="feature"><div class="feature__icon">▦</div>
+            <h3>Live dashboard</h3>
+            <p>A Mantine/React module on its own port: status, charts, session liveness, every captured event streaming over SSE, CLI commands from the browser.</p></div>
+          <div class="feature"><div class="feature__icon">◈</div>
+            <h3>Entity graph</h3>
+            <p>Typed nodes — product, task, rag, model, repo, credential, text — linked by native graph edges. Descriptions and comments are nodes too; documents attach as nodes.</p></div>
+          <div class="feature"><div class="feature__icon">⇶</div>
+            <h3>Runner</h3>
+            <p>Schedule any entity. The runner plans waves over <code>depends_on</code>, dispatches agents in parallel, writes results back as <code>produced</code> nodes, recurs with <code>every:</code>.</p></div>
+          <div class="feature"><div class="feature__icon">▤</div>
+            <h3>Pluggable modules</h3>
+            <p>Every capability beyond capture is a module with its own database, service account, dir, log, CLI namespace, and parameters. Contribute one from a template.</p></div>
+          <div class="feature"><div class="feature__icon">∞</div>
+            <h3>Nothing lost, ever</h3>
+            <p>Append-only SCD-2 everywhere: updates insert versions, unlinks insert retractions, cancels append rows. Time-ordered uuid7 ids make the substrate a historical log.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="install">
+      <div class="container">
+        <div class="block__head">
+          <p class="kicker">Install</p>
+          <h2>One command to a running OS</h2>
+        </div>
+        <div class="install-options">
+          <div class="install-option">
+            <div class="install-option__head">clone + build</div>
+            <div class="terminal"><div class="terminal__body"><pre>git clone https://github.com/k8nstantin/superx
+cd superx && cargo build</pre></div></div>
+          </div>
+          <div class="install-option">
+            <div class="install-option__head">initialize — prompts for a password, provisions, boots</div>
+            <div class="terminal"><div class="terminal__body"><pre>target/debug/superx --initialize</pre></div></div>
+          </div>
+          <div class="install-option">
+            <div class="install-option__head">confirm capture, open the dashboard</div>
+            <div class="terminal"><div class="terminal__body"><pre>target/debug/superx sessions
+target/debug/superx ui url   # → http://127.0.0.1:5150</pre></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="block alt" id="how">
+      <div class="container">
+        <div class="block__head">
+          <p class="kicker">How it works</p>
+          <h2>A kernel, and everything else is a module</h2>
+        </div>
+        <div class="layers">
+          <div class="layer"><div class="layer__id">L1</div><div><strong>Kernel</strong> <span class="muted">— boot, discovery, the capture engine, the telemetry firehose, the append-only substrate verbs. The hub every module talks through.</span></div></div>
+          <div class="layer"><div class="layer__id">L2</div><div><strong>Adapters</strong> <span class="muted">— per-agent capture: Claude Code, Gemini CLI, Claude Desktop. Tolerant parsers, cursor checkpoints, history backfill.</span></div></div>
+          <div class="layer"><div class="layer__id">L3</div><div><strong>Modules</strong> <span class="muted">— ui, entities, runner, website… each self-contained with its own database and CLI, enable/disable live, several of a kind side by side.</span></div></div>
+          <div class="layer"><div class="layer__id">L4</div><div><strong>Agents</strong> <span class="muted">— spawned by the runner, observed by the adapters: the loop that makes it an OS rather than a logger.</span></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="modules">
+      <div class="container">
+        <div class="block__head">
+          <p class="kicker">Modules</p>
+          <h2>Shipping today</h2>
+        </div>
+        <table class="modules-table">
+          <thead><tr><th>module</th><th>what it owns</th><th>cli</th></tr></thead>
+          <tbody>
+            <tr><td>ui</td><td>the dashboard — status, activity, sessions, console (port 5150)</td><td>superx ui …</td></tr>
+            <tr><td>entities</td><td>the product graph — nodes, native edges, texts, documents</td><td>superx entities …</td></tr>
+            <tr><td>runner</td><td>schedules + executes the graph with agents, in parallel</td><td>superx runner …</td></tr>
+            <tr><td>website</td><td>this site — served by the OS locally, deployed by CI</td><td>superx website …</td></tr>
+            <tr><td>hello</td><td>the contribution template — copy it, ship a module</td><td>superx hello …</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="block alt" id="cta">
+      <div class="container" style="text-align:center">
+        <h2>Your agents are already talking.<br /><span class="grad">Start listening — then start directing.</span></h2>
+        <div class="button-group" style="justify-content:center">
+          <a class="btn btn-primary" href="https://github.com/k8nstantin/superx">GitHub</a>
+          <a class="btn btn-secondary" href="https://github.com/k8nstantin/superx/blob/main/docs/MODULES.md">Write a module</a>
+        </div>
+      </div>
+    </section>
+
+    <footer class="site-footer">
+      <div class="container footer__inner">
+        <div><span class="wordmark__text">superx</span> <span class="muted">· the agentic OS · Apache-2.0</span></div>
+        <nav class="site-nav">
+          <a href="https://github.com/k8nstantin/superx">GitHub</a>
+          <a href="https://github.com/k8nstantin/superx/blob/main/BLUEPRINT.md">Blueprint</a>
+          <a href="https://github.com/k8nstantin/superx/blob/main/docs/MODULES.md">Modules guide</a>
+          <a href="https://swindex.ai/">swindex</a>
+        </nav>
+      </div>
+    </footer>
+  </body>
+</html>

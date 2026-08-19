@@ -17,6 +17,7 @@ use superx_mod_entities as _;
 use superx_mod_hello as _;
 use superx_mod_runner as _;
 use superx_mod_ui as _;
+use superx_mod_website as _;
 
 pub use clap::Parser;
 pub use config::Config;

@@ -3744,6 +3744,7 @@ dependencies = [
  "superx-mod-hello",
  "superx-mod-runner",
  "superx-mod-ui",
+ "superx-mod-website",
  "superx-ops",
  "surrealdb",
  "tempfile",
@@ -3837,6 +3838,20 @@ dependencies = [
  "tokio",
  "tracing",
  "ts-rs",
+]
+
+[[package]]
+name = "superx-mod-website"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "linkme",
+ "rust-embed",
+ "superx-kernel",
+ "surrealdb",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

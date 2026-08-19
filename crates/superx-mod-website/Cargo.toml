@@ -1,0 +1,20 @@
+[package]
+name = "superx-mod-website"
+description = "The public SuperX website: swindex-themed static site, served locally by the OS and deployed to GitHub Pages (epic #213)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+linkme.workspace = true
+rust-embed = "8"
+superx-kernel = { path = "../superx-kernel" }
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
+
+[dev-dependencies]
+surrealdb.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

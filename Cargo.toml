@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/superx-kernel", "crates/superx-mod-entities", "crates/superx-mod-hello", "crates/superx-mod-runner", "crates/superx-mod-ui", "crates/superx-ops", "crates/superx"]
+members = ["crates/superx-kernel", "crates/superx-mod-entities", "crates/superx-mod-hello", "crates/superx-mod-runner", "crates/superx-mod-ui", "crates/superx-mod-website", "crates/superx-ops", "crates/superx"]
 
 [workspace.package]
 version = "1.0.0"
@@ -14,6 +14,7 @@ superx-mod-entities = { path = "crates/superx-mod-entities" }
 superx-mod-hello = { path = "crates/superx-mod-hello" }
 superx-mod-runner = { path = "crates/superx-mod-runner" }
 superx-mod-ui = { path = "crates/superx-mod-ui" }
+superx-mod-website = { path = "crates/superx-mod-website" }
 superx-ops = { path = "crates/superx-ops" }
 
 # Substrate SDK — kv-mem for in-process tests; protocol-ws for the
