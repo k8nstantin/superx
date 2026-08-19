@@ -28,6 +28,8 @@ pub const SEEDED_TYPES: &[(&str, &str, &str)] = &[
     ("comments", "relation", "text comments on an entity"),
     ("instructs", "relation", "text instructs a task"),
     ("authenticates", "relation", "credential authenticates the source (repo, jira, any service)"),
+    ("depends_on", "relation", "execution ordering: source runs only after target completes (runner, D25)"),
+    ("produced", "relation", "task produced a result (text/document node written back by the runner, D26)"),
 ];
 
 /// One row of the registry, as read back for rendering.
