@@ -33,3 +33,6 @@ tmp/
 # Claude Code worktree / session state
 .claude/sessions/
 history.txt
+
+# Instance parameter file (runtime config, never committed)
+/params
