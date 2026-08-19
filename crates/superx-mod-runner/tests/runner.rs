@@ -103,3 +103,104 @@ async fn cli_usage_and_unprovisioned_honesty() {
     let honest = RunnerModule.cli(&kernel, &["queue".to_string()]).await;
     assert!(honest.is_err(), "test handle has no module_db — errors honestly");
 }
+
+// ---------------------------------------------------------------- R2 --
+// Wave planning against REAL graphs built with the entities module's
+// own verbs (dev-dependency), serialized through the ONE shared JSON
+// producer (`graph::to_json`) the CLI uses — the exact contract.
+
+async fn entities_db() -> superx_kernel::Db {
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("entities").await.expect("nsdb");
+    let ddl = superx_mod_entities::SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "t");
+    db.query(ddl).await.expect("ddl").check().expect("ok");
+    superx_mod_entities::registry::seed_types(&db).await.expect("seed");
+    db
+}
+
+async fn graph_of(db: &superx_kernel::Db, root: &superx_kernel::types::RecordId) -> superx_mod_runner::plan::Graph {
+    let sub = superx_mod_entities::graph::subgraph(db, root, 20, false).await.expect("subgraph");
+    let json = superx_mod_entities::graph::to_json(&sub, root);
+    serde_json::from_value(json).expect("contract parses")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waves_of_the_superx_example() {
+    use superx_mod_entities::{edges, nodes};
+    use superx_mod_runner::plan;
+    let db = entities_db().await;
+
+    let product = nodes::create_entity(&db, "product", "SuperX", None, None).await.expect("p");
+    let kernel_t = nodes::create_entity(&db, "task", "Modify the kernel", None, None).await.expect("k");
+    let mod_a = nodes::create_entity(&db, "task", "Build module A", None, None).await.expect("a");
+    let mod_b = nodes::create_entity(&db, "task", "Build module B", None, None).await.expect("b");
+    let qa_a = nodes::create_entity(&db, "task", "QA module A", None, None).await.expect("qa");
+    let qa_b = nodes::create_entity(&db, "task", "QA module B", None, None).await.expect("qb");
+    for t in [&kernel_t, &mod_a, &mod_b, &qa_a, &qa_b] {
+        edges::link(&db, &product, t, "contains").await.expect("contain");
+    }
+    edges::link(&db, &mod_a, &kernel_t, "depends_on").await.expect("d1");
+    edges::link(&db, &mod_b, &kernel_t, "depends_on").await.expect("d2");
+    edges::link(&db, &qa_a, &mod_a, "depends_on").await.expect("d3");
+    edges::link(&db, &qa_b, &mod_b, "depends_on").await.expect("d4");
+
+    let plan = plan::compute_waves(&graph_of(&db, &product).await).expect("plan");
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    let names: Vec<Vec<&str>> = plan
+        .waves
+        .iter()
+        .map(|w| w.iter().map(|t| t.name.as_str()).collect())
+        .collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    assert_eq!(names[0], vec!["Modify the kernel"]);
+    assert_eq!(names[1].len(), 2, "modules build in parallel: {names:?}");
+    assert!(names[1].contains(&"Build module A") && names[1].contains(&"Build module B"));
+    assert_eq!(names[2].len(), 2, "QA in parallel after each: {names:?}");
+
+    let rendered = plan::render_plan(&plan);
+    assert!(rendered.contains("(parallel)"), "{rendered}");
+    assert!(rendered.contains("5 tasks in 3 waves"), "{rendered}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cycles_refused_with_names() {
+    use superx_mod_entities::{edges, nodes};
+    use superx_mod_runner::plan;
+    let db = entities_db().await;
+    let root = nodes::create_entity(&db, "product", "P", None, None).await.expect("p");
+    let a = nodes::create_entity(&db, "task", "task-a", None, None).await.expect("a");
+    let b = nodes::create_entity(&db, "task", "task-b", None, None).await.expect("b");
+    edges::link(&db, &root, &a, "contains").await.expect("c1");
+    edges::link(&db, &root, &b, "contains").await.expect("c2");
+    edges::link(&db, &a, &b, "depends_on").await.expect("d1");
+    edges::link(&db, &b, &a, "depends_on").await.expect("d2");
+
+    let err = plan::compute_waves(&graph_of(&db, &root).await).unwrap_err().to_string();
+    assert!(err.contains("cycle"), "{err}");
+    assert!(err.contains("task-a") && err.contains("task-b"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_tasks_never_execute_and_external_deps_warn() {
+    use superx_mod_entities::{edges, nodes, texts};
+    use superx_mod_runner::plan;
+    let db = entities_db().await;
+
+    // A product with texts/repo but ZERO tasks plans to zero waves.
+    let empty = nodes::create_entity(&db, "product", "Docs only", None, None).await.expect("p");
+    texts::set_role_text(&db, &empty, "describes", "no tasks here").await.expect("t");
+    let plan0 = plan::compute_waves(&graph_of(&db, &empty).await).expect("plan");
+    assert_eq!(plan0.waves.len(), 0);
+
+    // A task depending on a NON-task (the repo) warns and runs wave 1.
+    let root = nodes::create_entity(&db, "product", "P2", None, None).await.expect("p2");
+    let task = nodes::create_entity(&db, "task", "build", None, None).await.expect("t2");
+    let repo = nodes::create_entity(&db, "repo", "the repo", None, None).await.expect("r");
+    edges::link(&db, &root, &task, "contains").await.expect("c");
+    edges::link(&db, &root, &repo, "contains").await.expect("c2");
+    edges::link(&db, &task, &repo, "depends_on").await.expect("d");
+    let plan1 = plan::compute_waves(&graph_of(&db, &root).await).expect("plan");
+    assert_eq!(plan1.waves.len(), 1);
+    assert_eq!(plan1.warnings.len(), 1, "{:?}", plan1.warnings);
+    assert!(plan1.warnings[0].contains("treated satisfied"));
+}

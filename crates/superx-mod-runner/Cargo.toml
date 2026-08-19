@@ -10,6 +10,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 linkme.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 superx-kernel = { path = "../superx-kernel" }
 superx-ops = { path = "../superx-ops" }
@@ -17,5 +18,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+superx-mod-entities = { path = "../superx-mod-entities" }
 surrealdb.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

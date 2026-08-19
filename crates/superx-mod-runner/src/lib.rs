@@ -7,6 +7,7 @@
 //! on this per the epic's authoritative spec.
 
 pub mod cli;
+pub mod plan;
 pub mod schedule;
 
 use async_trait::async_trait;

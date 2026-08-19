@@ -25,7 +25,7 @@ const USAGE: &str = "usage: superx entities <command>\n\
   comment <uuid-fragment> <text…>      add a comment text node (threads: comment a comment)\n\
   attach <uuid-fragment> <file-path>   copy a file in; document node + attached edge\n\
   tree <uuid-fragment> [--depth <n>] [--reverse]\n\
-  graph <uuid-fragment> [--json]       export the reachable subgraph\n\
+  graph <uuid-fragment> [--json] [--depth <n>]   export the reachable subgraph\n\
   types                                list the type registry\n\
   types add <name> --category entity|relation [--description <text>]\n\
 each write emits telemetry into the kernel firehose";
@@ -331,27 +331,17 @@ async fn graph_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
     let fragment = args.first().ok_or_else(usage)?;
     let root = nodes::resolve_entity(&db, fragment).await?;
-    let depth = resolved_max_depth(kernel).await;
+    let depth = match args.iter().position(|a| a == "--depth") {
+        Some(i) => args
+            .get(i + 1)
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&d| d > 0)
+            .ok_or_else(usage)?,
+        None => resolved_max_depth(kernel).await,
+    };
     let sub = graph::subgraph(&db, &root, depth, false).await?;
     if args.iter().any(|a| a == "--json") {
-        let json = serde_json::json!({
-            "root": record_uuid(&root),
-            "truncated_at_depth": sub.truncated_at_depth,
-            "nodes": sub.nodes.iter().map(|n| serde_json::json!({
-                "uid": record_uuid(&n.id),
-                "type": n.entity_type,
-                "name": n.name,
-                "content": n.content,
-                "depth": n.depth,
-            })).collect::<Vec<_>>(),
-            "edges": sub.edges.iter().map(|e| serde_json::json!({
-                "edge_uid": e.edge_uid,
-                "from": e.from,
-                "to": e.to,
-                "rel": e.rel_type,
-            })).collect::<Vec<_>>(),
-        });
-        Ok(format!("{json:#}\n"))
+        Ok(format!("{:#}\n", graph::to_json(&sub, &root)))
     } else {
         Ok(format!(
             "subgraph of {}: {} nodes, {} active edges{}\n(use --json for the full export)\n",

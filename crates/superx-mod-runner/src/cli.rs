@@ -11,7 +11,8 @@ const USAGE: &str = "usage: superx runner <command>\n\
   schedule <entity-fragment> [--at <rfc3339> | --in <n><s|m|h|d>] [--every <n><s|m|h|d>]\n\
   queue                        chain-current schedules, soonest first\n\
   cancel <schedule-fragment>\n\
-(plan lands in R2 #192; the executor loop in R3 #193; recurrence firing in R4 #194)";
+  plan <entity-fragment>       DRY RUN: the execution waves the graph implies\n\
+(the executor loop lands in R3 #193; recurrence firing in R4 #194)";
 
 /// Route a `superx runner …` invocation.
 ///
@@ -24,6 +25,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("schedule") => schedule_cmd(kernel, &args[1..]).await,
         Some("queue") => queue_cmd(kernel).await,
         Some("cancel") => cancel_cmd(kernel, &args[1..]).await,
+        Some("plan") => plan_cmd(kernel, &args[1..]).await,
         _ => Err(KernelError::Module(USAGE.to_string())),
     }
 }
@@ -111,6 +113,14 @@ async fn cancel_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     schedule::cancel_schedule(&db, &uid).await?;
     emit(kernel, "schedule_cancelled", serde_json::json!({ "schedule": uid })).await;
     Ok(format!("schedule {uid} cancelled (chain history kept)\n"))
+}
+
+async fn plan_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let fragment = args.first().ok_or_else(usage)?;
+    let depth = crate::plan::resolved_plan_depth(kernel).await;
+    let graph = crate::plan::fetch_graph(kernel, fragment, depth).await?;
+    let plan = crate::plan::compute_waves(&graph)?;
+    Ok(crate::plan::render_plan(&plan))
 }
 
 /// Resolve an entity fragment to (uuid, name) through the entities

@@ -18,6 +18,10 @@ pub struct GraphNode {
     pub entity_type: String,
     pub name: String,
     pub content: Option<String>,
+    /// FLEXIBLE attributes of the current state (prompt context).
+    pub attributes: Option<superx_kernel::types::Value>,
+    /// Current state's valid_from — the version the reader saw.
+    pub version: String,
     pub depth: usize,
 }
 
@@ -108,9 +112,15 @@ async fn push_level(
     let meta = current_meta(db, level).await?;
     for id in level {
         let uuid = record_uuid(id);
-        let (entity_type, name, content) = match meta.get(&uuid) {
-            Some(m) => (m.entity_type.clone(), m.name.clone(), m.content.clone()),
-            None => (String::new(), String::new(), None),
+        let (entity_type, name, content, attributes, version) = match meta.get(&uuid) {
+            Some(m) => (
+                m.entity_type.clone(),
+                m.name.clone(),
+                m.content.clone(),
+                m.attributes.clone(),
+                m.version.clone(),
+            ),
+            None => (String::new(), String::new(), None, None, String::new()),
         };
         // Content rides along only for content-bearing nodes; other
         // kinds keep exports lean.
@@ -119,7 +129,7 @@ async fn push_level(
         } else {
             None
         };
-        nodes.push(GraphNode { id: id.clone(), entity_type, name, content, depth });
+        nodes.push(GraphNode { id: id.clone(), entity_type, name, content, attributes, version, depth });
     }
     Ok(())
 }
@@ -187,4 +197,30 @@ fn first_line(s: &str) -> String {
     } else {
         line.to_string()
     }
+}
+
+/// The subgraph as the CLI's JSON contract — ONE producer so the
+/// `graph --json` command and every consumer (the runner, tests, the
+/// future UI page) speak the identical shape (#192 amendment).
+#[must_use]
+pub fn to_json(graph: &Subgraph, root: &RecordId) -> serde_json::Value {
+    serde_json::json!({
+        "root": record_uuid(root),
+        "truncated_at_depth": graph.truncated_at_depth,
+        "nodes": graph.nodes.iter().map(|n| serde_json::json!({
+            "uid": record_uuid(&n.id),
+            "type": n.entity_type,
+            "name": n.name,
+            "content": n.content,
+            "attributes": n.attributes.as_ref().map(crate::nodes::value_to_json),
+            "version": n.version,
+            "depth": n.depth,
+        })).collect::<Vec<_>>(),
+        "edges": graph.edges.iter().map(|e| serde_json::json!({
+            "edge_uid": e.edge_uid,
+            "from": e.from,
+            "to": e.to,
+            "rel": e.rel_type,
+        })).collect::<Vec<_>>(),
+    })
 }
