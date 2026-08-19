@@ -301,8 +301,8 @@ pub async fn run_stop(data_dir: &std::path::Path) -> Result<String, String> {
 pub async fn run_modules_list(kernel: &Kernel) -> Result<String, String> {
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<26} {:<38} {:<14} {:<9} {:<9} {}\n",
-        "MODULE", "MODULE_ID", "KIND", "INTENT", "LIFECYCLE", "VERSION"
+        "{:<26} {:<38} {:<14} {:<9} {:<9} {:<5} {}\n",
+        "MODULE", "MODULE_ID", "KIND", "INTENT", "LIFECYCLE", "PROV", "VERSION"
     ));
     for module in superx_kernel::KERNEL_MODULES {
         let desc = module.descriptor();
@@ -325,13 +325,21 @@ pub async fn run_modules_list(kernel: &Kernel) -> Result<String, String> {
                 }
                 _ => ("-".to_string(), "enabled", "never-booted".to_string()),
             };
+        let provisioned = kernel
+            .latest_module_record(desc.name)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| if r.provisioned { "yes" } else { "no" })
+            .unwrap_or("-");
         out.push_str(&format!(
-            "{:<26} {:<38} {:<14} {:<9} {:<9} v{}\n",
+            "{:<26} {:<38} {:<14} {:<9} {:<9} {:<5} v{}\n",
             desc.name,
             module_id,
             desc.kind.type_uid().trim_start_matches("node_"),
             intent,
             lifecycle,
+            provisioned,
             desc.version
         ));
     }
@@ -426,6 +434,13 @@ pub async fn run_modules_provision(
                 superx_kernel::types::Value::Bool(true),
             )
             .await;
+    }
+    // v2.2: the ledger records the provisioning fact first-class.
+    if let Ok(Some(entity)) = kernel.find_module_by_name(desc.kind, name).await {
+        kernel
+            .append_module_record(&desc, entity, true)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     kernel
         .log_telemetry(

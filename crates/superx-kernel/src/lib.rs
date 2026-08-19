@@ -69,8 +69,8 @@ pub use message::{MessageRecord, NewMessage};
 pub use lifecycle::LifecycleState;
 pub use metamodel::{MetamodelType, REQUIRED_METAMODEL_TYPES};
 pub use registry::{
-    KernelModule, KernelModuleDescriptor, ModuleStatus, NodeKind, RegistryStatus,
-    KERNEL_MODULES,
+    KernelModule, KernelModuleDescriptor, ModuleRecord, ModuleStatus, NodeKind,
+    RegistryStatus, KERNEL_MODULES,
 };
 pub use schema::SCHEMA_DDL;
 pub use substrate::{Kernel, NamedEntity};

@@ -236,5 +236,34 @@ DEFINE INDEX idx_message_agent ON TABLE message
 
 
 -- =========================================================================
+-- module — the module registration ledger (v2.2, operator directive
+-- 2026-08-19: SuperX keeps track of ALL the modules, first-class)
+-- =========================================================================
+-- Append-only, typed record of every module (re)registration and
+-- provisioning change. COMPLEMENTS the registry entity (which remains
+-- the identity anchor: parameters target it, telemetry subject FKs
+-- it, and its id IS the module's UUIDv7 reference — D18). "Current"
+-- = latest row per uid. One obvious `SELECT * FROM module` answers
+-- what SuperX knows about its modules.
+DEFINE TABLE module SCHEMAFULL
+    PERMISSIONS
+        FOR select FULL
+        FOR create FULL
+        FOR update NONE
+        FOR delete NONE;
+
+DEFINE FIELD uid         ON TABLE module TYPE string;
+DEFINE FIELD entity      ON TABLE module TYPE record<entity>;
+DEFINE FIELD kind        ON TABLE module TYPE string
+    ASSERT $value INSIDE ['kernel_module', 'adapter'];
+DEFINE FIELD version     ON TABLE module TYPE string;
+DEFINE FIELD provisioned ON TABLE module TYPE bool;
+DEFINE FIELD valid_from  ON TABLE module TYPE datetime;
+
+DEFINE INDEX idx_module_chain ON TABLE module
+    FIELDS uid, valid_from;
+
+
+-- =========================================================================
 -- END — schema locked from here forward (skill §7)
 -- =========================================================================

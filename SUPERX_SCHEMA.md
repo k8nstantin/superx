@@ -1,4 +1,4 @@
-# SUPERX_SCHEMA.md — Substrate Schema, Source of Truth (v2.1)
+# SUPERX_SCHEMA.md — Substrate Schema, Source of Truth (v2.2)
 
 > **Status: locked on apply.** v2 designed operator + model on
 > 2026-08-06; **v2.1** (conversations first-class: `message` table +
@@ -8,6 +8,8 @@
 > under root via [`scripts/deploy-schema.sh`](scripts/deploy-schema.sh).
 > From that moment the schema is locked: every change requires a fresh
 > per-change `Operator-approved:` PR marker (skill §7, CI-enforced).
+> **v2.2** (module registration ledger) designed 2026-08-19 per the
+> operator directive in issue #150.
 
 ## 1. Contracts (binding on every kernel verb)
 
@@ -46,7 +48,7 @@
 Root is operator-only, used exactly once per substrate to apply this
 schema. The kernel signs in as `superx_kernel` forever after (skill §10/§13).
 
-## 3. Tables (8)
+## 3. Tables (9)
 
 Every table is SCHEMAFULL, global (single-operator OS, no tenancy), and
 carries `valid_from: datetime` set by the kernel at insert.
@@ -157,7 +159,26 @@ session metadata (project path, title, …) lives in `state_ledger` like
 everything else. `telemetry_stream` remains the actions firehose;
 `message` is the conversations record.
 
-## 4. Indexes (8)
+### 3.9 `module` — the module registration ledger *(v2.2)*
+SuperX tracks every module first-class: one append-only row per
+(re)registration or provisioning change; current = latest per `uid`.
+Complements the registry entity — the entity remains the identity
+anchor (parameters target it, telemetry `subject` FKs it, its id is
+the module's UUIDv7 reference per D18).
+
+| field | type | note |
+|---|---|---|
+| `uid` | `string` | module name (`hello`, `capture`, `adapter_gemini_cli`) |
+| `entity` | `record<entity>` | FK to the module's registry entity |
+| `kind` | `string` ∈ `[kernel_module, adapter]` | |
+| `version` | `string` | crate version at registration |
+| `provisioned` | `bool` | own-db schema applied |
+
+Writers: `register_module` (every boot registration appends current
+facts, carrying the prior `provisioned` forward) and
+`modules provision` (appends a `provisioned = true` row).
+
+## 4. Indexes (9)
 
 | index | table | fields | kind |
 |---|---|---|---|
@@ -169,6 +190,7 @@ everything else. `telemetry_stream` remains the actions firehose;
 | `idx_telemetry_agent` *(v2.1)* | telemetry_stream | agent, valid_from | — |
 | `idx_message_session` *(v2.1)* | message | session, valid_from | — |
 | `idx_message_agent` *(v2.1)* | message | agent, valid_from | — |
+| `idx_module_chain` *(v2.2)* | module | uid, valid_from | — |
 
 The UNIQUE pair makes `ensure_*` find-then-create verbs race-safe
 (cross-process double-creates surface as engine refusals — skill §12).
@@ -190,6 +212,12 @@ v2.1 indexes back conversation rendering and per-agent queries.
 5. Decision: **capture everything by default** — no per-agent grant
    gate; "requesting perms where needed" is the OS-level file prompts.
    A future exclusion mechanism, if wanted, is a substrate parameter.
+
+## 5b. Delta in v2.2 (operator directive, issue #150)
+
+1. New `module` table — the module registration ledger (above).
+   Purely additive: fresh instances get it at initialize; existing
+   instances apply the one new section under the operator path.
 
 ## 5. Deltas from v1 (`archive/pre-reset-2026-08-06`)
 
