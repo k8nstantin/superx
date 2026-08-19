@@ -46,8 +46,8 @@ SuperX is an **agentic operating system** written in Rust.
    permission surface).
 4. **CLI** — the operator interface: `--initialize` (one-command
    provisioning + background boot, idempotent per instance; the
-   terminal returns), `stop` / `status` (background-OS lifecycle,
-   pidfile-backed), `agents`, `actions [--agent] [--live]` (the
+   terminal returns), `start` / `stop` / `restart` / `status` (background-OS
+   lifecycle, pidfile-backed), `agents`, `actions [--agent] [--live]` (the
    telemetry stream), `sessions` (list conversations), `read
    <session-fragment> [--live]` (render a conversation, historical
    then follow), `logs [--follow] [--daemon]` (the OS's own log).

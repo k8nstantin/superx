@@ -61,10 +61,21 @@ async fn run(cli: Cli, config: Config) -> Result<(), String> {
     let Some(command) = cli.command else {
         return Err("nothing to do — pass a command or --initialize (see --help)".to_string());
     };
-    // `stop` and `logs` must work without a reachable substrate.
+    // Lifecycle + logs commands manage their own connections.
     if matches!(command, Command::Stop) {
         superx::emit(&superx::run_stop(&config.data_dir).await?);
         return Ok(());
+    }
+    if matches!(command, Command::Start) {
+        return superx::run_start(&config).await;
+    }
+    if matches!(command, Command::Restart) {
+        if superx::initialize::read_live_pid(&config.data_dir).is_some() {
+            superx::emit(&superx::run_stop(&config.data_dir).await?);
+        } else {
+            superx::emit("OS was not running — starting it\n");
+        }
+        return superx::run_start(&config).await;
     }
     if let Command::Logs { lines, follow, daemon } = command {
         let (text, path, mut seen) = superx::run_logs(&config, lines, daemon)?;
@@ -101,7 +112,9 @@ async fn run(cli: Cli, config: Config) -> Result<(), String> {
             }
             superx::run_boot(&kernel).await
         }
-        Command::Stop | Command::Logs { .. } => unreachable!("handled above"),
+        Command::Start | Command::Stop | Command::Restart | Command::Logs { .. } => {
+            unreachable!("handled above")
+        }
         Command::Status => {
             superx::emit(&superx::run_status(&kernel, &config.data_dir).await?);
             Ok(())

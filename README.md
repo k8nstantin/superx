@@ -73,8 +73,15 @@ superx logs -n 40              # the OS's own log (--follow to tail)
 # Lifecycle:
 superx stop                    # graceful shutdown (lands in seconds,
                                # even mid-backfill)
-superx --initialize            # boots straight back — no re-prompt
+superx start                   # boot back (already-initialized instance)
+superx restart                 # stop + start — one command to pick up
+                               # a freshly built binary
 ```
+
+After upgrading the binary, `superx restart` moves the background OS
+to the new build. Live viewers (`actions --live`, `read --live`)
+render client-side — re-run them after an upgrade to pick up renderer
+changes.
 
 The first minutes after a fresh initialize are history backfill (your
 full Claude Code history; Gemini chat files capped at 8 MiB each,
