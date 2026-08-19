@@ -23,6 +23,53 @@ pub struct EntityRow {
     pub name: String,
 }
 
+/// Current metadata of an anchor, batch-resolved (issue #179): one
+/// correlated subquery per anchor picks ONLY the newest state row —
+/// version chains are never transferred whole.
+pub struct NodeMeta {
+    pub entity_type: String,
+    pub name: String,
+    pub content: Option<String>,
+}
+
+/// Batch-resolve current metadata for a set of anchors, keyed by
+/// uuid. Cost is bounded by the id set and the chain index, never by
+/// table size or history depth.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn current_meta(
+    db: &Db,
+    ids: &[RecordId],
+) -> Result<std::collections::HashMap<String, NodeMeta>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut resp = db
+        .query(
+            "SELECT id, entity_type,              (SELECT name, content, valid_from FROM entity_state               WHERE entity = $parent.id ORDER BY valid_from DESC LIMIT 1) AS state              FROM $ids",
+        )
+        .bind(("ids", ids.to_vec()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    Ok(rows.iter().filter_map(parse_meta).collect())
+}
+
+fn parse_meta(row: &Value) -> Option<(String, NodeMeta)> {
+    let id = obj_record(row, "id")?;
+    let entity_type = obj_str(row, "entity_type")?;
+    let state = match obj_get(row, "state") {
+        Some(Value::Array(a)) => a.first().cloned(),
+        _ => None,
+    };
+    let (name, content) = match &state {
+        Some(s) => (obj_str(s, "name").unwrap_or_default(), obj_str(s, "content")),
+        None => (String::new(), None),
+    };
+    Some((record_uuid(&id), NodeMeta { entity_type, name, content }))
+}
+
 /// Validate a type name against the registry for a category.
 ///
 /// # Errors
@@ -183,35 +230,20 @@ pub async fn list_entities(db: &Db, type_filter: Option<&str>) -> Result<Vec<Ent
         db.query("SELECT id, entity_type FROM entity").await?
     };
     let rows: Vec<Value> = resp.take(0)?;
-    let mut anchors: Vec<(RecordId, String)> = rows
-        .iter()
-        .filter_map(|r| Some((obj_record(r, "id")?, obj_str(r, "entity_type")?)))
-        .collect();
-    anchors.sort_by_key(|(id, _)| record_uuid(id));
+    let mut anchors: Vec<RecordId> = rows.iter().filter_map(|r| obj_record(r, "id")).collect();
+    anchors.sort_by_key(record_uuid);
 
-    // One batched read resolves every current label: newest state
-    // first, first-seen per anchor wins.
-    let ids: Vec<RecordId> = anchors.iter().map(|(id, _)| id.clone()).collect();
-    let mut resp = db
-        .query(
-            "SELECT entity, name, valid_from FROM entity_state \
-             WHERE entity INSIDE $ids ORDER BY valid_from DESC",
-        )
-        .bind(("ids", ids))
-        .await?;
-    let state_rows: Vec<Value> = resp.take(0)?;
-    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for row in &state_rows {
-        if let (Some(entity), Some(name)) = (obj_record(row, "entity"), obj_str(row, "name")) {
-            names.entry(record_uuid(&entity)).or_insert(name);
-        }
-    }
-
+    // Current labels only — never the whole version chains (#179).
+    let meta = current_meta(db, &anchors).await?;
     Ok(anchors
         .into_iter()
-        .map(|(id, entity_type)| {
-            let name = names.get(&record_uuid(&id)).cloned().unwrap_or_default();
-            EntityRow { id, entity_type, name }
+        .map(|id| {
+            let m = meta.get(&record_uuid(&id));
+            EntityRow {
+                entity_type: m.map(|m| m.entity_type.clone()).unwrap_or_default(),
+                name: m.map(|m| m.name.clone()).unwrap_or_default(),
+                id,
+            }
         })
         .collect())
 }

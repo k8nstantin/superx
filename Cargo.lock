@@ -3775,6 +3775,7 @@ name = "superx-mod-entities"
 version = "1.0.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "linkme",
  "serde_json",
  "superx-kernel",
