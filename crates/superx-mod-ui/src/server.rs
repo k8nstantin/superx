@@ -55,6 +55,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/{id}/activity", get(api_session_activity))
         .route("/api/activity", get(api_activity))
+        .route("/api/stats", get(api_stats))
         .route("/api/actions", get(api_actions))
         .route("/api/charts/summary", get(api_charts))
         .route("/api/events", get(api_events))
@@ -337,6 +338,16 @@ async fn api_session_activity(
         .min(ACTIVITY_BACKLOG_MAX);
     match crate::activity::session_activity(kernel, session, limit).await {
         Ok(events) => Response::ok(events),
+        Err(e) => Response::err(e.to_string()),
+    }
+}
+
+/// The Status page's aggregation (issue #228).
+async fn api_stats(State(state): State<AppState>) -> Response<StatsSummary> {
+    let kernel = &state.kernel;
+    let window = crate::resolved_stats_window(kernel).await;
+    match crate::stats::stats_summary(kernel, window).await {
+        Ok(s) => Response::ok(s),
         Err(e) => Response::err(e.to_string()),
     }
 }

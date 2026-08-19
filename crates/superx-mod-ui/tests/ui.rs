@@ -261,6 +261,92 @@ async fn global_activity_includes_everything_including_no_session_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_summary_mines_tools_lines_and_sessions_from_raw_events() {
+    use superx_kernel::message::json_to_object;
+    use superx_mod_ui::stats::stats_summary;
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-stats").await;
+
+    // Claude-style: Write (3 lines) + Bash, with 30 output tokens.
+    kernel
+        .log_message(superx_kernel::NewMessage {
+            session: session.clone(),
+            agent: agent.clone(),
+            role: "assistant".to_string(),
+            content: String::new(),
+            raw: Some(json_to_object(&serde_json::json!({
+                "message": {
+                    "usage": {"output_tokens": 30},
+                    "content": [
+                        {"type": "tool_use", "name": "Write",
+                         "input": {"file_path": "a.rs", "content": "a\nb\nc"}},
+                        {"type": "tool_use", "name": "Bash",
+                         "input": {"command": "ls"}}
+                    ]
+                }
+            }))),
+            seq: None,
+            emitted_at: None,
+        })
+        .await
+        .expect("write msg");
+    // Claude-style: Edit (2 lines).
+    kernel
+        .log_message(superx_kernel::NewMessage {
+            session: session.clone(),
+            agent: agent.clone(),
+            role: "assistant".to_string(),
+            content: String::new(),
+            raw: Some(json_to_object(&serde_json::json!({
+                "message": {"content": [
+                    {"type": "tool_use", "name": "Edit",
+                     "input": {"new_string": "x\ny"}}
+                ]}
+            }))),
+            seq: None,
+            emitted_at: None,
+        })
+        .await
+        .expect("edit msg");
+    // Gemini-style: a toolCall + 5 output tokens.
+    kernel
+        .log_message(superx_kernel::NewMessage {
+            session: session.clone(),
+            agent: agent.clone(),
+            role: "assistant".to_string(),
+            content: String::new(),
+            raw: Some(json_to_object(&serde_json::json!({
+                "tokens": {"output": 5},
+                "toolCalls": [{"name": "web_search"}]
+            }))),
+            seq: None,
+            emitted_at: None,
+        })
+        .await
+        .expect("gemini msg");
+
+    let s = stats_summary(&kernel, 100).await.expect("stats");
+    assert_eq!(s.messages_total, 3);
+    assert_eq!(s.output_tokens_total, 35, "30 claude + 5 gemini");
+    assert_eq!(s.lines_written, 5, "Write 3 + Edit 2");
+    assert_eq!(s.tools_window, 4, "Write + Bash + Edit + web_search");
+    let tool = |n: &str| s.tools.iter().find(|t| t.name == n).map(|t| t.value);
+    assert_eq!(tool("Write"), Some(1));
+    assert_eq!(tool("Bash"), Some(1));
+    assert_eq!(tool("Edit"), Some(1));
+    assert_eq!(tool("web_search"), Some(1));
+    assert_eq!(s.sessions_active, 1, "messages are fresh");
+    assert_eq!(s.window_messages, 100);
+    assert_eq!(s.top_sessions.len(), 1);
+    let top = &s.top_sessions[0];
+    assert_eq!(top.messages, 3);
+    assert_eq!(top.lines_written, 5);
+    assert_eq!(top.output_tokens, 35);
+    assert!(top.identity.starts_with("claude_code/"), "{}", top.identity);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_token_stats_mines_usage_from_raw_events() {
     use superx_kernel::message::json_to_object;
     use superx_mod_ui::activity::session_token_stats;
