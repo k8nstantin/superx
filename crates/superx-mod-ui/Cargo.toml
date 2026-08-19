@@ -8,7 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+async-stream = "0.3"
 axum.workspace = true
+futures-core = "0.3"
 linkme.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -16,6 +18,8 @@ superx-kernel = { path = "../superx-kernel" }
 superx-ops = { path = "../superx-ops" }
 tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
+ts-rs.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 surrealdb.workspace = true

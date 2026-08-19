@@ -605,6 +605,11 @@ fn compact_value(v: &Value) -> String {
 fn plain(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
+        Value::Number(n) => n
+            .to_int()
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| format!("{n:?}")),
+        Value::Bool(b) => b.to_string(),
         Value::None | Value::Null => String::new(),
         other => format!("{other:?}"),
     }

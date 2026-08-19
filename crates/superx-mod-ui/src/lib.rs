@@ -19,6 +19,7 @@ use superx_kernel::{
     KERNEL_MODULES,
 };
 
+pub mod api;
 mod server;
 
 pub const MODULE_NAME: &str = "ui";
@@ -31,6 +32,10 @@ pub const DEFAULT_PORT: u16 = 5150; // skill-allow: §9-const — bootstrap fall
 
 /// The placeholder page (P4); replaced by the built dashboard in P6.
 pub const PLACEHOLDER_HTML: &str = include_str!("../ui/dist/index.html");
+
+/// The UI module's own schema (command history, preferences) —
+/// provisioned into `superx/ui` by `superx modules provision ui`.
+pub const SCHEMA_DDL: &str = include_str!("../schema/ui.surql");
 
 pub struct UiModule;
 
@@ -82,8 +87,12 @@ impl KernelModule for UiModule {
         Ok(())
     }
 
+    fn schema_ddl(&self) -> Option<&'static str> {
+        Some(SCHEMA_DDL)
+    }
+
     fn needs_dir(&self) -> bool {
-        true // P5: preferences/exports live here
+        true // exports/downloads land here
     }
 
     /// `superx ui url` — where the dashboard lives.
