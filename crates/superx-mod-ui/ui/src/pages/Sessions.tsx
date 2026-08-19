@@ -1,14 +1,15 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Badge, Button, Card, Group, ScrollArea, Switch, Table, Text, Title, Tooltip } from '@mantine/core'
-import { fetchMessages, fetchSessions } from '../api'
+import { fetchSessionActivity, fetchSessions } from '../api'
 import { useSse } from '../useSse'
-import type { MessageView } from '../generated/MessageView'
+import type { SessionEvent } from '../generated/SessionEvent'
+import type { SessionView } from '../generated/SessionView'
 
 export default function SessionsPage() {
-  const [selected, setSelected] = useState<string | null>(null)
+  const [selected, setSelected] = useState<SessionView | null>(null)
   return selected ? (
-    <ConversationView id={selected} onBack={() => setSelected(null)} />
+    <SessionActivityView session={selected} onBack={() => setSelected(null)} />
   ) : (
     <SessionList onOpen={setSelected} />
   )
@@ -68,7 +69,7 @@ function relativeTime(iso: string | null): string {
   return then.toLocaleDateString()
 }
 
-function SessionList({ onOpen }: { onOpen: (id: string) => void }) {
+function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
   const sessions = useQuery({ queryKey: ['sessions'], queryFn: () => fetchSessions(), refetchInterval: 10000 })
   const rows = (sessions.data ?? []).slice().sort((a, b) => {
     const rank = LIVENESS_RANK[liveness(a.last_active)] - LIVENESS_RANK[liveness(b.last_active)]
@@ -81,7 +82,7 @@ function SessionList({ onOpen }: { onOpen: (id: string) => void }) {
     <Card withBorder>
       <style>{'@keyframes sx-glow { 0%, 100% { box-shadow: 0 0 4px 1px rgba(48,209,88,0.5); } 50% { box-shadow: 0 0 10px 4px rgba(48,209,88,0.9); } }'}</style>
       <Title order={5} mb="xs">
-        Captured conversations
+        Sessions — every conversation, grouping all its activity
       </Title>
       <ScrollArea h={600}>
         <Table striped highlightOnHover>
@@ -122,8 +123,8 @@ function SessionList({ onOpen }: { onOpen: (id: string) => void }) {
                 </Table.Td>
                 <Table.Td>{String(s.messages)}</Table.Td>
                 <Table.Td>
-                  <Button size="compact-xs" variant="light" onClick={() => onOpen(s.session_id)}>
-                    read
+                  <Button size="compact-xs" variant="light" onClick={() => onOpen(s)}>
+                    open
                   </Button>
                 </Table.Td>
               </Table.Tr>
@@ -135,19 +136,43 @@ function SessionList({ onOpen }: { onOpen: (id: string) => void }) {
   )
 }
 
-function ConversationView({ id, onBack }: { id: string; onBack: () => void }) {
+// One session's FULL activity (issue #172): messages + actions merged
+// chronologically — historical backlog, then live, auto-scrolling.
+function SessionActivityView({ session, onBack }: { session: SessionView; onBack: () => void }) {
   const [live, setLive] = useState(true)
-  const [liveRows, setLiveRows] = useState<string[]>([])
-  const backlog = useQuery({ queryKey: ['messages', id], queryFn: () => fetchMessages(id) })
+  const [kind, setKind] = useState<'all' | 'message' | 'action'>('all')
+  const [liveRows, setLiveRows] = useState<SessionEvent[]>([])
+  const backlog = useQuery({
+    queryKey: ['activity', session.session_id],
+    queryFn: () => fetchSessionActivity(session.session_id),
+  })
 
   useSse((e) => {
-    if (e.kind === 'message' && e.session_id === id) {
-      setLiveRows((prev) => [...prev, e.rendered])
-    }
+    const mine =
+      e.kind === 'message' ? e.session_id === session.session_id : e.session_src === session.src
+    if (!mine) return
+    setLiveRows((prev) => [
+      ...prev,
+      { kind: e.kind, role: null, rendered: e.rendered, valid_from: e.valid_from },
+    ])
   }, !live)
 
-  const roleColor = (m: MessageView) =>
-    m.role === 'user' ? 'teal' : m.role === 'assistant' ? 'indigo' : 'gray'
+  const rows = [...(backlog.data ?? []), ...liveRows].filter(
+    (r) => kind === 'all' || r.kind === kind,
+  )
+
+  // Pinned-to-bottom auto-scroll: follow new rows unless the user has
+  // scrolled up; resume following when they return near the bottom.
+  const viewport = useRef<HTMLDivElement>(null)
+  const following = useRef(true)
+  useEffect(() => {
+    if (following.current && viewport.current) {
+      viewport.current.scrollTo({ top: viewport.current.scrollHeight })
+    }
+  }, [rows.length])
+
+  const roleColor = (role: string | null) =>
+    role === 'user' ? 'teal' : role === 'assistant' ? 'indigo' : 'gray'
 
   return (
     <Card withBorder>
@@ -157,20 +182,53 @@ function ConversationView({ id, onBack }: { id: string; onBack: () => void }) {
             ← sessions
           </Button>
           <Title order={5} ff="monospace">
-            {id}
+            {session.agent}/{session.session_id}
           </Title>
         </Group>
-        <Switch label="live" checked={live} onChange={(e) => setLive(e.currentTarget.checked)} />
+        <Group>
+          {(['all', 'message', 'action'] as const).map((k) => (
+            <Badge
+              key={k}
+              variant={kind === k ? 'filled' : 'outline'}
+              style={{ cursor: 'pointer' }}
+              onClick={() => setKind(k)}
+            >
+              {k}
+            </Badge>
+          ))}
+          <Switch label="live" checked={live} onChange={(e) => setLive(e.currentTarget.checked)} />
+        </Group>
       </Group>
-      <ScrollArea h={580}>
-        {(backlog.data ?? []).map((m, i) => (
-          <Text key={i} size="sm" ff="monospace" mb={2} c={roleColor(m) === 'gray' ? 'dimmed' : undefined}>
-            {m.rendered}
+      <ScrollArea
+        h={580}
+        viewportRef={viewport}
+        onScrollPositionChange={({ y }) => {
+          const v = viewport.current
+          if (v) following.current = y + v.clientHeight >= v.scrollHeight - 40
+        }}
+      >
+        {rows.length === 0 && (
+          <Text c="dimmed" size="sm">
+            nothing captured for this session yet
           </Text>
-        ))}
-        {liveRows.map((r, i) => (
-          <Text key={`live-${i}`} size="sm" ff="monospace" mb={2} c="yellow.3">
-            {r}
+        )}
+        {rows.map((r, i) => (
+          <Text
+            key={`${r.valid_from}-${i}`}
+            size="sm"
+            ff="monospace"
+            mb={2}
+            c={r.kind === 'action' ? 'dimmed' : undefined}
+          >
+            <Badge
+              size="xs"
+              mr={6}
+              variant={r.kind === 'action' ? 'outline' : 'light'}
+              color={r.kind === 'message' ? roleColor(r.role) : 'indigo'}
+            >
+              {r.kind === 'message' ? (r.role ?? 'message') : 'action'}
+            </Badge>
+            {r.rendered}
           </Text>
         ))}
       </ScrollArea>

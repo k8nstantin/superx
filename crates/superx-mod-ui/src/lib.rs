@@ -19,6 +19,7 @@ use superx_kernel::{
     KERNEL_MODULES,
 };
 
+pub mod activity;
 pub mod api;
 mod server;
 

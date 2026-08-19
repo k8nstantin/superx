@@ -3,7 +3,7 @@
 import type { StatusResponse } from './generated/StatusResponse'
 import type { AgentView } from './generated/AgentView'
 import type { SessionView } from './generated/SessionView'
-import type { MessageView } from './generated/MessageView'
+import type { SessionEvent } from './generated/SessionEvent'
 import type { ActionView } from './generated/ActionView'
 import type { ChartsSummary } from './generated/ChartsSummary'
 
@@ -17,8 +17,8 @@ export const fetchStatus = () => get<StatusResponse>('/api/status')
 export const fetchAgents = () => get<AgentView[]>('/api/agents')
 export const fetchSessions = (agent?: string) =>
   get<SessionView[]>(`/api/sessions${agent ? `?agent=${agent}` : ''}`)
-export const fetchMessages = (id: string, limit = 500) =>
-  get<MessageView[]>(`/api/sessions/${id}/messages?limit=${limit}`)
+export const fetchSessionActivity = (id: string, limit = 500) =>
+  get<SessionEvent[]>(`/api/sessions/${id}/activity?limit=${limit}`)
 export const fetchActions = (limit = 50) => get<ActionView[]>(`/api/actions?limit=${limit}`)
 export const fetchCharts = () => get<ChartsSummary>('/api/charts/summary')
 

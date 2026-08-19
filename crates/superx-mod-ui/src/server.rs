@@ -53,7 +53,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/status", get(api_status))
         .route("/api/agents", get(api_agents))
         .route("/api/sessions", get(api_sessions))
-        .route("/api/sessions/{id}/messages", get(api_session_messages))
+        .route("/api/sessions/{id}/activity", get(api_session_activity))
         .route("/api/actions", get(api_actions))
         .route("/api/charts/summary", get(api_charts))
         .route("/api/events", get(api_events))
@@ -95,6 +95,7 @@ async fn sse_poller(kernel: Kernel, tx: broadcast::Sender<String>) {
                     rendered: superx_ops::render_event(a).trim_end().to_string(),
                     agent_id: a.agent.as_ref().map(superx_ops::record_uuid),
                     session_id: None,
+                    session_src: crate::activity::session_key_of(&a.payload),
                     valid_from: a.valid_from.to_rfc3339(),
                 };
                 if let Ok(json) = serde_json::to_string(&ev) {
@@ -112,6 +113,7 @@ async fn sse_poller(kernel: Kernel, tx: broadcast::Sender<String>) {
                     rendered: superx_ops::render_message(m).trim_end().to_string(),
                     agent_id: Some(superx_ops::record_uuid(&m.agent)),
                     session_id: Some(superx_ops::record_uuid(&m.session)),
+                    session_src: None,
                     valid_from: m.valid_from.to_rfc3339(),
                 };
                 if let Ok(json) = serde_json::to_string(&ev) {
@@ -282,33 +284,32 @@ async fn api_sessions(
 }
 
 #[derive(serde::Deserialize)]
-struct MessagesQuery {
+struct ActivityQuery {
     limit: Option<u32>,
 }
 
-async fn api_session_messages(
+/// Session-activity backlog page default and bound (issue #172).
+const ACTIVITY_BACKLOG_DEFAULT: u32 = 500; // skill-allow: §9-const — render page default, query-param overridable
+const ACTIVITY_BACKLOG_MAX: u32 = 2000; // skill-allow: §9-const — render page bound
+
+/// Everything the OS captured for one session — messages + actions,
+/// merged chronologically (issue #172).
+async fn api_session_activity(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
-    Query(q): Query<MessagesQuery>,
-) -> Response<Vec<MessageView>> {
+    Query(q): Query<ActivityQuery>,
+) -> Response<Vec<SessionEvent>> {
     let kernel = &state.kernel;
     let session = match superx_ops::resolve_session(kernel, &id).await {
         Ok(s) => s,
         Err(e) => return Response::err(e),
     };
-    let limit = q.limit.unwrap_or(SSE_BATCH);
-    match kernel.session_messages(session, limit).await {
-        Ok(messages) => Response::ok(
-            messages
-                .iter()
-                .map(|m| MessageView {
-                    session_id: superx_ops::record_uuid(&m.session),
-                    role: m.role.clone(),
-                    rendered: superx_ops::render_message(m).trim_end().to_string(),
-                    valid_from: m.valid_from.to_rfc3339(),
-                })
-                .collect(),
-        ),
+    let limit = q
+        .limit
+        .unwrap_or(ACTIVITY_BACKLOG_DEFAULT)
+        .min(ACTIVITY_BACKLOG_MAX);
+    match crate::activity::session_activity(kernel, session, limit).await {
+        Ok(events) => Response::ok(events),
         Err(e) => Response::err(e.to_string()),
     }
 }
