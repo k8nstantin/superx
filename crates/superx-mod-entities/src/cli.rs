@@ -6,7 +6,7 @@ use superx_kernel::types::Value;
 use superx_kernel::{Kernel, KernelError, NodeKind, Result};
 use superx_ops::record_uuid;
 
-use crate::{edges, graph, nodes, registry, texts, MODULE_NAME};
+use crate::{documents, edges, graph, nodes, registry, texts, MODULE_NAME};
 
 /// Traversal depth ceiling parameter on the module's registry entity.
 pub const MAX_DEPTH_PARAM: &str = "attr_entities_max_depth";
@@ -22,11 +22,12 @@ const USAGE: &str = "usage: superx entities <command>\n\
   describe <uuid-fragment> <text…>     set/evolve the describing text node\n\
   instruct <uuid-fragment> <text…>     set/evolve the instructing text node\n\
   comment <uuid-fragment> <text…>      add a comment text node (threads: comment a comment)\n\
+  attach <uuid-fragment> <file-path>   copy a file in; document node + attached edge\n\
   tree <uuid-fragment> [--depth <n>] [--reverse]\n\
   graph <uuid-fragment> [--json]       export the reachable subgraph\n\
   types                                list the type registry\n\
   types add <name> --category entity|relation [--description <text>]\n\
-(documents/attach land in epic #166 phase E4)";
+each write emits telemetry into the kernel firehose";
 
 /// Route a `superx entities …` invocation.
 ///
@@ -46,6 +47,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("describe") => role_text_cmd(kernel, &args[1..], "describes").await,
         Some("instruct") => role_text_cmd(kernel, &args[1..], "instructs").await,
         Some("comment") => comment_cmd(kernel, &args[1..]).await,
+        Some("attach") => attach_cmd(kernel, &args[1..]).await,
         Some("tree") => tree_cmd(kernel, &args[1..]).await,
         Some("graph") => graph_cmd(kernel, &args[1..]).await,
         _ => Err(KernelError::Module(USAGE.to_string())),
@@ -259,6 +261,52 @@ async fn comment_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     emit(kernel, "entity_created", &node_uuid, "text", "comment").await;
     emit_link(kernel, &record_uuid(&target), &node_uuid, "comments", "entities_linked").await;
     Ok(format!("comment added: {node_uuid}\n"))
+}
+
+async fn attach_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let (fragment, path) = match (args.first(), args.get(1)) {
+        (Some(f), Some(p)) => (f, std::path::PathBuf::from(p)),
+        _ => return Err(usage()),
+    };
+    let owner = nodes::resolve_entity(&db, fragment).await?;
+    let bytes = std::fs::read(&path).map_err(|e| {
+        KernelError::Module(format!("cannot read {}: {e}", path.display()))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+
+    // The file lands in the module's own dir, keyed by a fresh uuid7
+    // (the historical-log convention extends to stored blobs).
+    let files_dir = kernel.module_dir(MODULE_NAME)?.join("files");
+    std::fs::create_dir_all(&files_dir)
+        .map_err(|e| KernelError::Module(format!("cannot create files dir: {e}")))?;
+    let stored_name = format!("{}-{file_name}", uuid::Uuid::now_v7());
+    let stored = files_dir.join(&stored_name);
+    std::fs::write(&stored, &bytes)
+        .map_err(|e| KernelError::Module(format!("cannot store file: {e}")))?;
+
+    let mime = documents::mime_for(&file_name);
+    let node = documents::attach_document(
+        &db,
+        &owner,
+        &file_name,
+        &stored.to_string_lossy(),
+        mime,
+        bytes.len() as u64,
+    )
+    .await?;
+    let node_uuid = record_uuid(&node);
+    emit(kernel, "document_attached", &node_uuid, "document", &file_name).await;
+    emit_link(kernel, &record_uuid(&owner), &node_uuid, "attached", "entities_linked").await;
+    Ok(format!(
+        "document {node_uuid} attached ({mime}, {} bytes) — stored at {}\n",
+        bytes.len(),
+        stored.display()
+    ))
 }
 
 async fn tree_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {

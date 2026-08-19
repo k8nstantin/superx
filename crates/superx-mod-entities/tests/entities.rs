@@ -373,3 +373,39 @@ async fn describe_evolves_comment_multiplies() {
     assert_eq!(notes.len(), 3, "one describes + two comments on the product");
     assert!(notes.iter().any(|n| n.content == "Better description."));
 }
+
+// ---------------------------------------------------------------- E4 --
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn documents_are_graph_nodes() {
+    use superx_mod_entities::{documents, graph, nodes};
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    let doc = documents::attach_document(
+        &db,
+        &product,
+        "spec.pdf",
+        "/instance/modules/entities/files/xyz-spec.pdf",
+        "application/pdf",
+        4096,
+    )
+    .await
+    .expect("attach");
+
+    // The document rides the graph like any node.
+    let sub = graph::subgraph(&db, &product, 3, false).await.expect("bfs");
+    assert!(sub.nodes.iter().any(|n| n.entity_type == "document" && n.name == "spec.pdf"));
+    assert!(sub.edges.iter().any(|e| e.rel_type == "attached"));
+
+    // Metadata lives in attributes; the stored path is recoverable.
+    let state = nodes::current_state(&db, &doc).await.expect("q").expect("state");
+    let attrs = state.attributes.expect("attrs");
+    assert_eq!(
+        documents::stored_path(&attrs).as_deref(),
+        Some("/instance/modules/entities/files/xyz-spec.pdf")
+    );
+    assert_eq!(documents::mime_for("Spec.PDF"), "application/pdf");
+    assert_eq!(documents::mime_for("noext"), "application/octet-stream");
+}

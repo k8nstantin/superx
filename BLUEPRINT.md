@@ -135,7 +135,7 @@ gates.
 | G6 | CLI complete: `boot`, `status`, `agents`, `actions --live`, `sessions`, `read` — **FVP** | The demo sentence above, live |
 | G7+ | First modules: data fusion, graphify | Module seam proven |
 | **R1** | **v1.0.0 released** (2026-08-18): FVP + one-command background initialize + params file + logs | Tagged from `main`; operator-QA'd live |
-| **G8** | **Entities module — the product graph substrate** (epic #166, in progress): `superx-mod-entities` — typed entities as graph nodes, native SurrealDB edges (RELATE, D19), identity/state split (D20), text-as-entity (D22), full append-only history; executor is the NEXT epic (D21) | Operator's example graph built + traversed end-to-end via CLI |
+| **G8** | **Entities module — the product graph substrate** (2026-08-19, epic #166, E1–E4): `superx-mod-entities` — typed entities as graph nodes (16 seeded types incl. repo/credential, runtime-extensible), native SurrealDB edges (D19), identity/state split (D20), text-as-entity (D22), documents as nodes, BFS tree/JSON traversal, full append-only history; executor is the NEXT epic (D21) | Operator's example graph (product → components/task → rag/texts/document) built + traversed end-to-end via CLI; 15 contract tests |
 | **G7** | **Module framework + UI module shipped** (2026-08-19, epic #141): full facility contract (D17/D18), module ledger (v2.2), `superx-mod-hello` reference, `superx-mod-ui` dashboard (Status/Activity/Sessions/Console on Mantine), docs/MODULES.md | Every facility live-QA'd; contribution path documented |
 
 ## 7. Decisions record
@@ -158,6 +158,12 @@ gates.
 | D14 | Session lookup (2026-08-18, #122) | Sessions identified `<agent>/<uuid7>`; `read` matches any unique fragment; source id rides as `src=` |
 | D15 | Background OS (2026-08-18, #124) | `--initialize` returns the terminal: OS runs detached (pidfile, daemon log); `superx stop`; duplicate-capture guards; shutdown honored between source polls |
 | D16 | Instance config (2026-08-18, #125) | `params/superx.json` controls all bootstrap config inside the `<home>/{params,logs,db}` layout; precedence flag > env > file > fallback; `superx logs` surfaces the self-log. Released as **v1.0.0** |
+| D17 | Module facility contract (2026-08-19, epic #141) | A module is a self-contained mini-app: own db `superx/<name>` + service account (via `modules provision`), own dir, own log target, own CLI namespace, own parameters; kernel is the hub — modules depend on the kernel only, never on each other |
+| D18 | Module identity (2026-08-19, epic #141) | Every module is a registry entity with a uuid7 id; same-kind modules coexist (nothing assumes a singleton); compiled-in v1 contract (linkme), WASM parked |
+| D19 | Native graph edges (2026-08-19, epic #166) | The entities module links nodes with SurrealDB `RELATE` edges (`TYPE RELATION IN entity OUT entity ENFORCED`): traversal follows record pointers (cost = a node's degree, never table size); RELATE is creation-only — blessed as CREATE-equivalent under the append-only contract, module db only |
+| D20 | Identity/state split (2026-08-19, epic #166) | Graph nodes = one immutable uuid7 anchor row (stable edge target, forever) + SCD-2 `entity_state` version chains; edge history = `edge_uid` chains where unlink appends `active=false` |
+| D21 | Executor is the next epic (2026-08-19, epic #166) | This epic ships the graph substrate + CLI; the runner module that walks the graph and executes task nodes — and the dashboard graph page — follow separately |
+| D22 | Text-as-entity (2026-08-19, epic #166) | All long-form text (descriptions, comments, instructions) is a `text` NODE linked by role edges (`describes`/`comments`/`instructs`), direction owner → target; entities keep a one-line `name` label; describe/instruct evolve one node (its history = the text's evolution), comments multiply (threads = comment a comment) |
 
 ## 8. Binding rules (unchanged from v1, restated)
 
