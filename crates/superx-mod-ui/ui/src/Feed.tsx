@@ -51,18 +51,18 @@ function buildDirectory(sessions: SessionView[], agents: AgentView[]): Directory
 
 // Every session gets its own stable color (issue #200): hash the
 // session id into the palette, the same session is the same color
-// everywhere — the feed badges and the Sessions list.
+// everywhere. The hues are the validated dark-surface categorical
+// ramp (dataviz method, issue #207) — script-validated against this
+// dashboard's surface, no fluorescent steps.
 const SESSION_COLORS = [
-  'indigo',
-  'teal',
-  'orange',
-  'grape',
-  'cyan',
-  'pink',
-  'lime',
-  'violet',
-  'blue',
-  'red',
+  '#3987e5', // blue
+  '#d95926', // orange
+  '#199e70', // aqua
+  '#c98500', // ochre
+  '#d55181', // magenta
+  '#008300', // green
+  '#9085e9', // violet
+  '#e66767', // red
 ] as const
 
 export function sessionColor(sessionKey: string): string {
@@ -108,17 +108,20 @@ function identityOf(e: SseEvent, d: Directory): { label: string; key: string } |
 // labels actually visible — user, assistant, tool, action, …).
 const rowLabel = (r: SseEvent) => (r.kind === 'message' ? (r.role ?? 'message') : 'action')
 
-// ONE fixed color per label, solid, identical in every view (issue
-// #204): the operator picks these once and they never vary. Unknown
-// roles fall back to gray.
+// ONE fixed color per label, solid, identical in every view (issues
+// #204/#207). The three high-frequency labels wear the all-pairs
+// CVD-validated trio of the dark palette; `user` separates on the
+// LUMINANCE channel (near-white chip) because a fourth hue from any
+// ordering fails the validator's CVD floors. Unknown roles fall back
+// to the visible slate.
 const LABEL_COLORS: Record<string, string> = {
-  user: 'green',
-  assistant: 'blue',
-  tool: 'orange',
-  action: 'gray',
-  system: 'gray',
+  user: '#e8e6df', // near-white — unmistakable under every vision type
+  assistant: '#3987e5', // validated trio: blue
+  tool: '#d95926', //                  orange
+  action: '#199e70', //                aqua — visible at last
+  system: '#52514e', // slate — neutral but never invisible
 }
-const labelColor = (label: string) => LABEL_COLORS[label] ?? 'gray'
+const labelColor = (label: string) => LABEL_COLORS[label] ?? '#52514e'
 
 export function Feed({
   header,
