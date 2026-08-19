@@ -213,3 +213,10 @@ async fn supersede_state_refuses_non_attribute_category() -> Result<(), Box<dyn 
     );
     Ok(())
 }
+
+#[test]
+fn already_exists_classifier() {
+    use superx_kernel::provision::is_already_exists;
+    assert!(is_already_exists("The table 'module' already exists"));
+    assert!(!is_already_exists("Found type 'string' for field 'uid'"));
+}

@@ -84,8 +84,13 @@ pub enum Command {
     /// Stop the background OS started by --initialize or start.
     Stop,
     /// Restart the background OS: stop (if running), then start —
-    /// one command to pick up a freshly built binary.
+    /// one command to pick up a freshly built binary (the schema
+    /// self-upgrades on version mismatch).
     Restart,
+    /// Apply pending kernel-schema deltas to this instance
+    /// (tolerant re-apply; also runs automatically at start on
+    /// version mismatch).
+    Upgrade,
     /// Manage modules: list, enable, disable (live effect on the
     /// running OS within one capture tick).
     Modules {

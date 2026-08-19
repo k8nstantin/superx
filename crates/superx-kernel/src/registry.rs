@@ -232,15 +232,26 @@ impl Kernel {
         };
         self.write_descriptor(entity_id.clone(), descriptor).await?;
         // v2.2: append to the module registration ledger, carrying the
-        // prior provisioned fact forward (registration never
-        // un-provisions).
-        let provisioned = self
-            .latest_module_record(descriptor.name)
-            .await?
-            .map(|r| r.provisioned)
-            .unwrap_or(false);
-        self.append_module_record(descriptor, entity_id.clone(), provisioned)
-            .await?;
+        // prior provisioned fact forward. BEST-EFFORT by principle
+        // (issue #158, operator directive): the ledger is
+        // observability — a module's (or the ledger's own) problem
+        // must never brick registration or the boot. The core OS
+        // keeps working; that is the point of being modular.
+        let provisioned = match self.latest_module_record(descriptor.name).await {
+            Ok(record) => record.map(|r| r.provisioned).unwrap_or(false),
+            Err(e) => {
+                tracing::warn!(module = descriptor.name, error = %e,
+                    "module ledger unreadable — registering without it (run `superx upgrade`)");
+                false
+            }
+        };
+        if let Err(e) = self
+            .append_module_record(descriptor, entity_id.clone(), provisioned)
+            .await
+        {
+            tracing::warn!(module = descriptor.name, error = %e,
+                "module ledger append skipped — registration proceeds (run `superx upgrade`)");
+        }
         Ok(entity_id)
     }
 

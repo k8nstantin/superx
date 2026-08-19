@@ -144,3 +144,31 @@ async fn module_ledger_tracks_registrations_and_provisioning() -> Result<(), Box
     assert_eq!(history.len(), 3, "every change is a row: register, provision, re-register");
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_ledger_never_bricks_registration() -> Result<(), Box<dyn Error>> {
+    // Issue #158: an older/incompatible substrate refuses ledger
+    // appends. Registration must WARN and proceed — a module (or
+    // ledger) problem never takes the core OS down.
+    let kernel = common::fresh_seeded_kernel().await?;
+    kernel
+        .db()
+        .query(include_str!("fixtures/ledger_sabotage.surql"))
+        .await?
+        .check()?;
+
+    kernel
+        .register_module(&descriptor("resilient", "0.1.0"))
+        .await
+        .expect("registration proceeds despite the broken ledger");
+    assert!(
+        kernel
+            .detailed_status(NodeKind::KernelModule, "resilient")
+            .await?
+            .is_some(),
+        "module fully registered"
+    );
+    // And no ledger row landed (the append was refused + tolerated).
+    assert!(kernel.latest_module_record("resilient").await?.is_none());
+    Ok(())
+}

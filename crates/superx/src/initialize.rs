@@ -324,6 +324,68 @@ async fn wait_for_boot(
 
 /// Hand off to the background OS: guard against duplicates, spawn,
 /// wait for its boot, render the summary. The terminal returns.
+/// The schema-version parameter on the kernel entity.
+pub const SCHEMA_VERSION_PARAM: &str = "attr_schema_version";
+
+/// Read the substrate's stamped schema version, if any.
+pub async fn stamped_schema_version(kernel: &Kernel) -> Option<String> {
+    let entity = kernel
+        .find_module_by_name(superx_kernel::NodeKind::KernelModule, "kernel")
+        .await
+        .ok()
+        .flatten()?;
+    match kernel.get_parameter(entity, SCHEMA_VERSION_PARAM).await {
+        Ok(Some(superx_kernel::types::Value::String(v))) => Some(v),
+        _ => None,
+    }
+}
+
+/// Stamp the schema version the binary just ensured (best-effort —
+/// the kernel entity exists only after first boot).
+pub async fn stamp_schema_version(kernel: &Kernel) {
+    if let Ok(Some(entity)) = kernel
+        .find_module_by_name(superx_kernel::NodeKind::KernelModule, "kernel")
+        .await
+    {
+        let _ignored = kernel
+            .set_parameter(
+                entity,
+                SCHEMA_VERSION_PARAM,
+                superx_kernel::types::Value::String(superx_kernel::schema::SCHEMA_VERSION.into()),
+            )
+            .await;
+    }
+}
+
+/// Ensure the substrate schema matches this binary: on version
+/// mismatch (or no stamp), tolerantly re-apply the full kernel DDL
+/// under the operator path (issue #158) — a new binary on an older
+/// substrate self-upgrades instead of bricking the boot.
+pub async fn ensure_schema_current(kernel: &Kernel, config: &Config) -> Result<(), String> {
+    let expected = superx_kernel::schema::SCHEMA_VERSION;
+    if stamped_schema_version(kernel).await.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    let Some(password) = resolve_password(&config.data_dir) else {
+        return Err("no credentials for schema upgrade — run `superx --initialize`".to_string());
+    };
+    crate::emit(&format!(
+        "upgrading substrate schema to v{expected} (tolerant re-apply)…\n"
+    ));
+    let (statements, skipped) = superx_kernel::provision::upgrade_kernel_schema(
+        &config.endpoint,
+        &password,
+        &password, // D11: one password this phase
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    crate::emit(&format!(
+        "schema upgrade complete: {statements} statements, {skipped} already present\n"
+    ));
+    stamp_schema_version(kernel).await;
+    Ok(())
+}
+
 pub async fn start_background_os(kernel: &Kernel, config: &Config) -> Result<(), String> {
     if let Some(pid) = read_live_pid(&config.data_dir) {
         crate::emit(&format!(
@@ -331,11 +393,15 @@ pub async fn start_background_os(kernel: &Kernel, config: &Config) -> Result<(),
         ));
         return Ok(());
     }
+    // Issue #158: the version gate — covers --initialize, start, and
+    // restart, so "build → restart" IS the upgrade story.
+    ensure_schema_current(kernel, config).await?;
     let since = chrono::Utc::now();
     let pid = spawn_daemon(config)?;
     write_pidfile(&config.data_dir, pid)?;
     crate::emit(&format!("booting in background (pid {pid})…\n"));
     wait_for_boot(kernel, since, pid).await?;
+    stamp_schema_version(kernel).await; // kernel entity exists post-boot
     crate::emit(&crate::run_status(kernel, &config.data_dir).await?);
     crate::emit(&format!(
         "OS running in background (pid {pid}) — capture is live.\n\
