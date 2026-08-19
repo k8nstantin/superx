@@ -194,6 +194,22 @@ pub async fn run_status(kernel: &Kernel, data_dir: &Path) -> Result<String, Stri
         Some(pid) => out.push_str(&format!("OS: running in background (pid {pid})\n")),
         None => out.push_str("OS: not running (`superx --initialize` starts it)\n"),
     }
+    // The UI module's URL, when it is compiled in and registered
+    // (generic lookup — ops never depends on module crates).
+    if let Ok(Some(entity)) = kernel
+        .find_module_by_name(NodeKind::KernelModule, "ui")
+        .await
+    {
+        let port = match kernel.get_parameter(entity, "attr_ui_port").await {
+            Ok(Some(Value::Number(n))) => n
+                .to_int()
+                .and_then(|i| u16::try_from(i).ok())
+                .filter(|&p| p > 0)
+                .unwrap_or(5150), // skill-allow: §9-or — mirrors the ui module's param-overridable default
+            _ => 5150, // skill-allow: §9-const — mirrors the ui module's param-overridable default
+        };
+        out.push_str(&format!("UI: http://127.0.0.1:{port}\n"));
+    }
     for (kind, title) in [
         (NodeKind::KernelModule, "kernel modules"),
         (NodeKind::Adapter, "adapters"),

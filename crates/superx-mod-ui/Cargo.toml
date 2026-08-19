@@ -1,0 +1,22 @@
+[package]
+name = "superx-mod-ui"
+description = "The SuperX UI module: a rich web dashboard served by the running OS — status, live activity, sessions, console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+linkme.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+superx-kernel = { path = "../superx-kernel" }
+superx-ops = { path = "../superx-ops" }
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
+
+[dev-dependencies]
+surrealdb.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

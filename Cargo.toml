@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/superx-kernel", "crates/superx-mod-hello", "crates/superx-ops", "crates/superx"]
+members = ["crates/superx-kernel", "crates/superx-mod-hello", "crates/superx-mod-ui", "crates/superx-ops", "crates/superx"]
 
 [workspace.package]
 version = "1.0.0"
@@ -11,6 +11,7 @@ rust-version = "1.83"
 [workspace.dependencies]
 superx-kernel = { path = "crates/superx-kernel" }
 superx-mod-hello = { path = "crates/superx-mod-hello" }
+superx-mod-ui = { path = "crates/superx-mod-ui" }
 superx-ops = { path = "crates/superx-ops" }
 
 # Substrate SDK — kv-mem for in-process tests; protocol-ws for the
@@ -29,6 +30,9 @@ serde_json = "1"
 thiserror  = "2"
 tokio     = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 uuid      = { version = "1", features = ["v7", "serde"] }
+
+# The UI module's HTTP layer (SSE lives in axum core).
+axum = "0.8"
 
 # Kernel self-log — rolling file log independent of the substrate
 # (boot diagnostics must survive substrate unavailability).

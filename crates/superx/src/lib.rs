@@ -14,6 +14,7 @@ pub mod initialize;
 // Modules are compiled in (epic #141 v1 contract): an explicit link
 // reference per module crate keeps its linkme registration alive.
 use superx_mod_hello as _;
+use superx_mod_ui as _;
 
 pub use clap::Parser;
 pub use config::Config;

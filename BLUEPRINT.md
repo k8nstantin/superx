@@ -95,10 +95,10 @@ these v1 mechanics were verified live and are carried forward as
   v2 started as **one workspace, two crates**: `superx-kernel` (lib) and
   `superx` (bin, the CLI). Crates are extracted only when a module
   graduates and proves the seam — the graduates are
-  `superx-mod-hello`, the reference module (epic #141), and
-  `superx-ops` (P3): the shared runners/renderers both the CLI and
-  modules (first: the UI) consume — kernel-only dependencies, so
-  modules never depend on the bin: the template
+  `superx-mod-hello`, the reference module (epic #141), `superx-ops` (P3): the shared runners/renderers both the CLI and
+  modules consume — kernel-only dependencies, so modules never depend
+  on the bin — and `superx-mod-ui` (P4+): the UI module itself, an
+  axum server inside the daemon on `attr_ui_port`: the template
   contributors copy, exercising every facility of the module contract
   (own schema/db, own dir, own log, own CLI).
 - The F-phase roadmap, the 2026-06 quality backlog, and all 20 open
