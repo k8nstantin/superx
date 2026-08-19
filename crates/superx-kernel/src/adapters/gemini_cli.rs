@@ -373,9 +373,11 @@ impl GeminiCliAdapter {
                 Ok(1)
             }
             _ => {
-                // Unknown shape — captured raw, never dropped.
+                // Unknown shape — captured raw, never dropped, and
+                // still attributed to its session (issue #186).
                 let mut payload = Object::new();
                 payload.insert("file".to_string(), Value::String(file_key));
+                payload.insert("session".to_string(), Value::String(session_key));
                 let snippet: String = json.to_string().chars().take(500).collect();
                 payload.insert("snippet".to_string(), Value::String(snippet));
                 kernel

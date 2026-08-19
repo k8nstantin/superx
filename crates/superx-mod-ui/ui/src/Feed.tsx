@@ -93,7 +93,13 @@ function identityOf(e: SseEvent, d: Directory): { label: string; key: string } |
     return { label: `${match.agent}/${match.session_id.slice(0, 8)}`, key: match.session_id }
   if (e.kind === 'message' && e.session_id)
     return { label: e.session_id.slice(0, 8), key: e.session_id }
-  if (e.session_src) return { label: e.session_src.slice(0, 8), key: e.session_src }
+  if (e.session_src)
+    return {
+      // Legacy pre-#204 rows carry the literal fallback key; label
+      // them honestly instead of a truncated "unknown-".
+      label: e.session_src === 'unknown-session' ? 'unattributed' : e.session_src.slice(0, 8),
+      key: e.session_src,
+    }
   return null // a global OS event — no session
 }
 
