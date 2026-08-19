@@ -97,6 +97,9 @@ pub struct NameCount {
 pub struct SseEvent {
     pub kind: String, // "action" | "message"
     pub rendered: String,
+    /// Source-native role for message events (`user`, `assistant`, …);
+    /// `None` on actions.
+    pub role: Option<String>,
     pub agent_id: Option<String>,
     pub session_id: Option<String>,
     /// The source-session key stamped on per-session action events

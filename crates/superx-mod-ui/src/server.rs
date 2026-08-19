@@ -93,6 +93,7 @@ async fn sse_poller(kernel: Kernel, tx: broadcast::Sender<String>) {
                 let ev = SseEvent {
                     kind: "action".into(),
                     rendered: superx_ops::render_event(a).trim_end().to_string(),
+                    role: None,
                     agent_id: a.agent.as_ref().map(superx_ops::record_uuid),
                     session_id: None,
                     session_src: crate::activity::session_key_of(&a.payload),
@@ -111,6 +112,7 @@ async fn sse_poller(kernel: Kernel, tx: broadcast::Sender<String>) {
                 let ev = SseEvent {
                     kind: "message".into(),
                     rendered: superx_ops::render_message(m).trim_end().to_string(),
+                    role: Some(m.role.clone()),
                     agent_id: Some(superx_ops::record_uuid(&m.agent)),
                     session_id: Some(superx_ops::record_uuid(&m.session)),
                     session_src: None,

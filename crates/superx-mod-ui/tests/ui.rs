@@ -67,6 +67,40 @@ fn descriptor_and_facilities() {
 // Session activity — the merged per-session stream (issue #172)
 // ─────────────────────────────────────────────────────────────────────
 
+/// Seed one agent (with its descriptor, so name resolution works) and
+/// one of its sessions (capture-engine descriptor shape:
+/// `{name: "<agent>/<key>", session: "<key>", locator}`).
+async fn seed_agent_and_session(
+    kernel: &superx_kernel::Kernel,
+    agent_name: &str,
+    src_key: &str,
+) -> (
+    superx_kernel::types::RecordId,
+    superx_kernel::types::RecordId,
+) {
+    use superx_kernel::types::{Object, Value};
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let mut agent_desc = Object::new();
+    agent_desc.insert("name".to_string(), Value::String(agent_name.to_string()));
+    kernel
+        .supersede_state(agent.clone(), "attr_agent_descriptor", Value::Object(agent_desc))
+        .await
+        .expect("agent descriptor");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let mut desc = Object::new();
+    desc.insert(
+        "name".to_string(),
+        Value::String(format!("{agent_name}/{src_key}")),
+    );
+    desc.insert("session".to_string(), Value::String(src_key.to_string()));
+    desc.insert("locator".to_string(), Value::String("/tmp/x.jsonl".to_string()));
+    kernel
+        .supersede_state(session.clone(), "attr_session_descriptor", Value::Object(desc))
+        .await
+        .expect("session descriptor");
+    (agent, session)
+}
+
 #[test]
 fn session_key_of_reads_only_object_payloads() {
     use superx_kernel::types::{Object, Value};
@@ -88,21 +122,7 @@ async fn session_activity_merges_messages_and_actions_for_one_session() {
     use superx_mod_ui::activity::session_activity;
 
     let kernel = fresh_kernel().await;
-    let agent = kernel.create_entity("node_agent").await.expect("agent");
-    let session = kernel.create_entity("node_session").await.expect("session");
-
-    // The capture engine's descriptor shape: {name, session, locator}.
-    let mut desc = Object::new();
-    desc.insert(
-        "name".to_string(),
-        Value::String("claude_code/src-abc".to_string()),
-    );
-    desc.insert("session".to_string(), Value::String("src-abc".to_string()));
-    desc.insert("locator".to_string(), Value::String("/tmp/x.jsonl".to_string()));
-    kernel
-        .supersede_state(session.clone(), "attr_session_descriptor", Value::Object(desc))
-        .await
-        .expect("descriptor");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-abc").await;
 
     // 1. A conversation message.
     kernel
@@ -168,4 +188,72 @@ async fn session_activity_merges_messages_and_actions_for_one_session() {
     // Chronological: capture order is preserved across both tables.
     assert!(events[0].valid_from <= events[1].valid_from);
     assert!(events[1].valid_from <= events[2].valid_from);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_activity_keeps_the_newest_rows_when_truncated() {
+    use superx_mod_ui::activity::session_activity;
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-new").await;
+    for i in 0..4 {
+        kernel
+            .log_message(superx_kernel::NewMessage {
+                session: session.clone(),
+                agent: agent.clone(),
+                role: "user".to_string(),
+                content: format!("msg-{i}"),
+                raw: None,
+                seq: None,
+                emitted_at: None,
+            })
+            .await
+            .expect("message");
+    }
+
+    let events = session_activity(&kernel, session, 2).await.expect("activity");
+    assert_eq!(events.len(), 2, "merged page truncates to limit");
+    // Newest-N: the pinned-to-bottom view must end at the present.
+    assert!(events[0].rendered.contains("msg-2"), "{}", events[0].rendered);
+    assert!(events[1].rendered.contains("msg-3"), "{}", events[1].rendered);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_activity_never_bleeds_across_agents_sharing_a_source_key() {
+    use superx_kernel::types::{Object, Value};
+    use superx_mod_ui::activity::session_activity;
+
+    let kernel = fresh_kernel().await;
+    // Two agents whose sessions collide on the shared fallback key.
+    let (agent_a, session_a) =
+        seed_agent_and_session(&kernel, "claude_code", "unknown-session").await;
+    let (_agent_b, session_b) =
+        seed_agent_and_session(&kernel, "gemini_cli", "unknown-session").await;
+
+    // An action bound only via payload.session, emitted by agent A.
+    let mut tool = Object::new();
+    tool.insert(
+        "session".to_string(),
+        Value::String("unknown-session".to_string()),
+    );
+    tool.insert("tool".to_string(), Value::String("Bash".to_string()));
+    kernel
+        .log_telemetry_for_agent(
+            "tool_call",
+            Value::Object(tool),
+            Some(agent_a.clone()),
+            Some(agent_a.clone()),
+        )
+        .await
+        .expect("tool_call");
+
+    let a = session_activity(&kernel, session_a, 100).await.expect("a");
+    assert_eq!(a.len(), 1, "agent A's session sees its own action: {a:#?}");
+    assert!(a[0].rendered.contains("tool_call"));
+
+    let b = session_activity(&kernel, session_b, 100).await.expect("b");
+    assert!(
+        b.is_empty(),
+        "agent B's session must NOT see agent A's action: {b:#?}"
+    );
 }

@@ -136,6 +136,15 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
   )
 }
 
+// Live-row retention cap — matches Activity's MAX_ROWS; the backlog
+// endpoint re-serves older rows on refetch.
+const MAX_LIVE_ROWS = 500
+
+// A stable identity for one captured event: capture timestamp (ns
+// precision) + kind + rendered text. Used to dedupe rows that arrive
+// both over SSE and in a backlog refetch.
+const eventKey = (r: SessionEvent) => `${r.valid_from}|${r.kind}|${r.rendered}`
+
 // One session's FULL activity (issue #172): messages + actions merged
 // chronologically — historical backlog, then live, auto-scrolling.
 function SessionActivityView({ session, onBack }: { session: SessionView; onBack: () => void }) {
@@ -151,15 +160,24 @@ function SessionActivityView({ session, onBack }: { session: SessionView; onBack
     const mine =
       e.kind === 'message' ? e.session_id === session.session_id : e.session_src === session.src
     if (!mine) return
-    setLiveRows((prev) => [
-      ...prev,
-      { kind: e.kind, role: null, rendered: e.rendered, valid_from: e.valid_from },
-    ])
+    setLiveRows((prev) =>
+      [...prev, { kind: e.kind, role: e.role, rendered: e.rendered, valid_from: e.valid_from }].slice(
+        -MAX_LIVE_ROWS,
+      ),
+    )
   }, !live)
 
-  const rows = [...(backlog.data ?? []), ...liveRows].filter(
-    (r) => kind === 'all' || r.kind === kind,
-  )
+  // Merge backlog + live: dedupe (an event can arrive over SSE and
+  // again in a backlog refetch — the backlog copy wins), then re-sort
+  // by capture time (the SSE poller emits each tick's actions before
+  // its messages, so arrival order alone is not chronological).
+  const seen = new Map<string, SessionEvent>()
+  for (const r of [...(backlog.data ?? []), ...liveRows]) {
+    if (!seen.has(eventKey(r))) seen.set(eventKey(r), r)
+  }
+  const rows = [...seen.values()]
+    .sort((a, b) => a.valid_from.localeCompare(b.valid_from))
+    .filter((r) => kind === 'all' || r.kind === kind)
 
   // Pinned-to-bottom auto-scroll: follow new rows unless the user has
   // scrolled up; resume following when they return near the bottom.
@@ -207,7 +225,17 @@ function SessionActivityView({ session, onBack }: { session: SessionView; onBack
           if (v) following.current = y + v.clientHeight >= v.scrollHeight - 40
         }}
       >
-        {rows.length === 0 && (
+        {backlog.isLoading && (
+          <Text c="dimmed" size="sm">
+            loading captured activity…
+          </Text>
+        )}
+        {backlog.isError && (
+          <Text c="red.4" size="sm">
+            could not load this session's activity: {String(backlog.error)}
+          </Text>
+        )}
+        {!backlog.isLoading && !backlog.isError && rows.length === 0 && (
           <Text c="dimmed" size="sm">
             nothing captured for this session yet
           </Text>

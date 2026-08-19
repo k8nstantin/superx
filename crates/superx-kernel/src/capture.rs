@@ -209,7 +209,15 @@ pub async fn ensure_session(
     .await?;
     if created {
         let mut payload = Object::new();
-        payload.insert("session".to_string(), Value::String(name));
+        // `session` carries the BARE source key — the same contract
+        // every other per-session event follows (issue #172: clients
+        // attribute events to sessions by this key). The full
+        // `<agent>/<key>` name rides as `name` for human rendering.
+        payload.insert(
+            "session".to_string(),
+            Value::String(session_key.to_string()),
+        );
+        payload.insert("name".to_string(), Value::String(name));
         kernel
             .log_telemetry_for_agent(
                 "session_discovered",
