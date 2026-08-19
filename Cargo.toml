@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/superx-kernel", "crates/superx-mod-entities", "crates/superx-mod-hello", "crates/superx-mod-runner", "crates/superx-mod-ui", "crates/superx-ops", "crates/superx"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.83"

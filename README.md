@@ -9,6 +9,30 @@ moment the OS boots it captures everything every agent on the machine
 emits. Every other capability (data fusion, graphify, …) arrives as a
 module on top of the kernel.
 
+## v1.1.0 — The module framework era
+
+v1.1.0 (2026-08-19) turns the OS into a platform. Everything below
+arrived as pluggable modules on the epic #141 contract — own database,
+dir, log, CLI, parameters, UUIDv7 identity, ledger row — while the
+kernel stayed locked (one author: the operator, now CI-enforced):
+
+- **The module framework** — full facility contract, live
+  enable/disable, module ledger (schema v2.2), `superx-mod-hello`
+  reference, contribution guide (epic #141).
+- **The entities module** — the product graph substrate: typed nodes,
+  native edges, text-as-entity, documents, full append-only history
+  (epic #166; details below).
+- **The runner module** — schedule any entity, plan dependency waves,
+  execute task nodes with real agents, write results back into the
+  graph (epic #189; details below).
+- **The dashboard, unified** — sessions group ALL captured activity;
+  ONE live feed (history + SSE, auto-scrolling, session-attributed,
+  CVD-validated palette); context-window bars and token telemetry per
+  session (#172–#208).
+- **Operations** — self-upgrading schema path for new binaries on
+  older substrates (#158); the module contract cemented in docs + a
+  kernel-immutability CI gate (#210).
+
 ## v1.0.0 — Capabilities
 
 SuperX v1.0.0 is the first release of the agentic OS (reset 2026-08-06 →
