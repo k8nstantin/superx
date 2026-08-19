@@ -59,6 +59,11 @@ pub mod telemetry;
 /// across the workspace.
 pub use surrealdb::types;
 
+/// The handle type [`Kernel::module_db`](crate::Kernel::module_db)
+/// yields — the alias lets module crates name their own-db connection
+/// without importing surrealdb directly (the layering rule).
+pub type Db = surrealdb::Surreal<surrealdb::engine::any::Any>;
+
 pub use boot::{boot, BootEntry, BootReport};
 pub use capture::{
     AgentAdapter, DiscoveredSource, SourceRef, TickReport, ADAPTERS,

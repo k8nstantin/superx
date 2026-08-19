@@ -13,6 +13,7 @@ pub mod initialize;
 
 // Modules are compiled in (epic #141 v1 contract): an explicit link
 // reference per module crate keeps its linkme registration alive.
+use superx_mod_entities as _;
 use superx_mod_hello as _;
 use superx_mod_ui as _;
 
@@ -354,7 +355,8 @@ pub async fn run_modules_provision(
         .await
         .map_err(|e| e.to_string())?;
     Ok(format!(
-        "module '{name}' provisioned: own database superx/{name} + service account superx_mod_{name}\n"
+        "module '{name}' provisioned: own database superx/{name} + service account superx_mod_{name}\n\
+         restart the OS (superx restart) to activate its startup (schema-dependent seeding)\n"
     ))
 }
 

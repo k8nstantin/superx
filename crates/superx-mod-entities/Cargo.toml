@@ -1,0 +1,18 @@
+[package]
+name = "superx-mod-entities"
+description = "The product graph substrate: typed entities as nodes, native SurrealDB edges, text-as-entity, full append-only history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+linkme.workspace = true
+superx-kernel = { path = "../superx-kernel" }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+surrealdb.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
