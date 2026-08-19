@@ -10,7 +10,7 @@ use superx_kernel::{Db, Result};
 use superx_ops::record_uuid;
 
 use crate::edges::{expand, EdgeRow};
-use crate::nodes::{current_state, list_entities};
+use crate::nodes::current_meta;
 
 /// A traversed node, in visit order.
 pub struct GraphNode {
@@ -50,14 +50,6 @@ pub async fn subgraph(
     max_depth: usize,
     reverse: bool,
 ) -> Result<Subgraph> {
-    // Anchor metadata for labels — one pass over anchors + one
-    // batched label read (list_entities), reused across all levels.
-    let labels: HashMap<String, (String, String)> = list_entities(db, None)
-        .await?
-        .into_iter()
-        .map(|row| (record_uuid(&row.id), (row.entity_type, row.name)))
-        .collect();
-
     let mut nodes: Vec<GraphNode> = Vec::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -65,7 +57,10 @@ pub async fn subgraph(
 
     let mut frontier: Vec<RecordId> = vec![root.clone()];
     visited.insert(record_uuid(root));
-    push_node(db, &mut nodes, root, &labels, 0).await?;
+    // Labels are batch-resolved PER LEVEL for just the visited
+    // frontier (issue #179): a walk costs the reached nodes, never
+    // the table — the same contract the edge expansion keeps.
+    push_level(db, &mut nodes, std::slice::from_ref(root), 0).await?;
 
     let mut depth = 0;
     while !frontier.is_empty() {
@@ -88,10 +83,10 @@ pub async fn subgraph(
             });
             let target = if reverse { edge.from } else { edge.to };
             if visited.insert(record_uuid(&target)) {
-                push_node(db, &mut nodes, &target, &labels, depth + 1).await?;
                 next.push(target);
             }
         }
+        push_level(db, &mut nodes, &next, depth + 1).await?;
         frontier = next;
         depth += 1;
     }
@@ -99,23 +94,33 @@ pub async fn subgraph(
     Ok(Subgraph { nodes, edges, truncated_at_depth: truncated })
 }
 
-async fn push_node(
+/// Resolve one BFS level's metadata in a single batched read and
+/// append the level's nodes in stable (uuid7 = creation) order.
+async fn push_level(
     db: &Db,
     nodes: &mut Vec<GraphNode>,
-    id: &RecordId,
-    labels: &HashMap<String, (String, String)>,
+    level: &[RecordId],
     depth: usize,
 ) -> Result<()> {
-    let uuid = record_uuid(id);
-    let (entity_type, name) = labels.get(&uuid).cloned().unwrap_or_default();
-    // Content travels with content-bearing nodes (texts, documents)
-    // so exports and trees can show it without a second pass.
-    let content = if entity_type == "text" || entity_type == "document" {
-        current_state(db, id).await?.and_then(|s| s.content)
-    } else {
-        None
-    };
-    nodes.push(GraphNode { id: id.clone(), entity_type, name, content, depth });
+    if level.is_empty() {
+        return Ok(());
+    }
+    let meta = current_meta(db, level).await?;
+    for id in level {
+        let uuid = record_uuid(id);
+        let (entity_type, name, content) = match meta.get(&uuid) {
+            Some(m) => (m.entity_type.clone(), m.name.clone(), m.content.clone()),
+            None => (String::new(), String::new(), None),
+        };
+        // Content rides along only for content-bearing nodes; other
+        // kinds keep exports lean.
+        let content = if entity_type == "text" || entity_type == "document" {
+            content
+        } else {
+            None
+        };
+        nodes.push(GraphNode { id: id.clone(), entity_type, name, content, depth });
+    }
     Ok(())
 }
 

@@ -409,3 +409,44 @@ async fn documents_are_graph_nodes() {
     assert_eq!(documents::mime_for("Spec.PDF"), "application/pdf");
     assert_eq!(documents::mime_for("noext"), "application/octet-stream");
 }
+
+// -------------------------------------------------------------- #179 --
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deep_version_chains_list_only_currents() {
+    use superx_mod_entities::nodes;
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let anchor = nodes::create_entity(&db, "product", "v0", None, None).await.expect("create");
+    for n in 1..=25 {
+        nodes::update_entity(&db, &anchor, Some(format!("v{n}")), None, None)
+            .await
+            .expect("update");
+    }
+    let rows = nodes::list_entities(&db, None).await.expect("list");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "v25", "windowed read returns the current label");
+    assert_eq!(
+        nodes::state_history(&db, &anchor).await.expect("history").len(),
+        26,
+        "the full chain still exists"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subgraph_carries_text_content_via_batched_meta() {
+    use superx_mod_entities::{graph, nodes, texts};
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    texts::set_role_text(&db, &product, "describes", "The whole point.").await.expect("t");
+
+    let sub = graph::subgraph(&db, &product, 3, false).await.expect("bfs");
+    let text = sub.nodes.iter().find(|n| n.entity_type == "text").expect("text node");
+    assert_eq!(text.content.as_deref(), Some("The whole point."));
+    let root = sub.nodes.iter().find(|n| n.entity_type == "product").expect("root");
+    assert_eq!(root.name, "Widget");
+    assert!(root.content.is_none(), "non-content kinds stay lean");
+}

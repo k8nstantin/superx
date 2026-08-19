@@ -15,6 +15,7 @@ const DEFAULT_MAX_DEPTH: usize = 5; // skill-allow: §9-const — bootstrap fall
 const USAGE: &str = "usage: superx entities <command>\n\
   create --type <type> [--describe <text>] [--content <text>] [--attrs <json>] <name…>\n\
   update <uuid-fragment> [--name <name>] [--content <text>] [--attrs <json>]\n\
+         (--attrs REPLACES the whole attributes object; omit to keep it)\n\
   show <uuid-fragment> [--history]\n\
   list [--type <type>]\n\
   link <from-fragment> <to-fragment> --rel <relation-type>\n\
@@ -270,9 +271,9 @@ async fn attach_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         _ => return Err(usage()),
     };
     let owner = nodes::resolve_entity(&db, fragment).await?;
-    let bytes = std::fs::read(&path).map_err(|e| {
-        KernelError::Module(format!("cannot read {}: {e}", path.display()))
-    })?;
+    let size = std::fs::metadata(&path)
+        .map_err(|e| KernelError::Module(format!("cannot read {}: {e}", path.display())))?
+        .len();
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -286,7 +287,8 @@ async fn attach_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         .map_err(|e| KernelError::Module(format!("cannot create files dir: {e}")))?;
     let stored_name = format!("{}-{file_name}", uuid::Uuid::now_v7());
     let stored = files_dir.join(&stored_name);
-    std::fs::write(&stored, &bytes)
+    // Streamed copy — attachments never transit memory whole (#179).
+    std::fs::copy(&path, &stored)
         .map_err(|e| KernelError::Module(format!("cannot store file: {e}")))?;
 
     let mime = documents::mime_for(&file_name);
@@ -296,15 +298,14 @@ async fn attach_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         &file_name,
         &stored.to_string_lossy(),
         mime,
-        bytes.len() as u64,
+        size,
     )
     .await?;
     let node_uuid = record_uuid(&node);
     emit(kernel, "document_attached", &node_uuid, "document", &file_name).await;
     emit_link(kernel, &record_uuid(&owner), &node_uuid, "attached", "entities_linked").await;
     Ok(format!(
-        "document {node_uuid} attached ({mime}, {} bytes) — stored at {}\n",
-        bytes.len(),
+        "document {node_uuid} attached ({mime}, {size} bytes) — stored at {}\n",
         stored.display()
     ))
 }

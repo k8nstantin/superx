@@ -151,21 +151,41 @@ pub async fn expand(db: &Db, frontier: &[RecordId], reverse: bool) -> Result<Vec
     Ok(latest_per_chain(rows.iter().filter_map(parse_edge)))
 }
 
-/// Latest row per edge_uid wins (rows arrive in any order; compare
-/// valid_from lexically — RFC3339 sorts chronologically).
+/// Latest row per edge_uid wins. Timestamps are compared as PARSED
+/// datetimes (issue #179): lexical RFC3339 comparison inverts when a
+/// fractionless '…06Z' meets '…06.5Z' ('Z' > '.'), and this reduction
+/// decides which link states are real.
 fn latest_per_chain(rows: impl Iterator<Item = EdgeRow>) -> Vec<EdgeRow> {
     let mut latest: HashMap<String, EdgeRow> = HashMap::new();
     for row in rows {
         match latest.get(&row.edge_uid) {
-            Some(seen) if seen.valid_from >= row.valid_from => {}
+            Some(seen) if !newer(&row.valid_from, &seen.valid_from) => {}
             _ => {
                 latest.insert(row.edge_uid.clone(), row);
             }
         }
     }
     let mut out: Vec<EdgeRow> = latest.into_values().collect();
-    out.sort_by(|a, b| a.valid_from.cmp(&b.valid_from));
+    out.sort_by(|a, b| match (parse_ts(&a.valid_from), parse_ts(&b.valid_from)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        _ => a.valid_from.cmp(&b.valid_from),
+    });
     out
+}
+
+fn parse_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Is `a` strictly newer than `b`? Parsed comparison with a lexical
+/// fallback for unparseable strings.
+fn newer(a: &str, b: &str) -> bool {
+    match (parse_ts(a), parse_ts(b)) {
+        (Some(x), Some(y)) => x > y,
+        _ => a > b,
+    }
 }
 
 fn parse_edge(row: &Value) -> Option<EdgeRow> {
@@ -189,4 +209,19 @@ fn parse_edge(row: &Value) -> Option<EdgeRow> {
             _ => String::new(),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::newer;
+
+    #[test]
+    fn fractionless_timestamps_compare_chronologically() {
+        // The lexical trap: 'Z' (0x5A) > '.' (0x2E) would call the
+        // WHOLE second newer than the later fractional instant.
+        assert!(newer("2026-08-19T13:00:06.5Z", "2026-08-19T13:00:06Z"));
+        assert!(!newer("2026-08-19T13:00:06Z", "2026-08-19T13:00:06.5Z"));
+        assert!(newer("2026-08-19T13:00:06.55Z", "2026-08-19T13:00:06.5Z"));
+        assert!(!newer("same", "same"));
+    }
 }
