@@ -232,6 +232,23 @@ async fn api_sessions(
     else {
         return Json(out);
     };
+    // Resolve every agent ONCE — the per-session action count takes a
+    // pre-resolved scope instead of re-reading descriptors and
+    // re-resolving agents per row (review finding, issue #187).
+    let mut agent_ids: std::collections::HashMap<String, superx_kernel::types::RecordId> =
+        std::collections::HashMap::new();
+    if let Ok(agents) = kernel
+        .list_named_entities("node_agent", "attr_agent_descriptor")
+        .await
+    {
+        for a in &agents {
+            if let superx_kernel::types::Value::Object(o) = &a.payload {
+                if let Some(superx_kernel::types::Value::String(n)) = o.get("name") {
+                    agent_ids.insert(n.clone(), a.entity_id.clone());
+                }
+            }
+        }
+    }
     for s in sessions {
         let name = match &s.payload {
             superx_kernel::types::Value::Object(o) => match o.get("name") {
@@ -249,11 +266,16 @@ async fn api_sessions(
         let src = name.split_once('/').map_or("", |(_, r)| r).to_string();
         // TOTAL activity — messages + the session's action events
         // (issue #187: the list counts everything the feed shows).
+        let scope = if src.is_empty() {
+            None
+        } else {
+            agent_ids.get(&agent).map(|id| (id.clone(), src.clone()))
+        };
         let count = kernel
             .session_message_count(s.entity_id.clone())
             .await
             .unwrap_or(0)
-            + crate::activity::session_action_count(kernel, s.entity_id.clone())
+            + crate::activity::session_action_count(kernel, s.entity_id.clone(), scope)
                 .await
                 .unwrap_or(0);
         let last_active = kernel

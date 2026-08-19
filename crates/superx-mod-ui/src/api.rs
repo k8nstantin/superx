@@ -49,7 +49,6 @@ pub struct SessionView {
     pub last_active: Option<String>,
 }
 
-
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct ActionView {
@@ -85,6 +84,9 @@ pub struct NameCount {
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct SseEvent {
+    /// The underlying row's UUIDv7 — the event's EXACT identity, used
+    /// for client dedupe and stable render keys (issue #187 review).
+    pub id: String,
     pub kind: String, // "action" | "message"
     pub rendered: String,
     /// Source-native role for message events (`user`, `assistant`, …);

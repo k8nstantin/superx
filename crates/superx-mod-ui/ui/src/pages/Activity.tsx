@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Title } from '@mantine/core'
 import { fetchActivity, fetchAgents, fetchSessions } from '../api'
@@ -16,14 +16,16 @@ export default function ActivityPage() {
   const sessions = useQuery({ queryKey: ['sessions'], queryFn: () => fetchSessions(), refetchInterval: 10000 })
   const agents = useQuery({ queryKey: ['agents'], queryFn: fetchAgents, refetchInterval: 30000 })
 
-  useSse((e) => {
-    setLiveRows((prev) => [...prev, e].slice(-MAX_FEED_ROWS))
+  useSse((batch) => {
+    setLiveRows((prev) => [...prev, ...batch].slice(-MAX_FEED_ROWS))
   }, paused)
+
+  const rows = useMemo(() => mergeFeed(backlog.data ?? [], liveRows), [backlog.data, liveRows])
 
   return (
     <Feed
       header={<Title order={5}>Live activity — everything the OS captures, by session, as it happens</Title>}
-      rows={mergeFeed(backlog.data ?? [], liveRows)}
+      rows={rows}
       sessions={sessions.data ?? []}
       agents={agents.data ?? []}
       paused={paused}

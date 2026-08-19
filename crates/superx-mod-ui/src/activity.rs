@@ -48,6 +48,7 @@ pub fn session_key_of(payload: &Value) -> Option<String> {
 #[must_use]
 pub fn message_event(m: &MessageRecord) -> SseEvent {
     SseEvent {
+        id: superx_ops::record_uuid(&m.id),
         kind: "message".to_string(),
         rendered: superx_ops::render_message(m).trim_end().to_string(),
         role: Some(m.role.clone()),
@@ -63,6 +64,7 @@ pub fn message_event(m: &MessageRecord) -> SseEvent {
 #[must_use]
 pub fn action_event(a: &TelemetryRecord) -> SseEvent {
     SseEvent {
+        id: superx_ops::record_uuid(&a.id),
         kind: "action".to_string(),
         rendered: superx_ops::render_event(a).trim_end().to_string(),
         role: None,
@@ -120,35 +122,50 @@ async fn session_scope(
     })
 }
 
-/// Merge message + action rows by capture time (oldest first) and keep
-/// the NEWEST `limit` — per-stream limits alone would return 2×limit.
+/// A raw captured row awaiting rendering — rendering happens ONLY for
+/// rows that survive truncation.
+enum Raw<'a> {
+    Msg(&'a MessageRecord),
+    Act(&'a TelemetryRecord),
+}
+
+/// Merge message + action rows by capture time and keep the NEWEST
+/// `limit`, rendered oldest-first — per-stream limits alone would
+/// return 2×limit. This function is the SOLE ordering authority: the
+/// input slices may arrive in any order.
 fn merge_newest(
     messages: &[MessageRecord],
     actions: &[TelemetryRecord],
     limit: u32,
 ) -> Vec<SseEvent> {
-    let mut events: Vec<(chrono::DateTime<chrono::Utc>, SseEvent)> =
+    let mut rows: Vec<(chrono::DateTime<chrono::Utc>, Raw)> =
         Vec::with_capacity(messages.len() + actions.len());
     for m in messages {
-        events.push((m.valid_from, message_event(m)));
+        rows.push((m.valid_from, Raw::Msg(m)));
     }
     for a in actions {
-        events.push((a.valid_from, action_event(a)));
+        rows.push((a.valid_from, Raw::Act(a)));
     }
-    events.sort_by_key(|&(t, _)| t);
-    let excess = events.len().saturating_sub(limit as usize);
-    events.split_off(excess).into_iter().map(|(_, e)| e).collect()
+    rows.sort_by_key(|&(t, _)| t);
+    let excess = rows.len().saturating_sub(limit as usize);
+    rows.split_off(excess)
+        .into_iter()
+        .map(|(_, r)| match r {
+            Raw::Msg(m) => message_event(m),
+            Raw::Act(a) => action_event(a),
+        })
+        .collect()
 }
 
-/// The NEWEST `limit` messages across ALL sessions, oldest first.
+/// The NEWEST `limit` messages across ALL sessions (any order —
+/// merge_newest sorts).
 async fn recent_messages(kernel: &Kernel, limit: u32) -> Result<Vec<MessageRecord>> {
-    let mut rows: Vec<MessageRecord> = kernel
+    let rows: Vec<MessageRecord> = kernel
         .db()
         .query("SELECT * FROM message ORDER BY valid_from DESC LIMIT $limit")
         .bind(("limit", limit))
         .await?
         .take(0)?;
-    rows.reverse();
     Ok(rows)
 }
 
@@ -160,8 +177,7 @@ async fn recent_messages(kernel: &Kernel, limit: u32) -> Result<Vec<MessageRecor
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
 pub async fn global_activity(kernel: &Kernel, limit: u32) -> Result<Vec<SseEvent>> {
-    let mut actions = kernel.recent_telemetry(limit).await?;
-    actions.reverse();
+    let actions = kernel.recent_telemetry(limit).await?;
     let messages = recent_messages(kernel, limit).await?;
     Ok(merge_newest(&messages, &actions, limit))
 }
@@ -181,7 +197,7 @@ pub async fn session_activity(
     limit: u32,
 ) -> Result<Vec<SseEvent>> {
     let scope = session_scope(kernel, session.clone()).await?;
-    let mut messages: Vec<MessageRecord> = kernel
+    let messages: Vec<MessageRecord> = kernel
         .db()
         .query(
             "SELECT * FROM message WHERE session = $sess \
@@ -191,8 +207,7 @@ pub async fn session_activity(
         .bind(("limit", limit))
         .await?
         .take(0)?;
-    messages.reverse();
-    let mut actions: Vec<TelemetryRecord> = match scope {
+    let actions: Vec<TelemetryRecord> = match scope {
         Some((agent, src_key)) => {
             kernel
                 .db()
@@ -222,7 +237,6 @@ pub async fn session_activity(
                 .take(0)?
         }
     };
-    actions.reverse();
     Ok(merge_newest(&messages, &actions, limit))
 }
 
@@ -230,11 +244,20 @@ pub async fn session_activity(
 /// [`session_activity`]) — the sessions list shows TOTAL activity
 /// (messages + actions), not messages alone (issue #187).
 ///
+/// `scope` is the pre-resolved `(agent entity, source key)` pair —
+/// callers iterating many sessions resolve agents ONCE and pass the
+/// scope in, instead of paying a descriptor re-read + agent lookup
+/// per session (review finding). `None` drops the payload.session
+/// arm (matches nothing, never everything).
+///
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
-pub async fn session_action_count(kernel: &Kernel, session: RecordId) -> Result<i64> {
-    let scope = session_scope(kernel, session.clone()).await?;
+pub async fn session_action_count(
+    kernel: &Kernel,
+    session: RecordId,
+    scope: Option<(RecordId, String)>,
+) -> Result<i64> {
     let rows: Vec<Value> = match scope {
         Some((agent, src_key)) => {
             kernel

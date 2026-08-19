@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Badge, Button, Card, Group, ScrollArea, Table, Text, Title, Tooltip } from '@mantine/core'
 import { fetchAgents, fetchSessionActivity, fetchSessions } from '../api'
@@ -143,12 +143,28 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
   const sessions = useQuery({ queryKey: ['sessions'], queryFn: () => fetchSessions(), refetchInterval: 10000 })
   const agents = useQuery({ queryKey: ['agents'], queryFn: fetchAgents, refetchInterval: 30000 })
 
-  useSse((e) => {
-    const mine =
-      e.kind === 'message' ? e.session_id === session.session_id : e.session_src === session.src
-    if (!mine) return
-    setLiveRows((prev) => [...prev, e].slice(-MAX_FEED_ROWS))
+  // agent_id → name, for the live filter's agent scope below.
+  const agentName = useMemo(
+    () => new Map((agents.data ?? []).map((a) => [a.agent_id, a.name])),
+    [agents.data],
+  )
+
+  useSse((batch) => {
+    // Same scoping as the server-side backlog query: actions match by
+    // source key AND agent — source keys alone collide across agents
+    // on fallback keys like `unknown-session` (review finding). An
+    // agent the directory doesn't know yet is accepted rather than
+    // dropped (staleness must not lose legitimate rows).
+    const mine = batch.filter((e) =>
+      e.kind === 'message'
+        ? e.session_id === session.session_id
+        : e.session_src === session.src &&
+          (e.agent_id == null || (agentName.get(e.agent_id) ?? session.agent) === session.agent),
+    )
+    if (mine.length) setLiveRows((prev) => [...prev, ...mine].slice(-MAX_FEED_ROWS))
   }, paused)
+
+  const rows = useMemo(() => mergeFeed(backlog.data ?? [], liveRows), [backlog.data, liveRows])
 
   return (
     <Feed
@@ -162,7 +178,7 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
           </Title>
         </Group>
       }
-      rows={mergeFeed(backlog.data ?? [], liveRows)}
+      rows={rows}
       sessions={sessions.data ?? []}
       agents={agents.data ?? []}
       paused={paused}
