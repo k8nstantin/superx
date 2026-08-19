@@ -135,6 +135,7 @@ gates.
 | G6 | CLI complete: `boot`, `status`, `agents`, `actions --live`, `sessions`, `read` — **FVP** | The demo sentence above, live |
 | G7+ | First modules: data fusion, graphify | Module seam proven |
 | **R1** | **v1.0.0 released** (2026-08-18): FVP + one-command background initialize + params file + logs | Tagged from `main`; operator-QA'd live |
+| **G9** | **Runner module** (epic #189, one branch/PR per operator direction): `superx-mod-runner` — schedules entities (D23 two-table SCD-2 intent/fact chains), follows the graph (D25), executes task nodes with agents (D26), in-flight steerable (D27); spec is authoritative in the epic | Built from issues #190–#194 |
 | **G8** | **Entities module — the product graph substrate** (2026-08-19, epic #166, E1–E4): `superx-mod-entities` — typed entities as graph nodes (18 seeded types incl. repo/credential + the runner's depends_on/produced, runtime-extensible), native SurrealDB edges (D19), identity/state split (D20), text-as-entity (D22), documents as nodes, BFS tree/JSON traversal, full append-only history; executor is the NEXT epic (D21) | Operator's example graph (product → components/task → rag/texts/document) built + traversed end-to-end via CLI; 15 contract tests |
 | **G7** | **Module framework + UI module shipped** (2026-08-19, epic #141): full facility contract (D17/D18), module ledger (v2.2), `superx-mod-hello` reference, `superx-mod-ui` dashboard (Status/Activity/Sessions/Console on Mantine), docs/MODULES.md | Every facility live-QA'd; contribution path documented |
 
