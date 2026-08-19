@@ -207,12 +207,21 @@ impl ClaudeCodeAdapter {
         if trimmed.is_empty() {
             return Ok(());
         }
+        // The transcript FILE is `<sessionId>.jsonl` — the filename
+        // attributes lines that don't carry a sessionId themselves
+        // (sidecars, unparseable lines). Nothing is ever "unknown"
+        // (issues #186/#204).
+        let file_session = file
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown-session".to_string());
         let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             let mut payload = Object::new();
             payload.insert(
                 "file".to_string(),
                 Value::String(file.to_string_lossy().to_string()),
             );
+            payload.insert("session".to_string(), Value::String(file_session));
             let snippet: String = trimmed.chars().take(RAW_SNIPPET_MAX).collect();
             payload.insert("snippet".to_string(), Value::String(snippet));
             kernel
@@ -230,8 +239,8 @@ impl ClaudeCodeAdapter {
         let session_key = json
             .get("sessionId")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown-session")
-            .to_string();
+            .map(str::to_string)
+            .unwrap_or(file_session);
 
         match line_type {
             "user" | "assistant" => {
