@@ -82,6 +82,51 @@ jobs:
           echo "✅ §7: Operator-approved marker present in PR body."
 
   # --------------------------------------------------------------------
+  # Kernel-immutability gate (operator directive 2026-08-19, issue
+  # #210). THE KERNEL HAS ONE AUTHOR — THE OPERATOR. Module lanes never
+  # write kernel code; any PR whose diff touches crates/superx-kernel/
+  # fails unless the PR body carries an `Operator-approved: …` marker,
+  # which only the operator legitimately writes. Same pattern as the
+  # §7 schema gate.
+  # --------------------------------------------------------------------
+  kernel-immutability:
+    name: Kernel change requires operator approval
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect kernel-touching diff
+        id: detect
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if git diff --name-only "$base..$head" \
+              | grep -qE '^crates/superx-kernel/'; then
+            echo "kernel_touched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "kernel_touched=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require Operator-approved marker when the kernel is touched
+        if: steps.detect.outputs.kernel_touched == 'true'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ -z "${PR_BODY:-}" ] || ! grep -q 'Operator-approved:' <<<"$PR_BODY"; then
+            echo "❌ KERNEL: this PR touches crates/superx-kernel/ but the PR body"
+            echo "    does not include an 'Operator-approved: …' marker."
+            echo "    The kernel has ONE author — the operator. Module lanes never"
+            echo "    write kernel code (docs/MODULES.md, top banner). If a module"
+            echo "    needs a kernel change: file an issue describing the need and"
+            echo "    STOP — the operator authors kernel changes personally."
+            exit 1
+          fi
+          echo "✅ KERNEL: Operator-approved marker present in PR body."
+
+  # --------------------------------------------------------------------
   # Skill-immutability gate. Identical pattern for the skill text itself.
   # --------------------------------------------------------------------
   skill-immutability:
