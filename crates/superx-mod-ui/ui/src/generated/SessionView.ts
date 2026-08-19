@@ -7,6 +7,16 @@ export type SessionView = { identity: string, session_id: string, agent: string,
  */
 actions: bigint, 
 /**
+ * Current context-window footprint in tokens, from the newest
+ * usage-bearing captured message (issue #200); `None` when the
+ * session carries no usage data.
+ */
+context_tokens: bigint | null, 
+/**
+ * Cumulative output tokens across the session (issue #200).
+ */
+output_tokens: bigint | null, 
+/**
  * RFC3339 timestamp of the session's newest message.
  */
 last_active: string | null, };

@@ -240,6 +240,93 @@ pub async fn session_activity(
     Ok(merge_newest(&messages, &actions, limit))
 }
 
+/// Pull an i64 field out of a dynamic row object; 0 when absent.
+fn int_of(o: &superx_kernel::types::Object, key: &str) -> i64 {
+    match o.get(key) {
+        Some(Value::Number(n)) => n.to_int().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Pull a nested object field out of a dynamic row.
+fn obj_of(row: &Value, key: &str) -> Option<superx_kernel::types::Object> {
+    match row {
+        Value::Object(o) => match o.get(key) {
+            Some(Value::Object(inner)) => Some(inner.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A session's token telemetry, mined from the raw events adapters
+/// already preserve (issue #200): `(context, output_total)`.
+///
+/// - `context` — the NEWEST usage-bearing message's prompt footprint:
+///   Claude Code `raw.message.usage` (input + cache_read +
+///   cache_creation) or Gemini `raw.tokens` (total; else input+cached).
+/// - `output_total` — Σ output tokens across the session.
+///
+/// Both `None` when the session carries no usage data (e.g. telemetry-
+/// only agents). Pure SELECT over the `(session, valid_from)` index.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn session_token_stats(
+    kernel: &Kernel,
+    session: RecordId,
+) -> Result<(Option<i64>, Option<i64>)> {
+    let rows: Vec<Value> = kernel
+        .db()
+        .query(
+            "SELECT math::sum(raw.message.usage.output_tokens ?? raw.tokens.output ?? 0) \
+                 AS toks \
+             FROM message WHERE session = $sess GROUP ALL",
+        )
+        .bind(("sess", session.clone()))
+        .await?
+        .take(0)?;
+    let output_total = rows
+        .first()
+        .and_then(|row| match row {
+            Value::Object(o) => Some(int_of(o, "toks")),
+            _ => None,
+        })
+        .filter(|&n| n > 0);
+
+    let rows: Vec<Value> = kernel
+        .db()
+        .query(
+            "SELECT raw.message.usage AS cu, raw.tokens AS gu, valid_from \
+             FROM message WHERE session = $sess \
+               AND (raw.message.usage != NONE OR raw.tokens != NONE) \
+             ORDER BY valid_from DESC LIMIT 1",
+        )
+        .bind(("sess", session))
+        .await?
+        .take(0)?;
+    let context = rows.first().and_then(|row| {
+        if let Some(cu) = obj_of(row, "cu") {
+            let n = int_of(&cu, "input_tokens")
+                + int_of(&cu, "cache_read_input_tokens")
+                + int_of(&cu, "cache_creation_input_tokens");
+            return (n > 0).then_some(n);
+        }
+        if let Some(gu) = obj_of(row, "gu") {
+            let total = int_of(&gu, "total");
+            let n = if total > 0 {
+                total
+            } else {
+                int_of(&gu, "input") + int_of(&gu, "cached")
+            };
+            return (n > 0).then_some(n);
+        }
+        None
+    });
+    Ok((context, output_total))
+}
+
 /// Count of a session's action events (same matching as
 /// [`session_activity`]) — the sessions list shows TOTAL activity
 /// (messages + actions), not messages alone (issue #187).

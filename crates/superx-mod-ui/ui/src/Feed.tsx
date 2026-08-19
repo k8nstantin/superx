@@ -49,11 +49,34 @@ function buildDirectory(sessions: SessionView[], agents: AgentView[]): Directory
   return { bySessionId, bySrc, agentName }
 }
 
+// Every session gets its own stable color (issue #200): hash the
+// session id into the palette, the same session is the same color
+// everywhere — the feed badges and the Sessions list.
+const SESSION_COLORS = [
+  'indigo',
+  'teal',
+  'orange',
+  'grape',
+  'cyan',
+  'pink',
+  'lime',
+  'violet',
+  'blue',
+  'red',
+] as const
+
+export function sessionColor(sessionKey: string): string {
+  let h = 0
+  for (let i = 0; i < sessionKey.length; i++) h = (h * 31 + sessionKey.charCodeAt(i)) >>> 0
+  return SESSION_COLORS[h % SESSION_COLORS.length]
+}
+
 // Who is doing what: every row is attributed to its session —
 // messages by session entity id, actions by source-session key. When
 // two agents' sessions share a source key, the event's agent_id
-// picks the right one.
-function identityOf(e: SseEvent, d: Directory): string | null {
+// picks the right one. `key` is the stable identity the color hash
+// runs on (the session entity uuid when resolved).
+function identityOf(e: SseEvent, d: Directory): { label: string; key: string } | null {
   let match: SessionView | undefined
   if (e.kind === 'message') {
     match = e.session_id ? d.bySessionId.get(e.session_id) : undefined
@@ -66,9 +89,11 @@ function identityOf(e: SseEvent, d: Directory): string | null {
       match = candidates[0]
     }
   }
-  if (match) return `${match.agent}/${match.session_id.slice(0, 8)}`
-  if (e.kind === 'message' && e.session_id) return e.session_id.slice(0, 8)
-  if (e.session_src) return e.session_src.slice(0, 8)
+  if (match)
+    return { label: `${match.agent}/${match.session_id.slice(0, 8)}`, key: match.session_id }
+  if (e.kind === 'message' && e.session_id)
+    return { label: e.session_id.slice(0, 8), key: e.session_id }
+  if (e.session_src) return { label: e.session_src.slice(0, 8), key: e.session_src }
   return null // a global OS event — no session
 }
 
@@ -188,8 +213,13 @@ export function Feed({
                 {rowLabel(r)}
               </Badge>
               <Tooltip label={identity ? 'session' : 'no session — OS-level event'} withArrow>
-                <Badge size="xs" mr={6} variant="outline" color={identity ? 'gray' : 'yellow'}>
-                  {identity ?? 'system'}
+                <Badge
+                  size="xs"
+                  mr={6}
+                  variant="outline"
+                  color={identity ? sessionColor(identity.key) : 'yellow'}
+                >
+                  {identity?.label ?? 'system'}
                 </Badge>
               </Tooltip>
               {r.rendered}

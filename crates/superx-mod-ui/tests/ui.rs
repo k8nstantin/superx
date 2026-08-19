@@ -235,6 +235,62 @@ async fn global_activity_includes_everything_including_no_session_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_token_stats_mines_usage_from_raw_events() {
+    use superx_kernel::message::json_to_object;
+    use superx_mod_ui::activity::session_token_stats;
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-tok").await;
+
+    // Two assistant turns with Claude Code usage shapes; the SECOND is
+    // the newest, so context comes from it and outputs sum across both.
+    for (input, cache_read, output) in [(100i64, 1_000i64, 50i64), (10, 2_000, 20)] {
+        kernel
+            .log_message(superx_kernel::NewMessage {
+                session: session.clone(),
+                agent: agent.clone(),
+                role: "assistant".to_string(),
+                content: "hi".to_string(),
+                raw: Some(json_to_object(&serde_json::json!({
+                    "message": {"usage": {
+                        "input_tokens": input,
+                        "cache_read_input_tokens": cache_read,
+                        "output_tokens": output
+                    }}
+                }))),
+                seq: None,
+                emitted_at: None,
+            })
+            .await
+            .expect("message");
+    }
+    // A usage-less message (user prompt) must not disturb the stats.
+    kernel
+        .log_message(superx_kernel::NewMessage {
+            session: session.clone(),
+            agent: agent.clone(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+            raw: None,
+            seq: None,
+            emitted_at: None,
+        })
+        .await
+        .expect("plain message");
+
+    let (context, output_total) = session_token_stats(&kernel, session)
+        .await
+        .expect("stats");
+    assert_eq!(output_total, Some(70), "sum of output_tokens across turns");
+    assert_eq!(context, Some(2_010), "newest usage: input + cache_read");
+
+    // A session with no usage data reports nothing, never zeroes.
+    let (_a2, empty) = seed_agent_and_session(&kernel, "gemini_cli", "src-empty").await;
+    let (c, o) = session_token_stats(&kernel, empty).await.expect("empty");
+    assert_eq!((c, o), (None, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_activity_keeps_the_newest_rows_when_truncated() {
     use superx_mod_ui::activity::session_activity;
 

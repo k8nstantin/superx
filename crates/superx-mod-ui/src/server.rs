@@ -284,6 +284,12 @@ async fn api_sessions(
             .ok()
             .flatten()
             .map(|t| t.to_rfc3339());
+        // Token telemetry from the captured raw events (issue #200);
+        // best-effort — a session with no usage data shows nothing.
+        let (context_tokens, output_tokens) =
+            crate::activity::session_token_stats(kernel, s.entity_id.clone())
+                .await
+                .unwrap_or((None, None));
         let uuid = superx_ops::record_uuid(&s.entity_id);
         out.push(SessionView {
             identity: format!("{agent}/{uuid}"),
@@ -291,6 +297,8 @@ async fn api_sessions(
             agent,
             src,
             actions: count,
+            context_tokens,
+            output_tokens,
             last_active,
         });
     }
