@@ -45,6 +45,12 @@ pub struct SessionView {
     /// TOTAL activity for the session — messages + action events
     /// (issue #187).
     pub actions: i64,
+    /// Current context-window footprint in tokens, from the newest
+    /// usage-bearing captured message (issue #200); `None` when the
+    /// session carries no usage data.
+    pub context_tokens: Option<i64>,
+    /// Cumulative output tokens across the session (issue #200).
+    pub output_tokens: Option<i64>,
     /// RFC3339 timestamp of the session's newest message.
     pub last_active: Option<String>,
 }

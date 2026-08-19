@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Badge, Button, Card, Group, ScrollArea, Table, Text, Title, Tooltip } from '@mantine/core'
 import { fetchAgents, fetchSessionActivity, fetchSessions } from '../api'
 import { useSse } from '../useSse'
-import { Feed, MAX_FEED_ROWS, mergeFeed } from '../Feed'
+import { Feed, MAX_FEED_ROWS, mergeFeed, sessionColor } from '../Feed'
 import type { SseEvent } from '../generated/SseEvent'
 import type { SessionView } from '../generated/SessionView'
 
@@ -59,6 +59,15 @@ function LivenessDot({ state }: { state: Liveness }) {
   )
 }
 
+// Compact token rendering: 1234 → 1.2k, 1234567 → 1.2M, absent → —.
+function fmtTokens(n: number | bigint | null): string {
+  if (n == null) return '—'
+  const v = Number(n)
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`
+  return String(v)
+}
+
 function relativeTime(iso: string | null): string {
   if (!iso) return '—'
   const then = new Date(iso)
@@ -93,6 +102,8 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
               <Table.Th>Agent</Table.Th>
               <Table.Th>Session</Table.Th>
               <Table.Th>Source id</Table.Th>
+              <Table.Th>Context</Table.Th>
+              <Table.Th>Tokens</Table.Th>
               <Table.Th>Last active</Table.Th>
               <Table.Th>Actions</Table.Th>
             </Table.Tr>
@@ -107,7 +118,7 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
                   <Badge variant="light">{s.agent}</Badge>
                 </Table.Td>
                 <Table.Td>
-                  <Text size="xs" ff="monospace">
+                  <Text size="xs" ff="monospace" c={sessionColor(s.session_id)}>
                     {s.session_id}
                   </Text>
                 </Table.Td>
@@ -115,6 +126,16 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
                   <Text size="xs" ff="monospace" c="dimmed">
                     {s.src}
                   </Text>
+                </Table.Td>
+                <Table.Td>
+                  <Tooltip label="context-window footprint at the latest turn" withArrow>
+                    <Text size="xs">{fmtTokens(s.context_tokens)}</Text>
+                  </Tooltip>
+                </Table.Td>
+                <Table.Td>
+                  <Tooltip label="cumulative output tokens" withArrow>
+                    <Text size="xs">{fmtTokens(s.output_tokens)}</Text>
+                  </Tooltip>
                 </Table.Td>
                 <Table.Td>
                   <Tooltip label={s.last_active ?? 'no messages yet'} withArrow>
