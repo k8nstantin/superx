@@ -216,7 +216,8 @@ export function Feed({
                 <Badge
                   size="xs"
                   mr={6}
-                  variant="outline"
+                  variant="filled"
+                  autoContrast
                   color={identity ? sessionColor(identity.key) : 'yellow'}
                 >
                   {identity?.label ?? 'system'}

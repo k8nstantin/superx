@@ -49,6 +49,10 @@ pub struct SessionView {
     /// usage-bearing captured message (issue #200); `None` when the
     /// session carries no usage data.
     pub context_tokens: Option<i64>,
+    /// `context_tokens` as a percentage of the instance's context
+    /// window (`attr_ui_context_window_tokens`), clamped to 100 —
+    /// drives the Sessions list's context bar (issue #202).
+    pub context_pct: Option<i64>,
     /// Cumulative output tokens across the session (issue #200).
     pub output_tokens: Option<i64>,
     /// RFC3339 timestamp of the session's newest message.

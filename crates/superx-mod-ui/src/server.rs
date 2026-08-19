@@ -232,6 +232,8 @@ async fn api_sessions(
     else {
         return Json(out);
     };
+    // The context bar's denominator — resolved once per request.
+    let window = crate::resolved_context_window(kernel).await;
     // Resolve every agent ONCE — the per-session action count takes a
     // pre-resolved scope instead of re-reading descriptors and
     // re-resolving agents per row (review finding, issue #187).
@@ -290,6 +292,7 @@ async fn api_sessions(
             crate::activity::session_token_stats(kernel, s.entity_id.clone())
                 .await
                 .unwrap_or((None, None));
+        let context_pct = context_tokens.map(|c| ((c * 100) / window).clamp(0, 100));
         let uuid = superx_ops::record_uuid(&s.entity_id);
         out.push(SessionView {
             identity: format!("{agent}/{uuid}"),
@@ -298,6 +301,7 @@ async fn api_sessions(
             src,
             actions: count,
             context_tokens,
+            context_pct,
             output_tokens,
             last_active,
         });

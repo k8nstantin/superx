@@ -1,9 +1,9 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Badge, Button, Card, Group, ScrollArea, Table, Text, Title, Tooltip } from '@mantine/core'
+import { Badge, Button, Card, Group, Progress, ScrollArea, Table, Text, Title, Tooltip } from '@mantine/core'
 import { fetchAgents, fetchSessionActivity, fetchSessions } from '../api'
 import { useSse } from '../useSse'
-import { Feed, MAX_FEED_ROWS, mergeFeed, sessionColor } from '../Feed'
+import { Feed, MAX_FEED_ROWS, mergeFeed } from '../Feed'
 import type { SseEvent } from '../generated/SseEvent'
 import type { SessionView } from '../generated/SessionView'
 
@@ -55,6 +55,24 @@ function LivenessDot({ state }: { state: Liveness }) {
           ...styles[state],
         }}
       />
+    </Tooltip>
+  )
+}
+
+// Context is a FINITE window (issue #202): render usage as a bar —
+// green through mid-range, yellow from 70%, red when full (≥90%).
+function ContextBar({ pct, tokens }: { pct: bigint | null; tokens: bigint | null }) {
+  if (pct == null) return <Text size="xs">—</Text>
+  const p = Number(pct)
+  const color = p >= 90 ? 'red' : p >= 70 ? 'yellow' : 'green'
+  return (
+    <Tooltip label={`context window: ${fmtTokens(tokens)} used (${p}%)`} withArrow>
+      <Group gap={6} wrap="nowrap">
+        <Progress value={p} color={color} size="sm" w={70} />
+        <Text size="xs" w={44}>
+          {fmtTokens(tokens)}
+        </Text>
+      </Group>
     </Tooltip>
   )
 }
@@ -118,7 +136,7 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
                   <Badge variant="light">{s.agent}</Badge>
                 </Table.Td>
                 <Table.Td>
-                  <Text size="xs" ff="monospace" c={sessionColor(s.session_id)}>
+                  <Text size="xs" ff="monospace">
                     {s.session_id}
                   </Text>
                 </Table.Td>
@@ -128,9 +146,7 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
                   </Text>
                 </Table.Td>
                 <Table.Td>
-                  <Tooltip label="context-window footprint at the latest turn" withArrow>
-                    <Text size="xs">{fmtTokens(s.context_tokens)}</Text>
-                  </Tooltip>
+                  <ContextBar pct={s.context_pct} tokens={s.context_tokens} />
                 </Table.Td>
                 <Table.Td>
                   <Tooltip label="cumulative output tokens" withArrow>

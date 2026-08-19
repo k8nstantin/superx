@@ -2,7 +2,10 @@
 //! are QA'd against a real instance per the epic.
 
 use superx_kernel::{Kernel, KernelModule, SCHEMA_DDL};
-use superx_mod_ui::{resolved_port, resolved_url, UiModule, DEFAULT_PORT, MODULE_NAME, PORT_PARAM};
+use superx_mod_ui::{
+    resolved_context_window, resolved_port, resolved_url, UiModule, CONTEXT_WINDOW_PARAM,
+    DEFAULT_CONTEXT_WINDOW, DEFAULT_PORT, MODULE_NAME, PORT_PARAM,
+};
 
 const TEST_PASSWORD: &str = "test-kernel-password-for-mem-engine";
 
@@ -38,6 +41,29 @@ async fn port_defaults_then_follows_the_parameter() {
         .expect("param");
     assert_eq!(resolved_port(&kernel).await, 7777, "parameter wins");
     assert_eq!(resolved_url(&kernel).await, "http://127.0.0.1:7777");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_window_defaults_then_follows_the_parameter() {
+    let kernel = fresh_kernel().await;
+    assert_eq!(
+        resolved_context_window(&kernel).await,
+        DEFAULT_CONTEXT_WINDOW,
+        "unregistered → default"
+    );
+    let entity = kernel
+        .register_module(&UiModule.descriptor())
+        .await
+        .expect("register");
+    kernel
+        .set_parameter(
+            entity,
+            CONTEXT_WINDOW_PARAM,
+            superx_kernel::types::Value::Number(200_000.into()),
+        )
+        .await
+        .expect("param");
+    assert_eq!(resolved_context_window(&kernel).await, 200_000, "parameter wins");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
