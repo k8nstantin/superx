@@ -1,11 +1,13 @@
 import { useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  Anchor,
   Badge,
   Button,
   Card,
   Collapse,
   Grid,
+  FileInput,
   Group,
   Modal,
   ScrollArea,
@@ -18,8 +20,10 @@ import {
   Tooltip,
 } from '@mantine/core'
 import {
+  attachFile,
   commentEntity,
   createEntity,
+  downloadUrl,
   describeEntity,
   fetchDetail,
   fetchEntities,
@@ -32,6 +36,7 @@ import {
   updateEntity,
 } from '../api'
 import { MarkdownEditor, MarkdownView, type MarkdownEditorHandle } from '../Markdown'
+import { GraphPanel } from '../Graph'
 import type { EntityDetail } from '../generated/EntityDetail'
 
 // The Entities page (issue #231, approved design): list with a type
@@ -244,6 +249,8 @@ function DetailView({
   const [editOpen, setEditOpen] = useState(false)
   const [linkOpen, setLinkOpen] = useState(false)
   const [describeOpen, setDescribeOpen] = useState(false)
+  const [attachOpen, setAttachOpen] = useState(false)
+  const [graphOpen, setGraphOpen] = useState(false)
   const history = useQuery({
     queryKey: ['history', frag],
     queryFn: () => fetchHistory(frag),
@@ -290,21 +297,30 @@ function DetailView({
           <Button size="compact-sm" variant="default" onClick={() => setLinkOpen(true)}>
             + Link
           </Button>
-          <Tooltip label="file attach lands in EU4" withArrow>
-            <Button size="compact-sm" variant="default" disabled>
-              + Attach
-            </Button>
-          </Tooltip>
-          <Tooltip label="the per-entity graph lands in EU5" withArrow>
-            <Button size="compact-sm" variant="default" disabled>
-              Graph
-            </Button>
-          </Tooltip>
+          <Button size="compact-sm" variant="default" onClick={() => setAttachOpen(true)}>
+            + Attach
+          </Button>
+          <Button
+            size="compact-sm"
+            variant={graphOpen ? 'filled' : 'default'}
+            onClick={() => setGraphOpen((o) => !o)}
+          >
+            Graph {graphOpen ? '▴' : '▾'}
+          </Button>
           <Button size="compact-sm" variant="default" onClick={() => setHistoryOpen((o) => !o)}>
             History {historyOpen ? '▴' : '▾'}
           </Button>
         </Group>
       </Group>
+
+      <Collapse expanded={graphOpen}>
+        <Card withBorder mb="sm">
+          <Title order={6} mb="xs">
+            GRAPH · ROOTED AT THIS ENTITY
+          </Title>
+          {graphOpen && <GraphPanel frag={d.id} onOpen={onOpen} />}
+        </Card>
+      </Collapse>
 
       <Collapse expanded={historyOpen}>
         <Card withBorder mb="sm">
@@ -416,6 +432,32 @@ function DetailView({
               <MarkdownView markdown={d.content} />
             </Card>
           )}
+          <Card withBorder mb="md">
+            <Group justify="space-between" mb="xs">
+              <Title order={6} tt="uppercase" c="dimmed">
+                Attachments
+              </Title>
+              <Button size="compact-xs" variant="subtle" onClick={() => setAttachOpen(true)}>
+                + attach
+              </Button>
+            </Group>
+            {d.attachments.length === 0 ? (
+              <Text size="sm" c="dimmed">
+                no files yet — attachments become document entities, linked attached→
+              </Text>
+            ) : (
+              d.attachments.map((a) => (
+                <Group key={a.id} justify="space-between" wrap="nowrap" mb={4}>
+                  <Anchor href={downloadUrl(a.id)} size="sm" download>
+                    {a.name}
+                  </Anchor>
+                  <Text size="xs" c="dimmed" ff="monospace">
+                    {fmtBytes(Number(a.size))} · {a.mime}
+                  </Text>
+                </Group>
+              ))
+            )}
+          </Card>
           <Card withBorder>
             <Title order={6} tt="uppercase" c="dimmed" mb="xs">
               Attributes
@@ -448,7 +490,81 @@ function DetailView({
         initial={description?.content ?? ''}
         onSaved={refresh}
       />
+      <AttachModal
+        opened={attachOpen}
+        onClose={() => setAttachOpen(false)}
+        frag={frag}
+        onAttached={refresh}
+      />
     </>
+  )
+}
+
+function fmtBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${n} B`
+}
+
+// EU4 — one file at a time: the bytes go up as the request body, and
+// the module stores them under its own dir as a document entity.
+function AttachModal({
+  opened,
+  onClose,
+  frag,
+  onAttached,
+}: {
+  opened: boolean
+  onClose: () => void
+  frag: string
+  onAttached: () => void
+}) {
+  const [file, setFile] = useState<File | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  return (
+    <Modal opened={opened} onClose={onClose} title="Attach a file" size="md">
+      <FileInput
+        label="File"
+        placeholder="choose a file…"
+        value={file}
+        onChange={setFile}
+        clearable
+      />
+      <Text size="xs" c="dimmed" mt="xs">
+        the file is copied into the entities module&apos;s own directory and recorded as a
+        document entity, linked attached→ from this one
+      </Text>
+      {error && (
+        <Text c="red.4" size="sm" mt="xs">
+          {error}
+        </Text>
+      )}
+      <Group justify="flex-end" mt="md">
+        <Button variant="default" onClick={onClose}>
+          Cancel
+        </Button>
+        <Button
+          loading={busy}
+          disabled={!file}
+          onClick={() => {
+            if (!file) return
+            setBusy(true)
+            setError(null)
+            void attachFile(frag, file)
+              .then(() => {
+                setFile(null)
+                onClose()
+                onAttached()
+              })
+              .catch((e) => setError(String(e)))
+              .finally(() => setBusy(false))
+          }}
+        >
+          Attach
+        </Button>
+      </Group>
+    </Modal>
   )
 }
 

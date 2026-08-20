@@ -9,6 +9,7 @@ import type { CreateReq } from './generated/CreateReq'
 import type { UpdateReq } from './generated/UpdateReq'
 import type { LinkReq } from './generated/LinkReq'
 import type { TypeReq } from './generated/TypeReq'
+import type { GraphView } from './generated/GraphView'
 
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(path)
@@ -55,6 +56,23 @@ export const linkEntity = (frag: string, req: LinkReq) =>
   post<{ edge_uid: string }>(`/api/entities/${frag}/link`, req)
 export const unlinkEntity = (frag: string, req: LinkReq) =>
   post<{ edge_uid: string }>(`/api/entities/${frag}/unlink`, req)
+
+// EU5 — the subgraph rooted at ONE entity.
+export const fetchGraph = (frag: string, depth: number, direction: string) =>
+  get<GraphView>(`/api/entities/${frag}/graph?depth=${depth}&direction=${direction}`)
+
+// EU4 — the bytes ARE the body; the name rides in the query string, so
+// there is no multipart boundary on either side of the wire.
+export async function attachFile(frag: string, file: File): Promise<{ id: string }> {
+  const r = await fetch(
+    `/api/entities/${frag}/attach?name=${encodeURIComponent(file.name)}`,
+    { method: 'POST', body: file },
+  )
+  if (!r.ok) throw new Error(await errText(r))
+  return r.json() as Promise<{ id: string }>
+}
+
+export const downloadUrl = (id: string) => `/api/attachments/${id}/download`
 
 // Every entity type wears a stable color from the validated ramp
 // (project UI standard) — hashed by name so runtime-added types get

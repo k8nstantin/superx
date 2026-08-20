@@ -5,7 +5,7 @@
 //! verbs (validation and versioning identical to the CLI) and emits
 //! kernel telemetry.
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
 use axum::routing::{get, post};
@@ -33,6 +33,7 @@ struct AppState {
 ///
 /// [`KernelError::Module`] when the port cannot be bound.
 pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
+    let upload_limit = crate::resolved_upload_limit(&kernel).await;
     let app = Router::new()
         .route("/api/ping", get(api_ping))
         .route("/api/types", get(api_types).post(api_types_add))
@@ -45,6 +46,17 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/entities/{frag}/comment", post(api_comment))
         .route("/api/entities/{frag}/link", post(api_link))
         .route("/api/entities/{frag}/unlink", post(api_unlink))
+        // EU5 — the graph is PER ENTITY: rooted where you opened it.
+        .route("/api/entities/{frag}/graph", get(api_graph))
+        // EU4 — attachments. Upload carries the bytes as the request
+        // body with the name as a query parameter: one file, no
+        // multipart boundary to parse, and the size cap sits on the
+        // route where it belongs.
+        .route(
+            "/api/entities/{frag}/attach",
+            post(api_attach).layer(DefaultBodyLimit::max(upload_limit)),
+        )
+        .route("/api/attachments/{frag}/download", get(api_download))
         .fallback(get(static_assets))
         .with_state(AppState { kernel });
     let addr = format!("127.0.0.1:{port}");
@@ -263,6 +275,145 @@ async fn api_unlink(
             Resp::ok(serde_json::json!({ "edge_uid": edge_uid }))
         }
         Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GraphQuery {
+    depth: Option<usize>,
+    /// `out` | `in` | `both` (default) — which way the walk runs.
+    direction: Option<String>,
+}
+
+/// EU5 — the subgraph rooted at one entity.
+async fn api_graph(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+    Query(q): Query<GraphQuery>,
+) -> Resp<api::GraphView> {
+    let db = module_db!(state);
+    // The module's existing depth ceiling governs; a deeper request is
+    // clamped rather than refused.
+    let ceiling = crate::cli::resolved_max_depth(&state.kernel).await;
+    let opening = crate::resolved_graph_depth(&state.kernel).await;
+    let depth = q.depth.unwrap_or(opening).clamp(1, ceiling);
+    let direction = q.direction.unwrap_or_else(|| "both".to_string());
+    match api::graph_view(&db, &frag, depth, &direction).await {
+        Ok(v) => Resp::ok(v),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AttachQuery {
+    /// The uploaded file's own name, for the document node's metadata.
+    name: Option<String>,
+}
+
+/// EU4 — store an uploaded file under the module's dir and record the
+/// document node + `attached` edge. The bytes never leave the module.
+async fn api_attach(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+    Query(q): Query<AttachQuery>,
+    body: axum::body::Bytes,
+) -> Resp<serde_json::Value> {
+    let db = module_db!(state);
+    if body.is_empty() {
+        return Resp::err("empty upload".to_string());
+    }
+    // The client's filename is untrusted: keep only the final
+    // component so it can never climb out of the files dir.
+    let raw = q.name.unwrap_or_else(|| "attachment".to_string());
+    let file_name = std::path::Path::new(&raw)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .unwrap_or("attachment")
+        .to_string();
+
+    let owner = match crate::nodes::resolve_entity(&db, &frag).await {
+        Ok(o) => o,
+        Err(e) => return Resp::err(e.to_string()),
+    };
+    let files_dir = match state.kernel.module_dir(crate::MODULE_NAME) {
+        Ok(d) => d.join("files"),
+        Err(e) => return Resp::err(e.to_string()),
+    };
+    if let Err(e) = std::fs::create_dir_all(&files_dir) {
+        return Resp::err(format!("cannot create files dir: {e}"));
+    }
+    // Same storage convention as `superx entities attach`: a uuid7
+    // prefix keeps names unique and time-ordered.
+    let stored = files_dir.join(format!("{}-{file_name}", uuid::Uuid::now_v7()));
+    let size = body.len() as u64;
+    if let Err(e) = std::fs::write(&stored, &body) {
+        return Resp::err(format!("cannot store file: {e}"));
+    }
+    let mime = crate::documents::mime_for(&file_name);
+    match crate::documents::attach_document(
+        &db,
+        &owner,
+        &file_name,
+        &stored.to_string_lossy(),
+        mime,
+        size,
+    )
+    .await
+    {
+        Ok(node) => {
+            let uuid = superx_ops::record_uuid(&node);
+            emit(&state.kernel, "document_attached", format!("{file_name} → {frag}")).await;
+            Resp::ok(serde_json::json!({ "id": uuid, "name": file_name, "size": size }))
+        }
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+/// EU4 — hand an attachment's bytes back.
+async fn api_download(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let db = match state.kernel.module_db(crate::MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let (path, name, mime) = match api::attachment_file(&db, &frag).await {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    };
+    // The stored path is a substrate fact, but serve it only if it
+    // really sits under this module's files dir — a rogue path in the
+    // attributes must not turn this route into an arbitrary file read.
+    let files_dir = match state.kernel.module_dir(crate::MODULE_NAME) {
+        Ok(d) => d.join("files"),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let (Ok(real), Ok(root)) = (
+        std::fs::canonicalize(&path),
+        std::fs::canonicalize(&files_dir),
+    ) else {
+        return (StatusCode::NOT_FOUND, "attachment file is missing").into_response();
+    };
+    if !real.starts_with(&root) {
+        return (StatusCode::FORBIDDEN, "attachment is outside the module's files dir")
+            .into_response();
+    }
+    match std::fs::read(&real) {
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, mime),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", name.replace('"', "")),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, format!("cannot read attachment: {e}")).into_response(),
     }
 }
 

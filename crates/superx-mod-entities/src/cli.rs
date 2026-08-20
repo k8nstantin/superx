@@ -357,7 +357,7 @@ async fn graph_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
 
 /// Resolve the traversal ceiling: substrate parameter, else the
 /// marked bootstrap fallback (ui-module resolved_port pattern).
-async fn resolved_max_depth(kernel: &Kernel) -> usize {
+pub(crate) async fn resolved_max_depth(kernel: &Kernel) -> usize {
     let Ok(Some(entity)) = kernel
         .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
         .await
