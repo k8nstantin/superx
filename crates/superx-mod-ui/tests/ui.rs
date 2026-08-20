@@ -695,6 +695,26 @@ async fn search_reaches_all_history_across_messages_and_actions() {
         .await
         .expect("miss")
         .is_empty());
+
+    // Not every payload is an object: `module_provisioned` emits a bare
+    // string. Reading a field off it must yield nothing, not an error
+    // that takes the whole search down.
+    kernel
+        .log_telemetry("module_provisioned", Value::String("needlemod".to_string()), None)
+        .await
+        .expect("bare payload");
+    let after_bare = global_activity(&kernel, 100, None, Some("needle"))
+        .await
+        .expect("search survives a non-object payload");
+    assert_eq!(after_bare.len(), 2, "the bare-payload row neither matches nor breaks it");
+    assert_eq!(
+        global_activity(&kernel, 100, None, Some("module_provisioned"))
+            .await
+            .expect("by name")
+            .len(),
+        1,
+        "and it is still findable by its event name"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

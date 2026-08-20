@@ -172,13 +172,29 @@ pub type Query<'a> = Option<&'a str>;
 /// whatever the client happens to be holding.
 const MSG_MATCH: &str = "string::contains(string::lowercase(content), $q)";
 
-/// The action-side keyword clause. A telemetry payload is `any` —
-/// schemaless by design — so the search casts it to text to look
-/// inside it. That is a search over unstructured content, not a
-/// conversion papering over a mis-typed struct: nothing downstream
-/// consumes the cast value, and every field keeps its own type.
-const ACT_MATCH: &str = "(string::contains(string::lowercase(lifecycle_event), $q) \
-     OR string::contains(string::lowercase(<string>payload), $q))";
+/// The payload fields a keyword search looks inside. A telemetry
+/// payload is `any`, so there is no schema to enumerate — this is the
+/// vocabulary the adapters and modules actually emit (the same kind of
+/// captured-shape knowledge as `stats::WRITE_TOOLS`). Each is read as
+/// the string it already is: no `<string>` cast, which §14 forbids.
+const SEARCHED_PAYLOAD_FIELDS: &[&str] = &[
+    "tool", "name", "file", "line", "session", "error", "source", "kind", "url", "detail",
+    "snippet", "adapter", "reason", "status",
+];
+
+/// The action-side keyword clause: the event name, plus every payload
+/// field above. A field the payload lacks coalesces to the empty
+/// string rather than dropping the row.
+fn act_match() -> String {
+    let fields: Vec<String> = SEARCHED_PAYLOAD_FIELDS
+        .iter()
+        .map(|f| format!("string::contains(string::lowercase(payload.{f} ?? ''), $q)"))
+        .collect();
+    format!(
+        "(string::contains(string::lowercase(lifecycle_event), $q) OR {})",
+        fields.join(" OR ")
+    )
+}
 
 /// Assemble one page query. Every fragment spliced in here is a
 /// compile-time constant; the operator's keyword and the cursor reach
@@ -254,7 +270,7 @@ async fn recent_actions(
     if before.is_none() && q.is_none() {
         return kernel.recent_telemetry(limit).await;
     }
-    let sql = page_query("telemetry_stream", None, before, q, ACT_MATCH);
+    let sql = page_query("telemetry_stream", None, before, q, &act_match());
     let rows: Vec<TelemetryRecord> = page!(kernel, sql, limit, before, q);
     Ok(rows)
 }
@@ -310,7 +326,7 @@ pub async fn session_activity(
         }),
         before,
         q,
-        ACT_MATCH,
+        &act_match(),
     );
     let actions: Vec<TelemetryRecord> = match scope {
         Some((agent, src_key)) => page!(
