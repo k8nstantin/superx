@@ -7,6 +7,7 @@ import type { SseEvent } from './generated/SseEvent'
 import type { ActionView } from './generated/ActionView'
 import type { ChartsSummary } from './generated/ChartsSummary'
 import type { StatsSummary } from './generated/StatsSummary'
+import type { InsightsSummary } from './generated/InsightsSummary'
 
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(path)
@@ -24,6 +25,7 @@ export const fetchActivity = (limit = 500) => get<SseEvent[]>(`/api/activity?lim
 export const fetchActions = (limit = 50) => get<ActionView[]>(`/api/actions?limit=${limit}`)
 export const fetchCharts = () => get<ChartsSummary>('/api/charts/summary')
 export const fetchStats = () => get<StatsSummary>('/api/stats')
+export const fetchInsights = () => get<InsightsSummary>('/api/insights')
 
 export async function runCommand(argv: string[]): Promise<{ output: string; is_error: boolean }> {
   const r = await fetch('/api/command', {

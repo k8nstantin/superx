@@ -56,6 +56,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/sessions/{id}/activity", get(api_session_activity))
         .route("/api/activity", get(api_activity))
         .route("/api/stats", get(api_stats))
+        .route("/api/insights", get(api_insights))
         .route("/api/actions", get(api_actions))
         .route("/api/charts/summary", get(api_charts))
         .route("/api/events", get(api_events))
@@ -362,6 +363,16 @@ async fn api_stats(State(state): State<AppState>) -> Response<StatsSummary> {
     let kernel = &state.kernel;
     let window = crate::resolved_stats_window(kernel).await;
     match crate::stats::stats_summary(kernel, window).await {
+        Ok(s) => Response::ok(s),
+        Err(e) => Response::err(e.to_string()),
+    }
+}
+
+/// Deep statistics (issue #237) — all-history aggregates computed in
+/// the engine. Separate from `/api/stats` so the live tiles keep their
+/// fast refresh while these poll lazily.
+async fn api_insights(State(state): State<AppState>) -> Response<InsightsSummary> {
+    match crate::insights::insights_summary(&state.kernel).await {
         Ok(s) => Response::ok(s),
         Err(e) => Response::err(e.to_string()),
     }
