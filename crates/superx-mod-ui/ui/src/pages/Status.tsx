@@ -333,16 +333,19 @@ export default function StatusPage() {
 
       {(i?.events_per_day.length ?? 0) > 0 && (
         <Card withBorder mb="md">
-          <Title order={5} mb="xs">
-            The work calendar — every event the OS ever captured, by day
-          </Title>
+          <Group justify="space-between" mb="xs">
+            <Title order={5}>The work calendar — messages by the day they were written</Title>
+            <Text size="xs" c="dimmed">
+              the agent&apos;s own clock, not our capture time
+            </Text>
+          </Group>
           <EChart
             height={190}
             option={{
               tooltip: {
                 ...TOOLTIP,
                 formatter: (p: { value: [string, number] }) =>
-                  `${p.value[0]}<br/>${fmtCompact(p.value[1])} events`,
+                  `${p.value[0]}<br/>${fmtCompact(p.value[1])} messages`,
               },
               visualMap: {
                 min: 0,
@@ -403,7 +406,7 @@ export default function StatusPage() {
                   formatter: (p: { value: [number, number, number] }) =>
                     `${HEAT_ROWS[p.value[1]]} ${String(p.value[0]).padStart(2, '0')}:00<br/>${fmtCompact(
                       p.value[2],
-                    )} events`,
+                    )} messages`,
                 },
                 grid: { left: 46, right: 14, top: 10, bottom: 40 },
                 xAxis: {
