@@ -60,6 +60,55 @@ pub async fn resolved_ui_port(kernel: &Kernel) -> u16 {
     }
 }
 
+/// How many hops the per-entity graph opens at (EU5). The ceiling is
+/// `attr_entities_max_depth`; this is where the view STARTS.
+pub const GRAPH_DEPTH_PARAM: &str = "attr_entities_graph_depth";
+const DEFAULT_GRAPH_DEPTH: usize = 2; // skill-allow: §9-const — bootstrap fallback, param-overridable (attr_entities_graph_depth)
+
+/// Resolve the graph's opening depth.
+pub async fn resolved_graph_depth(kernel: &Kernel) -> usize {
+    let Ok(Some(entity)) = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+    else {
+        return DEFAULT_GRAPH_DEPTH;
+    };
+    match kernel.get_parameter(entity, GRAPH_DEPTH_PARAM).await {
+        Ok(Some(Value::Number(n))) => n
+            .to_int()
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|&d| d > 0)
+            .unwrap_or(DEFAULT_GRAPH_DEPTH),
+        _ => DEFAULT_GRAPH_DEPTH,
+    }
+}
+
+/// Largest attachment the UI accepts, in megabytes (EU4).
+pub const UPLOAD_LIMIT_PARAM: &str = "attr_entities_max_upload_mb";
+const DEFAULT_UPLOAD_MB: usize = 25; // skill-allow: §9-const — bootstrap fallback, param-overridable (attr_entities_max_upload_mb)
+const BYTES_PER_MB: usize = 1024 * 1024; // skill-allow: §9-const — unit conversion, not policy
+
+/// Resolve the upload ceiling in BYTES, for the attach route's body
+/// limit. An unbounded upload is a way to fill the disk, so the cap is
+/// a parameter rather than absent.
+pub async fn resolved_upload_limit(kernel: &Kernel) -> usize {
+    let Ok(Some(entity)) = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+    else {
+        return DEFAULT_UPLOAD_MB * BYTES_PER_MB;
+    };
+    let mb = match kernel.get_parameter(entity, UPLOAD_LIMIT_PARAM).await {
+        Ok(Some(Value::Number(n))) => n
+            .to_int()
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|&m| m > 0)
+            .unwrap_or(DEFAULT_UPLOAD_MB),
+        _ => DEFAULT_UPLOAD_MB,
+    };
+    mb * BYTES_PER_MB
+}
+
 /// This module's UI URL.
 pub async fn resolved_ui_url(kernel: &Kernel) -> String {
     format!("http://127.0.0.1:{}", resolved_ui_port(kernel).await)

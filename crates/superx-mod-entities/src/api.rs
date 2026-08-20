@@ -10,12 +10,14 @@
 
 use serde::{Deserialize, Serialize};
 use superx_kernel::message::value_from_json;
-use superx_kernel::types::RecordId;
+use std::collections::HashSet;
+
+use superx_kernel::types::{RecordId, Value};
 use superx_kernel::{Db, KernelError, Result};
 use superx_ops::record_uuid;
 use ts_rs::TS;
 
-use crate::{edges, graph, nodes, registry, texts};
+use crate::{documents, edges, graph, nodes, registry, texts};
 
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
@@ -73,6 +75,53 @@ pub struct EntityDetail {
     /// Active NON-TEXT edges, both directions (text-role edges show
     /// as annotations instead).
     pub edges: Vec<EdgeView>,
+    /// Files attached to this entity (EU4) — the `attached` edges,
+    /// resolved to their document nodes' metadata.
+    pub attachments: Vec<AttachmentView>,
+}
+
+/// One attached file. `size` is bytes as recorded at attach time; the
+/// bytes themselves live under the module's own dir and are served
+/// only through the download route.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct AttachmentView {
+    pub id: String,
+    pub name: String,
+    pub mime: String,
+    pub size: i64,
+}
+
+/// One node of a per-entity subgraph (EU5).
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct GraphNodeView {
+    pub id: String,
+    pub entity_type: String,
+    pub name: String,
+    /// Hops from the root — 0 is the entity the graph is rooted at.
+    pub depth: i64,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct GraphEdgeView {
+    pub from: String,
+    pub to: String,
+    pub rel_type: String,
+}
+
+/// The subgraph reachable from one entity — the graph is PER ENTITY
+/// (operator model): rooted where you opened it, never a global map.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct GraphView {
+    pub root: String,
+    pub nodes: Vec<GraphNodeView>,
+    pub edges: Vec<GraphEdgeView>,
+    /// The walk stopped at the depth limit — there is more out there.
+    pub truncated: bool,
+    pub depth: i64,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -246,7 +295,7 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
     }
     let others: Vec<RecordId> = views.iter().map(|(o, _)| o.clone()).collect();
     let meta = nodes::current_meta(db, &others).await?;
-    let edges = views
+    let edges: Vec<EdgeView> = views
         .into_iter()
         .map(|(other, mut v)| {
             if let Some(m) = meta.get(&record_uuid(&other)) {
@@ -257,6 +306,8 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
         })
         .collect();
 
+    let attachments = attachments_of(db, &edges).await?;
+
     Ok(EntityDetail {
         id: record_uuid(&id),
         entity_type,
@@ -266,7 +317,133 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
         version: state.valid_from,
         annotations,
         edges,
+        attachments,
     })
+}
+
+/// Resolve the `attached` edges to their documents' file metadata
+/// (EU4). Attachments are ordinary entities, so they already appear
+/// among the edges — this reads the metadata the download route needs.
+async fn attachments_of(db: &Db, edges: &[EdgeView]) -> Result<Vec<AttachmentView>> {
+    let mut out = Vec::new();
+    for e in edges.iter().filter(|e| e.outbound && e.rel_type == "attached") {
+        let Ok(doc) = nodes::resolve_entity(db, &e.other_id).await else {
+            continue;
+        };
+        let Some(state) = nodes::current_state(db, &doc).await? else {
+            continue;
+        };
+        let attrs = state.attributes.as_ref();
+        out.push(AttachmentView {
+            id: e.other_id.clone(),
+            name: attr_str(attrs, "original_name").unwrap_or_else(|| state.name.clone()),
+            mime: attr_str(attrs, "mime").unwrap_or_else(|| "application/octet-stream".into()),
+            size: attr_int(attrs, "size"),
+        });
+    }
+    Ok(out)
+}
+
+fn attr_str(attrs: Option<&Value>, key: &str) -> Option<String> {
+    match attrs {
+        Some(Value::Object(o)) => match o.get(key) {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn attr_int(attrs: Option<&Value>, key: &str) -> i64 {
+    match attrs {
+        Some(Value::Object(o)) => match o.get(key) {
+            Some(Value::Number(n)) => n.to_int().unwrap_or(0),
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// The subgraph rooted at one entity (EU5). `both` unions the forward
+/// and reverse walks: an entity's neighbourhood is what it points at
+/// AND what points at it — a root-level entity should show its whole
+/// world, which is the operator's model for this view.
+pub async fn graph_view(
+    db: &Db,
+    fragment: &str,
+    depth: usize,
+    direction: &str,
+) -> Result<GraphView> {
+    let id = nodes::resolve_entity(db, fragment).await?;
+    let walks: &[bool] = match direction {
+        "out" => &[false],
+        "in" => &[true],
+        _ => &[false, true],
+    };
+    let mut nodes_out: Vec<GraphNodeView> = Vec::new();
+    let mut edges_out: Vec<GraphEdgeView> = Vec::new();
+    let mut truncated = false;
+    let mut seen_nodes: HashSet<String> = HashSet::new();
+    let mut seen_edges: HashSet<String> = HashSet::new();
+    for &reverse in walks {
+        let sub = graph::subgraph(db, &id, depth, reverse).await?;
+        truncated |= sub.truncated_at_depth;
+        for n in sub.nodes {
+            let uuid = record_uuid(&n.id);
+            // A node reached by both walks keeps its SHALLOWEST depth.
+            if let Some(prev) = nodes_out.iter_mut().find(|p| p.id == uuid) {
+                prev.depth = prev.depth.min(n.depth as i64);
+                continue;
+            }
+            if !seen_nodes.insert(uuid.clone()) {
+                continue;
+            }
+            nodes_out.push(GraphNodeView {
+                id: uuid,
+                entity_type: n.entity_type,
+                name: n.name,
+                depth: n.depth as i64,
+            });
+        }
+        for e in sub.edges {
+            if !seen_edges.insert(e.edge_uid.clone()) {
+                continue;
+            }
+            edges_out.push(GraphEdgeView {
+                from: e.from,
+                to: e.to,
+                rel_type: e.rel_type,
+            });
+        }
+    }
+    // An edge whose far end was never reached would render as a stub.
+    edges_out.retain(|e| seen_nodes.contains(&e.from) && seen_nodes.contains(&e.to));
+    Ok(GraphView {
+        root: record_uuid(&id),
+        nodes: nodes_out,
+        edges: edges_out,
+        truncated,
+        depth: depth as i64,
+    })
+}
+
+/// Where an attachment's bytes live, and what to call them on the way
+/// out. Path resolution stays in the module: the stored path is a
+/// substrate fact written by the attach path, never client input.
+pub async fn attachment_file(db: &Db, fragment: &str) -> Result<(String, String, String)> {
+    let id = nodes::resolve_entity(db, fragment).await?;
+    let state = nodes::current_state(db, &id)
+        .await?
+        .ok_or_else(|| KernelError::Module("attachment has no state".into()))?;
+    let attrs = state.attributes.as_ref();
+    let path = attrs
+        .and_then(documents::stored_path)
+        .ok_or_else(|| KernelError::Module("not an attachment: no stored file".into()))?;
+    Ok((
+        path,
+        attr_str(attrs, "original_name").unwrap_or(state.name),
+        attr_str(attrs, "mime").unwrap_or_else(|| "application/octet-stream".into()),
+    ))
 }
 
 pub async fn history(db: &Db, fragment: &str) -> Result<Vec<VersionView>> {

@@ -138,6 +138,163 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_graph_is_rooted_at_the_entity_and_walks_both_ways() {
+    use superx_mod_entities::api;
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    // product —contains→ task —depends_on→ repo, and a rag pointing AT
+    // the task: a chain plus an inbound edge, so direction matters.
+    let mk = |t: &'static str, n: &'static str| {
+        let db = &db;
+        async move {
+            api::create(
+                db,
+                &api::CreateReq {
+                    entity_type: t.into(),
+                    name: n.into(),
+                    description: None,
+                    content: None,
+                    attributes_json: None,
+                },
+            )
+            .await
+            .expect("create")
+        }
+    };
+    let product = mk("product", "Widget").await;
+    let task = mk("task", "Build it").await;
+    let repo = mk("repo", "widget-src").await;
+    let rag = mk("rag", "widget docs").await;
+    for (from, rel, to) in [
+        (&product, "contains", &task),
+        (&task, "depends_on", &repo),
+        (&rag, "consults", &task),
+    ] {
+        api::link(&db, from, &api::LinkReq { to: to.clone(), rel: rel.into() })
+            .await
+            .expect("link");
+    }
+
+    // Rooted at the task, both ways: reaches product (in), repo (out),
+    // rag (in) — its whole neighbourhood.
+    let g = api::graph_view(&db, &task, 2, "both").await.expect("graph");
+    assert_eq!(g.root, task);
+    let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(g.nodes.len(), 4, "the task and its three neighbours: {names:?}");
+    assert_eq!(
+        g.nodes.iter().find(|n| n.id == task).map(|n| n.depth),
+        Some(0),
+        "the root sits at depth 0"
+    );
+    assert!(g.edges.iter().any(|e| e.rel_type == "depends_on"));
+    assert!(g.edges.iter().any(|e| e.rel_type == "consults"));
+
+    // Outbound only: the task reaches the repo, and nothing that
+    // merely points at it.
+    let out = api::graph_view(&db, &task, 2, "out").await.expect("out");
+    let out_names: Vec<&str> = out.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(out_names.contains(&"widget-src"), "{out_names:?}");
+    assert!(!out_names.contains(&"widget docs"), "inbound must stay out: {out_names:?}");
+
+    // Depth 1 from the product sees the task but not the repo behind
+    // it, and says the walk was cut short.
+    let shallow = api::graph_view(&db, &product, 1, "out").await.expect("shallow");
+    let shallow_names: Vec<&str> = shallow.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(shallow_names.contains(&"Build it"));
+    assert!(!shallow_names.contains(&"widget-src"), "{shallow_names:?}");
+    assert!(shallow.truncated, "there IS more past depth 1");
+
+    // Every edge returned connects two nodes that were returned —
+    // a dangling edge would render as a stub.
+    let ids: std::collections::HashSet<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(g.edges.iter().all(|e| ids.contains(e.from.as_str()) && ids.contains(e.to.as_str())));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_attachments_surface_on_the_owner_and_resolve_to_their_file() {
+    use superx_mod_entities::{api, documents};
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let owner = api::create(
+        &db,
+        &api::CreateReq {
+            entity_type: "task".into(),
+            name: "Ship it".into(),
+            description: None,
+            content: None,
+            attributes_json: None,
+        },
+    )
+    .await
+    .expect("owner");
+    let owner_id = superx_mod_entities::nodes::resolve_entity(&db, &owner).await.expect("resolve");
+
+    let doc = documents::attach_document(
+        &db,
+        &owner_id,
+        "notes.md",
+        "/tmp/entities/files/01a0-notes.md",
+        documents::mime_for("notes.md"),
+        4096,
+    )
+    .await
+    .expect("attach");
+
+    // The owner's detail shows it as an attachment, not just an edge.
+    let d = api::detail(&db, &owner).await.expect("detail");
+    assert_eq!(d.attachments.len(), 1, "{:?}", d.attachments);
+    let a = &d.attachments[0];
+    assert_eq!(a.name, "notes.md");
+    assert_eq!(a.mime, "text/markdown");
+    assert_eq!(a.size, 4096);
+    assert!(d.edges.iter().any(|e| e.rel_type == "attached" && e.outbound));
+
+    // The download route resolves the stored path from the substrate.
+    let (path, name, mime) = api::attachment_file(&db, &superx_ops::record_uuid(&doc))
+        .await
+        .expect("file");
+    assert_eq!(path, "/tmp/entities/files/01a0-notes.md");
+    assert_eq!((name.as_str(), mime.as_str()), ("notes.md", "text/markdown"));
+
+    // An entity that is not an attachment has no file to serve.
+    assert!(
+        api::attachment_file(&db, &owner).await.is_err(),
+        "a task is not a document"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_limit_defaults_then_follows_the_parameter() {
+    use superx_kernel::{KernelModule, SCHEMA_DDL as KERNEL_DDL};
+    use superx_mod_entities::{resolved_upload_limit, UPLOAD_LIMIT_PARAM};
+
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("kernel").await.expect("nsdb");
+    let ddl = KERNEL_DDL.replace("$SUPERX_KERNEL_PASSWORD", "test-password");
+    db.query(ddl).await.expect("ddl").check().expect("ddl ok");
+    let kernel = superx_kernel::Kernel::from_db(db);
+    for t in superx_kernel::REQUIRED_METAMODEL_TYPES {
+        kernel
+            .ensure_type_definition(t.uid, t.category, t.memory_tier)
+            .await
+            .expect("seed");
+    }
+    let mb = 1024 * 1024;
+    assert_eq!(resolved_upload_limit(&kernel).await, 25 * mb, "unregistered → default");
+    let entity = kernel
+        .register_module(&EntitiesModule.descriptor())
+        .await
+        .expect("register");
+    kernel
+        .set_parameter(entity, UPLOAD_LIMIT_PARAM, superx_kernel::types::Value::Number(4.into()))
+        .await
+        .expect("param");
+    assert_eq!(resolved_upload_limit(&kernel).await, 4 * mb, "parameter wins");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ui_port_defaults_then_follows_the_parameter() {
     use superx_mod_entities::{resolved_ui_port, resolved_ui_url, DEFAULT_UI_PORT, UI_PORT_PARAM};
     // A KERNEL substrate (not the module db): port parameters live on
