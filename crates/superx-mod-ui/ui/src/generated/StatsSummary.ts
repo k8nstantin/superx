@@ -2,6 +2,7 @@
 import type { NameCount } from "./NameCount";
 import type { SessionStat } from "./SessionStat";
 import type { TimeCount } from "./TimeCount";
+import type { ToolOutcome } from "./ToolOutcome";
 
 /**
  * The Status page's aggregation (issue #228): substrate totals plus
@@ -26,6 +27,10 @@ window_messages: number, events_per_minute: Array<TimeCount>, message_roles: Arr
  * Tool invocations by tool name, window-scoped, descending.
  */
 tools: Array<NameCount>, 
+/**
+ * Did those calls work? Window-scoped, descending by volume.
+ */
+tool_outcomes: Array<ToolOutcome>, 
 /**
  * Busiest sessions in the window, by message count.
  */

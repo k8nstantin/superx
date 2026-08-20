@@ -347,6 +347,169 @@ async fn stats_summary_mines_tools_lines_and_sessions_from_raw_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_summary_scores_tool_outcomes_across_both_agent_shapes() {
+    use superx_kernel::message::json_to_object;
+    use superx_mod_ui::stats::stats_summary;
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-outcome").await;
+    let msg = |raw: serde_json::Value| superx_kernel::NewMessage {
+        session: session.clone(),
+        agent: agent.clone(),
+        role: "assistant".to_string(),
+        content: String::new(),
+        raw: Some(json_to_object(&raw)),
+        seq: None,
+        emitted_at: None,
+    };
+
+    // Claude Code: the call, then its verdict in a LATER message.
+    kernel
+        .log_message(msg(serde_json::json!({
+            "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "nope"}},
+                {"type": "tool_use", "id": "t3", "name": "Read", "input": {"file_path": "a"}}
+            ]}
+        })))
+        .await
+        .expect("calls");
+    kernel
+        .log_message(msg(serde_json::json!({
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "is_error": false},
+                {"type": "tool_result", "tool_use_id": "t2", "is_error": true}
+            ]}
+        })))
+        .await
+        .expect("results");
+    // Gemini: the verdict rides on the call itself.
+    kernel
+        .log_message(msg(serde_json::json!({
+            "toolCalls": [
+                {"name": "run_shell_command", "status": "success"},
+                {"name": "run_shell_command", "status": "error"},
+                {"name": "replace", "status": "cancelled"}
+            ]
+        })))
+        .await
+        .expect("gemini");
+
+    let s = stats_summary(&kernel, 100).await.expect("stats");
+    let out = |n: &str| s.tool_outcomes.iter().find(|t| t.name == n).expect("tool");
+    let bash = out("Bash");
+    assert_eq!((bash.ok, bash.failed), (1, 1), "t1 ok, t2 failed");
+    // t3 never got a result inside the window — counted, not guessed.
+    let read = out("Read");
+    assert_eq!((read.ok, read.failed, read.unknown), (0, 0, 1));
+    let shell = out("run_shell_command");
+    assert_eq!((shell.ok, shell.failed), (1, 1));
+    assert_eq!(out("replace").cancelled, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_per_minute_stays_ordered_across_midnight() {
+    use superx_mod_ui::stats::stats_summary;
+
+    let kernel = fresh_kernel().await;
+    // Two events either side of midnight, logged oldest-last so the
+    // 23:5x event cannot win by insertion order alone.
+    for t in ["2026-08-19T23:58:00Z", "2026-08-20T00:03:00Z"] {
+        kernel
+            .db()
+            .query(
+                "CREATE telemetry_stream SET lifecycle_event = 'probe', payload = {},
+                 valid_from = <datetime>$t",
+            )
+            .bind(("t", t.to_string()))
+            .await
+            .expect("seed")
+            .check()
+            .expect("ok");
+    }
+    let s = stats_summary(&kernel, 10).await.expect("stats");
+    let labels: Vec<&str> = s.events_per_minute.iter().map(|p| p.t.as_str()).collect();
+    assert_eq!(labels, vec!["23:58", "00:03"], "the night crossing reads left→right");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insights_summary_reads_what_nothing_read_before() {
+    use superx_kernel::message::json_to_object;
+    use superx_mod_ui::insights::insights_summary;
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-deep").await;
+    let msg = |raw: serde_json::Value| superx_kernel::NewMessage {
+        session: session.clone(),
+        agent: agent.clone(),
+        role: "assistant".to_string(),
+        content: String::new(),
+        raw: Some(json_to_object(&raw)),
+        seq: None,
+        emitted_at: None,
+    };
+    kernel
+        .log_message(msg(serde_json::json!({
+            "message": {
+                "model": "claude-fable-5",
+                "usage": {"input_tokens": 100, "output_tokens": 20,
+                          "cache_read_input_tokens": 900, "cache_creation_input_tokens": 50}
+            }
+        })))
+        .await
+        .expect("cc msg");
+    kernel
+        .log_message(msg(serde_json::json!({
+            "model": "gemini-2.5-pro",
+            "tokens": {"input": 10, "output": 5, "cached": 100}
+        })))
+        .await
+        .expect("gemini msg");
+    kernel
+        .db()
+        .query(
+            "CREATE telemetry_stream SET lifecycle_event = 'module_active',
+             payload = { name: 'entities', startup_duration_ms: 187 }, valid_from = time::now()",
+        )
+        .await
+        .expect("seed startup")
+        .check()
+        .expect("ok");
+
+    let i = insights_summary(&kernel).await.expect("insights");
+
+    // Both token vocabularies land in one set of counters.
+    assert_eq!(i.tokens.input, 110, "100 claude + 10 gemini");
+    assert_eq!(i.tokens.output, 25);
+    assert_eq!(i.tokens.cache_read, 1000, "900 claude + 100 gemini cached");
+    assert_eq!(i.tokens.cache_write, 50);
+
+    // Model names — read here for the first time.
+    let model = |n: &str| i.models.iter().find(|m| m.name == n).map(|m| m.value);
+    assert_eq!(model("claude-fable-5"), Some(1));
+    assert_eq!(model("gemini-2.5-pro"), Some(1));
+
+    // The per-agent link resolves to the agent's name, not a raw id.
+    let cc = i.per_agent.iter().find(|a| a.name == "claude_code").expect("agent split");
+    assert_eq!(cc.messages, 2);
+    assert_eq!(cc.output_tokens, 25);
+
+    // Capture health and the kind mix.
+    assert!(i.event_kinds.iter().any(|k| k.name == "module_active"));
+    assert!(i.events_last_hour >= 1);
+    assert!(i.last_event_secs.is_some_and(|s| s < 60), "just captured");
+    assert_eq!(
+        i.module_startup.iter().find(|m| m.name == "entities").map(|m| m.value),
+        Some(187)
+    );
+
+    // The calendar and the week grid both have today in them.
+    assert!(!i.events_per_day.is_empty());
+    assert!(i.hour_weekday.iter().any(|c| c.value > 0));
+    assert!(i.hour_weekday.iter().all(|c| (1..=7).contains(&c.weekday) && c.hour < 24));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_token_stats_mines_usage_from_raw_events() {
     use superx_kernel::message::json_to_object;
     use superx_mod_ui::activity::session_token_stats;

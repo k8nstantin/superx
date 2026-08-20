@@ -122,8 +122,78 @@ pub struct StatsSummary {
     pub boot_durations: Vec<TimeCount>,
     /// Tool invocations by tool name, window-scoped, descending.
     pub tools: Vec<NameCount>,
+    /// Did those calls work? Window-scoped, descending by volume.
+    pub tool_outcomes: Vec<ToolOutcome>,
     /// Busiest sessions in the window, by message count.
     pub top_sessions: Vec<SessionStat>,
+}
+
+/// A tool's outcomes in the window. Claude Code reports per call via
+/// `tool_result.is_error` (joined back to the name by `tool_use_id`);
+/// Gemini reports a status string per call. `unknown` is a call whose
+/// result fell outside the window — counted, never guessed at.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ToolOutcome {
+    pub name: String,
+    pub ok: i64,
+    pub failed: i64,
+    pub cancelled: i64,
+    pub unknown: i64,
+}
+
+/// Deep statistics (issue #237) — engine-side aggregates over ALL
+/// history, not a window. Served separately from [`StatsSummary`] so
+/// the live tiles keep their fast refresh.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct InsightsSummary {
+    /// Events per calendar day, oldest first (`t` = `YYYY-MM-DD`).
+    pub events_per_day: Vec<TimeCount>,
+    /// Events by hour of day × day of week.
+    pub hour_weekday: Vec<HeatCell>,
+    pub tokens: TokenTotals,
+    /// Messages by model name, descending.
+    pub models: Vec<NameCount>,
+    /// Messages and output tokens by agent, descending.
+    pub per_agent: Vec<AgentSplit>,
+    /// Telemetry volume by event kind, descending.
+    pub event_kinds: Vec<NameCount>,
+    /// Newest startup reading per module, in milliseconds.
+    pub module_startup: Vec<NameCount>,
+    /// Age of the newest captured event — the capture-alive signal.
+    pub last_event_secs: Option<i64>,
+    pub events_last_hour: i64,
+}
+
+/// One cell of the hour × weekday grid. `weekday` is SurrealDB's
+/// `time::wday` (1 = Monday … 7 = Sunday).
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct HeatCell {
+    pub hour: i64,
+    pub weekday: i64,
+    pub value: i64,
+}
+
+/// The four token counters, summed across every captured message.
+/// Cost is deliberately absent: nothing in the substrate records it,
+/// and a computed guess would be a fabrication.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct TokenTotals {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct AgentSplit {
+    pub name: String,
+    pub messages: i64,
+    pub output_tokens: i64,
 }
 
 #[derive(Debug, Serialize, TS)]

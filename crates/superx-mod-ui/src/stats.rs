@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
-use crate::api::{NameCount, SessionStat, StatsSummary, TimeCount};
+use crate::api::{NameCount, SessionStat, StatsSummary, TimeCount, ToolOutcome};
 
 /// Telemetry window backing the events/min timeline (same bound the
 /// charts endpoint has always used).
@@ -81,6 +81,28 @@ struct SessAgg {
     messages: i64,
     lines: i64,
     out_tokens: i64,
+}
+
+/// Did the calls work? Claude Code answers in a LATER message — the
+/// `tool_result` block carries `is_error` and points back at the call
+/// by `tool_use_id` — so outcomes are resolved by joining the two
+/// across the window. A call whose result fell outside the window
+/// stays `unknown` rather than being scored as a success.
+#[derive(Default)]
+struct Outcome {
+    ok: i64,
+    failed: i64,
+    cancelled: i64,
+    calls: i64,
+}
+
+/// Fold the Gemini status vocabulary into the shared one.
+fn score_status(o: &mut Outcome, status: &str) {
+    match status {
+        "error" | "failed" => o.failed += 1,
+        "cancelled" | "canceled" => o.cancelled += 1,
+        _ => o.ok += 1,
+    }
 }
 
 /// One in-engine `count() GROUP ALL` over a table.
@@ -170,6 +192,11 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
     let mut tools: HashMap<String, i64> = HashMap::new();
     let mut lines_written = 0i64;
     let mut per_session: HashMap<String, SessAgg> = HashMap::new();
+    let mut outcomes: HashMap<String, Outcome> = HashMap::new();
+    // tool_use_id → tool name, so a later tool_result can be scored.
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    // Results seen before their call (the walk is newest-first).
+    let mut pending_results: HashMap<String, bool> = HashMap::new();
     for m in &msgs {
         let sid = superx_ops::record_uuid(&m.session);
         let agg = per_session.entry(sid).or_default();
@@ -183,15 +210,48 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
             if let Some(Value::Array(blocks)) = msg.get("content") {
                 for b in blocks.iter() {
                     let Some(block) = obj(b) else { continue };
-                    if get_str(block, "type") != Some("tool_use") {
-                        continue;
-                    }
-                    let name = get_str(block, "name").unwrap_or("tool").to_string();
-                    *tools.entry(name.clone()).or_insert(0) += 1;
-                    if let Some(Value::Object(input)) = block.get("input") {
-                        let n = block_lines(&name, input);
-                        lines_written += n;
-                        agg.lines += n;
+                    match get_str(block, "type") {
+                        Some("tool_use") => {
+                            let name = get_str(block, "name").unwrap_or("tool").to_string();
+                            *tools.entry(name.clone()).or_insert(0) += 1;
+                            let entry = outcomes.entry(name.clone()).or_default();
+                            entry.calls += 1;
+                            // The result may already have gone by.
+                            if let Some(id) = get_str(block, "id") {
+                                match pending_results.remove(id) {
+                                    Some(true) => entry.failed += 1,
+                                    Some(false) => entry.ok += 1,
+                                    None => {
+                                        call_names.insert(id.to_string(), name.clone());
+                                    }
+                                }
+                            }
+                            if let Some(Value::Object(input)) = block.get("input") {
+                                let n = block_lines(&name, input);
+                                lines_written += n;
+                                agg.lines += n;
+                            }
+                        }
+                        Some("tool_result") => {
+                            let Some(id) = get_str(block, "tool_use_id") else { continue };
+                            let failed = matches!(block.get("is_error"), Some(Value::Bool(true)));
+                            match call_names.remove(id) {
+                                Some(name) => {
+                                    let entry = outcomes.entry(name).or_default();
+                                    if failed {
+                                        entry.failed += 1;
+                                    } else {
+                                        entry.ok += 1;
+                                    }
+                                }
+                                // Newest-first: the call comes later in
+                                // the walk. Hold the verdict for it.
+                                None => {
+                                    pending_results.insert(id.to_string(), failed);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -204,10 +264,27 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
             for c in calls.iter() {
                 let Some(call) = obj(c) else { continue };
                 let name = get_str(call, "name").unwrap_or("tool").to_string();
-                *tools.entry(name).or_insert(0) += 1;
+                *tools.entry(name.clone()).or_insert(0) += 1;
+                // Gemini reports the verdict inline, on the call itself.
+                let entry = outcomes.entry(name).or_default();
+                entry.calls += 1;
+                if let Some(status) = get_str(call, "status") {
+                    score_status(entry, status);
+                }
             }
         }
     }
+    let mut tool_outcomes: Vec<ToolOutcome> = outcomes
+        .into_iter()
+        .map(|(name, o)| ToolOutcome {
+            name,
+            ok: o.ok,
+            failed: o.failed,
+            cancelled: o.cancelled,
+            unknown: (o.calls - o.ok - o.failed - o.cancelled).max(0),
+        })
+        .collect();
+    tool_outcomes.sort_by_key(|t| std::cmp::Reverse(t.ok + t.failed + t.cancelled + t.unknown));
     let tools_window: i64 = tools.values().sum();
     let mut tools: Vec<NameCount> = tools
         .into_iter()
@@ -234,11 +311,14 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
 
     // ── timeline / roles / boots (the former charts endpoint's data) ─
     let events = kernel.recent_telemetry(EVENT_WINDOW).await?;
+    // Keyed by the FULL timestamp: bucketing on "%H:%M" alone sorts
+    // 00:03 before 23:59, so any window spanning midnight came out
+    // scrambled. The label stays short; only the sort key is whole.
     let mut per_minute: std::collections::BTreeMap<String, i64> = Default::default();
     let mut boots = Vec::new();
     for e in &events {
         *per_minute
-            .entry(e.valid_from.format("%H:%M").to_string())
+            .entry(e.valid_from.format("%Y-%m-%dT%H:%M").to_string())
             .or_insert(0) += 1;
         if e.lifecycle_event == "boot_complete" {
             if let Value::Object(o) = &e.payload {
@@ -281,11 +361,16 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
         window_messages: window,
         events_per_minute: per_minute
             .into_iter()
-            .map(|(t, value)| TimeCount { t, value })
+            .map(|(key, value)| TimeCount {
+                // "…T14:07" → "14:07"; the sort already happened.
+                t: key.split('T').next_back().unwrap_or(&key).to_string(),
+                value,
+            })
             .collect(),
         message_roles,
         boot_durations: boots,
         tools,
+        tool_outcomes,
         top_sessions,
     })
 }
