@@ -157,15 +157,105 @@ fn merge_newest(
         .collect()
 }
 
-/// The NEWEST `limit` messages across ALL sessions (any order —
+/// Where a backwards page starts: the newest rows STRICTLY older than
+/// this instant. `None` means the present — the first page.
+///
+/// Strict `<` cannot skip a row: the cursor is the oldest row the
+/// client already holds, so its exact instant is already on screen.
+pub type Before = Option<chrono::DateTime<chrono::Utc>>;
+
+/// A keyword the feed is filtered to, lowercased. `None` = no filter.
+pub type Query<'a> = Option<&'a str>;
+
+/// The message-side keyword clause. Searching runs over the captured
+/// text itself, in the engine, so it reaches ALL history rather than
+/// whatever the client happens to be holding.
+const MSG_MATCH: &str = "string::contains(string::lowercase(content), $q)";
+
+/// The action-side keyword clause. A telemetry payload is `any` —
+/// schemaless by design — so the search casts it to text to look
+/// inside it. That is a search over unstructured content, not a
+/// conversion papering over a mis-typed struct: nothing downstream
+/// consumes the cast value, and every field keeps its own type.
+const ACT_MATCH: &str = "(string::contains(string::lowercase(lifecycle_event), $q) \
+     OR string::contains(string::lowercase(<string>payload), $q))";
+
+/// Assemble one page query. Every fragment spliced in here is a
+/// compile-time constant; the operator's keyword and the cursor reach
+/// the engine ONLY as bound parameters, never as query text.
+fn page_query(table: &str, scope: Option<&str>, before: Before, q: Query, keyword: &str) -> String {
+    let mut wheres: Vec<&str> = Vec::new();
+    if let Some(s) = scope {
+        wheres.push(s);
+    }
+    if before.is_some() {
+        wheres.push("valid_from < $before");
+    }
+    if q.is_some() {
+        wheres.push(keyword);
+    }
+    let clause = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {} ", wheres.join(" AND "))
+    };
+    format!("SELECT * FROM {table} {clause}ORDER BY valid_from DESC LIMIT $limit")
+}
+
+/// Run a page query with only the bindings its clauses actually use.
+macro_rules! page {
+    ($kernel:expr, $sql:expr, $limit:expr, $before:expr, $q:expr $(, $extra:expr)*) => {{
+        let mut stmt = $kernel.db().query(&$sql).bind(("limit", $limit));
+        $( stmt = stmt.bind($extra); )*
+        if let Some(cut) = $before {
+            stmt = stmt.bind(("before", cut));
+        }
+        if let Some(k) = $q {
+            stmt = stmt.bind(("q", k.to_lowercase()));
+        }
+        stmt.await?.take(0)?
+    }};
+}
+
+/// The NEWEST `limit` messages across ALL sessions, optionally walking
+/// backwards from a cursor and/or filtered to a keyword (any order —
 /// merge_newest sorts).
-async fn recent_messages(kernel: &Kernel, limit: u32) -> Result<Vec<MessageRecord>> {
-    let rows: Vec<MessageRecord> = kernel
-        .db()
-        .query("SELECT * FROM message ORDER BY valid_from DESC LIMIT $limit")
-        .bind(("limit", limit))
-        .await?
-        .take(0)?;
+async fn recent_messages(
+    kernel: &Kernel,
+    limit: u32,
+    before: Before,
+    q: Query<'_>,
+) -> Result<Vec<MessageRecord>> {
+    if before.is_none() && q.is_none() {
+        let rows: Vec<MessageRecord> = kernel
+            .db()
+            .query("SELECT * FROM message ORDER BY valid_from DESC LIMIT $limit")
+            .bind(("limit", limit))
+            .await?
+            .take(0)?;
+        return Ok(rows);
+    }
+    let sql = page_query("message", None, before, q, MSG_MATCH);
+    let rows: Vec<MessageRecord> = page!(kernel, sql, limit, before, q);
+    Ok(rows)
+}
+
+/// The NEWEST `limit` telemetry events, optionally older than a cursor
+/// and/or filtered to a keyword. The kernel's own `recent_telemetry`
+/// has no cursor or search form, and adding one is a kernel change —
+/// so the paged read lives here, in the module, over the same table
+/// and index.
+async fn recent_actions(
+    kernel: &Kernel,
+    limit: u32,
+    before: Before,
+    q: Query<'_>,
+) -> Result<Vec<TelemetryRecord>> {
+    if before.is_none() && q.is_none() {
+        return kernel.recent_telemetry(limit).await;
+    }
+    let sql = page_query("telemetry_stream", None, before, q, ACT_MATCH);
+    let rows: Vec<TelemetryRecord> = page!(kernel, sql, limit, before, q);
     Ok(rows)
 }
 
@@ -176,9 +266,14 @@ async fn recent_messages(kernel: &Kernel, limit: u32) -> Result<Vec<MessageRecor
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
-pub async fn global_activity(kernel: &Kernel, limit: u32) -> Result<Vec<SseEvent>> {
-    let actions = kernel.recent_telemetry(limit).await?;
-    let messages = recent_messages(kernel, limit).await?;
+pub async fn global_activity(
+    kernel: &Kernel,
+    limit: u32,
+    before: Before,
+    q: Query<'_>,
+) -> Result<Vec<SseEvent>> {
+    let actions = recent_actions(kernel, limit, before, q).await?;
+    let messages = recent_messages(kernel, limit, before, q).await?;
     Ok(merge_newest(&messages, &actions, limit))
 }
 
@@ -195,47 +290,40 @@ pub async fn session_activity(
     kernel: &Kernel,
     session: RecordId,
     limit: u32,
+    before: Before,
+    q: Query<'_>,
 ) -> Result<Vec<SseEvent>> {
     let scope = session_scope(kernel, session.clone()).await?;
-    let messages: Vec<MessageRecord> = kernel
-        .db()
-        .query(
-            "SELECT * FROM message WHERE session = $sess \
-             ORDER BY valid_from DESC LIMIT $limit",
-        )
-        .bind(("sess", session.clone()))
-        .bind(("limit", limit))
-        .await?
-        .take(0)?;
+
+    let msg_sql = page_query("message", Some("session = $sess"), before, q, MSG_MATCH);
+    let messages: Vec<MessageRecord> =
+        page!(kernel, msg_sql, limit, before, q, ("sess", session.clone()));
+
+    // Two ways an action belongs to a session (see the module doc);
+    // without a resolved scope only the subject arm can match — it must
+    // never widen to everything.
+    let act_sql = page_query(
+        "telemetry_stream",
+        Some(match scope {
+            Some(_) => "(subject = $sess OR (agent = $agent AND payload.session = $src))",
+            None => "subject = $sess",
+        }),
+        before,
+        q,
+        ACT_MATCH,
+    );
     let actions: Vec<TelemetryRecord> = match scope {
-        Some((agent, src_key)) => {
-            kernel
-                .db()
-                .query(
-                    "SELECT * FROM telemetry_stream \
-                     WHERE subject = $sess \
-                        OR (agent = $agent AND payload.session = $src) \
-                     ORDER BY valid_from DESC LIMIT $limit",
-                )
-                .bind(("sess", session))
-                .bind(("agent", agent))
-                .bind(("src", src_key))
-                .bind(("limit", limit))
-                .await?
-                .take(0)?
-        }
-        None => {
-            kernel
-                .db()
-                .query(
-                    "SELECT * FROM telemetry_stream WHERE subject = $sess \
-                     ORDER BY valid_from DESC LIMIT $limit",
-                )
-                .bind(("sess", session))
-                .bind(("limit", limit))
-                .await?
-                .take(0)?
-        }
+        Some((agent, src_key)) => page!(
+            kernel,
+            act_sql,
+            limit,
+            before,
+            q,
+            ("sess", session),
+            ("agent", agent),
+            ("src", src_key)
+        ),
+        None => page!(kernel, act_sql, limit, before, q, ("sess", session)),
     };
     Ok(merge_newest(&messages, &actions, limit))
 }
@@ -273,6 +361,35 @@ fn obj_of(row: &Value, key: &str) -> Option<superx_kernel::types::Object> {
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
+/// The model CURRENTLY doing this session's work: the newest message
+/// that names one. A session outlives the model choice — the operator
+/// switches mid-conversation — so this is a moving fact, read fresh
+/// rather than stamped on the session once (issue #241).
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn session_model(kernel: &Kernel, session: RecordId) -> Result<Option<String>> {
+    let rows: Vec<Value> = kernel
+        .db()
+        .query(
+            "SELECT raw.message.model ?? raw.model AS model, valid_from \
+             FROM message WHERE session = $sess \
+               AND (raw.message.model != NONE OR raw.model != NONE) \
+             ORDER BY valid_from DESC LIMIT 1",
+        )
+        .bind(("sess", session))
+        .await?
+        .take(0)?;
+    Ok(rows.first().and_then(|row| match row {
+        Value::Object(o) => match o.get("model") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }))
+}
+
 pub async fn session_token_stats(
     kernel: &Kernel,
     session: RecordId,

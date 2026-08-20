@@ -1,5 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { Badge, Card, Group, ScrollArea, Switch, Text, Tooltip } from '@mantine/core'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  Badge,
+  Card,
+  CloseButton,
+  Group,
+  ScrollArea,
+  Switch,
+  Text,
+  TextInput,
+  Tooltip,
+} from '@mantine/core'
 import type { SseEvent } from './generated/SseEvent'
 import type { SessionView } from './generated/SessionView'
 import type { AgentView } from './generated/AgentView'
@@ -16,13 +26,17 @@ export const MAX_FEED_ROWS = 500
 // so arrival order alone is not chronological), capped to the newest
 // rows. Code-point compare: RFC3339 UTC strings order correctly by
 // code point; localeCompare does not (ICU collates '.' before '+').
-export function mergeFeed(backlog: SseEvent[], live: SseEvent[]): SseEvent[] {
+//
+// The cap bounds what the LIVE stream may accumulate on its own. Pages
+// the reader deliberately fetched raise it (issue #241) — scrolling
+// back must not drop the rows you scrolled back to.
+export function mergeFeed(backlog: SseEvent[], live: SseEvent[], cap = MAX_FEED_ROWS): SseEvent[] {
   const seen = new Map<string, SseEvent>()
   // Backlog LAST: on a duplicate id the backlog copy wins.
   for (const r of [...live, ...backlog]) seen.set(r.id, r)
   return [...seen.values()]
     .sort((a, b) => (a.valid_from < b.valid_from ? -1 : a.valid_from > b.valid_from ? 1 : 0))
-    .slice(-MAX_FEED_ROWS)
+    .slice(-cap)
 }
 
 // O(1) lookup structures for per-row session attribution. `bySrc` is
@@ -76,7 +90,10 @@ export function sessionColor(sessionKey: string): string {
 // two agents' sessions share a source key, the event's agent_id
 // picks the right one. `key` is the stable identity the color hash
 // runs on (the session entity uuid when resolved).
-function identityOf(e: SseEvent, d: Directory): { label: string; key: string } | null {
+function identityOf(
+  e: SseEvent,
+  d: Directory,
+): { label: string; key: string; model?: string } | null {
   let match: SessionView | undefined
   if (e.kind === 'message') {
     match = e.session_id ? d.bySessionId.get(e.session_id) : undefined
@@ -90,7 +107,14 @@ function identityOf(e: SseEvent, d: Directory): { label: string; key: string } |
     }
   }
   if (match)
-    return { label: `${match.agent}/${match.session_id.slice(0, 8)}`, key: match.session_id }
+    return {
+      // The model is part of the session's identity (issue #241): the
+      // session outlives the model choice, so it is the CURRENT model,
+      // read live rather than stamped at the session's birth.
+      label: `${match.agent}/${match.session_id.slice(0, 8)}${match.model ? ` · ${match.model}` : ''}`,
+      key: match.session_id,
+      model: match.model ?? undefined,
+    }
   if (e.kind === 'message' && e.session_id)
     return { label: e.session_id.slice(0, 8), key: e.session_id }
   if (e.session_src)
@@ -101,6 +125,15 @@ function identityOf(e: SseEvent, d: Directory): { label: string; key: string } |
       key: e.session_src,
     }
   return null // a global OS event — no session
+}
+
+// Does a LIVE row belong in a searched feed? The backlog is filtered
+// in the engine, over the captured text; a row arriving over SSE is
+// already rendered, so it is matched against what the reader sees.
+// Same intent, the only check available at that point.
+export function matchesSearch(e: SseEvent, q: string): boolean {
+  if (!q) return true
+  return e.rendered.toLowerCase().includes(q.toLowerCase())
 }
 
 // The label a row wears — the same string its badge shows, and the
@@ -132,6 +165,11 @@ export function Feed({
   onPausedChange,
   loading,
   error,
+  onLoadOlder,
+  loadingOlder,
+  exhausted,
+  search,
+  onSearchChange,
 }: {
   header: React.ReactNode
   rows: SseEvent[]
@@ -141,6 +179,14 @@ export function Feed({
   onPausedChange: (v: boolean) => void
   loading?: boolean
   error?: string | null
+  /// Fetch the page before the oldest row on screen (issue #241).
+  onLoadOlder?: (before: string | undefined) => void
+  loadingOlder?: boolean
+  exhausted?: boolean
+  /// Keyword search — matched in the engine across ALL captured
+  /// history, not just the rows on screen (issue #241).
+  search?: string
+  onSearchChange?: (v: string) => void
 }) {
   const [label, setLabel] = useState<string>('all')
   // Chips are the DISTINCT labels present in the feed right now. A
@@ -167,11 +213,47 @@ export function Feed({
     }
   }, [lastId, loading])
 
+  // Scrolling back (issue #241). Reaching the top asks for the page
+  // before the oldest row; when those rows land the viewport is
+  // rebased so the row you were reading stays under your eyes instead
+  // of being shoved down by everything prepended above it.
+  const firstId = visible.length > 0 ? visible[0].id : ''
+  const anchor = useRef<{ height: number; top: number } | null>(null)
+  const askOlder = () => {
+    const v = viewport.current
+    if (!v || !onLoadOlder || loadingOlder || exhausted) return
+    if (v.scrollHeight <= v.clientHeight + 40) return // nothing to scroll yet
+    anchor.current = { height: v.scrollHeight, top: v.scrollTop }
+    onLoadOlder(visible[0]?.valid_from)
+  }
+  useLayoutEffect(() => {
+    const v = viewport.current
+    const a = anchor.current
+    if (v && a) {
+      v.scrollTop = v.scrollHeight - a.height + a.top
+      anchor.current = null
+    }
+  }, [firstId])
+
   return (
     <Card withBorder>
       <Group justify="space-between" mb="xs">
         {header}
         <Group gap="xs">
+          {onSearchChange && (
+            <TextInput
+              size="xs"
+              w={230}
+              placeholder="search all captured history…"
+              value={search ?? ''}
+              onChange={(e) => onSearchChange(e.currentTarget.value)}
+              rightSection={
+                search ? (
+                  <CloseButton size="xs" onClick={() => onSearchChange('')} aria-label="clear" />
+                ) : null
+              }
+            />
+          )}
           {['all', ...labels].map((k) => (
             <Badge
               key={k}
@@ -194,12 +276,23 @@ export function Feed({
         viewportRef={viewport}
         onScrollPositionChange={({ y }) => {
           const v = viewport.current
-          if (v) following.current = y + v.clientHeight >= v.scrollHeight - 80
+          if (!v) return
+          following.current = y + v.clientHeight >= v.scrollHeight - 80
+          if (y < 120) askOlder()
         }}
       >
         {loading && (
           <Text c="dimmed" size="sm">
             loading captured activity…
+          </Text>
+        )}
+        {!loading && onLoadOlder && visible.length > 0 && (
+          <Text c="dimmed" size="xs" ta="center" mb={4}>
+            {loadingOlder
+              ? 'loading older…'
+              : exhausted
+                ? '— the beginning of what the OS captured —'
+                : 'scroll up for more history'}
           </Text>
         )}
         {error && (
@@ -209,7 +302,9 @@ export function Feed({
         )}
         {!loading && !error && visible.length === 0 && (
           <Text c="dimmed" size="sm">
-            nothing captured yet — work in any coding agent to see it land here
+            {search
+              ? `nothing captured matches “${search}”`
+              : 'nothing captured yet — work in any coding agent to see it land here'}
           </Text>
         )}
         {visible.map((r) => {

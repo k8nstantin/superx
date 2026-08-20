@@ -310,6 +310,9 @@ async fn api_sessions(
                 .await
                 .unwrap_or((None, None));
         let context_pct = context_tokens.map(|c| ((c * 100) / window).clamp(0, 100));
+        let model = crate::activity::session_model(kernel, s.entity_id.clone())
+            .await
+            .unwrap_or(None);
         let uuid = superx_ops::record_uuid(&s.entity_id);
         out.push(SessionView {
             identity: format!("{agent}/{uuid}"),
@@ -321,6 +324,7 @@ async fn api_sessions(
             context_pct,
             output_tokens,
             last_active,
+            model,
         });
     }
     Json(out)
@@ -329,11 +333,37 @@ async fn api_sessions(
 #[derive(serde::Deserialize)]
 struct ActivityQuery {
     limit: Option<u32>,
+    /// Walk BACKWARDS from here (RFC3339): the newest page strictly
+    /// older than this instant. Absent = the present (issue #241).
+    before: Option<String>,
+    /// Keyword filter, matched in the engine against captured message
+    /// text and action payloads — so it searches ALL history, not just
+    /// the page the client happens to hold (issue #241).
+    q: Option<String>,
+}
+
+/// A blank or whitespace-only keyword is NO filter, not a filter that
+/// matches everything by accident.
+fn keyword(raw: Option<&String>) -> Option<&str> {
+    raw.map(|s| s.trim()).filter(|s| !s.is_empty())
 }
 
 /// Session-activity backlog page default and bound (issue #172).
 const ACTIVITY_BACKLOG_DEFAULT: u32 = 500; // skill-allow: §9-const — render page default, query-param overridable
 const ACTIVITY_BACKLOG_MAX: u32 = 2000; // skill-allow: §9-const — render page bound
+
+/// Parse the backwards cursor. A malformed one is an error, never a
+/// silent fall back to the present — that would serve the newest page
+/// again and the feed would loop forever instead of paging back.
+fn parse_before(raw: Option<&String>) -> std::result::Result<crate::activity::Before, String> {
+    match raw {
+        None => Ok(None),
+        Some(s) => match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(t) => Ok(Some(t.with_timezone(&chrono::Utc))),
+            Err(e) => Err(format!("before must be an RFC3339 timestamp: {e}")),
+        },
+    }
+}
 
 /// Everything the OS captured for one session — messages + actions,
 /// merged chronologically (issue #172). Same row shape as the SSE
@@ -352,7 +382,13 @@ async fn api_session_activity(
         .limit
         .unwrap_or(ACTIVITY_BACKLOG_DEFAULT)
         .min(ACTIVITY_BACKLOG_MAX);
-    match crate::activity::session_activity(kernel, session, limit).await {
+    let before = match parse_before(q.before.as_ref()) {
+        Ok(b) => b,
+        Err(e) => return Response::err(e),
+    };
+    match crate::activity::session_activity(kernel, session, limit, before, keyword(q.q.as_ref()))
+        .await
+    {
         Ok(events) => Response::ok(events),
         Err(e) => Response::err(e.to_string()),
     }
@@ -389,7 +425,11 @@ async fn api_activity(
         .limit
         .unwrap_or(ACTIVITY_BACKLOG_DEFAULT)
         .min(ACTIVITY_BACKLOG_MAX);
-    match crate::activity::global_activity(kernel, limit).await {
+    let before = match parse_before(q.before.as_ref()) {
+        Ok(b) => b,
+        Err(e) => return Response::err(e),
+    };
+    match crate::activity::global_activity(kernel, limit, before, keyword(q.q.as_ref())).await {
         Ok(events) => Response::ok(events),
         Err(e) => Response::err(e.to_string()),
     }

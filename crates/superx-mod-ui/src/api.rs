@@ -62,6 +62,11 @@ pub struct SessionView {
     pub output_tokens: Option<i64>,
     /// RFC3339 timestamp of the session's newest message.
     pub last_active: Option<String>,
+    /// The model CURRENTLY doing this session's work (issue #241).
+    /// A session outlives the model choice — switching mid-session is
+    /// normal — so this is the newest message's model, not a stamp
+    /// taken when the session began. `None` when nothing names one.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize, TS)]

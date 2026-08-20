@@ -25,4 +25,11 @@ output_tokens: bigint | null,
 /**
  * RFC3339 timestamp of the session's newest message.
  */
-last_active: string | null, };
+last_active: string | null, 
+/**
+ * The model CURRENTLY doing this session's work (issue #241).
+ * A session outlives the model choice — switching mid-session is
+ * normal — so this is the newest message's model, not a stamp
+ * taken when the session began. `None` when nothing names one.
+ */
+model: string | null, };

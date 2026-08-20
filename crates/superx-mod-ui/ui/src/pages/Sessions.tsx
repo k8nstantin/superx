@@ -1,9 +1,11 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useDebouncedValue } from '@mantine/hooks'
 import { Badge, Button, Card, Group, Progress, ScrollArea, Table, Text, Title, Tooltip } from '@mantine/core'
 import { fetchAgents, fetchSessionActivity, fetchSessions } from '../api'
 import { useSse } from '../useSse'
-import { Feed, MAX_FEED_ROWS, mergeFeed } from '../Feed'
+import { Feed, MAX_FEED_ROWS, matchesSearch, mergeFeed } from '../Feed'
+import { useFeedHistory } from '../useFeedHistory'
 import type { SseEvent } from '../generated/SseEvent'
 import type { SessionView } from '../generated/SessionView'
 
@@ -119,6 +121,7 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
               <Table.Th w={24} />
               <Table.Th>Agent</Table.Th>
               <Table.Th>Session</Table.Th>
+              <Table.Th>Model</Table.Th>
               <Table.Th>Source id</Table.Th>
               <Table.Th>Context</Table.Th>
               <Table.Th>Tokens</Table.Th>
@@ -139,6 +142,19 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
                   <Text size="xs" ff="monospace">
                     {s.session_id}
                   </Text>
+                </Table.Td>
+                <Table.Td>
+                  {s.model ? (
+                    <Tooltip label="the model currently doing this session's work" withArrow>
+                      <Badge variant="light" color="pelican">
+                        {s.model}
+                      </Badge>
+                    </Tooltip>
+                  ) : (
+                    <Text size="xs" c="dimmed">
+                      —
+                    </Text>
+                  )}
                 </Table.Td>
                 <Table.Td>
                   <Text size="xs" ff="monospace" c="dimmed">
@@ -173,9 +189,11 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
 function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => void }) {
   const [paused, setPaused] = useState(false)
   const [liveRows, setLiveRows] = useState<SseEvent[]>([])
+  const [search, setSearch] = useState('')
+  const [q] = useDebouncedValue(search.trim(), 350)
   const backlog = useQuery({
-    queryKey: ['activity', session.session_id],
-    queryFn: () => fetchSessionActivity(session.session_id),
+    queryKey: ['activity', session.session_id, q],
+    queryFn: () => fetchSessionActivity(session.session_id, undefined, undefined, q),
   })
   const sessions = useQuery({ queryKey: ['sessions'], queryFn: () => fetchSessions(), refetchInterval: 10000 })
   const agents = useQuery({ queryKey: ['agents'], queryFn: fetchAgents, refetchInterval: 30000 })
@@ -198,10 +216,23 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
         : e.session_src === session.src &&
           (e.agent_id == null || (agentName.get(e.agent_id) ?? session.agent) === session.agent),
     )
-    if (mine.length) setLiveRows((prev) => [...prev, ...mine].slice(-MAX_FEED_ROWS))
+    const keep = mine.filter((e) => matchesSearch(e, q))
+    if (keep.length) setLiveRows((prev) => [...prev, ...keep].slice(-MAX_FEED_ROWS))
   }, paused)
 
-  const rows = useMemo(() => mergeFeed(backlog.data ?? [], liveRows), [backlog.data, liveRows])
+  const page = useCallback(
+    (before: string, limit: number) => fetchSessionActivity(session.session_id, limit, before, q),
+    [session.session_id, q],
+  )
+  const { older, loadOlder, loadingOlder, exhausted } = useFeedHistory(
+    `${session.session_id}:${q}`,
+    page,
+  )
+
+  const rows = useMemo(
+    () => mergeFeed([...older, ...(backlog.data ?? [])], liveRows, MAX_FEED_ROWS + older.length),
+    [older, backlog.data, liveRows],
+  )
 
   return (
     <Feed
@@ -213,6 +244,11 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
           <Title order={5} ff="monospace">
             {session.agent}/{session.session_id}
           </Title>
+          {session.model && (
+            <Badge variant="light" color="pelican">
+              {session.model}
+            </Badge>
+          )}
         </Group>
       }
       rows={rows}
@@ -222,6 +258,11 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
       onPausedChange={setPaused}
       loading={backlog.isLoading}
       error={backlog.isError ? String(backlog.error) : null}
+      onLoadOlder={loadOlder}
+      loadingOlder={loadingOlder}
+      exhausted={exhausted}
+      search={search}
+      onSearchChange={setSearch}
     />
   )
 }
