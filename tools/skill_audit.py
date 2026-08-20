@@ -21,6 +21,8 @@ Exit codes
   0  clean — no violations detected
   1  at least one violation (per-line bright-line rule OR DDL-bypass
      OR structural check — all are hard violations)
+  2  inconclusive — found nothing to scan, so nothing was verified
+     (a gate that cannot fail is not a gate)
 
 Usage
 -----
@@ -121,13 +123,30 @@ def is_lib_file(path: Path) -> bool:
     return path.name == "lib.rs"
 
 
+# Build and vendor trees, matched RELATIVE to the repo root. Matching a
+# bare component anywhere in the absolute path made the audit blind
+# inside a git worktree: a worktree lives at
+# `<repo>/.claude/worktrees/<branch>/`, so every file under it carried a
+# `worktrees` component and was skipped — the audit reported CLEAN
+# having scanned nothing (issue #243).
+SKIPPED_TREES = ("target", "node_modules", "dist")
+
+
+def is_skipped(path: Path) -> bool:
+    """True for build/vendor output BELOW the repo root."""
+    try:
+        rel = path.relative_to(REPO_ROOT)
+    except ValueError:
+        return False  # outside the root — the caller chose it deliberately
+    return any(part in SKIPPED_TREES for part in rel.parts)
+
+
 def iter_rust_files(scope: str) -> Iterator[Path]:
     """Yield Rust files matching the requested scope."""
     if not CRATES_DIR.exists():
         return
     for path in sorted(CRATES_DIR.rglob("*.rs")):
-        # Always skip target/ and third-party/build trees.
-        if any(part in ("target", "node_modules", "dist", "worktrees") for part in path.parts):
+        if is_skipped(path):
             continue
         if scope == "production" and is_test_file(path):
             continue
@@ -857,7 +876,7 @@ def detect_unauthorized_ddl_in_code() -> List[Violation]:
 # Reporting
 # --------------------------------------------------------------------------
 
-def print_human(violations: List[Violation]) -> None:
+def print_human(violations: List[Violation], scanned: int = 0) -> None:
     if violations:
         print()
         print(f"{Ansi.RED}{Ansi.BOLD}── Bright-line violations ──{Ansi.NC}")
@@ -878,6 +897,7 @@ def print_human(violations: List[Violation]) -> None:
     if not violations:
         print(f"{Ansi.GRN}════════════════════════════════════════════════════════{Ansi.NC}")
         print(f"{Ansi.GRN}{Ansi.BOLD}✅ SKILL AUDIT CLEAN{Ansi.NC}")
+        print(f"{Ansi.GRN}{Ansi.DIM}   {scanned} Rust file(s) scanned{Ansi.NC}")
         print(f"{Ansi.GRN}════════════════════════════════════════════════════════{Ansi.NC}")
         return
 
@@ -961,6 +981,15 @@ def main() -> int:
         print_rules_only()
         return 0
 
+    # A gate that cannot fail is not a gate: scanning nothing used to
+    # print CLEAN (issue #243). Refuse instead, and say where it looked.
+    scanned = len(list(iter_rust_files("all")))
+    if scanned == 0:
+        print(f"{Ansi.RED}{Ansi.BOLD}❌ SKILL AUDIT INCONCLUSIVE{Ansi.NC}")
+        print(f"  no Rust files found under {CRATES_DIR}")
+        print("  the audit checked NOTHING — this is a failure, not a pass")
+        return 2
+
     # Per-line regex rules
     violations = audit_all_rules()
     # Structural checks (duplicate literals, telemetry coverage, arch sync)
@@ -974,7 +1003,7 @@ def main() -> int:
     if args.json:
         print_json(violations)
     else:
-        print_human(violations)
+        print_human(violations, scanned)
 
     return 1 if violations else 0
 
