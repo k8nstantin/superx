@@ -84,7 +84,10 @@ function ListView({ onOpen }: { onOpen: (frag: string) => void }) {
           <Select
             placeholder="Type: all"
             clearable
-            data={(types.data ?? []).map((t) => t.name)}
+            data={(types.data ?? []).map((t) => ({
+              value: t.name,
+              label: t.system ? `${t.name} — comments & descriptions` : t.name,
+            }))}
             value={typeFilter}
             onChange={setTypeFilter}
             w={170}
@@ -176,15 +179,17 @@ function CreateModal({
     onError: (e) => setError(String(e)),
   })
   return (
-    <Modal opened={opened} onClose={onClose} title="New entity" size="lg">
+    <Modal opened={opened} onClose={onClose} title="New entity" size="xl">
       <Group grow mb="sm">
         <Select
           label="Type — from the type registry"
           placeholder="pick a type"
-          data={(types.data ?? []).map((t) => ({
-            value: t.name,
-            label: t.description ? `${t.name} — ${t.description}` : t.name,
-          }))}
+          data={(types.data ?? [])
+            .filter((t) => !t.system)
+            .map((t) => ({
+              value: t.name,
+              label: t.description ? `${t.name} — ${t.description}` : t.name,
+            }))}
           value={type}
           onChange={setType}
           searchable
@@ -194,7 +199,7 @@ function CreateModal({
       <Text size="sm" fw={600} mb={4}>
         Description <Text span size="xs" c="dimmed">— becomes a text node linked describes→</Text>
       </Text>
-      <MarkdownEditor ref={desc} />
+      {opened && <MarkdownEditor ref={desc} minHeight={300} maxHeight="45vh" />}
       <Textarea
         label="Attributes — optional JSON, schema-free per type"
         mt="sm"
@@ -453,7 +458,7 @@ function CommentComposer({ frag, onPosted }: { frag: string; onPosted: () => voi
   const [busy, setBusy] = useState(false)
   return (
     <div>
-      <MarkdownEditor key={key} ref={editor} />
+      <MarkdownEditor key={key} ref={editor} minHeight={160} maxHeight="40vh" />
       <Group justify="flex-end" mt="xs">
         <Button
           size="compact-sm"
@@ -494,8 +499,8 @@ function DescribeModal({
   const editor = useRef<MarkdownEditorHandle>(null)
   const [busy, setBusy] = useState(false)
   return (
-    <Modal opened={opened} onClose={onClose} title="Description" size="lg">
-      {opened && <MarkdownEditor ref={editor} initial={initial} />}
+    <Modal opened={opened} onClose={onClose} title="Description" size="xl">
+      {opened && <MarkdownEditor ref={editor} initial={initial} minHeight={420} maxHeight="60vh" />}
       <Group justify="flex-end" mt="md">
         <Button variant="default" onClick={onClose}>
           Cancel
@@ -539,12 +544,14 @@ function EditModal({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   return (
-    <Modal opened={opened} onClose={onClose} title={`Edit ${detail.name} — a new version`} size="lg">
+    <Modal opened={opened} onClose={onClose} title={`Edit ${detail.name} — a new version`} size="xl">
       <TextInput label="Name" value={name} onChange={(e) => setName(e.currentTarget.value)} mb="sm" />
       <Text size="sm" fw={600} mb={4}>
         Content
       </Text>
-      {opened && <MarkdownEditor ref={content} initial={detail.content ?? ''} />}
+      {opened && (
+        <MarkdownEditor ref={content} initial={detail.content ?? ''} minHeight={340} maxHeight="45vh" />
+      )}
       <Textarea
         label="Attributes — REPLACES the whole object; leave as-is to keep"
         mt="sm"
