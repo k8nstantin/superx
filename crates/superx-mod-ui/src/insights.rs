@@ -63,11 +63,15 @@ async fn rows(kernel: &Kernel, query: &'static str) -> Result<Vec<Value>> {
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
 pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
-    // ── the work calendar: every day the OS captured anything ───────
+    // ── the work calendar ───────────────────────────────────────────
+    // By the AGENT'S clock, not ours: `emitted_at` is the source's own
+    // timestamp, `valid_from` merely when capture first saw the row.
+    // Bucketing on the latter draws the ingest run — a few days — and
+    // hides months of real history (issue #239).
     let events_per_day = rows(
         kernel,
-        "SELECT time::format(valid_from, '%Y-%m-%d') AS t, count() AS value
-         FROM telemetry_stream GROUP BY t ORDER BY t",
+        "SELECT time::format(emitted_at ?? valid_from, '%Y-%m-%d') AS t, count() AS value
+         FROM message GROUP BY t ORDER BY t",
     )
     .await?
     .iter()
@@ -80,12 +84,13 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
     })
     .collect();
 
-    // ── the week's rhythm: hour × weekday ───────────────────────────
+    // ── the week's rhythm: hour × weekday, same clock as above ──────
     let hour_weekday = rows(
         kernel,
-        "SELECT time::hour(valid_from) AS hour, time::wday(valid_from) AS weekday,
+        "SELECT time::hour(emitted_at ?? valid_from) AS hour,
+                time::wday(emitted_at ?? valid_from) AS weekday,
                 count() AS value
-         FROM telemetry_stream GROUP BY hour, weekday",
+         FROM message GROUP BY hour, weekday",
     )
     .await?
     .iter()

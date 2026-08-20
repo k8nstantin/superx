@@ -510,6 +510,43 @@ async fn insights_summary_reads_what_nothing_read_before() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_calendar_follows_the_agents_clock_not_the_capture_run() {
+    use superx_mod_ui::insights::insights_summary;
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "gemini_cli", "src-clock").await;
+    // A conversation from May, ingested today — the shape of every
+    // backfill. Wednesday 2026-05-20, 14:00 UTC.
+    let emitted: chrono::DateTime<chrono::Utc> = "2026-05-20T14:30:00Z".parse().expect("ts");
+    for _ in 0..3 {
+        kernel
+            .log_message(superx_kernel::NewMessage {
+                session: session.clone(),
+                agent: agent.clone(),
+                role: "assistant".to_string(),
+                content: "old work".to_string(),
+                raw: None,
+                seq: None,
+                emitted_at: Some(emitted),
+            })
+            .await
+            .expect("backfilled msg");
+    }
+
+    let i = insights_summary(&kernel).await.expect("insights");
+    let day = i.events_per_day.iter().find(|d| d.t == "2026-05-20");
+    assert_eq!(day.map(|d| d.value), Some(3), "the calendar day is May, not today");
+    assert!(
+        i.events_per_day.iter().all(|d| d.t == "2026-05-20"),
+        "capture time must not appear as a second day: {:?}",
+        i.events_per_day.iter().map(|d| &d.t).collect::<Vec<_>>()
+    );
+    // 2026-05-20 is a Wednesday → time::wday 3, hour 14.
+    let cell = i.hour_weekday.iter().find(|c| c.value == 3).expect("cell");
+    assert_eq!((cell.hour, cell.weekday), (14, 3));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_token_stats_mines_usage_from_raw_events() {
     use superx_kernel::message::json_to_object;
     use superx_mod_ui::activity::session_token_stats;
