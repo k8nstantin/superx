@@ -23,6 +23,35 @@ fn facilities_declared() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_port_defaults_then_follows_the_parameter() {
+    use superx_mod_entities::{resolved_ui_port, resolved_ui_url, DEFAULT_UI_PORT, UI_PORT_PARAM};
+    // A KERNEL substrate (not the module db): port parameters live on
+    // the module's registry entity.
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("kernel").await.expect("nsdb");
+    let ddl = superx_kernel::SCHEMA_DDL.replace("$SUPERX_KERNEL_PASSWORD", "test-password");
+    db.query(ddl).await.expect("ddl").check().expect("ddl ok");
+    let kernel = superx_kernel::Kernel::from_db(db);
+    for t in superx_kernel::REQUIRED_METAMODEL_TYPES {
+        kernel
+            .ensure_type_definition(t.uid, t.category, t.memory_tier)
+            .await
+            .expect("seed");
+    }
+    assert_eq!(resolved_ui_port(&kernel).await, DEFAULT_UI_PORT, "unregistered → default");
+    let entity = kernel
+        .register_module(&EntitiesModule.descriptor())
+        .await
+        .expect("register");
+    kernel
+        .set_parameter(entity, UI_PORT_PARAM, Value::Number(7272.into()))
+        .await
+        .expect("param");
+    assert_eq!(resolved_ui_port(&kernel).await, 7272, "parameter wins");
+    assert_eq!(resolved_ui_url(&kernel).await, "http://127.0.0.1:7272");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seeding_is_idempotent() {
     let db = fresh_db().await;
     let first = registry::seed_types(&db).await.expect("seed");
