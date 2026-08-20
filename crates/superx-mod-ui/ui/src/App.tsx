@@ -21,7 +21,10 @@ export default function App() {
     <AppShell header={{ height: 52 }} navbar={{ width: 180, breakpoint: 'xs' }} padding="md">
       <AppShell.Header>
         <Group h="100%" px="md" justify="space-between">
-          <Title order={3}>⚙ SuperX</Title>
+          <Group gap={10}>
+            <img src="/logo.svg" alt="" width={26} height={26} style={{ borderRadius: 6 }} />
+            <Title order={3}>SuperX</Title>
+          </Group>
           <Text size="sm" c="dimmed">
             the agentic OS
           </Text>
