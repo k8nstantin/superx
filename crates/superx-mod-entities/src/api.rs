@@ -375,6 +375,7 @@ pub async fn graph_view(
     direction: &str,
 ) -> Result<GraphView> {
     let id = nodes::resolve_entity(db, fragment).await?;
+    let root_uuid = record_uuid(&id);
     let walks: &[bool] = match direction {
         "out" => &[false],
         "in" => &[true],
@@ -389,7 +390,16 @@ pub async fn graph_view(
         let sub = graph::subgraph(db, &id, depth, reverse).await?;
         truncated |= sub.truncated_at_depth;
         for n in sub.nodes {
+            // Descriptions and comments organize TEXT; they are not
+            // members of the product graph (operator, issue #246).
+            // They are always leaves — set_role_text and add_comment
+            // link target→text and nothing links out of one — so
+            // dropping them cannot cut a path. The detail page is
+            // where they belong, and shows them.
             let uuid = record_uuid(&n.id);
+            if n.entity_type == TEXT_TYPE && uuid != root_uuid {
+                continue;
+            }
             // A node reached by both walks keeps its SHALLOWEST depth.
             if let Some(prev) = nodes_out.iter_mut().find(|p| p.id == uuid) {
                 prev.depth = prev.depth.min(n.depth as i64);
@@ -419,7 +429,7 @@ pub async fn graph_view(
     // An edge whose far end was never reached would render as a stub.
     edges_out.retain(|e| seen_nodes.contains(&e.from) && seen_nodes.contains(&e.to));
     Ok(GraphView {
-        root: record_uuid(&id),
+        root: root_uuid,
         nodes: nodes_out,
         edges: edges_out,
         truncated,

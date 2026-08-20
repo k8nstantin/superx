@@ -212,6 +212,70 @@ async fn ui_graph_is_rooted_at_the_entity_and_walks_both_ways() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_graph_leaves_descriptions_and_comments_out_of_it() {
+    use superx_mod_entities::api;
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    // A product with a description and a comment — both text carriers —
+    // plus one real neighbour.
+    let product = api::create(
+        &db,
+        &api::CreateReq {
+            entity_type: "product".into(),
+            name: "Widget".into(),
+            description: Some("the composable widget".into()),
+            content: None,
+            attributes_json: None,
+        },
+    )
+    .await
+    .expect("create");
+    api::comment(&db, &product, "ship it by friday").await.expect("comment");
+    let task = api::create(
+        &db,
+        &api::CreateReq {
+            entity_type: "task".into(),
+            name: "Build it".into(),
+            description: None,
+            content: None,
+            attributes_json: None,
+        },
+    )
+    .await
+    .expect("task");
+    api::link(&db, &product, &api::LinkReq { to: task.clone(), rel: "contains".into() })
+        .await
+        .expect("link");
+
+    let g = api::graph_view(&db, &product, 3, "both").await.expect("graph");
+    assert!(
+        g.nodes.iter().all(|n| n.entity_type != "text"),
+        "texts organize descriptions and comments — they are not graph members: {:?}",
+        g.nodes.iter().map(|n| (&n.entity_type, &n.name)).collect::<Vec<_>>()
+    );
+    let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(names.len(), 2, "the product and its task, nothing else: {names:?}");
+    assert!(names.contains(&"Build it"));
+    // …and no edge is left pointing at a node that is no longer there.
+    let ids: std::collections::HashSet<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(g.edges.iter().all(|e| ids.contains(e.from.as_str()) && ids.contains(e.to.as_str())));
+    assert!(g.edges.iter().all(|e| e.rel_type != "describes" && e.rel_type != "comments"));
+
+    // They are still THERE, on the detail page, which is their place.
+    let d = api::detail(&db, &product).await.expect("detail");
+    assert!(d.annotations.iter().any(|a| a.rel_type == "describes"));
+    assert!(d.annotations.iter().any(|a| a.rel_type == "comments"));
+
+    // Opening the graph ON a text keeps it as the root — you are
+    // looking at it — rather than handing back an empty canvas.
+    let text_id = &d.annotations[0].text_id;
+    let tg = api::graph_view(&db, text_id, 2, "both").await.expect("text graph");
+    assert_eq!(&tg.root, text_id);
+    assert!(tg.nodes.iter().any(|n| n.id == *text_id), "the root survives");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ui_attachments_surface_on_the_owner_and_resolve_to_their_file() {
     use superx_mod_entities::{api, documents};
     let db = fresh_db().await;
