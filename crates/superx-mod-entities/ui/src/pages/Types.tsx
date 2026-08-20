@@ -58,7 +58,15 @@ export default function TypesPage() {
                       </Badge>
                     </Table.Td>
                     <Table.Td>
-                      <Text size="sm">{t.description ?? '—'}</Text>
+                      <Text size="sm">
+                        {t.description ?? '—'}
+                        {t.system && (
+                          <Text span size="xs" c="dimmed">
+                            {' '}
+                            · created for you when you write one — not in the New-entity list
+                          </Text>
+                        )}
+                      </Text>
                     </Table.Td>
                   </Table.Tr>
                 ))}

@@ -38,6 +38,10 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
     );
     let rels = api::rel_types(&db).await.expect("rels");
     assert!(rels.contains(&"depends_on".to_string()));
+    // The text carrier is registered but never hand-created: flagged
+    // so the create form drops it.
+    assert!(types.iter().any(|t| t.name == "text" && t.system));
+    assert!(types.iter().all(|t| t.name == "text" || !t.system));
 
     // Create with a markdown description + JSON attributes.
     let product = api::create(
@@ -93,6 +97,21 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
     api::comment(&db, &product, "Priority: high").await.expect("comment");
     let d = api::detail(&db, &product).await.expect("detail3");
     assert!(d.annotations.iter().any(|a| a.rel_type == "comments"));
+
+    // The list is entities, not their annotations: the description and
+    // comment text nodes stay out of it unless asked for by name.
+    let listed = api::list(&db, None).await.expect("list");
+    assert!(listed.iter().any(|e| e.id == product));
+    assert!(
+        listed.iter().all(|e| e.entity_type != "text"),
+        "text carriers must not show as entity rows"
+    );
+    let texts_only = api::list(&db, Some("text")).await.expect("list text");
+    assert!(
+        texts_only.len() >= 2,
+        "asking for the carrier type still returns them: {}",
+        texts_only.len()
+    );
 
     // Link task depends_on... task depends on nothing here — link the
     // product to the task and check both directions + unlink history.

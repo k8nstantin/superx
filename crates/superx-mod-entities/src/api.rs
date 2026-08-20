@@ -22,6 +22,9 @@ use crate::{edges, graph, nodes, registry, texts};
 pub struct TypeView {
     pub name: String,
     pub description: Option<String>,
+    /// The module creates these itself (the `text` carrier) — the
+    /// create form must not offer them.
+    pub system: bool,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -145,14 +148,27 @@ fn attrs_to_json(v: &Option<superx_kernel::types::Value>) -> Option<String> {
     serde_json::to_string_pretty(&json).ok()
 }
 
+/// The module's own annotation carrier: descriptions, comments and
+/// instructions are `text` entities hung off their target by a role
+/// edge (`texts::set_role_text` / `add_comment`). It is a real
+/// registered type, but nothing hand-creates one — writing a
+/// description IS creating it.
+const TEXT_TYPE: &str = "text"; // skill-allow: §9-const — the module's own data model (texts.rs, graph.rs), not a tunable
+
 /// ENTITY types only — relation kinds are not "types" (operator
-/// model); they surface solely through [`rel_types`].
+/// model); they surface solely through [`rel_types`]. The carrier type
+/// is flagged, not hidden: the registry stays honest and the create
+/// form drops it.
 pub async fn types_list(db: &Db) -> Result<Vec<TypeView>> {
     Ok(registry::list_types(db)
         .await?
         .into_iter()
         .filter(|t| t.category == "entity")
-        .map(|t| TypeView { name: t.name, description: t.description })
+        .map(|t| TypeView {
+            system: t.name == TEXT_TYPE,
+            name: t.name,
+            description: t.description,
+        })
         .collect())
 }
 
@@ -171,10 +187,15 @@ pub async fn rel_types(db: &Db) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The entity list. Text nodes are annotations of the entity they hang
+/// off — every comment and description would otherwise land here as a
+/// row of its own — so the unfiltered list omits them; asking for the
+/// carrier type by name still returns them.
 pub async fn list(db: &Db, type_filter: Option<&str>) -> Result<Vec<EntityListItem>> {
     Ok(nodes::list_entities(db, type_filter)
         .await?
         .into_iter()
+        .filter(|e| type_filter.is_some() || e.entity_type != TEXT_TYPE)
         .map(|e| EntityListItem {
             id: record_uuid(&e.id),
             entity_type: e.entity_type,
