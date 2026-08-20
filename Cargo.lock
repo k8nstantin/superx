@@ -3781,12 +3781,14 @@ dependencies = [
  "linkme",
  "mime_guess",
  "rust-embed",
+ "serde",
  "serde_json",
  "superx-kernel",
  "superx-ops",
  "surrealdb",
  "tokio",
  "tracing",
+ "ts-rs",
  "uuid",
 ]
 

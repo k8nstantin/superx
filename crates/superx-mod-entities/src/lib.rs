@@ -10,6 +10,7 @@
 //! service account, own dir (`modules/entities/` — document files),
 //! own log (`target: "entities"`), own CLI (`superx entities …`).
 
+pub mod api;
 pub mod cli;
 pub mod documents;
 pub mod edges;
