@@ -19,9 +19,17 @@ export const fetchStatus = () => get<StatusResponse>('/api/status')
 export const fetchAgents = () => get<AgentView[]>('/api/agents')
 export const fetchSessions = (agent?: string) =>
   get<SessionView[]>(`/api/sessions${agent ? `?agent=${agent}` : ''}`)
-export const fetchSessionActivity = (id: string, limit = 500) =>
-  get<SseEvent[]>(`/api/sessions/${id}/activity?limit=${limit}`)
-export const fetchActivity = (limit = 500) => get<SseEvent[]>(`/api/activity?limit=${limit}`)
+// `before` (RFC3339) walks BACKWARDS: the newest page strictly older
+// than that instant — how the feeds scroll into history. `q` filters
+// in the ENGINE, so it searches all history rather than the loaded
+// page (issue #241).
+const feedArgs = (before?: string, q?: string) =>
+  (before ? `&before=${encodeURIComponent(before)}` : '') +
+  (q && q.trim() ? `&q=${encodeURIComponent(q.trim())}` : '')
+export const fetchSessionActivity = (id: string, limit = 500, before?: string, q?: string) =>
+  get<SseEvent[]>(`/api/sessions/${id}/activity?limit=${limit}${feedArgs(before, q)}`)
+export const fetchActivity = (limit = 500, before?: string, q?: string) =>
+  get<SseEvent[]>(`/api/activity?limit=${limit}${feedArgs(before, q)}`)
 export const fetchActions = (limit = 50) => get<ActionView[]>(`/api/actions?limit=${limit}`)
 export const fetchCharts = () => get<ChartsSummary>('/api/charts/summary')
 export const fetchStats = () => get<StatsSummary>('/api/stats')

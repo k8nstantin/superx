@@ -199,7 +199,7 @@ async fn session_activity_merges_messages_and_actions_for_one_session() {
         .await
         .expect("boot");
 
-    let events = session_activity(&kernel, session.clone(), 100)
+    let events = session_activity(&kernel, session.clone(), 100, None, None)
         .await
         .expect("activity");
 
@@ -240,7 +240,7 @@ async fn global_activity_includes_everything_including_no_session_events() {
         .await
         .expect("boot");
 
-    let events = global_activity(&kernel, 100).await.expect("global");
+    let events = global_activity(&kernel, 100, None, None).await.expect("global");
     // The global feed carries the message, its session, AND the
     // no-session OS event — everyone and everything, one place.
     assert!(
@@ -623,11 +623,235 @@ async fn session_activity_keeps_the_newest_rows_when_truncated() {
             .expect("message");
     }
 
-    let events = session_activity(&kernel, session, 2).await.expect("activity");
+    let events = session_activity(&kernel, session, 2, None, None).await.expect("activity");
     assert_eq!(events.len(), 2, "merged page truncates to limit");
     // Newest-N: the pinned-to-bottom view must end at the present.
     assert!(events[0].rendered.contains("msg-2"), "{}", events[0].rendered);
     assert!(events[1].rendered.contains("msg-3"), "{}", events[1].rendered);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_reaches_all_history_across_messages_and_actions() {
+    use superx_kernel::types::{Object, Value};
+    use superx_mod_ui::activity::{global_activity, session_activity};
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-find").await;
+    for text in ["the needle is here", "haystack one", "haystack two"] {
+        kernel
+            .log_message(superx_kernel::NewMessage {
+                session: session.clone(),
+                agent: agent.clone(),
+                role: "user".to_string(),
+                content: text.to_string(),
+                raw: None,
+                seq: None,
+                emitted_at: None,
+            })
+            .await
+            .expect("message");
+    }
+    // An action whose payload — not its name — carries the keyword.
+    let mut p = Object::new();
+    p.insert("session".to_string(), Value::String("src-find".to_string()));
+    p.insert("tool".to_string(), Value::String("NeedleTool".to_string()));
+    kernel
+        .log_telemetry_for_agent(
+            "tool_call",
+            Value::Object(p),
+            Some(agent.clone()),
+            Some(agent.clone()),
+        )
+        .await
+        .expect("action");
+
+    // Message text and action payloads both match, case-insensitively.
+    let hits = global_activity(&kernel, 100, None, Some("NEEDLE"))
+        .await
+        .expect("search");
+    assert_eq!(hits.len(), 2, "one message + one action: {hits:#?}");
+    assert!(hits.iter().any(|h| h.kind == "message"));
+    assert!(hits.iter().any(|h| h.kind == "action"));
+
+    // The event NAME is searchable too.
+    let by_name = global_activity(&kernel, 100, None, Some("tool_call"))
+        .await
+        .expect("by name");
+    assert_eq!(by_name.len(), 1);
+
+    // Search composes with the session scope and with paging.
+    let scoped = session_activity(&kernel, session.clone(), 100, None, Some("haystack"))
+        .await
+        .expect("scoped");
+    assert_eq!(scoped.len(), 2, "both haystacks, no needle: {scoped:#?}");
+    let cut: chrono::DateTime<chrono::Utc> = scoped[1].valid_from.parse().expect("rfc3339");
+    let older = session_activity(&kernel, session.clone(), 100, Some(cut), Some("haystack"))
+        .await
+        .expect("older page of matches");
+    assert_eq!(older.len(), 1, "paging a search walks only its matches");
+
+    // A keyword that matches nothing returns nothing — never everything.
+    assert!(global_activity(&kernel, 100, None, Some("zzz-not-here"))
+        .await
+        .expect("miss")
+        .is_empty());
+
+    // Not every payload is an object: `module_provisioned` emits a bare
+    // string. Reading a field off it must yield nothing, not an error
+    // that takes the whole search down.
+    kernel
+        .log_telemetry("module_provisioned", Value::String("needlemod".to_string()), None)
+        .await
+        .expect("bare payload");
+    let after_bare = global_activity(&kernel, 100, None, Some("needle"))
+        .await
+        .expect("search survives a non-object payload");
+    assert_eq!(after_bare.len(), 2, "the bare-payload row neither matches nor breaks it");
+    assert_eq!(
+        global_activity(&kernel, 100, None, Some("module_provisioned"))
+            .await
+            .expect("by name")
+            .len(),
+        1,
+        "and it is still findable by its event name"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_model_is_the_newest_one_the_session_used() {
+    use superx_kernel::message::json_to_object;
+    use superx_mod_ui::activity::session_model;
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-model").await;
+    assert_eq!(
+        session_model(&kernel, session.clone()).await.expect("none yet"),
+        None,
+        "no message names a model yet"
+    );
+
+    for model in ["claude-opus-5", "claude-fable-5"] {
+        kernel
+            .log_message(superx_kernel::NewMessage {
+                session: session.clone(),
+                agent: agent.clone(),
+                role: "assistant".to_string(),
+                content: String::new(),
+                raw: Some(json_to_object(&serde_json::json!({ "message": { "model": model } }))),
+                seq: None,
+                emitted_at: None,
+            })
+            .await
+            .expect("message");
+    }
+    // The operator switched mid-session: the CURRENT model wins.
+    assert_eq!(
+        session_model(&kernel, session.clone()).await.expect("model"),
+        Some("claude-fable-5".to_string())
+    );
+
+    // Gemini names it at the root instead — same answer, one field over.
+    let (agent2, session2) = seed_agent_and_session(&kernel, "gemini_cli", "src-model-2").await;
+    kernel
+        .log_message(superx_kernel::NewMessage {
+            session: session2.clone(),
+            agent: agent2,
+            role: "assistant".to_string(),
+            content: String::new(),
+            raw: Some(json_to_object(&serde_json::json!({ "model": "gemini-3.1-pro" }))),
+            seq: None,
+            emitted_at: None,
+        })
+        .await
+        .expect("gemini message");
+    assert_eq!(
+        session_model(&kernel, session2).await.expect("gemini model"),
+        Some("gemini-3.1-pro".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feeds_page_backwards_through_the_whole_history() {
+    use superx_kernel::types::{Object, Value};
+    use superx_mod_ui::activity::{global_activity, session_activity};
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-page").await;
+
+    // 25 messages and 25 actions in the one session: 50 rows, more
+    // than any single page below.
+    for n in 0..25 {
+        kernel
+            .log_message(superx_kernel::NewMessage {
+                session: session.clone(),
+                agent: agent.clone(),
+                role: "user".to_string(),
+                content: format!("m{n}"),
+                raw: None,
+                seq: None,
+                emitted_at: None,
+            })
+            .await
+            .expect("message");
+        let mut p = Object::new();
+        p.insert("session".to_string(), Value::String("src-page".to_string()));
+        p.insert("tool".to_string(), Value::String(format!("t{n}")));
+        kernel
+            .log_telemetry_for_agent(
+                "tool_call",
+                Value::Object(p),
+                Some(agent.clone()),
+                Some(agent.clone()),
+            )
+            .await
+            .expect("action");
+    }
+
+    // Walk the session feed backwards a page at a time, exactly as the
+    // dashboard does: cursor = the oldest row currently held.
+    let page = 10;
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<chrono::DateTime<chrono::Utc>> = None;
+    for _ in 0..12 {
+        let rows = session_activity(&kernel, session.clone(), page, cursor, None)
+            .await
+            .expect("page");
+        if rows.is_empty() {
+            break;
+        }
+        assert!(rows.len() <= page as usize, "a page never exceeds its limit");
+        // Oldest-first within the page, and every page older than the last.
+        let oldest = &rows[0];
+        cursor = Some(oldest.valid_from.parse().expect("rfc3339"));
+        for r in &rows {
+            seen.push(r.id.clone());
+        }
+    }
+    let unique: std::collections::HashSet<&String> = seen.iter().collect();
+    assert_eq!(unique.len(), 50, "every row reachable exactly once: {}", seen.len());
+    assert_eq!(seen.len(), 50, "no row served twice across page boundaries");
+
+    // A cursor older than everything ends the walk rather than looping.
+    let ancient: chrono::DateTime<chrono::Utc> = "2000-01-01T00:00:00Z".parse().expect("ts");
+    assert!(
+        session_activity(&kernel, session.clone(), page, Some(ancient), None)
+            .await
+            .expect("empty")
+            .is_empty(),
+        "before the beginning is empty, which is how the UI stops"
+    );
+
+    // The global feed pages the same way — 50 session rows plus the
+    // module/boot events any instance carries.
+    let first = global_activity(&kernel, 10, None, None).await.expect("global");
+    assert_eq!(first.len(), 10);
+    let cut: chrono::DateTime<chrono::Utc> = first[0].valid_from.parse().expect("rfc3339");
+    let older = global_activity(&kernel, 10, Some(cut), None).await.expect("older");
+    assert!(!older.is_empty(), "there IS more history behind the first page");
+    assert!(
+        older.iter().all(|o| o.valid_from < first[0].valid_from),
+        "a page is strictly older than the cursor"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -659,11 +883,11 @@ async fn session_activity_never_bleeds_across_agents_sharing_a_source_key() {
         .await
         .expect("tool_call");
 
-    let a = session_activity(&kernel, session_a, 100).await.expect("a");
+    let a = session_activity(&kernel, session_a, 100, None, None).await.expect("a");
     assert_eq!(a.len(), 1, "agent A's session sees its own action: {a:#?}");
     assert!(a[0].rendered.contains("tool_call"));
 
-    let b = session_activity(&kernel, session_b, 100).await.expect("b");
+    let b = session_activity(&kernel, session_b, 100, None, None).await.expect("b");
     assert!(
         b.is_empty(),
         "agent B's session must NOT see agent A's action: {b:#?}"
