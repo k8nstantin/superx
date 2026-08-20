@@ -23,6 +23,102 @@ fn facilities_declared() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_api_round_trip_create_detail_update_comment_link_types() {
+    use superx_mod_entities::api;
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    // Types: ENTITY kinds only — relations are not "types" (operator
+    // model); they surface separately for the link picker.
+    let types = api::types_list(&db).await.expect("types");
+    assert!(types.iter().any(|t| t.name == "product"));
+    assert!(
+        !types.iter().any(|t| t.name == "depends_on"),
+        "relation kinds must not appear as types"
+    );
+    let rels = api::rel_types(&db).await.expect("rels");
+    assert!(rels.contains(&"depends_on".to_string()));
+
+    // Create with a markdown description + JSON attributes.
+    let product = api::create(
+        &db,
+        &api::CreateReq {
+            entity_type: "product".into(),
+            name: "Widget X".into(),
+            description: Some("**Widget X** is the composable widget product.".into()),
+            content: None,
+            attributes_json: Some(r#"{"owner": "calexander"}"#.into()),
+        },
+    )
+    .await
+    .expect("create");
+    let task = api::create(
+        &db,
+        &api::CreateReq {
+            entity_type: "task".into(),
+            name: "Build the widget".into(),
+            description: None,
+            content: None,
+            attributes_json: None,
+        },
+    )
+    .await
+    .expect("create task");
+
+    // Detail: description annotation + attributes round-trip.
+    let d = api::detail(&db, &product).await.expect("detail");
+    assert_eq!(d.name, "Widget X");
+    assert_eq!(d.entity_type, "product");
+    assert!(d.annotations.iter().any(|a| a.rel_type == "describes"
+        && a.content.contains("composable")));
+    assert!(d.attributes_json.as_deref().unwrap_or("").contains("calexander"));
+
+    // Update = a new version; history grows.
+    api::update(
+        &db,
+        &product,
+        &api::UpdateReq {
+            name: Some("Widget X2".into()),
+            content: None,
+            attributes_json: None,
+        },
+    )
+    .await
+    .expect("update");
+    let h = api::history(&db, &product).await.expect("history");
+    assert!(h.len() >= 2, "update appended a version: {}", h.len());
+    assert_eq!(api::detail(&db, &product).await.expect("detail2").name, "Widget X2");
+
+    // Comment lands as an annotation.
+    api::comment(&db, &product, "Priority: high").await.expect("comment");
+    let d = api::detail(&db, &product).await.expect("detail3");
+    assert!(d.annotations.iter().any(|a| a.rel_type == "comments"));
+
+    // Link task depends_on... task depends on nothing here — link the
+    // product to the task and check both directions + unlink history.
+    api::link(&db, &task, &api::LinkReq { to: product.clone(), rel: "depends_on".into() })
+        .await
+        .expect("link");
+    let dt = api::detail(&db, &task).await.expect("task detail");
+    assert!(dt.edges.iter().any(|e| e.rel_type == "depends_on"
+        && e.outbound
+        && e.other_name == "Widget X2"));
+    let dp = api::detail(&db, &product).await.expect("product detail");
+    assert!(dp.edges.iter().any(|e| e.rel_type == "depends_on" && !e.outbound));
+    api::unlink(&db, &task, &api::LinkReq { to: product.clone(), rel: "depends_on".into() })
+        .await
+        .expect("unlink");
+    let dt = api::detail(&db, &task).await.expect("task detail 2");
+    assert!(!dt.edges.iter().any(|e| e.rel_type == "depends_on"), "unlinked edge hidden");
+
+    // New entity type via the UI path — always an entity kind.
+    api::types_add(&db, &api::TypeReq { name: "dashboard".into(), description: Some("a BI dashboard".into()) })
+        .await
+        .expect("type add");
+    assert!(api::types_list(&db).await.expect("types2").iter().any(|t| t.name == "dashboard"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ui_port_defaults_then_follows_the_parameter() {
     use superx_mod_entities::{resolved_ui_port, resolved_ui_url, DEFAULT_UI_PORT, UI_PORT_PARAM};
     // A KERNEL substrate (not the module db): port parameters live on

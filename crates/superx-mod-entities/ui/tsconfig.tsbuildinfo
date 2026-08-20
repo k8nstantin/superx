@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/main.tsx"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/markdown.tsx","./src/api.ts","./src/main.tsx","./src/generated/annotationview.ts","./src/generated/createreq.ts","./src/generated/edgeview.ts","./src/generated/entitydetail.ts","./src/generated/entitylistitem.ts","./src/generated/linkreq.ts","./src/generated/textreq.ts","./src/generated/typereq.ts","./src/generated/typeview.ts","./src/generated/updatereq.ts","./src/generated/versionview.ts","./src/pages/entities.tsx","./src/pages/types.tsx"],"version":"5.9.3"}

@@ -13,7 +13,9 @@ chrono.workspace = true
 linkme.workspace = true
 mime_guess = "2"
 rust-embed = "8"
+serde.workspace = true
 serde_json.workspace = true
+ts-rs.workspace = true
 superx-kernel = { path = "../superx-kernel" }
 superx-ops = { path = "../superx-ops" }
 tokio = { workspace = true, features = ["net"] }
