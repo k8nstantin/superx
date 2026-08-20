@@ -28,6 +28,7 @@ const USAGE: &str = "usage: superx entities <command>\n\
   graph <uuid-fragment> [--json] [--depth <n>]   export the reachable subgraph\n\
   types                                list the type registry\n\
   types add <name> --category entity|relation [--description <text>]\n\
+  url                                  where this module's own UI lives\n\
 each write emits telemetry into the kernel firehose";
 
 /// Route a `superx entities …` invocation.
@@ -51,6 +52,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("attach") => attach_cmd(kernel, &args[1..]).await,
         Some("tree") => tree_cmd(kernel, &args[1..]).await,
         Some("graph") => graph_cmd(kernel, &args[1..]).await,
+        Some("url") => Ok(format!("{}\n", crate::resolved_ui_url(kernel).await)),
         _ => Err(KernelError::Module(USAGE.to_string())),
     }
 }

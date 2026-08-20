@@ -16,15 +16,53 @@ pub mod edges;
 pub mod graph;
 pub mod nodes;
 pub mod registry;
+mod server;
 pub mod texts;
 
 use async_trait::async_trait;
+use superx_kernel::types::Value;
 use superx_kernel::{
     Kernel, KernelModule, KernelModuleDescriptor, NodeKind, Result, KERNEL_MODULES,
 };
 
 /// The module's name — db name, dir name, CLI namespace, log target.
 pub const MODULE_NAME: &str = "entities";
+
+/// Port parameter for this module's OWN UI (epic #216, EU1) on its
+/// registry entity.
+pub const UI_PORT_PARAM: &str = "attr_entities_ui_port";
+
+/// Default UI port when the parameter is unset.
+pub const DEFAULT_UI_PORT: u16 = 5151; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
+/// The convention every module with a UI follows (D-UI2): its UI URL
+/// as a parameter on its own registry entity — the core dashboard
+/// discovers module UIs from the substrate, never via code coupling.
+pub const MODULE_UI_URL_PARAM: &str = "attr_module_ui_url";
+
+/// Resolve this module's UI port: parameter on the module entity,
+/// else default.
+pub async fn resolved_ui_port(kernel: &Kernel) -> u16 {
+    let Ok(Some(entity)) = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+    else {
+        return DEFAULT_UI_PORT;
+    };
+    match kernel.get_parameter(entity, UI_PORT_PARAM).await {
+        Ok(Some(Value::Number(n))) => n
+            .to_int()
+            .and_then(|i| u16::try_from(i).ok())
+            .filter(|&p| p > 0)
+            .unwrap_or(DEFAULT_UI_PORT),
+        _ => DEFAULT_UI_PORT,
+    }
+}
+
+/// This module's UI URL.
+pub async fn resolved_ui_url(kernel: &Kernel) -> String {
+    format!("http://127.0.0.1:{}", resolved_ui_port(kernel).await)
+}
 
 /// The module's own schema, applied by `superx modules provision
 /// entities` into `superx/entities` (kernel schema untouched — §7).
@@ -67,6 +105,26 @@ impl KernelModule for EntitiesModule {
                 );
             }
         }
+        // The module's OWN UI (epic #216, EU1): spawn the server and
+        // publish the URL on this module's registry entity so the core
+        // dashboard discovers it from the substrate (D-UI2).
+        let port = resolved_ui_port(kernel).await;
+        server::spawn(kernel.clone(), port).await?;
+        let url = format!("http://127.0.0.1:{port}");
+        if let Ok(Some(entity)) = kernel
+            .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+            .await
+        {
+            kernel
+                .set_parameter(entity.clone(), MODULE_UI_URL_PARAM, Value::String(url.clone()))
+                .await?;
+            let mut payload = superx_kernel::types::Object::new();
+            payload.insert("url".to_string(), Value::String(url.clone()));
+            kernel
+                .log_telemetry("entities_ui_started", Value::Object(payload), Some(entity))
+                .await?;
+        }
+        tracing::info!(target: "entities", %url, "entities ui serving");
         Ok(())
     }
 

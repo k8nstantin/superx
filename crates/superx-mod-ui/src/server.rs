@@ -148,6 +148,20 @@ async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
                     .ok()
                     .flatten()
                     .map(|r| r.provisioned);
+                // D-UI2: a module that serves its own UI publishes
+                // its URL on its registry entity; never a link to
+                // ourselves.
+                let ui_url = if s.name == crate::MODULE_NAME {
+                    None
+                } else {
+                    match kernel
+                        .get_parameter(s.entity_id.clone(), "attr_module_ui_url")
+                        .await
+                    {
+                        Ok(Some(superx_kernel::types::Value::String(u))) => Some(u),
+                        _ => None,
+                    }
+                };
                 modules.push(ModuleView {
                     name: s.name,
                     kind: kind.type_uid().trim_start_matches("node_").to_string(),
@@ -155,6 +169,7 @@ async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
                     version: s.version,
                     module_id: superx_ops::record_uuid(&s.entity_id),
                     provisioned,
+                    ui_url,
                 });
             }
         }

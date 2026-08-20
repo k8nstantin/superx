@@ -24,6 +24,11 @@ pub struct ModuleView {
     pub version: String,
     pub module_id: String,
     pub provisioned: Option<bool>,
+    /// The module's OWN UI, when it serves one — discovered from the
+    /// substrate via the `attr_module_ui_url` parameter on the
+    /// module's registry entity (epic #216, D-UI2). The dashboard's
+    /// nav grows a button per module UI with zero per-module code.
+    pub ui_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, TS)]
