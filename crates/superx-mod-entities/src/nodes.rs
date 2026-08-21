@@ -254,7 +254,11 @@ pub async fn list_entities(db: &Db, type_filter: Option<&str>) -> Result<Vec<Ent
     };
     let rows: Vec<Value> = resp.take(0)?;
     let mut anchors: Vec<RecordId> = rows.iter().filter_map(|r| obj_record(r, "id")).collect();
+    // NEWEST FIRST (issue #257): uuid7 is time-ordered, so reversing
+    // creation order puts what you just made at the top — an
+    // ascending list buries every new entity below the fold.
     anchors.sort_by_key(record_uuid);
+    anchors.reverse();
 
     // Current labels only — never the whole version chains (#179).
     let meta = current_meta(db, &anchors).await?;
