@@ -64,3 +64,15 @@
 .sx-view .bn-block-outer:first-child .bn-block-content {
   padding-top: 0;
 }
+
+/* Compact preview: a collapsed comment's first block is often its
+   heading, and a full-size h1 fills the whole preview with a title the
+   header line already shows. Shrink headings so the preview previews
+   the CONTENT (#261). */
+.sx-compact h1,
+.sx-compact h2,
+.sx-compact h3 {
+  font-size: 1rem;
+  line-height: 1.4;
+  margin: 0;
+}
