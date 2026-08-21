@@ -36,7 +36,6 @@ import {
   updateEntity,
 } from '../api'
 import { MarkdownEditor, MarkdownView, type MarkdownEditorHandle } from '../Markdown'
-import { GraphPanel } from '../Graph'
 import type { EntityDetail } from '../generated/EntityDetail'
 
 // The Entities page (issue #231, approved design): list with a type
@@ -44,7 +43,11 @@ import type { EntityDetail } from '../generated/EntityDetail'
 // with description/instructions/comments (BlockNote), edges, history.
 
 export default function EntitiesPage() {
-  const [selected, setSelected] = useState<string | null>(null)
+  // `?entity=<frag>` opens straight onto that entity — how the graph
+  // window links back to what it is rooted at (#250).
+  const [selected, setSelected] = useState<string | null>(
+    () => new URLSearchParams(window.location.search).get('entity'),
+  )
   return selected ? (
     <DetailView frag={selected} onBack={() => setSelected(null)} onOpen={setSelected} />
   ) : (
@@ -250,7 +253,6 @@ function DetailView({
   const [linkOpen, setLinkOpen] = useState(false)
   const [describeOpen, setDescribeOpen] = useState(false)
   const [attachOpen, setAttachOpen] = useState(false)
-  const [graphOpen, setGraphOpen] = useState(false)
   const history = useQuery({
     queryKey: ['history', frag],
     queryFn: () => fetchHistory(frag),
@@ -300,27 +302,23 @@ function DetailView({
           <Button size="compact-sm" variant="default" onClick={() => setAttachOpen(true)}>
             + Attach
           </Button>
+          {/* Opens in its own window: a force-directed graph needs the
+              room, and a panel between the cards gives it none (#250). */}
           <Button
             size="compact-sm"
-            variant={graphOpen ? 'filled' : 'default'}
-            onClick={() => setGraphOpen((o) => !o)}
+            variant="default"
+            component="a"
+            href={`/graph/${d.id}`}
+            target="_blank"
+            rel="noopener"
           >
-            Graph {graphOpen ? '▴' : '▾'}
+            Graph ↗
           </Button>
           <Button size="compact-sm" variant="default" onClick={() => setHistoryOpen((o) => !o)}>
             History {historyOpen ? '▴' : '▾'}
           </Button>
         </Group>
       </Group>
-
-      <Collapse expanded={graphOpen}>
-        <Card withBorder mb="sm">
-          <Title order={6} mb="xs">
-            GRAPH · ROOTED AT THIS ENTITY
-          </Title>
-          {graphOpen && <GraphPanel frag={d.id} onOpen={onOpen} />}
-        </Card>
-      </Collapse>
 
       <Collapse expanded={historyOpen}>
         <Card withBorder mb="sm">

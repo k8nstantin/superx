@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Anchor, AppShell, Group, NavLink, Text } from '@mantine/core'
 import { fetchPing } from './api'
 import EntitiesPage from './pages/Entities'
 import TypesPage from './pages/Types'
+import GraphFull, { graphRouteId } from './pages/GraphFull'
 
 // The entities module's OWN dashboard (epic #216, approved design):
 // logo + wordmark, back link to the core dashboard (discovered from
@@ -13,9 +14,24 @@ import TypesPage from './pages/Types'
 const PAGES = ['Entities', 'Types'] as const
 type Page = (typeof PAGES)[number]
 
+/// One route, so one `pathname` check rather than a router dependency
+/// (issue #250): `/graph/<id>` is the graph in its own window, and the
+/// module's static handler already serves index.html for it.
+function useRoute(): string {
+  const [path, setPath] = useState(() => window.location.pathname)
+  useEffect(() => {
+    const onNav = () => setPath(window.location.pathname)
+    window.addEventListener('popstate', onNav)
+    return () => window.removeEventListener('popstate', onNav)
+  }, [])
+  return path
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>('Entities')
   const ping = useQuery({ queryKey: ['ping'], queryFn: fetchPing })
+  const graphId = graphRouteId(useRoute())
+  if (graphId) return <GraphFull frag={graphId} />
   return (
     <AppShell header={{ height: 52 }} navbar={{ width: 180, breakpoint: 'xs' }} padding="md">
       <AppShell.Header>

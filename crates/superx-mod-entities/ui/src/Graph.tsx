@@ -53,6 +53,10 @@ export function GraphPanel({
     }
   })
 
+  // How much room this canvas has, relative to the inline panel the
+  // force numbers were originally tuned against (460px tall).
+  const roominess = Math.min(2.2, Math.max(1, height / 460))
+
   const links = edges.map((e) => ({
     source: e.from,
     target: e.to,
@@ -159,8 +163,17 @@ export function GraphPanel({
                 // Sparse graphs need far more repulsion to use the
                 // canvas; dense ones fly apart with it. Scale to size.
                 force: {
-                  repulsion: data.length <= 10 ? 1500 : data.length <= 30 ? 600 : 320,
-                  edgeLength: data.length <= 10 ? [180, 280] : [100, 180],
+                  // Sparse graphs need far more repulsion to use the
+                  // canvas; dense ones fly apart with it. Scaled by the
+                  // canvas too (#250): the same graph in a full window
+                  // has more room to spread than in a panel, and fixed
+                  // numbers leave a big window mostly empty.
+                  repulsion: Math.round(
+                    (data.length <= 10 ? 1500 : data.length <= 30 ? 600 : 320) * roominess,
+                  ),
+                  edgeLength: (data.length <= 10 ? [180, 280] : [100, 180]).map((l) =>
+                    Math.round(l * roominess),
+                  ),
                   gravity: 0.08,
                   friction: 0.6,
                   layoutAnimation: true,
