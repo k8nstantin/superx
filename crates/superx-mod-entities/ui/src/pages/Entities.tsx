@@ -6,6 +6,7 @@ import {
   Button,
   Card,
   Collapse,
+  Divider,
   Grid,
   FileInput,
   Group,
@@ -36,7 +37,9 @@ import {
   updateEntity,
 } from '../api'
 import { MarkdownEditor, MarkdownView, type MarkdownEditorHandle } from '../Markdown'
+import { LongText, previewLine } from '../LongText'
 import type { EntityDetail } from '../generated/EntityDetail'
+import type { AnnotationView } from '../generated/AnnotationView'
 import { useBreadcrumb } from '../Breadcrumbs'
 
 // The Entities page (issue #231, approved design): list with a type
@@ -239,6 +242,91 @@ function CreateModal({
   )
 }
 
+/**
+ * A text node's content, with its own version chain on show.
+ *
+ * A description is a text ENTITY (D22), so it has an SCD-2 chain of its
+ * own — the runner spec's description is on its third version. The page
+ * used to render the current body with no hint that earlier ones exist,
+ * while the History button showed the *anchor's* chain, which is a
+ * different thing (#261). `fetchHistory` works on any fragment and
+ * VersionView carries `content`, so browsing needs no new route.
+ */
+function TextNodeCard({
+  title,
+  annotation,
+  onEdit,
+  sectionRef,
+}: {
+  title: string
+  annotation: AnnotationView
+  onEdit?: () => void
+  sectionRef?: React.Ref<HTMLDivElement>
+}) {
+  const [at, setAt] = useState<string | null>(null)
+  const history = useQuery({
+    queryKey: ['history', annotation.text_id],
+    queryFn: () => fetchHistory(annotation.text_id),
+  })
+  // Ascending — oldest first (nodes.rs:220), so the last row is current.
+  const versions = history.data ?? []
+  const current = versions[versions.length - 1]
+  const chosen = at ? versions.find((v) => v.valid_from === at) : undefined
+  const historical = Boolean(chosen) && chosen?.valid_from !== current?.valid_from
+  const shown = chosen ? versions.indexOf(chosen) + 1 : versions.length
+  // The annotation always carries the live body; history supplies the
+  // older ones. Never fall back silently to the wrong version.
+  const body = (historical ? chosen?.content : annotation.content) ?? annotation.content
+
+  return (
+    <Card withBorder mb="md" ref={sectionRef}>
+      <Group justify="space-between" mb="xs" wrap="nowrap">
+        <Group gap="xs" wrap="nowrap">
+          <Title order={6} tt="uppercase" c="dimmed">
+            {title}
+          </Title>
+          {versions.length > 0 && (
+            <Badge size="xs" variant="light" color={historical ? 'yellow' : 'pelican'}>
+              v{shown} of {versions.length}
+            </Badge>
+          )}
+        </Group>
+        <Group gap={6} wrap="nowrap">
+          {versions.length > 1 && (
+            <Select
+              size="xs"
+              w={215}
+              value={at ?? current?.valid_from ?? null}
+              onChange={setAt}
+              comboboxProps={{ withinPortal: true }}
+              data={[...versions].reverse().map((v, i) => ({
+                value: v.valid_from,
+                label:
+                  'v' +
+                  String(versions.length - i) +
+                  ' · ' +
+                  v.valid_from.slice(0, 16).replace('T', ' ') +
+                  (i === 0 ? ' · current' : ''),
+              }))}
+            />
+          )}
+          {onEdit && (
+            <Button size="compact-xs" variant="subtle" disabled={historical} onClick={onEdit}>
+              edit
+            </Button>
+          )}
+        </Group>
+      </Group>
+      {historical && (
+        <Text size="xs" c="yellow.4" mb={6}>
+          viewing v{shown} of {versions.length} · historical, not current — editing is disabled here
+        </Text>
+      )}
+      <LongText markdown={body} />
+    </Card>
+  )
+}
+
 function DetailView({
   frag,
   onBack,
@@ -276,6 +364,16 @@ function DetailView({
   const description = d?.annotations.find((a) => a.rel_type === 'describes')
   const instructions = d?.annotations.find((a) => a.rel_type === 'instructs')
   const comments = (d?.annotations ?? []).filter((a) => a.rel_type === 'comments')
+
+  // A description can be a whole build spec, so the sections below it
+  // are a scroll away even when collapsed. Jump to them (#261).
+  const descRef = useRef<HTMLDivElement>(null)
+  const instrRef = useRef<HTMLDivElement>(null)
+  const commentsRef = useRef<HTMLDivElement>(null)
+  const edgesRef = useRef<HTMLDivElement>(null)
+  const attachRef = useRef<HTMLDivElement>(null)
+  const jump = (r: React.RefObject<HTMLDivElement | null>) =>
+    r.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 
   if (detail.isError)
     return (
@@ -329,6 +427,31 @@ function DetailView({
         </Group>
       </Group>
 
+      <Group gap={6} mb="sm" wrap="wrap">
+        <Text size="xs" c="dimmed" tt="uppercase">
+          jump to
+        </Text>
+        {description && (
+          <Button size="compact-xs" variant="light" onClick={() => jump(descRef)}>
+            description
+          </Button>
+        )}
+        {instructions && (
+          <Button size="compact-xs" variant="light" onClick={() => jump(instrRef)}>
+            instructions
+          </Button>
+        )}
+        <Button size="compact-xs" variant="light" onClick={() => jump(commentsRef)}>
+          comments {comments.length > 0 ? `(${comments.length})` : ''}
+        </Button>
+        <Button size="compact-xs" variant="light" onClick={() => jump(edgesRef)}>
+          edges {d.edges.length > 0 ? `(${d.edges.length})` : ''}
+        </Button>
+        <Button size="compact-xs" variant="light" onClick={() => jump(attachRef)}>
+          attachments {d.attachments.length > 0 ? `(${d.attachments.length})` : ''}
+        </Button>
+      </Group>
+
       <Collapse expanded={historyOpen}>
         <Card withBorder mb="sm">
           <Title order={6} mb="xs">
@@ -336,8 +459,12 @@ function DetailView({
           </Title>
           {(history.data ?? []).map((v, i, all) => (
             <Group key={v.valid_from} gap="sm" mb={4}>
-              <Text size="xs" ff="monospace" c="dimmed" w={30}>
-                v{all.length - i}
+              {/* state_history orders ASC (nodes.rs:220), so index 0 is
+                  the OLDEST — it is v1. Counting down from the length
+                  labelled the first version as the last one (#261). */}
+              <Text size="xs" ff="monospace" c="dimmed" w={44}>
+                v{i + 1}
+                {i === all.length - 1 ? '*' : ''}
               </Text>
               <Text size="xs" c="dimmed" w={190} ff="monospace">
                 {v.valid_from}
@@ -345,55 +472,100 @@ function DetailView({
               <Text size="sm">{v.name}</Text>
             </Group>
           ))}
+          <Text size="xs" c="dimmed" mt={6}>
+            * current
+          </Text>
         </Card>
       </Collapse>
 
       <Grid gap="md">
         <Grid.Col span={{ base: 12, lg: 6 }}>
-          <Card withBorder mb="md">
-            <Group justify="space-between" mb="xs">
-              <Title order={6} tt="uppercase" c="dimmed">
-                Description · text node
-              </Title>
-              <Button size="compact-xs" variant="subtle" onClick={() => setDescribeOpen(true)}>
-                {description ? 'edit' : 'add'}
-              </Button>
-            </Group>
-            {description ? (
-              <MarkdownView markdown={description.content} />
-            ) : (
+          {description ? (
+            <TextNodeCard
+              title="Description · text node"
+              annotation={description}
+              onEdit={() => setDescribeOpen(true)}
+              sectionRef={descRef}
+            />
+          ) : (
+            <Card withBorder mb="md" ref={descRef}>
+              <Group justify="space-between" mb="xs">
+                <Title order={6} tt="uppercase" c="dimmed">
+                  Description · text node
+                </Title>
+                <Button size="compact-xs" variant="subtle" onClick={() => setDescribeOpen(true)}>
+                  add
+                </Button>
+              </Group>
               <Text size="sm" c="dimmed">
                 no description yet
               </Text>
-            )}
-          </Card>
-          {instructions && (
-            <Card withBorder mb="md">
-              <Title order={6} tt="uppercase" c="dimmed" mb="xs">
-                Instructions · instructs → text node
-              </Title>
-              <MarkdownView markdown={instructions.content} />
             </Card>
           )}
-          <Card withBorder>
+          {instructions && (
+            <TextNodeCard
+              title="Instructions · instructs → text node"
+              annotation={instructions}
+              sectionRef={instrRef}
+            />
+          )}
+          {/* The discussion starts here, and it has to LOOK like it
+              does: a 35k-char description above an unmarked comment
+              reads as one continuous document (#261). */}
+          <Divider
+            my="md"
+            labelPosition="left"
+            label={`comments · ${comments.length}`}
+            color="dark.5"
+          />
+          <Card withBorder ref={commentsRef}>
             <Title order={6} tt="uppercase" c="dimmed" mb="xs">
-              Comments · text nodes
+              Comments · {comments.length} text node{comments.length === 1 ? '' : 's'}
             </Title>
-            {comments.map((c) => (
+            {comments.length === 0 && (
+              <Text size="sm" c="dimmed" mb="xs">
+                no comments yet — the box below posts one as a linked text node
+              </Text>
+            )}
+            {comments.map((c, i) => (
               <div
                 key={c.text_id}
-                style={{ borderLeft: '2px solid #3B2449', paddingLeft: 12, marginBottom: 10 }}
+                style={{
+                  border: '1px solid #3B2449',
+                  borderRadius: 6,
+                  padding: '8px 10px',
+                  marginBottom: 10,
+                }}
               >
-                <MarkdownView markdown={c.content} />
+                <Group gap="xs" mb={4} wrap="nowrap">
+                  <Badge size="xs" variant="light" color="pelican">
+                    #{i + 1}
+                  </Badge>
+                  <Text
+                    size="xs"
+                    fw={600}
+                    style={{
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {previewLine(c.content)}
+                  </Text>
+                  <Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
+                    {c.text_id.slice(0, 8)}
+                  </Text>
+                </Group>
+                <LongText markdown={c.content} collapsedHeight={110} compact />
               </div>
             ))}
             <CommentComposer frag={frag} onPosted={refresh} />
           </Card>
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 6 }}>
-          <Card withBorder mb="md">
+          <Card withBorder mb="md" ref={edgesRef}>
             <Title order={6} tt="uppercase" c="dimmed" mb="xs">
-              Edges
+              Edges · {d.edges.length}
             </Title>
             {d.edges.length === 0 && (
               <Text size="sm" c="dimmed">
@@ -439,10 +611,10 @@ function DetailView({
               <MarkdownView markdown={d.content} />
             </Card>
           )}
-          <Card withBorder mb="md">
+          <Card withBorder mb="md" ref={attachRef}>
             <Group justify="space-between" mb="xs">
               <Title order={6} tt="uppercase" c="dimmed">
-                Attachments
+                Attachments · {d.attachments.length}
               </Title>
               <Button size="compact-xs" variant="subtle" onClick={() => setAttachOpen(true)}>
                 + attach
