@@ -495,6 +495,17 @@ pub async fn describe(db: &Db, fragment: &str, text: &str) -> Result<String> {
     Ok(record_uuid(&text_id))
 }
 
+/// Set or evolve the entity's INSTRUCTING text (D22). This is the node
+/// the runner reads as the `Instructions:` block of a dispatched task's
+/// prompt (`superx-mod-runner`'s `build_prompt`) — a brief stored
+/// anywhere else never reaches the agent: `content` is not read, and a
+/// `describes` node renders in Linked context as a bare name.
+pub async fn instruct(db: &Db, fragment: &str, text: &str) -> Result<String> {
+    let id = nodes::resolve_entity(db, fragment).await?;
+    let (text_id, _new) = texts::set_role_text(db, &id, "instructs", text).await?;
+    Ok(record_uuid(&text_id))
+}
+
 pub async fn comment(db: &Db, fragment: &str, text: &str) -> Result<String> {
     let id = nodes::resolve_entity(db, fragment).await?;
     let text_id = texts::add_comment(db, &id, text).await?;

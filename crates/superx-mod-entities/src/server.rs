@@ -43,6 +43,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/entities/{frag}/history", get(api_history))
         .route("/api/entities/{frag}/update", post(api_update))
         .route("/api/entities/{frag}/describe", post(api_describe))
+        .route("/api/entities/{frag}/instruct", post(api_instruct))
         .route("/api/entities/{frag}/comment", post(api_comment))
         .route("/api/entities/{frag}/link", post(api_link))
         .route("/api/entities/{frag}/unlink", post(api_unlink))
@@ -227,6 +228,23 @@ async fn api_describe(
     match api::describe(&db, &frag, &req.text).await {
         Ok(id) => {
             emit(&state.kernel, "entity_described", frag).await;
+            Resp::ok(serde_json::json!({ "text_id": id }))
+        }
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+/// The task brief the runner dispatches. Without this route nothing
+/// outside the CLI can give a task executable instructions (issue #248).
+async fn api_instruct(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+    Json(req): Json<api::TextReq>,
+) -> Resp<serde_json::Value> {
+    let db = module_db!(state);
+    match api::instruct(&db, &frag, &req.text).await {
+        Ok(id) => {
+            emit(&state.kernel, "entity_instructed", frag).await;
             Resp::ok(serde_json::json!({ "text_id": id }))
         }
         Err(e) => Resp::err(e.to_string()),

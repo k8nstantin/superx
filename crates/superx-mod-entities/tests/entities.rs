@@ -138,6 +138,65 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_instruct_sets_the_brief_the_runner_dispatches() {
+    use superx_mod_entities::api;
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    let task = api::create(
+        &db,
+        &api::CreateReq {
+            entity_type: "task".into(),
+            name: "Build the module skeleton".into(),
+            description: Some("what this task is about".into()),
+            content: None,
+            attributes_json: None,
+        },
+    )
+    .await
+    .expect("task");
+
+    let first = api::instruct(&db, &task, "Step 1: create the crate.")
+        .await
+        .expect("instruct");
+
+    // It lands as an `instructs` annotation — the role the runner reads
+    // for the Instructions block — and sits beside, not on top of, the
+    // describing text.
+    let d = api::detail(&db, &task).await.expect("detail");
+    let ins: Vec<_> = d.annotations.iter().filter(|a| a.rel_type == "instructs").collect();
+    assert_eq!(ins.len(), 1, "{:?}", d.annotations);
+    assert_eq!(ins[0].content, "Step 1: create the crate.");
+    assert!(
+        d.annotations.iter().any(|a| a.rel_type == "describes"),
+        "the description is untouched"
+    );
+
+    // A second call EVOLVES the same text node (set_role_text's
+    // contract) — one node, one version chain, so an instruction can be
+    // edited without losing what the agent was told before.
+    let second = api::instruct(&db, &task, "Step 1: create the crate. Step 2: register it.")
+        .await
+        .expect("re-instruct");
+    assert_eq!(first, second, "same text node, evolved");
+
+    let d = api::detail(&db, &task).await.expect("detail 2");
+    let ins: Vec<_> = d.annotations.iter().filter(|a| a.rel_type == "instructs").collect();
+    assert_eq!(ins.len(), 1, "still exactly one instructs node: {:?}", ins);
+    assert!(ins[0].content.contains("Step 2"));
+
+    let history = api::history(&db, &first).await.expect("text history");
+    assert!(history.len() >= 2, "both versions retained: {}", history.len());
+
+    // The instructing text is a text carrier, so it stays out of the
+    // entity list and out of the graph, like every other annotation.
+    let listed = api::list(&db, None).await.expect("list");
+    assert!(listed.iter().all(|e| e.id != first), "the brief is not an entity row");
+    let g = api::graph_view(&db, &task, 2, "both").await.expect("graph");
+    assert!(g.nodes.iter().all(|n| n.entity_type != "text"), "{:?}", g.nodes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ui_graph_is_rooted_at_the_entity_and_walks_both_ways() {
     use superx_mod_entities::api;
     let db = fresh_db().await;
