@@ -548,3 +548,19 @@ code, pre {
 .loop { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-family: var(--font-code); font-size: 0.85rem; color: var(--text-dim); }
 .loop__step { border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 8px 12px; background: var(--bg-alt); }
 .loop__arrow { color: var(--accent-bright); }
+
+/* ── Screenshots (real captures from a running instance) ───────────── */
+.shot { margin: 0 0 var(--space-xl); }
+.shot img {
+  display: block; width: 100%; height: auto;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+  background: var(--bg-alt);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+.shot figcaption {
+  margin-top: 14px; color: var(--text-dim); font-size: 0.92rem; line-height: 1.6;
+  max-width: 78ch;
+}
+.shot figcaption code { color: var(--accent-bright); }
+.shot__lead { color: var(--text-dim); max-width: 78ch; margin: 0 0 var(--space-lg); }
+.shot__lead code { color: var(--accent-bright); }
