@@ -224,3 +224,88 @@ pub fn to_json(graph: &Subgraph, root: &RecordId) -> serde_json::Value {
         })).collect::<Vec<_>>(),
     })
 }
+
+/// Parent-edge priority when an entity has several incoming edges
+/// (issue #252): structural containment first, then attachment, then
+/// the text roles, then anything else. The first match wins, so a
+/// component under a product reads as its child even when other
+/// entities also point at it.
+const PARENT_PRIORITY: [&str; 6] = [
+    "contains",
+    "attached",
+    "describes",
+    "instructs",
+    "comments",
+    "produced",
+];
+
+/// One step of an ancestor path.
+pub struct Ancestor {
+    pub id: RecordId,
+    pub entity_type: String,
+    pub name: String,
+    /// The edge that links this ancestor to the step below it.
+    pub rel_type: String,
+}
+
+/// The ancestor path of an entity, ROOT FIRST, excluding the entity
+/// itself: walk active incoming edges upward, choosing one parent per
+/// level by [`PARENT_PRIORITY`]. Cycle-safe (a visited set stops the
+/// walk) and depth-capped, so a cyclic graph terminates instead of
+/// climbing forever.
+///
+/// # Errors
+///
+/// [`KernelError::Db`](superx_kernel::KernelError::Db) for engine
+/// errors.
+pub async fn ancestors(db: &Db, anchor: &RecordId, max_depth: usize) -> Result<Vec<Ancestor>> {
+    let mut path: Vec<Ancestor> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::from([record_uuid(anchor)]);
+    let mut here = anchor.clone();
+
+    for _ in 0..max_depth {
+        let incoming: Vec<EdgeRow> = expand(db, std::slice::from_ref(&here), true)
+            .await?
+            .into_iter()
+            .filter(|e| e.active && !visited.contains(&record_uuid(&e.from)))
+            .collect();
+        if incoming.is_empty() {
+            break;
+        }
+        // One parent per level: priority first, then creation order
+        // (uuid7 sorts chronologically) so the choice is stable.
+        let pick = PARENT_PRIORITY
+            .iter()
+            .find_map(|rel| {
+                let mut matches: Vec<&EdgeRow> =
+                    incoming.iter().filter(|e| e.rel_type == *rel).collect();
+                matches.sort_by_key(|e| record_uuid(&e.from));
+                matches.first().copied()
+            })
+            .or_else(|| {
+                let mut rest: Vec<&EdgeRow> = incoming.iter().collect();
+                rest.sort_by_key(|e| record_uuid(&e.from));
+                rest.first().copied()
+            });
+        let Some(edge) = pick else { break };
+
+        let parent = edge.from.clone();
+        let uuid = record_uuid(&parent);
+        visited.insert(uuid.clone());
+        let meta = current_meta(db, std::slice::from_ref(&parent)).await?;
+        let (entity_type, name) = match meta.get(&uuid) {
+            Some(m) => (m.entity_type.clone(), m.name.clone()),
+            None => (String::new(), String::new()),
+        };
+        path.push(Ancestor {
+            id: parent.clone(),
+            entity_type,
+            name,
+            rel_type: edge.rel_type.clone(),
+        });
+        here = parent;
+    }
+
+    path.reverse(); // root first
+    Ok(path)
+}

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Button, Card, Code, Group, ScrollArea, Text, TextInput, Title } from '@mantine/core'
 import { runCommand } from '../api'
+import { useBreadcrumb } from '../Breadcrumbs'
 
 interface Entry {
   argv: string
@@ -9,6 +10,7 @@ interface Entry {
 }
 
 export default function ConsolePage() {
+  useBreadcrumb([{ label: 'Console' }])
   const [input, setInput] = useState('')
   const [history, setHistory] = useState<Entry[]>([])
   const [busy, setBusy] = useState(false)

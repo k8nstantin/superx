@@ -16,6 +16,7 @@ import {
 import { fetchInsights, fetchStats, fetchStatus } from '../api'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK, INK_MUTED, TOOLTIP } from '../EChart'
 import { sessionColor } from '../Feed'
+import { useBreadcrumb } from '../Breadcrumbs'
 
 // The Status page (issues #228, #237): the OS's captured numbers,
 // front and center — what the agents did (tools, lines of code, did
@@ -52,6 +53,7 @@ function fmtAge(secs: number | bigint | null | undefined): string {
 }
 
 export default function StatusPage() {
+  useBreadcrumb([{ label: 'Status' }])
   const status = useQuery({ queryKey: ['status'], queryFn: fetchStatus, refetchInterval: 10000 })
   const stats = useQuery({ queryKey: ['stats'], queryFn: fetchStats, refetchInterval: 15000 })
   // All-history aggregates: heavier, and they move slowly.

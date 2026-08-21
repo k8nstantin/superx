@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Anchor, Group, Text, Title } from '@mantine/core'
-import { fetchDetail, fetchPing, typeColor } from '../api'
+import { Anchor, Box, Group, Text } from '@mantine/core'
+import { fetchDetail, fetchPing } from '../api'
+import { useBreadcrumb, BreadcrumbTrail } from '../Breadcrumbs'
 import { GraphPanel } from '../Graph'
 
 // The graph in its own window (issue #250). A force-directed graph
@@ -47,15 +48,27 @@ export default function GraphFull({ frag }: { frag: string }) {
     window.dispatchEvent(new PopStateEvent('popstate'))
   }
 
+  // Same trail as the dashboard (#253) — here an ancestor click
+  // re-roots the graph rather than leaving the window.
+  useBreadcrumb([
+    { label: 'Entities', onClick: () => (window.location.href = '/') },
+    ...(d?.ancestors ?? []).map((a) => ({
+      label: a.name || a.id.slice(0, 8),
+      onClick: () => reroot(a.id),
+    })),
+    ...(d ? [{ label: d.name }] : []),
+  ])
+
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
       <Group
         h={HEADER}
         px="md"
-        justify="space-between"
+        gap="lg"
+        wrap="nowrap"
         style={{ borderBottom: '1px solid #3B2449', flexShrink: 0 }}
       >
-        <Group gap={10}>
+        <Group gap={10} wrap="nowrap">
           <img src="/logo.svg" alt="" width={26} height={26} style={{ borderRadius: 6 }} />
           <Text
             component="span"
@@ -66,22 +79,14 @@ export default function GraphFull({ frag }: { frag: string }) {
           >
             superx
           </Text>
-          <Text c="dimmed" fz={15}>
+          <Text c="dimmed" fz={15} style={{ whiteSpace: 'nowrap' }}>
             · graph
           </Text>
-          {d && (
-            <>
-              <Text c="dimmed" fz={15}>
-                ·
-              </Text>
-              <Text fz={15} fw={600} c={typeColor(d.entity_type)}>
-                {d.entity_type}
-              </Text>
-              <Title order={5}>{d.name}</Title>
-            </>
-          )}
         </Group>
-        <Group gap="md">
+        <Box style={{ flex: 1, minWidth: 0 }}>
+          <BreadcrumbTrail onHome={() => (window.location.href = '/')} />
+        </Box>
+        <Group gap="md" wrap="nowrap">
           <Anchor href={`/?entity=${frag}`} size="sm">
             open the entity →
           </Anchor>

@@ -7,11 +7,13 @@ import { useSse } from '../useSse'
 import { Feed, MAX_FEED_ROWS, matchesSearch, mergeFeed } from '../Feed'
 import { useFeedHistory } from '../useFeedHistory'
 import type { SseEvent } from '../generated/SseEvent'
+import { useBreadcrumb } from '../Breadcrumbs'
 
 // The GLOBAL scope of THE feed (issue #187): everyone and everything
 // in one place — historical backlog, then live. The session view is
 // the same exact feed, filtered.
 export default function ActivityPage() {
+  useBreadcrumb([{ label: 'Activity' }])
   const [paused, setPaused] = useState(false)
   const [liveRows, setLiveRows] = useState<SseEvent[]>([])
   const [search, setSearch] = useState('')

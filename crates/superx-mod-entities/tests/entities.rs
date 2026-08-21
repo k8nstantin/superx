@@ -815,3 +815,55 @@ async fn subgraph_carries_text_content_via_batched_meta() {
     assert_eq!(root.name, "Widget");
     assert!(root.content.is_none(), "non-content kinds stay lean");
 }
+
+// -------------------------------------------------------------- #253 --
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ancestor_path_is_root_first_priority_ordered_and_cycle_safe() {
+    use superx_mod_entities::{edges, graph, nodes, texts};
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("seed");
+
+    // product ─contains→ component ─contains→ task
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    let part = nodes::create_entity(&db, "product", "Frame", None, None).await.expect("c");
+    let task = nodes::create_entity(&db, "task", "Build frame", None, None).await.expect("t");
+    edges::link(&db, &product, &part, "contains").await.expect("l1");
+    edges::link(&db, &part, &task, "contains").await.expect("l2");
+
+    let trail = graph::ancestors(&db, &task, 12).await.expect("walk");
+    let names: Vec<&str> = trail.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, vec!["Widget", "Frame"], "root first, self excluded");
+    assert_eq!(trail[1].rel_type, "contains");
+
+    // A second, non-structural incoming edge must not outrank `contains`.
+    let rag = nodes::create_entity(&db, "rag", "Datasheets", None, None).await.expect("r");
+    edges::link(&db, &rag, &task, "linked").await.expect("l3");
+    let trail = graph::ancestors(&db, &task, 12).await.expect("walk");
+    assert_eq!(
+        trail.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        vec!["Widget", "Frame"],
+        "contains wins the parent slot"
+    );
+
+    // A text node's parent is the entity it annotates.
+    let (text, _) = texts::set_role_text(&db, &task, "describes", "what to build").await.expect("d");
+    let trail = graph::ancestors(&db, &text, 12).await.expect("walk");
+    assert_eq!(
+        trail.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        vec!["Widget", "Frame", "Build frame"]
+    );
+
+    // Depth cap honoured.
+    let capped = graph::ancestors(&db, &task, 1).await.expect("walk");
+    assert_eq!(capped.len(), 1);
+
+    // A root — nothing points at it — has no ancestors.
+    assert!(graph::ancestors(&db, &product, 12).await.expect("walk").is_empty());
+
+    // A cycle terminates instead of climbing forever (asserted last:
+    // it gives the root an incoming edge).
+    edges::link(&db, &task, &product, "contains").await.expect("cycle");
+    let trail = graph::ancestors(&db, &task, 12).await.expect("walk");
+    assert!(trail.len() <= 3, "visited set stops the cycle: {}", trail.len());
+}
