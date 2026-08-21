@@ -123,8 +123,21 @@ async fn static_assets(uri: axum::http::Uri) -> axum::response::Response {
     let serve = |name: &str| {
         Assets::get(name).map(|f| {
             let mime = mime_guess::from_path(name).first_or_octet_stream();
+            // Cache policy (issue #255): index.html names the
+            // content-hashed bundle, so it must ALWAYS be revalidated
+            // — a cached entry point pins the browser to a stale
+            // dashboard through every rebuild. The hashed assets it
+            // points at are immutable by construction.
+            let cache = if name.starts_with("assets/") {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-store"
+            };
             (
-                [(axum::http::header::CONTENT_TYPE, mime.to_string())],
+                [
+                    (axum::http::header::CONTENT_TYPE, mime.to_string()),
+                    (axum::http::header::CACHE_CONTROL, cache.to_string()),
+                ],
                 f.data.into_owned(),
             )
                 .into_response()
