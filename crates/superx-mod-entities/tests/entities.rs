@@ -585,6 +585,9 @@ async fn list_shows_current_labels_and_filters() {
 
     let all = nodes::list_entities(&db, None).await.expect("list");
     assert_eq!(all.len(), 2, "one row per entity, not per version");
+    // Newest first (#257): the task was created after the product, so
+    // whatever you just made is the FIRST row, never buried last.
+    assert_eq!(all[0].name, "Build widget", "newest first");
     assert!(all.iter().any(|r| r.name == "Widget v2"), "list shows CURRENT label");
     assert!(!all.iter().any(|r| r.name == "Widget"), "stale label absent");
 
