@@ -316,6 +316,10 @@ pub async fn boot(kernel: &Kernel) -> Result<BootReport> {
         let state = match outcome {
             Ok(()) => {
                 tracing::info!(module = name, elapsed_ms, "module active");
+                // The reconciler converges desired state onto actual
+                // state, so boot has to record what it started or the
+                // first tick would start everything a second time (M0).
+                kernel.note_module_running(name);
                 kernel.mark_active(desc.kind, name, elapsed_ms).await?;
                 LifecycleState::Active {
                     startup_duration_ms: elapsed_ms,
@@ -323,6 +327,9 @@ pub async fn boot(kernel: &Kernel) -> Result<BootReport> {
             }
             Err(error) => {
                 tracing::warn!(module = name, %error, "module startup failed");
+                // Same reason as the reconciler's failure path: a
+                // half-started module must not read as running (M0).
+                kernel.signal_module_stop(name);
                 kernel.mark_failed(desc.kind, name, &error, "startup").await?;
                 LifecycleState::Failed {
                     error,

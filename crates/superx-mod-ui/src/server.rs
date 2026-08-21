@@ -17,6 +17,7 @@ use superx_kernel::{Kernel, KernelError, NodeKind, Result};
 use tokio::sync::broadcast;
 
 use crate::api::*;
+use crate::MODULE_NAME;
 
 /// The built dashboard (Vite output). Debug builds read from disk
 /// (iterate with `npm run build` without recompiling Rust); release
@@ -67,22 +68,42 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| KernelError::Module(format!("ui cannot bind {addr}: {e}")))?;
+    // Stop means stop (M0): the kernel cancels this token on
+    // `modules disable`/`restart`, axum closes the listener and the
+    // port is free for the next start.
+    let stop = kernel.module_token(MODULE_NAME);
+    let poller_stop = stop.clone();
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        let served = axum::serve(listener, app)
+            .with_graceful_shutdown(stop.cancelled())
+            .await;
+        if let Err(e) = served {
             tracing::error!(target: "ui", error = %e, "ui server exited");
+        } else {
+            tracing::info!(target: "ui", "ui server closed");
         }
     });
-    tokio::spawn(sse_poller(kernel, events));
+    tokio::spawn(sse_poller(kernel, events, poller_stop));
     Ok(())
 }
 
 /// ONE poller for all SSE clients: bridges the kernel's live
 /// primitives into the broadcast channel; idles when nobody listens.
-async fn sse_poller(kernel: Kernel, tx: broadcast::Sender<String>) {
+async fn sse_poller(
+    kernel: Kernel,
+    tx: broadcast::Sender<String>,
+    stop: superx_kernel::supervise::CancelToken,
+) {
     let mut after = chrono::Utc::now();
     loop {
         let poll = superx_ops::live_poll_secs(&kernel).await;
         tokio::time::sleep(Duration::from_secs(poll)).await;
+        // A stopped module leaves no tasks behind (M0): the poll
+        // boundary is the natural place to notice.
+        if stop.is_cancelled() {
+            tracing::info!(target: "ui", "sse poller stopped");
+            return;
+        }
         if tx.receiver_count() == 0 {
             after = chrono::Utc::now(); // nobody watching — skip ahead
             continue;

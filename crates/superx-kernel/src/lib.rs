@@ -50,6 +50,7 @@ pub mod provision;
 pub mod registry;
 pub mod schema;
 pub mod substrate;
+pub mod supervise;
 pub mod telemetry;
 
 /// Substrate value/record types, re-exported for modules and adapters.

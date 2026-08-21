@@ -160,6 +160,9 @@ pub enum ModulesAction {
     /// Provision a module's OWN database (its schema + service
     /// account) — operator one-shot per module.
     Provision { name: String },
+    /// Restart a module in place: shutdown() then startup(), inside
+    /// one capture tick. The OS keeps running.
+    Restart { name: String },
 }
 
 /// Connect + signin with an actionable hint on auth refusal. The
@@ -237,6 +240,10 @@ pub async fn run_boot(kernel: &Kernel) -> Result<(), String> {
     let capture = tokio::spawn(async move {
         superx_kernel::capture::run_loop(&loop_kernel, rx).await
     });
+    // Module lifecycle converges HERE (M0). `superx modules disable`
+    // runs in a different process and cannot reach into this one's
+    // memory — it writes the substrate, and this is what notices.
+    superx_kernel::supervise::spawn_reconciler(kernel.clone(), tx.subscribe());
     emit("capture loop running — ctrl-c to shut down\n");
 
     tokio::signal::ctrl_c()
@@ -246,6 +253,10 @@ pub async fn run_boot(kernel: &Kernel) -> Result<(), String> {
     if tx.send(true).is_err() {
         tracing::warn!("capture loop already gone at shutdown signal");
     }
+    // Modules get their stop notice and their shutdown() call before
+    // the process exits — servers close their listeners, buffers
+    // flush. Previously they were simply torn down mid-flight.
+    superx_kernel::supervise::shutdown_all(kernel).await;
     match capture.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),

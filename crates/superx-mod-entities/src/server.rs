@@ -14,6 +14,7 @@ use superx_kernel::types::Value;
 use superx_kernel::{Kernel, KernelError, NodeKind, Result};
 
 use crate::api;
+use crate::MODULE_NAME;
 
 /// The built entities dashboard (Vite output). Debug builds read from
 /// disk (iterate with `npm run build` without recompiling Rust);
@@ -34,6 +35,11 @@ struct AppState {
 /// [`KernelError::Module`] when the port cannot be bound.
 pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
     let upload_limit = crate::resolved_upload_limit(&kernel).await;
+    // Stop means stop: on `modules disable`/`restart` the kernel
+    // cancels this token and axum closes the listener, releasing the
+    // port. Without it the socket stayed bound after shutdown() and a
+    // re-enable could not bind (M0).
+    let stop = kernel.module_token(MODULE_NAME);
     let app = Router::new()
         .route("/api/ping", get(api_ping))
         .route("/api/types", get(api_types).post(api_types_add))
@@ -64,8 +70,13 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .await
         .map_err(|e| KernelError::Module(format!("entities ui cannot bind {addr}: {e}")))?;
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        let served = axum::serve(listener, app)
+            .with_graceful_shutdown(stop.cancelled())
+            .await;
+        if let Err(e) = served {
             tracing::error!(target: "entities", error = %e, "entities ui server exited");
+        } else {
+            tracing::info!(target: "entities", "entities ui server closed");
         }
     });
     Ok(())
