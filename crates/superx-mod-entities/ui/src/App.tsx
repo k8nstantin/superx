@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Anchor, AppShell, Group, NavLink, Text } from '@mantine/core'
+import { Anchor, AppShell, Box, Group, NavLink, Text } from '@mantine/core'
 import { fetchPing } from './api'
 import EntitiesPage from './pages/Entities'
 import TypesPage from './pages/Types'
 import GraphFull, { graphRouteId } from './pages/GraphFull'
+import { BreadcrumbProvider, BreadcrumbTrail } from './Breadcrumbs'
 
 // The entities module's OWN dashboard (epic #216, approved design):
 // logo + wordmark, back link to the core dashboard (discovered from
@@ -28,6 +29,14 @@ function useRoute(): string {
 }
 
 export default function App() {
+  return (
+    <BreadcrumbProvider>
+      <Shell />
+    </BreadcrumbProvider>
+  )
+}
+
+function Shell() {
   const [page, setPage] = useState<Page>('Entities')
   const ping = useQuery({ queryKey: ['ping'], queryFn: fetchPing })
   const graphId = graphRouteId(useRoute())
@@ -35,8 +44,8 @@ export default function App() {
   return (
     <AppShell header={{ height: 52 }} navbar={{ width: 180, breakpoint: 'xs' }} padding="md">
       <AppShell.Header>
-        <Group h="100%" px="md" justify="space-between">
-          <Group gap={10}>
+        <Group h="100%" px="md" gap="lg" wrap="nowrap">
+          <Group gap={10} wrap="nowrap">
             <img src="/logo.svg" alt="" width={26} height={26} style={{ borderRadius: 6 }} />
             <Text
               component="span"
@@ -47,12 +56,16 @@ export default function App() {
             >
               superx
             </Text>
-            <Text c="dimmed" fz={15}>
+            <Text c="dimmed" fz={15} style={{ whiteSpace: 'nowrap' }}>
               · entities{ping.data ? ` · v${ping.data.version}` : ''}
             </Text>
           </Group>
+          {/* Where you are in the graph, not just which page (#253). */}
+          <Box style={{ flex: 1, minWidth: 0 }}>
+            <BreadcrumbTrail onHome={() => setPage('Entities')} />
+          </Box>
           {ping.data?.core_url && (
-            <Anchor href={ping.data.core_url} size="sm">
+            <Anchor href={ping.data.core_url} size="sm" style={{ whiteSpace: 'nowrap' }}>
               ← core dashboard
             </Anchor>
           )}

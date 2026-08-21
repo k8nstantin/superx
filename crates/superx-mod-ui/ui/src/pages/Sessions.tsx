@@ -8,9 +8,15 @@ import { Feed, MAX_FEED_ROWS, matchesSearch, mergeFeed } from '../Feed'
 import { useFeedHistory } from '../useFeedHistory'
 import type { SseEvent } from '../generated/SseEvent'
 import type { SessionView } from '../generated/SessionView'
+import { useBreadcrumb } from '../Breadcrumbs'
 
 export default function SessionsPage() {
   const [selected, setSelected] = useState<SessionView | null>(null)
+  useBreadcrumb(
+    selected
+      ? [{ label: 'Sessions', onClick: () => setSelected(null) }, { label: selected.identity }]
+      : [{ label: 'Sessions' }],
+  )
   return selected ? (
     <SessionFeed session={selected} onBack={() => setSelected(null)} />
   ) : (

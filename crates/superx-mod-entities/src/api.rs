@@ -19,6 +19,11 @@ use ts_rs::TS;
 
 use crate::{documents, edges, graph, nodes, registry, texts};
 
+/// Depth ceiling for the breadcrumb walk (#253): deep enough for any
+/// real product hierarchy, shallow enough that a pathological graph
+/// cannot stall a detail render.
+const ANCESTOR_MAX_DEPTH: usize = 12; // skill-allow: §9-const — render-layer bound, not a policy tunable
+
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct TypeView {
@@ -58,6 +63,18 @@ pub struct EdgeView {
     pub outbound: bool,
 }
 
+/// One step of the ancestor path (issue #253) — the breadcrumb the
+/// dashboards render above an entity. Root first.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct AncestorView {
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+    /// The edge linking this step to the one below it.
+    pub rel_type: String,
+}
+
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct EntityDetail {
@@ -78,6 +95,8 @@ pub struct EntityDetail {
     /// Files attached to this entity (EU4) — the `attached` edges,
     /// resolved to their document nodes' metadata.
     pub attachments: Vec<AttachmentView>,
+    /// The ancestor path, ROOT FIRST, excluding this entity (#253).
+    pub ancestors: Vec<AncestorView>,
 }
 
 /// One attached file. `size` is bytes as recorded at attach time; the
@@ -307,6 +326,16 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
         .collect();
 
     let attachments = attachments_of(db, &edges).await?;
+    let ancestors = graph::ancestors(db, &id, ANCESTOR_MAX_DEPTH)
+        .await?
+        .into_iter()
+        .map(|a| AncestorView {
+            id: record_uuid(&a.id),
+            name: a.name,
+            entity_type: a.entity_type,
+            rel_type: a.rel_type,
+        })
+        .collect();
 
     Ok(EntityDetail {
         id: record_uuid(&id),
@@ -318,6 +347,7 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
         annotations,
         edges,
         attachments,
+        ancestors,
     })
 }
 

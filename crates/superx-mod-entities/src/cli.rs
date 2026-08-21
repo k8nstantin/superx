@@ -11,6 +11,8 @@ use crate::{documents, edges, graph, nodes, registry, texts, MODULE_NAME};
 /// Traversal depth ceiling parameter on the module's registry entity.
 pub const MAX_DEPTH_PARAM: &str = "attr_entities_max_depth";
 const DEFAULT_MAX_DEPTH: usize = 5; // skill-allow: §9-const — bootstrap fallback, param-overridable (attr_entities_max_depth)
+/// Depth ceiling for the breadcrumb walk (#253).
+const ANCESTOR_MAX_DEPTH: usize = 12; // skill-allow: §9-const — render-layer bound, not a policy tunable
 
 const USAGE: &str = "usage: superx entities <command>\n\
   create --type <type> [--describe <text>] [--content <text>] [--attrs <json>] <name…>\n\
@@ -159,6 +161,16 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         "entity {} · type {entity_type} · created {created_at}\n",
         record_uuid(&anchor)
     );
+    // The breadcrumb trail, CLI edition (#253) — same walk the
+    // dashboards render.
+    let trail = graph::ancestors(&db, &anchor, ANCESTOR_MAX_DEPTH).await?;
+    if !trail.is_empty() {
+        let names: Vec<String> = trail
+            .iter()
+            .map(|a| format!("{} ({})", a.name, a.entity_type))
+            .collect();
+        out.push_str(&format!("path: {} › this\n", names.join(" › ")));
+    }
     if history {
         let versions = nodes::state_history(&db, &anchor).await?;
         out.push_str(&format!("history ({} versions, oldest first):\n", versions.len()));

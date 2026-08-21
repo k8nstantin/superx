@@ -37,6 +37,7 @@ import {
 } from '../api'
 import { MarkdownEditor, MarkdownView, type MarkdownEditorHandle } from '../Markdown'
 import type { EntityDetail } from '../generated/EntityDetail'
+import { useBreadcrumb } from '../Breadcrumbs'
 
 // The Entities page (issue #231, approved design): list with a type
 // DROPDOWN + search + New entity; click a row → the entity's detail
@@ -69,6 +70,7 @@ function TypeBadge({ type, outline }: { type: string; outline?: boolean }) {
 }
 
 function ListView({ onOpen }: { onOpen: (frag: string) => void }) {
+  useBreadcrumb([{ label: 'Entities' }])
   const [typeFilter, setTypeFilter] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
@@ -264,6 +266,13 @@ function DetailView({
     void qc.invalidateQueries({ queryKey: ['entities'] })
   }
   const d = detail.data
+  // The ancestor path from the server (#253) — root first, each step
+  // clickable, this entity last.
+  useBreadcrumb([
+    { label: 'Entities', onClick: onBack },
+    ...(d?.ancestors ?? []).map((a) => ({ label: a.name || a.id.slice(0, 8), onClick: () => onOpen(a.id) })),
+    ...(d ? [{ label: d.name }] : []),
+  ])
   const description = d?.annotations.find((a) => a.rel_type === 'describes')
   const instructions = d?.annotations.find((a) => a.rel_type === 'instructs')
   const comments = (d?.annotations ?? []).filter((a) => a.rel_type === 'comments')

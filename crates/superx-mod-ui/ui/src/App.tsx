@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { AppShell, NavLink, Title, Text, Group } from '@mantine/core'
+import { AppShell, Box, NavLink, Title, Text, Group } from '@mantine/core'
 import { fetchStatus } from './api'
+import { BreadcrumbProvider, BreadcrumbTrail } from './Breadcrumbs'
 import StatusPage from './pages/Status'
 import ActivityPage from './pages/Activity'
 import SessionsPage from './pages/Sessions'
@@ -11,6 +12,14 @@ const PAGES = ['Status', 'Activity', 'Sessions', 'Console'] as const
 type Page = (typeof PAGES)[number]
 
 export default function App() {
+  return (
+    <BreadcrumbProvider>
+      <Shell />
+    </BreadcrumbProvider>
+  )
+}
+
+function Shell() {
   const [page, setPage] = useState<Page>('Status')
   // Module UIs are discovered from the substrate (epic #216, D-UI2):
   // any module publishing attr_module_ui_url gets a nav button here,
@@ -20,12 +29,16 @@ export default function App() {
   return (
     <AppShell header={{ height: 52 }} navbar={{ width: 180, breakpoint: 'xs' }} padding="md">
       <AppShell.Header>
-        <Group h="100%" px="md" justify="space-between">
-          <Group gap={10}>
+        <Group h="100%" px="md" gap="lg" wrap="nowrap">
+          <Group gap={10} wrap="nowrap">
             <img src="/logo.svg" alt="" width={26} height={26} style={{ borderRadius: 6 }} />
             <Title order={3}>SuperX</Title>
           </Group>
-          <Text size="sm" c="dimmed">
+          {/* The header's dead middle now says where you are (#253). */}
+          <Box style={{ flex: 1, minWidth: 0 }}>
+            <BreadcrumbTrail onHome={() => setPage('Status')} />
+          </Box>
+          <Text size="sm" c="dimmed" visibleFrom="sm" style={{ whiteSpace: 'nowrap' }}>
             the agentic OS
           </Text>
         </Group>
