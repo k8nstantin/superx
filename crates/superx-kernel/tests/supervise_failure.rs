@@ -68,10 +68,22 @@ async fn a_failed_start_backs_off_before_trying_again() -> R {
         "a failed startup must not read as running, or nothing would ever retry it"
     );
 
+    // Pin the backoff rather than relying on the default being longer
+    // than this loop takes: on a slow machine twelve passes can exceed
+    // a second, and the retry that follows is CORRECT behaviour being
+    // read as a failure. The property under test is "a pending backoff
+    // blocks a retry", so the backoff must be unambiguous.
+    let knobs = kernel
+        .find_module_by_name(NodeKind::KernelModule, "kernel")
+        .await?
+        .expect("the kernel's own entity");
+    kernel
+        .set_parameter(knobs, BACKOFF_BASE_PARAM, Value::Number(3_600_000.into()))
+        .await?;
+
     reconcile_once(&kernel).await;
     assert_eq!(kernel.module_failure_count(BROKEN), 1, "one attempt recorded");
 
-    // The default backoff is a second; these passes take microseconds.
     for _ in 0..12 {
         reconcile_once(&kernel).await;
     }
