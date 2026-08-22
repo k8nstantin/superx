@@ -15,7 +15,7 @@ mod common;
 use std::time::Duration;
 
 use superx_kernel::supervise::{reconcile_once, request_restart, shutdown_all, RESTART_PARAM};
-use superx_kernel::{ModuleStatus, NodeKind};
+use superx_kernel::{LifecycleState, ModuleStatus, NodeKind};
 
 use common::fresh_kernel;
 
@@ -164,4 +164,85 @@ async fn an_unknown_module_cannot_be_restarted() -> R {
         .expect_err("an unknown module is refused, never silently accepted");
     assert!(err.to_string().contains("no-such-module"), "the error names it: {err}");
     Ok(())
+}
+
+/// Review finding #2: with the port gone, `modules list` was still
+/// reporting `active`. A registry that lies about what is running is
+/// worse than one that says nothing.
+#[tokio::test]
+async fn disable_records_the_lifecycle_state_too() -> R {
+    let kernel = fresh_kernel().await?;
+    superx_kernel::boot(&kernel).await?;
+    assert!(matches!(
+        lifecycle_of(&kernel, MODULE).await?,
+        LifecycleState::Active { .. }
+    ));
+
+    kernel
+        .set_module_status(NodeKind::KernelModule, MODULE, ModuleStatus::Disabled)
+        .await?;
+    reconcile_once(&kernel).await;
+
+    assert_eq!(
+        lifecycle_of(&kernel, MODULE).await?,
+        LifecycleState::Disabled,
+        "the substrate says what is true: stopped, not active"
+    );
+
+    kernel
+        .set_module_status(NodeKind::KernelModule, MODULE, ModuleStatus::Enabled)
+        .await?;
+    reconcile_once(&kernel).await;
+    assert!(
+        matches!(
+            lifecycle_of(&kernel, MODULE).await?,
+            LifecycleState::Active { .. }
+        ),
+        "and active again once it is"
+    );
+    Ok(())
+}
+
+/// Review finding #5: a restart stamped in the future used to satisfy
+/// "newer than the start" on every single pass — an endless restart
+/// loop from one bad value or a clock skew. It must wait for its time.
+#[tokio::test]
+async fn a_future_dated_restart_waits_instead_of_looping() -> R {
+    let kernel = fresh_kernel().await?;
+    superx_kernel::boot(&kernel).await?;
+    let started = kernel.module_started_at(MODULE).expect("running");
+    let entity = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE)
+        .await?
+        .expect("registered");
+    kernel
+        .set_parameter(
+            entity,
+            RESTART_PARAM,
+            superx_kernel::types::Value::String(
+                (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            ),
+        )
+        .await?;
+
+    for _ in 0..5 {
+        reconcile_once(&kernel).await;
+    }
+    assert_eq!(
+        kernel.module_started_at(MODULE),
+        Some(started),
+        "a request dated in the future does not fire, and does not fire repeatedly"
+    );
+    Ok(())
+}
+
+async fn lifecycle_of(
+    kernel: &superx_kernel::Kernel,
+    name: &str,
+) -> Result<LifecycleState, Box<dyn std::error::Error>> {
+    Ok(kernel
+        .detailed_status(NodeKind::KernelModule, name)
+        .await?
+        .expect("registered")
+        .lifecycle)
 }
