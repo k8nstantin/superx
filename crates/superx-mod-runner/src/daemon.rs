@@ -3,8 +3,6 @@
 //! spawned once at startup, honors live disable per tick, and picks
 //! up mid-life provisioning (each tick re-tries `module_db`).
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use chrono::Utc;
 use superx_kernel::capture::module_enabled;
 use superx_kernel::{Kernel, NodeKind};
@@ -23,22 +21,30 @@ const DEFAULT_MAX_PARALLEL: usize = 2; // skill-allow: §9-const — bootstrap f
 pub const TICK_PARAM: &str = "attr_runner_tick_secs";
 const DEFAULT_TICK_SECS: u64 = 5; // skill-allow: §9-const — bootstrap fallback, param-overridable (attr_runner_tick_secs)
 
-static LOOP_STARTED: AtomicBool = AtomicBool::new(false);
-
-/// Spawn the loop exactly once per process (startup re-runs on live
-/// enable; the guard keeps it single).
+/// Spawn the scheduler loop.
+///
+/// The kernel owns single-start (M0): it only calls `startup()` for a
+/// module it is not already running. A process-lifetime `AtomicBool`
+/// used to guard this, which was correct while nothing could ever
+/// stop a module — and fatal the moment one can, because a latched
+/// static means the loop never comes back after a restart.
 pub fn spawn_once(kernel: Kernel) {
-    if LOOP_STARTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    tokio::spawn(run_loop(kernel));
+    let stop = kernel.module_token(MODULE_NAME);
+    tokio::spawn(run_loop(kernel, stop));
 }
 
-async fn run_loop(kernel: Kernel) {
+async fn run_loop(kernel: Kernel, stop: superx_kernel::supervise::CancelToken) {
     tracing::info!(target: "runner", "scheduler loop up");
     loop {
         let tick = resolved_u64(&kernel, TICK_PARAM, DEFAULT_TICK_SECS).await;
         tokio::time::sleep(std::time::Duration::from_secs(tick.max(1))).await;
+
+        // Stopped means gone, not idling: the tick boundary is where a
+        // firing-free moment exists to leave on.
+        if stop.is_cancelled() {
+            tracing::info!(target: "runner", "scheduler loop stopped");
+            return;
+        }
 
         match module_enabled(&kernel, NodeKind::KernelModule, MODULE_NAME).await {
             Ok(true) => {}

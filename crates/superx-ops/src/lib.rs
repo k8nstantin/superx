@@ -164,6 +164,26 @@ pub async fn run_modules_set(
     ))
 }
 
+/// `superx modules restart <name>`: ask the running OS to cycle a
+/// module. Stamps the module's entity; the daemon's reconciler does
+/// the work on its next tick (nothing here can reach into the
+/// daemon's memory — it is a different process).
+///
+/// # Errors
+///
+/// The module's own error text when it is not registered, or a
+/// substrate refusal.
+pub async fn run_modules_restart(kernel: &Kernel, name: &str) -> Result<String, String> {
+    let desc = resolve_module(kernel, name).await?;
+    superx_kernel::supervise::request_restart(kernel, desc.kind, desc.name)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{} restart requested — the running OS cycles it within one reconcile tick\n",
+        desc.name
+    ))
+}
+
 /// A module's own CLI: route `superx <module-name> [args…]` to the
 /// module's `cli()` hook.
 pub async fn run_module_cli(

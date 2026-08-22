@@ -156,6 +156,9 @@ async fn run(cli: Cli, config: Config) -> Result<(), String> {
                 superx::ModulesAction::Provision { name } => {
                     superx::run_modules_provision(&config, &kernel, &name).await?
                 }
+                superx::ModulesAction::Restart { name } => {
+                    superx::run_modules_restart(&kernel, &name).await?
+                }
             };
             superx::emit(&text);
             Ok(())

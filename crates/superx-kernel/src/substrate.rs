@@ -51,6 +51,11 @@ pub struct Kernel {
     /// The instance home (`<home>/…` layout) when known — anchors
     /// module dirs. Set by the CLI via [`Kernel::with_home`].
     home: Option<std::path::PathBuf>,
+    /// Modules running in THIS process: their stop signals and start
+    /// instants (M0). Behind an `Arc` because `Kernel` is cloned into
+    /// every background task, and a clone that could not see the
+    /// running set would hand out tokens nobody cancels.
+    pub(crate) runtime: crate::supervise::RuntimeTable,
 }
 
 impl Kernel {
@@ -126,6 +131,7 @@ impl Kernel {
             endpoint: Some(endpoint.to_string()),
             service_password: Some(retained_password),
             home: None,
+            runtime: crate::supervise::RuntimeTable::default(),
         })
     }
 
@@ -142,6 +148,7 @@ impl Kernel {
             endpoint: None,
             service_password: None,
             home: None,
+            runtime: crate::supervise::RuntimeTable::default(),
         }
     }
 
