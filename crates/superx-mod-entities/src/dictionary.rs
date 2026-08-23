@@ -145,6 +145,20 @@ const SEEDED: &[Seed] = &[
         agent_note: Some("Yours to refine. Record what you learn so the next run starts ahead."),
     },
     Seed {
+        key: "instructions",
+        kind: SLOT,
+        display: "Instructions",
+        semantics: "directive",
+        value_kind: Some("markdown"),
+        cardinality: Some("one"),
+        writable_by: Some("any"),
+        description: "the assignment — what to actually do",
+        agent_note: Some(
+            "Do this. You may complete it, and you may refuse it and say why — \
+             what you may never do is quietly do something else.",
+        ),
+    },
+    Seed {
         key: "comments",
         kind: SLOT,
         display: "Comments",

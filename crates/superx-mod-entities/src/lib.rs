@@ -17,6 +17,7 @@ pub mod documents;
 pub mod edges;
 pub mod graph;
 pub mod nodes;
+pub mod notes;
 pub mod registry;
 mod server;
 pub mod texts;
