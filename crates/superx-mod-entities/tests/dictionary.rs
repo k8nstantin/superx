@@ -202,3 +202,112 @@ async fn the_listing_hides_archived_labels_by_default() {
         "both kinds of label are one vocabulary"
     );
 }
+
+/// Redefining a label must not silently strip what the redefinition did
+/// not mention. `mandate` is operator-writable precisely so a role
+/// cannot rewrite away its own constraints — editing its wording must
+/// not hand that power back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redefining_preserves_what_it_does_not_mention() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("seed");
+
+    dictionary::define(
+        &db,
+        "mandate",
+        SLOT,
+        "Mandate",
+        "binding",
+        Some("reworded, same meaning"),
+    )
+    .await
+    .expect("redefine");
+
+    let now = dictionary::current(&db, "mandate", SLOT)
+        .await
+        .expect("read")
+        .expect("still defined");
+    assert_eq!(now.description.as_deref(), Some("reworded, same meaning"));
+    assert_eq!(
+        now.writable_by.as_deref(),
+        Some("operator"),
+        "a reworded mandate is still not the role's to edit"
+    );
+    assert_eq!(now.cardinality.as_deref(), Some("one"), "shape survives");
+    assert!(
+        now.agent_note.is_some(),
+        "the note telling the agent it cannot change this must survive"
+    );
+}
+
+/// The dictionary only grows, so a superseded term must be hideable or
+/// the vocabulary in use gets buried in the vocabulary that used to be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archiving_hides_a_label_and_restoring_brings_it_back() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("seed");
+
+    dictionary::archive(&db, "spec", SLOT, true)
+        .await
+        .expect("archive");
+
+    let visible = dictionary::list(&db, false).await.expect("list");
+    assert!(
+        !visible.iter().any(|l| l.key == "spec"),
+        "an archived label is out of the way"
+    );
+    let all = dictionary::list(&db, true).await.expect("list all");
+    assert!(
+        all.iter().any(|l| l.key == "spec" && l.archived),
+        "still there, still readable — nothing is ever deleted"
+    );
+    assert_eq!(
+        dictionary::current(&db, "spec", SLOT)
+            .await
+            .expect("read")
+            .expect("defined")
+            .description
+            .as_deref(),
+        Some("the contract the work is built against and judged by"),
+        "archiving hides a definition; it does not erase one"
+    );
+
+    dictionary::archive(&db, "spec", SLOT, false)
+        .await
+        .expect("restore");
+    assert!(dictionary::list(&db, false)
+        .await
+        .expect("list")
+        .iter()
+        .any(|l| l.key == "spec"));
+
+    dictionary::archive(&db, "nonexistent", SLOT, true)
+        .await
+        .expect_err("archiving a term the dictionary does not define is a mistake, not a no-op");
+}
+
+/// The whole point of versioning a label is being able to read what it
+/// used to mean — every entity written under the old meaning was
+/// written under the old meaning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_reads_every_version_oldest_first() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("seed");
+
+    dictionary::define(&db, "spec", SLOT, "Spec", "binding", Some("now binding"))
+        .await
+        .expect("redefine");
+
+    let versions = dictionary::history(&db, "spec", SLOT).await.expect("history");
+    assert_eq!(versions.len(), 2, "the seeded one and the redefinition");
+    assert_eq!(versions[0].semantics, "context", "oldest first");
+    assert_eq!(versions[1].semantics, "binding");
+    assert!(
+        versions[0].valid_from <= versions[1].valid_from,
+        "a version chain you cannot date is not reviewable"
+    );
+    assert!(
+        versions.iter().all(|v| v.valid_from.is_some()),
+        "every version is dated"
+    );
+}

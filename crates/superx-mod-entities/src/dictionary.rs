@@ -73,6 +73,10 @@ pub struct LabelRow {
     pub cardinality: Option<String>,
     pub writable_by: Option<String>,
     pub archived: bool,
+    /// When this version was written. The chain is ordered by
+    /// `(valid_from, id)` — the uuid7 row id breaks ties, so "latest
+    /// wins" never means "whichever writer's clock ran fast".
+    pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A seeded label: the vocabulary SuperX ships with.
@@ -252,18 +256,82 @@ async fn append(db: &Db, mut row: Object) -> Result<()> {
 ///
 /// [`KernelError::Db`] for engine errors.
 pub async fn current(db: &Db, key: &str, kind: &str) -> Result<Option<LabelRow>> {
+    Ok(current_object(db, key, kind).await?.as_ref().and_then(parse_obj))
+}
+
+/// The head of a label's chain as stored — every column, including the
+/// ones [`LabelRow`] does not surface. This is what a redefinition
+/// carries forward, so a field nobody mentioned is never dropped.
+async fn current_object(db: &Db, key: &str, kind: &str) -> Result<Option<Object>> {
     let mut resp = db
         .query(
-            "SELECT key, label_kind, display, semantics, description, agent_note, \
-             value_kind, cardinality, writable_by, archived, valid_from \
-             FROM label WHERE key = $key AND label_kind = $kind \
-             ORDER BY valid_from DESC LIMIT 1",
+            "SELECT * FROM label WHERE key = $key AND label_kind = $kind \
+             ORDER BY valid_from DESC, id DESC LIMIT 1",
         )
         .bind(("key", key.to_string()))
         .bind(("kind", kind.to_string()))
         .await?;
     let rows: Vec<Value> = resp.take(0)?;
-    Ok(rows.first().and_then(parse))
+    Ok(rows.into_iter().next().and_then(|v| match v {
+        Value::Object(o) => Some(o),
+        _ => None,
+    }))
+}
+
+/// Every version of one label, oldest first. Nothing is ever deleted,
+/// so this is the whole history of what the term has meant — and the
+/// reason a redefinition is reviewable rather than a silent edit.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn history(db: &Db, key: &str, kind: &str) -> Result<Vec<LabelRow>> {
+    let mut resp = db
+        .query(
+            "SELECT * FROM label WHERE key = $key AND label_kind = $kind \
+             ORDER BY valid_from ASC, id ASC",
+        )
+        .bind(("key", key.to_string()))
+        .bind(("kind", kind.to_string()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    Ok(rows.iter().filter_map(parse).collect())
+}
+
+/// Hide a superseded label, or bring one back. Nothing is ever deleted,
+/// so without this the dictionary only grows and eventually buries the
+/// vocabulary actually in use. Archiving APPENDS, like every other
+/// change — the label's history is intact and it stays readable to
+/// anything that referenced it.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] if the dictionary does not define the label;
+/// [`KernelError::Db`] for engine errors.
+pub async fn archive(db: &Db, key: &str, kind: &str, archived: bool) -> Result<()> {
+    let Some(mut row) = carry_forward(db, key, kind).await? else {
+        return Err(KernelError::Module(format!(
+            "the dictionary has no {kind} label '{key}'"
+        )));
+    };
+    row.insert("archived".to_string(), Value::Bool(archived));
+    append(db, row).await?;
+    let verb = if archived { "archived" } else { "restored" };
+    bump(db, &format!("{verb} {kind} label '{key}'")).await?;
+    Ok(())
+}
+
+/// The current definition, stripped of what belongs to the ROW rather
+/// than to the definition, ready to be amended and appended.
+async fn carry_forward(db: &Db, key: &str, kind: &str) -> Result<Option<Object>> {
+    let Some(mut prior) = current_object(db, key, kind).await? else {
+        return Ok(None);
+    };
+    // The new version is a new row: it gets its own id and its own
+    // timestamp. Carrying these would either collide or backdate it.
+    prior.remove("id");
+    prior.remove("valid_from");
+    Ok(Some(prior))
 }
 
 /// The whole dictionary, current definitions only, archived ones
@@ -275,9 +343,7 @@ pub async fn current(db: &Db, key: &str, kind: &str) -> Result<Option<LabelRow>>
 pub async fn list(db: &Db, include_archived: bool) -> Result<Vec<LabelRow>> {
     let mut resp = db
         .query(
-            "SELECT key, label_kind, display, semantics, description, agent_note, \
-             value_kind, cardinality, writable_by, archived, valid_from \
-             FROM label ORDER BY valid_from ASC",
+            "SELECT * FROM label ORDER BY valid_from ASC, id ASC",
         )
         .await?;
     let rows: Vec<Value> = resp.take(0)?;
@@ -305,7 +371,7 @@ pub async fn list(db: &Db, include_archived: bool) -> Result<Vec<LabelRow>> {
 /// [`KernelError::Db`] for engine errors.
 pub async fn revision(db: &Db) -> Result<i64> {
     let mut resp = db
-        .query("SELECT revision, valid_from FROM dictionary ORDER BY valid_from DESC LIMIT 1")
+        .query("SELECT id, revision, valid_from FROM dictionary ORDER BY valid_from DESC, id DESC LIMIT 1")
         .await?;
     let rows: Vec<Value> = resp.take(0)?;
     Ok(rows.first().and_then(int_field).unwrap_or(0))
@@ -370,7 +436,13 @@ pub async fn define(
             allowed.join(", ")
         )));
     }
-    let mut row = Object::new();
+    // A redefinition changes what it names and PRESERVES what it does
+    // not. Building a fresh row here would silently drop every field the
+    // caller left unmentioned — rewording `mandate` would strip
+    // `writable_by: operator` and hand a role the power to edit its own
+    // constraints, which is precisely the property the label exists to
+    // hold.
+    let mut row = carry_forward(db, key, kind).await?.unwrap_or_default();
     row.insert("key".to_string(), Value::String(key.to_string()));
     row.insert("label_kind".to_string(), Value::String(kind.to_string()));
     row.insert("display".to_string(), Value::String(display.to_string()));
@@ -378,7 +450,11 @@ pub async fn define(
     if let Some(d) = description {
         row.insert("description".to_string(), Value::String(d.to_string()));
     }
-    row.insert("archived".to_string(), Value::Bool(false));
+    // Archiving is its own act; redefining an archived label does not
+    // quietly bring it back.
+    if !row.contains_key("archived") {
+        row.insert("archived".to_string(), Value::Bool(false));
+    }
     append(db, row).await?;
     bump(db, &format!("defined {kind} label '{key}'")).await?;
     Ok(())
@@ -386,6 +462,10 @@ pub async fn define(
 
 fn parse(row: &Value) -> Option<LabelRow> {
     let Value::Object(o) = row else { return None };
+    parse_obj(o)
+}
+
+fn parse_obj(o: &Object) -> Option<LabelRow> {
     Some(LabelRow {
         key: str_field(o, "key")?,
         label_kind: str_field(o, "label_kind")?,
@@ -397,6 +477,10 @@ fn parse(row: &Value) -> Option<LabelRow> {
         cardinality: str_field(o, "cardinality"),
         writable_by: str_field(o, "writable_by"),
         archived: matches!(o.get("archived"), Some(Value::Bool(true))),
+        valid_from: match o.get("valid_from") {
+            Some(Value::Datetime(d)) => Some(**d),
+            _ => None,
+        },
     })
 }
 

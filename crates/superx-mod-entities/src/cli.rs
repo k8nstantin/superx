@@ -32,6 +32,8 @@ const USAGE: &str = "usage: superx entities <command>\n\
   types add <name> --category entity|relation [--description <text>]\n\
   labels [--all]                       the dictionary: what the terminology means\n\
   labels define <key> --kind slot|link --semantics <s> [--display <d>] [--description <text>]\n\
+  labels history <key> --kind slot|link      every version of one label, oldest first\n\
+  labels archive <key> --kind slot|link [--restore]\n\
   url                                  where this module's own UI lives\n\
 each write emits telemetry into the kernel firehose";
 
@@ -82,6 +84,48 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         let revision = crate::dictionary::revision(&db).await?;
         return Ok(format!(
             "defined {kind} label '{key}' ({semantics}) — dictionary revision {revision}\n"
+        ));
+    }
+
+    if args.first().map(String::as_str) == Some("history") {
+        let key = args.get(1).ok_or_else(usage)?;
+        let kind = flag(args, "--kind").ok_or_else(usage)?;
+        let versions = crate::dictionary::history(&db, key, &kind).await?;
+        if versions.is_empty() {
+            return Err(KernelError::Module(format!(
+                "the dictionary has no {kind} label '{key}'"
+            )));
+        }
+        let mut out = format!("{kind} label '{key}' — {} version(s)\n", versions.len());
+        for (n, v) in versions.iter().enumerate() {
+            let when = v
+                .valid_from
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let archived = if v.archived { "  [archived]" } else { "" };
+            out.push_str(&format!(
+                "\n  v{}  {}  {}{}\n      {}\n",
+                n + 1,
+                when,
+                v.semantics,
+                archived,
+                v.description.as_deref().unwrap_or("")
+            ));
+        }
+        out.push_str("\nthe oldest version is what the entities written under it meant\n");
+        return Ok(out);
+    }
+
+    if args.first().map(String::as_str) == Some("archive") {
+        let key = args.get(1).ok_or_else(usage)?;
+        let kind = flag(args, "--kind").ok_or_else(usage)?;
+        let restore = args.iter().any(|a| a == "--restore");
+        crate::dictionary::archive(&db, key, &kind, !restore).await?;
+        let revision = crate::dictionary::revision(&db).await?;
+        let verb = if restore { "restored" } else { "archived" };
+        return Ok(format!(
+            "{verb} {kind} label '{key}' — dictionary revision {revision}\n\
+             nothing was deleted; every version is still readable via labels history\n"
         ));
     }
 
