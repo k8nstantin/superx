@@ -82,13 +82,7 @@ pub async fn write(
     body: &str,
     author: &Author,
 ) -> Result<(String, bool)> {
-    let defined = dictionary::current(db, label, SLOT).await?.ok_or_else(|| {
-        KernelError::Module(format!(
-            "the dictionary defines no slot label '{label}' — \
-             define it first (superx entities labels define), because a slot \
-             nobody defined is a slot nobody can interpret"
-        ))
-    })?;
+    let defined = require_label(db, label).await?;
 
     // "one" means one: amend the chain that exists rather than leaving
     // two live descriptions and no rule for which one counts.
@@ -320,4 +314,43 @@ fn str_field(o: &Object, key: &str) -> Option<String> {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// The dictionary entry for a slot label, or a refusal.
+///
+/// Two different situations look identical from a missing lookup, and
+/// conflating them is what makes this subtle:
+///
+/// * the dictionary was **never seeded** — the schema exists but startup
+///   has not run. `superx modules provision <m>` leaves exactly that
+///   window open, and module CLI verbs reach the database inside it, so
+///   this is a real state and not only a test artifact.
+/// * the label **genuinely does not exist**.
+///
+/// Seeding an EMPTY dictionary settles which one it is. An initialized
+/// dictionary is never touched, so writing prose can never move the
+/// revision that readers cache against — and because archiving appends
+/// rather than deletes, an archived label leaves the table non-empty and
+/// can never be resurrected by this path.
+async fn require_label(db: &Db, label: &str) -> Result<dictionary::LabelRow> {
+    if let Some(defined) = dictionary::current(db, label, SLOT).await? {
+        return Ok(defined);
+    }
+    if dictionary::revision(db).await? == 0 {
+        let seeded = dictionary::seed(db).await?;
+        tracing::info!(
+            target: "entities",
+            seeded,
+            label,
+            "dictionary was never seeded — shipped vocabulary applied before the first prose write"
+        );
+        if let Some(defined) = dictionary::current(db, label, SLOT).await? {
+            return Ok(defined);
+        }
+    }
+    Err(KernelError::Module(format!(
+        "the dictionary defines no slot label '{label}' — \
+         define it first (superx entities labels define), because a slot \
+         nobody defined is a slot nobody can interpret"
+    )))
 }

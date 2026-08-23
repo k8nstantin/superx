@@ -256,3 +256,54 @@ async fn every_prose_role_maps_to_a_label() {
     }
     texts::label_for_role("produced").expect_err("a role with no label is refused");
 }
+
+/// Provisioning applies the schema and tells the operator to restart to
+/// activate startup seeding — so "schema exists, dictionary does not" is
+/// a real state, and module CLI verbs reach the database inside it. A
+/// prose write there must work, not lecture the operator about defining
+/// `description`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_never_seeded_dictionary_is_seeded_before_the_first_prose_write() {
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("entities").await.expect("nsdb");
+    let ddl = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "test-password");
+    db.query(ddl).await.expect("ddl").check().expect("schema");
+    registry::seed_types(&db).await.expect("types");
+    // Deliberately NOT dictionary::seed — this is the provisioned-but-
+    // never-started instance.
+    assert_eq!(dictionary::revision(&db).await.expect("rev"), 0);
+
+    let product = create_entity(&db, "product", "Ledger", None, None).await.expect("create");
+    notes::write(&db, &product, "description", "it works", &Author::operator())
+        .await
+        .expect("a provisioned instance can be described");
+
+    assert!(dictionary::revision(&db).await.expect("rev") > 0, "seeded on the way past");
+    assert_eq!(
+        notes::for_entity(&db, &product, false).await.expect("read")[0].body,
+        "it works"
+    );
+}
+
+/// The other half of that judgment: an INITIALIZED dictionary is never
+/// touched by a prose write, so the revision readers cache against
+/// cannot move because somebody left a comment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seeded_dictionary_is_never_written_by_prose() {
+    let db = fresh_db().await;
+    let product = create_entity(&db, "product", "Ledger", None, None).await.expect("create");
+    let before = dictionary::revision(&db).await.expect("rev");
+
+    notes::write(&db, &product, "description", "fine", &Author::operator())
+        .await
+        .expect("write");
+    notes::write(&db, &product, "vibes", "not fine", &Author::operator())
+        .await
+        .expect_err("an absent label in an initialized dictionary is still refused");
+
+    assert_eq!(
+        dictionary::revision(&db).await.expect("rev"),
+        before,
+        "neither the accepted write nor the refused one moved the cache key"
+    );
+}

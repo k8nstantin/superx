@@ -60,6 +60,37 @@ pub const LINK_SEMANTICS: [&str; 6] = [
     "governance",  // oversight
 ];
 
+/// Which slot labels a type carries, and in what order.
+///
+/// A type that declares nothing is inert: there is no slot to put
+/// anything in, so nothing can be said about one of its entities and
+/// nothing can act on it. Every entity type therefore carries at least
+/// `description` and `comments` — something to say what it is, and a
+/// channel to talk about it.
+///
+/// `description` is `context` on a product and `directive` on a task —
+/// the same label treated differently by what carries it, which is what
+/// `semantics_override` is for.
+const SEEDED_TYPE_LABELS: &[(&str, &[(&str, bool)])] = &[
+    ("product", &[("description", true), ("spec", false), ("comments", false)]),
+    ("task", &[("description", true), ("instructions", false), ("comments", false)]),
+    ("rag", &[("description", true), ("comments", false)]),
+    ("model", &[("description", true), ("comments", false)]),
+    ("document", &[("description", false), ("comments", false)]),
+    ("repo", &[("description", false), ("comments", false)]),
+    ("credential", &[("description", false), ("comments", false)]),
+];
+
+/// A slot a type carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeSlot {
+    pub entity_type: String,
+    pub label: String,
+    pub required: bool,
+    pub display_order: i64,
+    pub active: bool,
+}
+
 /// One row of the dictionary, as read back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelRow {
@@ -246,6 +277,92 @@ pub async fn seed(db: &Db) -> Result<usize> {
         bump(db, "seeded the shipped dictionary").await?;
     }
     Ok(created)
+}
+
+/// Bind the shipped types to the slots they carry; returns how many
+/// bindings were new. Idempotent, like every other seed — a binding the
+/// operator has since retired is not resurrected.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn seed_type_labels(db: &Db) -> Result<usize> {
+    let mut created = 0;
+    for (entity_type, slots) in SEEDED_TYPE_LABELS {
+        let existing = slots_for(db, entity_type, true).await?;
+        for (order, (label, required)) in slots.iter().enumerate() {
+            if existing.iter().any(|s| &s.label == label) {
+                continue;
+            }
+            let mut row = Object::new();
+            row.insert("entity_type".to_string(), Value::String((*entity_type).to_string()));
+            row.insert("label".to_string(), Value::String((*label).to_string()));
+            row.insert("required".to_string(), Value::Bool(*required));
+            row.insert(
+                "display_order".to_string(),
+                Value::Number(i64::try_from(order).unwrap_or(i64::MAX).into()),
+            );
+            row.insert("active".to_string(), Value::Bool(true));
+            row.insert("valid_from".to_string(), Value::Datetime(chrono::Utc::now().into()));
+            db.query("CREATE $id CONTENT $row")
+                .bind(("id", new_id("type_label")))
+                .bind(("row", Value::Object(row)))
+                .await?
+                .check()?;
+            created += 1;
+        }
+    }
+    if created > 0 {
+        bump(db, "bound the shipped types to their slots").await?;
+    }
+    Ok(created)
+}
+
+/// The slots one type carries, in display order. Retired bindings are
+/// omitted unless asked for — `active = false` retires a slot without
+/// erasing that it existed, because entities written under it still have
+/// values in it.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn slots_for(db: &Db, entity_type: &str, include_retired: bool) -> Result<Vec<TypeSlot>> {
+    let mut resp = db
+        .query(
+            "SELECT * FROM type_label WHERE entity_type = $t \
+             ORDER BY valid_from ASC, id ASC",
+        )
+        .bind(("t", entity_type.to_string()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    // Latest row per (type, label) wins — the chain read.
+    let mut heads: std::collections::BTreeMap<String, TypeSlot> =
+        std::collections::BTreeMap::new();
+    for row in &rows {
+        if let Some(slot) = parse_slot(row) {
+            heads.insert(slot.label.clone(), slot);
+        }
+    }
+    let mut out: Vec<TypeSlot> = heads
+        .into_values()
+        .filter(|s| include_retired || s.active)
+        .collect();
+    out.sort_by_key(|s| s.display_order);
+    Ok(out)
+}
+
+fn parse_slot(row: &Value) -> Option<TypeSlot> {
+    let Value::Object(o) = row else { return None };
+    Some(TypeSlot {
+        entity_type: str_field(o, "entity_type")?,
+        label: str_field(o, "label")?,
+        required: matches!(o.get("required"), Some(Value::Bool(true))),
+        display_order: match o.get("display_order") {
+            Some(Value::Number(n)) => n.to_int().unwrap_or(0),
+            _ => 0,
+        },
+        active: !matches!(o.get("active"), Some(Value::Bool(false))),
+    })
 }
 
 /// Append a label row and bump the revision. Every write is a new row

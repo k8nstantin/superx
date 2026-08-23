@@ -311,3 +311,45 @@ async fn history_reads_every_version_oldest_first() {
         "every version is dated"
     );
 }
+
+/// A type that declares no slots is inert: there is nowhere to put
+/// anything, so nothing can be said about one of its entities and
+/// nothing can act on it. Every shipped entity type therefore carries at
+/// least something to say what it is and a channel to discuss it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_shipped_type_carries_at_least_a_description_and_a_channel() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+    let bound = dictionary::seed_type_labels(&db).await.expect("slots");
+    assert!(bound > 0);
+
+    for entity_type in ["product", "task", "rag", "model", "document", "repo", "credential"] {
+        let slots = dictionary::slots_for(&db, entity_type, false).await.expect("slots");
+        assert!(
+            slots.iter().any(|s| s.label == "description"),
+            "{entity_type} can say what it is"
+        );
+        assert!(
+            slots.iter().any(|s| s.label == "comments"),
+            "{entity_type} can be discussed"
+        );
+    }
+
+    // The motivating pair, declared where it belongs: a product carries
+    // both, a task carries the assignment instead of the contract.
+    let product = dictionary::slots_for(&db, "product", false).await.expect("slots");
+    assert!(product.iter().any(|s| s.label == "spec"));
+    let task = dictionary::slots_for(&db, "task", false).await.expect("slots");
+    assert!(task.iter().any(|s| s.label == "instructions"));
+
+    // Display order is declared, not incidental: description leads.
+    assert_eq!(product[0].label, "description");
+    assert!(product[0].required, "a product with no description says nothing");
+
+    // Idempotent, like every other seed.
+    assert_eq!(
+        dictionary::seed_type_labels(&db).await.expect("reseed"),
+        0,
+        "a binding the operator retired is not resurrected"
+    );
+}

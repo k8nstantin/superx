@@ -30,7 +30,7 @@ const USAGE: &str = "usage: superx entities <command>\n\
   graph <uuid-fragment> [--json] [--depth <n>]   export the reachable subgraph\n\
   types                                list the type registry\n\
   types add <name> --category entity|relation [--description <text>]\n\
-  labels [--all]                       the dictionary: what the terminology means\n\
+  labels [--all] [--for <type>]        the dictionary: what the terminology means\n\
   labels define <key> --kind slot|link --semantics <s> [--display <d>] [--description <text>]\n\
   labels history <key> --kind slot|link      every version of one label, oldest first\n\
   labels archive <key> --kind slot|link [--restore]\n\
@@ -132,6 +132,36 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
             "{verb} {kind} label '{key}' — dictionary revision {revision}\n\
              nothing was deleted; every version is still readable via labels history\n"
         ));
+    }
+
+    if let Some(entity_type) = flag(args, "--for") {
+        let slots = crate::dictionary::slots_for(&db, &entity_type, false).await?;
+        if slots.is_empty() {
+            return Ok(format!(
+                "type '{entity_type}' declares no slots — nothing can be attached to \
+                 one of its entities, so nothing can act on it\n"
+            ));
+        }
+        let mut out = format!("type '{entity_type}' carries {} slot(s)\n\n", slots.len());
+        for slot in &slots {
+            let defined = crate::dictionary::current(&db, &slot.label, crate::dictionary::SLOT)
+                .await?;
+            let semantics = defined
+                .as_ref()
+                .map_or("?".to_string(), |d| d.semantics.clone());
+            let card = defined
+                .as_ref()
+                .and_then(|d| d.cardinality.clone())
+                .unwrap_or_else(|| "-".to_string());
+            out.push_str(&format!(
+                "  {:<14} {:<11} {:<5} {}\n",
+                slot.label,
+                semantics,
+                card,
+                if slot.required { "required" } else { "" }
+            ));
+        }
+        return Ok(out);
     }
 
     let include_archived = args.iter().any(|a| a == "--all");
