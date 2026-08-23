@@ -134,9 +134,7 @@ async fn a_comment_can_answer_a_comment() {
         .expect("comment");
     let child = notes::reply(
         &db,
-        &task,
         &parent,
-        "comments",
         "because the alternative loses history",
         &Author::operator(),
     )
@@ -147,9 +145,15 @@ async fn a_comment_can_answer_a_comment() {
     let reply = all.iter().find(|n| n.uid == child).expect("reply present");
     assert_eq!(reply.parent_uid.as_deref(), Some(parent.as_str()));
 
-    notes::reply(&db, &task, "no-such-note", "comments", "…", &Author::operator())
+    notes::reply(&db, "no-such-note", "…", &Author::operator())
         .await
         .expect_err("a reply to nothing is a mistake, not a root comment");
+
+    // The reply inherits what it answers: same entity, same label. Neither
+    // is the caller's to choose, so a thread cannot span two entities and
+    // a spec cannot answer a description.
+    let inherited = all.iter().find(|n| n.uid == child).expect("reply");
+    assert_eq!(inherited.label, "comments");
 }
 
 /// Retracting says "this no longer stands". It must not say "this was
@@ -162,7 +166,7 @@ async fn retracting_withdraws_without_erasing() {
     let (uid, _) = notes::write(&db, &task, "comments", "ship it friday", &Author::operator())
         .await
         .expect("comment");
-    notes::retract(&db, &task, &uid, &Author::operator()).await.expect("retract");
+    notes::retract(&db, &uid, &Author::operator()).await.expect("retract");
 
     assert!(
         notes::for_entity(&db, &task, false).await.expect("read").is_empty(),
@@ -306,4 +310,28 @@ async fn a_seeded_dictionary_is_never_written_by_prose() {
         before,
         "neither the accepted write nor the refused one moved the cache key"
     );
+}
+
+/// A note belongs to the entity it was written on, and no argument
+/// should be able to move it. Deriving the entity from the note rather
+/// than taking it from the caller is what makes that true by
+/// construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_note_cannot_be_moved_to_another_entity() {
+    let db = fresh_db().await;
+    let a = create_entity(&db, "product", "A", None, None).await.expect("a");
+    let b = create_entity(&db, "product", "B", None, None).await.expect("b");
+
+    let (uid, _) = notes::write(&db, &a, "comments", "said on A", &Author::operator())
+        .await
+        .expect("write");
+    notes::reply(&db, &uid, "answered on A", &Author::operator()).await.expect("reply");
+    notes::retract(&db, &uid, &Author::operator()).await.expect("retract");
+
+    assert!(
+        notes::for_entity(&db, &b, true).await.expect("read").is_empty(),
+        "nothing leaked onto the other entity"
+    );
+    let on_a = notes::for_entity(&db, &a, true).await.expect("read");
+    assert_eq!(on_a.len(), 2, "the note and its reply both stayed put");
 }

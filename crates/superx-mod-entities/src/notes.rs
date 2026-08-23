@@ -115,33 +115,30 @@ pub async fn write(
 }
 
 /// Reply to a note — a comment on a comment. Threading needs a parent,
-/// and an edge has no fields to put one in, which is why this could
-/// not exist while prose was an entity joined by an edge.
+/// and an edge has no fields to put one in, which is why this could not
+/// exist while prose was an entity joined by an edge.
+///
+/// The entity and the label come from the PARENT, never from the
+/// caller: a thread spanning two entities, or a `spec` answering a
+/// `description`, is not a thing anyone should be able to write by
+/// passing the wrong argument.
 ///
 /// # Errors
 ///
-/// [`KernelError::Module`] for an unknown label or a missing parent;
-/// [`KernelError::Db`] for engine errors.
-pub async fn reply(
-    db: &Db,
-    entity: &RecordId,
-    parent_uid: &str,
-    label: &str,
-    body: &str,
-    author: &Author,
-) -> Result<String> {
-    if current(db, parent_uid).await?.is_none() {
-        return Err(KernelError::Module(format!(
-            "no note '{parent_uid}' to reply to"
-        )));
-    }
+/// [`KernelError::Module`] if there is no such parent; [`KernelError::Db`]
+/// for engine errors.
+pub async fn reply(db: &Db, parent_uid: &str, body: &str, author: &Author) -> Result<String> {
+    let parent = current(db, parent_uid)
+        .await?
+        .ok_or_else(|| KernelError::Module(format!("no note '{parent_uid}' to reply to")))?;
+    let entity = attached_to(&parent)?;
     let uid = uuid::Uuid::now_v7().to_string();
     append(
         db,
         Version {
-            entity,
+            entity: &entity,
             uid: &uid,
-            label,
+            label: &parent.label,
             body,
             parent_uid: Some(parent_uid.to_string()),
             active: true,
@@ -156,18 +153,23 @@ pub async fn reply(
 /// Appends like every other change — a retraction that erased the thing
 /// retracted would destroy the reason anyone said it.
 ///
+/// Everything but `active` comes from the note itself. Taking the entity
+/// as an argument meant a caller passing the wrong one would append a
+/// row that MOVED the note to a different entity, silently.
+///
 /// # Errors
 ///
 /// [`KernelError::Module`] if there is no such note; [`KernelError::Db`]
 /// for engine errors.
-pub async fn retract(db: &Db, entity: &RecordId, uid: &str, author: &Author) -> Result<()> {
+pub async fn retract(db: &Db, uid: &str, author: &Author) -> Result<()> {
     let Some(note) = current(db, uid).await? else {
         return Err(KernelError::Module(format!("no note '{uid}'")));
     };
+    let entity = attached_to(&note)?;
     append(
         db,
         Version {
-            entity,
+            entity: &entity,
             uid,
             label: &note.label,
             body: &note.body,
@@ -177,6 +179,14 @@ pub async fn retract(db: &Db, entity: &RecordId, uid: &str, author: &Author) -> 
         },
     )
     .await
+}
+
+/// What a note hangs off. The column is `record<entity>` and required,
+/// so an absence here means the row was written outside these verbs.
+fn attached_to(note: &Note) -> Result<RecordId> {
+    note.entity.clone().ok_or_else(|| {
+        KernelError::Module(format!("note '{}' is attached to nothing", note.uid))
+    })
 }
 
 /// Every current note on an entity, oldest first. Retracted notes are

@@ -222,32 +222,12 @@ async fn notes_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("reply") => {
             let parent = args.get(1).ok_or_else(usage)?;
             let text = rest(args, 2)?;
-            let parent_note = notes::current(&db, parent)
-                .await?
-                .ok_or_else(|| KernelError::Module(format!("no note '{parent}'")))?;
-            let entity = parent_note.entity.clone().ok_or_else(|| {
-                KernelError::Module(format!("note '{parent}' is attached to nothing"))
-            })?;
-            let uid = notes::reply(
-                &db,
-                &entity,
-                parent,
-                &parent_note.label,
-                &text,
-                &notes::Author::operator(),
-            )
-            .await?;
+            let uid = notes::reply(&db, parent, &text, &notes::Author::operator()).await?;
             Ok(format!("replied to {parent} — note {uid}\n"))
         }
         Some("retract") => {
             let uid = args.get(1).ok_or_else(usage)?;
-            let note = notes::current(&db, uid)
-                .await?
-                .ok_or_else(|| KernelError::Module(format!("no note '{uid}'")))?;
-            let entity = note.entity.clone().ok_or_else(|| {
-                KernelError::Module(format!("note '{uid}' is attached to nothing"))
-            })?;
-            notes::retract(&db, &entity, uid, &notes::Author::operator()).await?;
+            notes::retract(&db, uid, &notes::Author::operator()).await?;
             Ok(format!(
                 "retracted note {uid} — it no longer stands, and every version is \
                  still readable via notes history\n"
