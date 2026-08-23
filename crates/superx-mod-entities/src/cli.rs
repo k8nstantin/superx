@@ -30,6 +30,8 @@ const USAGE: &str = "usage: superx entities <command>\n\
   graph <uuid-fragment> [--json] [--depth <n>]   export the reachable subgraph\n\
   types                                list the type registry\n\
   types add <name> --category entity|relation [--description <text>]\n\
+  labels [--all]                       the dictionary: what the terminology means\n\
+  labels define <key> --kind slot|link --semantics <s> [--display <d>] [--description <text>]\n\
   url                                  where this module's own UI lives\n\
 each write emits telemetry into the kernel firehose";
 
@@ -42,6 +44,7 @@ each write emits telemetry into the kernel firehose";
 pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
     match args.first().map(String::as_str) {
         Some("types") => types_cmd(kernel, &args[1..]).await,
+        Some("labels") => labels_cmd(kernel, &args[1..]).await,
         Some("create") => create_cmd(kernel, &args[1..]).await,
         Some("update") => update_cmd(kernel, &args[1..]).await,
         Some("show") => show_cmd(kernel, &args[1..]).await,
@@ -57,6 +60,56 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("url") => Ok(format!("{}\n", crate::resolved_ui_url(kernel).await)),
         _ => Err(KernelError::Module(USAGE.to_string())),
     }
+}
+
+/// `superx entities labels` — the dictionary (#266).
+///
+/// Reading it is a precondition for interpreting anything else: types
+/// say what a thing is, labels say what the terminology means. A
+/// product carrying both a `description` and a `spec` is the case that
+/// makes it matter — same kind, same storage, and the label is the
+/// entire difference.
+async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    if args.first().map(String::as_str) == Some("define") {
+        let key = args.get(1).ok_or_else(usage)?;
+        let kind = flag(args, "--kind").ok_or_else(usage)?;
+        let semantics = flag(args, "--semantics").ok_or_else(usage)?;
+        let display = flag(args, "--display").unwrap_or_else(|| key.clone());
+        let description = flag(args, "--description");
+        crate::dictionary::define(&db, key, &kind, &display, &semantics, description.as_deref())
+            .await?;
+        let revision = crate::dictionary::revision(&db).await?;
+        return Ok(format!(
+            "defined {kind} label '{key}' ({semantics}) — dictionary revision {revision}\n"
+        ));
+    }
+
+    let include_archived = args.iter().any(|a| a == "--all");
+    let labels = crate::dictionary::list(&db, include_archived).await?;
+    let revision = crate::dictionary::revision(&db).await?;
+    let mut out = format!("dictionary — revision {revision}\n");
+    for kind in [crate::dictionary::SLOT, crate::dictionary::LINK] {
+        let of_kind: Vec<_> = labels.iter().filter(|l| l.label_kind == kind).collect();
+        if of_kind.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n{kind} labels\n"));
+        for l in of_kind {
+            let card = l.cardinality.as_deref().unwrap_or("-");
+            let archived = if l.archived { "  [archived]" } else { "" };
+            out.push_str(&format!(
+                "  {:<14} {:<11} {:<5} {}{}\n",
+                l.key,
+                l.semantics,
+                card,
+                l.description.as_deref().unwrap_or(""),
+                archived
+            ));
+        }
+    }
+    out.push_str("\nsemantics decide how an agent must TREAT a label, not just its shape\n");
+    Ok(out)
 }
 
 async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
@@ -479,6 +532,12 @@ fn next_value(args: &[String], i: usize) -> Result<String> {
 
 fn usage() -> KernelError {
     KernelError::Module(USAGE.to_string())
+}
+
+/// The value after a `--flag`, if it is present and followed by one.
+fn flag(args: &[String], name: &str) -> Option<String> {
+    let at = args.iter().position(|a| a == name)?;
+    args.get(at + 1).cloned()
 }
 
 /// Parse `add <name> --category <c> [--description <text…>]`.

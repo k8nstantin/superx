@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod cli;
+pub mod dictionary;
 pub mod documents;
 pub mod edges;
 pub mod graph;
@@ -146,6 +147,16 @@ impl KernelModule for EntitiesModule {
                     tracing::info!(target: "entities", seeded, "type registry seeded");
                 } else {
                     tracing::info!(target: "entities", "type registry current");
+                }
+                // The dictionary is a precondition for reading anything
+                // (#266): types say what a thing is, labels say what the
+                // terminology means.
+                let labels = dictionary::seed(&db).await?;
+                let revision = dictionary::revision(&db).await?;
+                if labels > 0 {
+                    tracing::info!(target: "entities", labels, revision, "dictionary seeded");
+                } else {
+                    tracing::info!(target: "entities", revision, "dictionary current");
                 }
             }
             Err(e) => {
