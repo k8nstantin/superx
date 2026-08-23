@@ -541,6 +541,7 @@ pub async fn define(
     display: &str,
     semantics: &str,
     description: Option<&str>,
+    cardinality: Option<&str>,
 ) -> Result<()> {
     if key.is_empty()
         || !key
@@ -580,6 +581,17 @@ pub async fn define(
     row.insert("semantics".to_string(), Value::String(semantics.to_string()));
     if let Some(d) = description {
         row.insert("description".to_string(), Value::String(d.to_string()));
+    }
+    // Without this the dictionary could not be TOLD a slot is singular,
+    // so every operator-defined label behaved as `many` — the safe
+    // default, but not a choice anyone could make.
+    if let Some(c) = cardinality {
+        if !["one", "many"].contains(&c) {
+            return Err(KernelError::Module(format!(
+                "cardinality '{c}' must be 'one' or 'many'"
+            )));
+        }
+        row.insert("cardinality".to_string(), Value::String(c.to_string()));
     }
     // Archiving is its own act; redefining an archived label does not
     // quietly bring it back.

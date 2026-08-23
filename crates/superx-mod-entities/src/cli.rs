@@ -31,7 +31,8 @@ const USAGE: &str = "usage: superx entities <command>\n\
   types                                list the type registry\n\
   types add <name> --category entity|relation [--description <text>]\n\
   labels [--all] [--for <type>]        the dictionary: what the terminology means\n\
-  labels define <key> --kind slot|link --semantics <s> [--display <d>] [--description <text>]\n\
+  labels define <key> --kind slot|link --semantics <s> [--cardinality one|many]\n\
+                       [--display <d>] [--description <text>]\n\
   labels history <key> --kind slot|link      every version of one label, oldest first\n\
   labels archive <key> --kind slot|link [--restore]\n\
   notes <uuid-fragment> [--all]        the prose attached to an entity, by label\n\
@@ -84,8 +85,17 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         let semantics = flag(args, "--semantics").ok_or_else(usage)?;
         let display = flag(args, "--display").unwrap_or_else(|| key.clone());
         let description = flag(args, "--description");
-        crate::dictionary::define(&db, key, &kind, &display, &semantics, description.as_deref())
-            .await?;
+        let cardinality = flag(args, "--cardinality");
+        crate::dictionary::define(
+            &db,
+            key,
+            &kind,
+            &display,
+            &semantics,
+            description.as_deref(),
+            cardinality.as_deref(),
+        )
+        .await?;
         let revision = crate::dictionary::revision(&db).await?;
         return Ok(format!(
             "defined {kind} label '{key}' ({semantics}) — dictionary revision {revision}\n"

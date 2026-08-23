@@ -22,6 +22,7 @@ use superx_kernel::types::{Object, RecordId, Value};
 use superx_kernel::{Db, KernelError, Result};
 
 use crate::dictionary::{self, SLOT};
+use crate::nodes::anchor_info;
 use crate::registry::new_id;
 
 /// Who wrote a note. Authorship is not only provenance: it is the
@@ -82,6 +83,14 @@ pub async fn write(
     body: &str,
     author: &Author,
 ) -> Result<(String, bool)> {
+    // `record<entity>` type-checks the SHAPE of the value; it does not
+    // verify the row exists — probed on a real engine, not assumed. All
+    // writes go through these verbs, which §10 already makes the
+    // enforcement layer, so the check lives here. Without it a note
+    // attaches to nothing and is unreachable from either direction: no
+    // entity lists it, and nothing points back.
+    anchor_info(db, entity).await?;
+
     let defined = require_label(db, label).await?;
 
     // "one" means one: amend the chain that exists rather than leaving

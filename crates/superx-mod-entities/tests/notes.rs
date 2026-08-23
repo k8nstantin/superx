@@ -335,3 +335,41 @@ async fn a_note_cannot_be_moved_to_another_entity() {
     let on_a = notes::for_entity(&db, &a, true).await.expect("read");
     assert_eq!(on_a.len(), 2, "the note and its reply both stayed put");
 }
+
+/// `record<entity>` type-checks the shape of the value; it does NOT
+/// verify the row exists — probed on a real engine rather than assumed.
+/// A note attached to nothing is unreachable from both directions: no
+/// entity lists it, and nothing points back. So the verb refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prose_cannot_be_attached_to_an_entity_that_does_not_exist() {
+    use superx_kernel::types::{RecordId, Uuid};
+
+    let db = fresh_db().await;
+    let ghost = RecordId::new("entity", Uuid::from(uuid::Uuid::now_v7()));
+
+    notes::write(&db, &ghost, "comments", "attached to nothing", &Author::operator())
+        .await
+        .expect_err("an anchor that does not exist is refused");
+}
+
+/// A label defined at runtime could not be told it is singular, so every
+/// one of them behaved as `many` — the safe default, but not a choice
+/// anyone could make.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_label_can_be_declared_singular() {
+    let db = fresh_db().await;
+    let product = create_entity(&db, "product", "Ledger", None, None).await.expect("create");
+
+    dictionary::define(&db, "risk_note", "slot", "Risk note", "context", None, Some("one"))
+        .await
+        .expect("define");
+
+    let (first, _) = notes::write(&db, &product, "risk_note", "v1", &Author::operator())
+        .await
+        .expect("write");
+    let (second, is_new) = notes::write(&db, &product, "risk_note", "v2", &Author::operator())
+        .await
+        .expect("write");
+    assert_eq!(first, second, "singular means the second write amends the first");
+    assert!(!is_new);
+}
