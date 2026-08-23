@@ -1,147 +1,127 @@
 # SuperX
 
-**The Agentic Operating System.** Rust, backed by SurrealDB.
+**The agentic OS.** Rust, on SurrealDB. Apache-2.0. [k8nstantin.github.io/superx](https://k8nstantin.github.io/superx/)
 
-SurrealDB is the OS's filesystem: every fact SuperX knows — agents,
-telemetry, state, configuration, the module registry itself — lives in
-the substrate. The kernel's core capability is telemetry: from the
-moment the OS boots it captures everything every agent on the machine
-emits. Every other capability (data fusion, graphify, …) arrives as a
-module on top of the kernel.
+Your coding agents already run all day. SuperX captures every one of them — full conversations, tool calls, token usage, live and historical — then puts them to work: model the work as a graph, schedule it, dispatch agents against it in dependency order, and write the results back where the next agent will find them.
 
-## v1.1.0 — The module framework era
+```
+capture everything → model work as a graph → schedule the graph → agents execute → results land in the graph ↺
+```
 
-v1.1.0 (2026-08-19) turns the OS into a platform. Everything below
-arrived as pluggable modules on the epic #141 contract — own database,
-dir, log, CLI, parameters, UUIDv7 identity, ledger row — while the
-kernel stayed locked (one author: the operator, now CI-enforced):
+Every fact is an insert. Nothing is overwritten, so the history is evidence rather than a story.
 
-- **The module framework** — full facility contract, live
-  enable/disable, module ledger (schema v2.2), `superx-mod-hello`
-  reference, contribution guide (epic #141).
-- **The entities module** — the product graph substrate: typed nodes,
-  native edges, text-as-entity, documents, full append-only history
-  (epic #166; details below).
-- **The runner module** — schedule any entity, plan dependency waves,
-  execute task nodes with real agents, write results back into the
-  graph (epic #189; details below).
-- **The dashboard, unified** — sessions group ALL captured activity;
-  ONE live feed (history + SSE, auto-scrolling, session-attributed,
-  CVD-validated palette); context-window bars and token telemetry per
-  session (#172–#208).
-- **Operations** — self-upgrading schema path for new binaries on
-  older substrates (#158); the module contract cemented in docs + a
-  kernel-immutability CI gate (#210).
+![The SuperX dashboard](superx-mod-website/img/dashboard.png)
 
-## v1.0.0 — Capabilities
+---
 
-SuperX v1.0.0 is the first release of the agentic OS (reset 2026-08-06 →
-release 2026-08-18; v1-era code preserved at
-[`archive/pre-reset-2026-08-06`](../../tree/archive/pre-reset-2026-08-06)).
+## What it does
 
-- **One-command initialize** — `superx --initialize` prompts you to
-  create the instance password (any password accepted at this phase),
-  starts a local SurrealDB, applies the locked schema, saves
-  credentials (`0600`), boots the OS **in the background**, and
-  returns your terminal. Idempotent per instance; `superx stop` shuts
-  the OS down; `superx status` shows the pid + module lifecycle.
-- **Three agent adapters, built from real machine data** — Claude Code
-  (full conversations, history backfill + live), Gemini CLI
-  (conversations with re-emission dedupe and byte-capped backfill),
-  Claude Desktop (honest telemetry — it stores no conversations
-  locally). Adding an adapter touches zero engine code.
-- **Conversations first-class** — sessions identified
-  `<agent>/<uuid7>` (source id as `src=`); `superx read <any-unique-
-  fragment> --live` renders history then follows live.
-- **Everything queryable by agent_id** — `agents`, `sessions`,
-  `actions [--agent] [--live]` over an append-only SCD-2 substrate
-  (SurrealDB), UUIDv7 row ids, minimal-privilege service account.
-- **Configured, not hardcoded** — `params/superx.json` controls all
-  bootstrap config (precedence: flag > env > file > fallback) inside
-  the instance layout below; runtime tunables live in the substrate
-  as parameters. `superx logs [--follow]` surfaces the OS's own log.
-- **Engineering substrate** — failure-isolated module boot, cursor-
-  checkpointed lossless restarts, tolerant parsing (unknown shapes
-  captured raw, never dropped), kernel self-log, 56 tests, three
-  CI-enforced gates.
+### 1. Captures every agent, with no agent-side setup
 
-## The UI
+Per-agent adapters read the transcript files that Claude Code, Gemini CLI and Claude Desktop already write. Nothing is installed into their settings, no hooks, no wrapper binary — start the OS and history appears.
 
-The OS serves its own dashboard — the first module on the module
-framework:
+- **Backfill then tail.** Full history on first contact, then live from per-file byte-offset cursors, so a restart resumes exactly where it stopped.
+- **Tolerant parsing.** Recognized lines become typed `message` rows with the raw JSON kept alongside; anything unrecognized still lands as telemetry rather than being dropped. An agent changing its format degrades capture, it does not stop it.
+- **Sessions are `agent/uuid7`**, resolvable by any unique fragment, with token usage and context pressure read from the transcript rather than estimated.
 
 ```bash
-superx modules provision ui   # once: the UI's own database (command history…)
-superx ui url                 # → http://127.0.0.1:5150 (attr_ui_port parameter)
+superx agents                  # discovered agents, sessions, sources
+superx sessions                # captured conversations, newest activity first
+superx read <fragment> --live  # one conversation: history, then live
+superx actions --live          # the action stream as it happens
 ```
 
-Open it: **Status** (stat cards, module table, live charts — events/min,
-per-agent activity, message roles, boot durations), **Activity** (THE
-feed, global scope: everything the OS captures — history then live,
-every row attributed to its session, chronological + auto-scrolling,
-filter + pause), **Sessions** (the same exact feed, by session: rows
-show total activity counts and liveness; click a session to open its
-feed — messages and actions together, historical then live), **Console**
-(run the read CLI commands from the browser; history persisted in the
-UI's own db). Dev flow: `npm run dev` in `crates/superx-mod-ui/ui`
-proxies `/api` to the running OS; `npm run build` + restart ships it.
+### 2. Models the work as a graph
 
-Modules are how SuperX grows — see [`docs/MODULES.md`](docs/MODULES.md)
-to contribute one (the framework supports several modules of the same
-kind side by side: your UI and a contributed one on different ports).
+The entities module is the product substrate: typed nodes joined by native SurrealDB edges, extensible at runtime.
 
-## The entities module — the product graph
+- **18 kinds seeded, and kinds are data** — `product`, `task`, `rag`, `model`, `document`, `text`, `repo`, `credential`, joined by `contains`, `depends_on`, `consults`, `describes`, `instructs`, `produced`, `attached`. Adding a kind is a command, not a release.
+- **Text is a node.** Descriptions, instructions and comments are `text` entities linked by role edges, so each carries its own version chain and one text can serve several entities.
+- **Files attach as document nodes**, stored under the module's own directory.
+- **Traversal follows record pointers**, so expanding a node costs its degree — not the size of the edge history.
 
-Typed entities as graph nodes, native SurrealDB edges, full append-only
-history (epic #166). Provision once (`superx modules provision entities`,
-then restart), then:
+![A product graph](superx-mod-website/img/graph.png)
 
-```sh
-superx entities create --type product --describe "What this product is." Widget X
-superx entities create --type task Build the widget
-superx entities link <product-uuid> <task-uuid> --rel linked
-superx entities instruct <task-uuid> Read the description; build each component.
-superx entities comment <task-uuid> Priority: high.
-superx entities tree <product-uuid>          # the whole product, one view
-superx entities graph <product-uuid> --json  # subgraph export (nodes + edges)
-superx entities attach <product-uuid> ./spec.pdf
-superx entities create --type repo --attrs '{"url":"git@github.com:org/widget.git","branch":"main"}' Widget repo
-superx entities create --type credential --attrs '{"kind":"ssh","keychain":"widget-deploy-key"}' Widget deploy key
-superx entities show <task-uuid>             # state + instructs/comments inline
-superx entities types add review --category relation
+```bash
+superx entities create --type product --describe "what it is" Widget X
+superx entities create --type task Build the frame
+superx entities link <product> <task> --rel contains
+superx entities instruct <task> Read the description, then build it.
+superx entities tree <product>          # the whole product, one view
+superx entities graph <product> --json  # nodes + edges, for anything else
 ```
 
-Nodes: product · task · rag · model · document · text · repo ·
-credential (extensible at runtime). A credential node stores a secret
-REFERENCE (env var / keychain item) in its attributes, linked
-`repo —authenticates→ credential` — so an agent following a task edge
-to a repo also finds how to authenticate, all in one graph. Long-form text is itself a node linked by role edges
-(describes / comments / instructs) — descriptions evolve with their own
-history, comments thread. Every change is an INSERT; nothing is ever
-lost. Agents executing task nodes from the graph is the next epic.
+Each entity carries its real ancestor path, and the module ships its own dashboard on its own port:
 
-## The runner module — schedule the graph, agents execute it
+![An entity, with its ancestor path](superx-mod-website/img/entity.png)
 
-Schedule any entity; the runner follows its graph (epic #189). Provision
-once (`superx modules provision runner`, restart), set the executor
-command, and the OS starts directing work — and capturing its own
-agents doing it:
+### 3. Schedules that graph, and agents execute it
 
-```sh
-superx runner plan <product-uuid>        # dry run: the execution waves
-superx runner schedule <product-uuid> --in 10s --every 1d
-superx runner queue
-superx runner runs                       # firing history per task
-superx runner cancel <schedule-uuid>
+A schedule row carries a time, an entity reference and a recurrence. Nothing else — the plan is already in the graph.
+
+- **Waves.** Firing resolves the target's subgraph and layers its task nodes over `depends_on` with a topological sort; cycles are refused with the offending path named. Independent tasks dispatch in parallel up to a bounded parameter; dependants wait for a successful run **in this firing**, so a re-run is not blocked by last week's completion.
+- **Prompt assembly.** Each task spawns the configured agent command with its instructions, the product's description, and the attributes of everything it links to one hop out.
+- **Write-back.** Output becomes a `produced` text node linked to the task, so the next agent reads it as context.
+- **Steerable mid-run.** Every run pins the `valid_from` of the instruction text it dispatched with, and the subgraph is re-read at every wave — editing the graph while it runs steers whatever has not dispatched yet.
+- **No default executor.** `attr_runner_agent_cmd` is unset until you set it, and dispatch refuses loudly rather than spawning something you did not ask for.
+
+```bash
+superx runner plan <product>                 # dry run: the waves the graph implies
+superx runner config agent_cmd claude -p     # nothing spawns until this is set
+superx runner schedule <product> --in 10s --every 1d
+superx runner runs                           # firing history per task
 ```
 
-Tasks execute when their `depends_on` targets are done — independent
-tasks in parallel (`attr_runner_max_parallel`). The agent command is
-the `attr_runner_agent_cmd` parameter (e.g. `claude -p`); unset means
-dispatch refuses loudly. Results write back into the graph as
-`task —produced→ text` nodes; every run pins the instruction version
-it dispatched, and mid-run graph edits steer everything not yet
-dispatched (D27).
+### 4. Everything above capture is a module
+
+The kernel owns boot, capture, the telemetry stream, the substrate verbs and the module registry. Every other capability is a module that gets, by contract: its own database (`superx/<name>`) and service account, its own directory, log target, CLI namespace, substrate parameters, UUIDv7 identity, and optionally its own HTTP UI discovered from the substrate. Modules depend on the kernel and never on each other; several of a kind can coexist; they can be enabled and disabled on a running OS, and one failing to register does not stop the rest from booting.
+
+| module | owns | CLI |
+|---|---|---|
+| `kernel` | substrate, boot, module registry | `superx status · logs` |
+| `capture` | the capture loop over every discovered agent | `superx agents · sessions · read` |
+| `ui` | the core dashboard — status, live feed, sessions, console | `superx ui url` |
+| `entities` | the product graph + its own dashboard | `superx entities …` |
+| `runner` | schedules, waves, dispatch, write-back | `superx runner …` |
+| `hello` | the contribution template | `superx hello greet` |
+
+![The entity list](superx-mod-website/img/entities.png)
+
+---
+
+## The substrate
+
+SurrealDB, insert-only, and the shape is the point:
+
+- **A node is an immutable UUIDv7 anchor** plus an SCD-2 chain of state rows. "Current" is the newest row in the chain, computed at read time — never a mutated column, so an anchor stays a stable target for edges forever.
+- **Edges are a native `TYPE RELATION … ENFORCED` table** written by `RELATE`. Unlinking appends a retraction row on the same edge chain instead of deleting one, so the link history survives.
+- **The service account issues only `SELECT` and `CREATE`.** No verb in the codebase can `UPDATE` or `DELETE` — append-only is structural, not a convention someone has to remember.
+- **UUIDv7 everywhere**, so ids are time-ordered and the substrate is its own historical log.
+- **Nine kernel tables:** `type_definition`, `cursor_type`, `entity`, `relation`, `state_ledger`, `cursor`, `telemetry_stream`, `message`, `module`. The kernel schema is locked and CI-gated; modules bring their own.
+
+Upgrades are `git pull`, `cargo build`, `superx restart` — the schema self-upgrades on version mismatch.
+
+## The code
+
+| crate | lines | what it is |
+|---|---:|---|
+| `superx-kernel` | 7.5k | substrate verbs, boot, capture engine, adapters, telemetry, module registry |
+| `superx-mod-entities` | 4.8k | the product graph, its HTTP API and its own React dashboard |
+| `superx-mod-ui` | 3.1k | the core dashboard: typed API, SSE, four pages |
+| `superx-mod-runner` | 2.0k | schedules, wave planning, dispatch, recurrence |
+| `superx` | 1.6k | the CLI and the initialize/lifecycle flow |
+| `superx-ops` | 0.7k | shared runners and renderers |
+| `superx-mod-hello` | 0.2k | the module template |
+
+185 tests, all on an in-memory engine, no fixtures to maintain.
+
+## Contributing
+
+The most useful thing to add is **an agent adapter** — one trait with two methods, `discover` and `poll`. Cursor, Codex, Copilot and Windsurf are unclaimed, and each one widens what the OS can see; `crates/superx-kernel/src/adapters/claude_code.rs` is the reference.
+
+After that, **a module**: the contract is documented end to end in [`docs/MODULES.md`](docs/MODULES.md) and `superx-mod-hello` exists to be copied. If you have wanted a capability on top of captured agent history — search, cost analysis, a different dashboard, an export — it is a crate with a descriptor, not a fork.
+
+Workflow: an issue defines the work, one short-lived branch per issue, a PR whose body opens with `Closes #N`, and three green gates. Questions that are not bug reports belong in [Discussions](../../discussions).
 
 ## Instance layout
 
