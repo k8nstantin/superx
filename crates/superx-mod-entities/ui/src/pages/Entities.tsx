@@ -265,8 +265,8 @@ function TextNodeCard({
 }) {
   const [at, setAt] = useState<string | null>(null)
   const history = useQuery({
-    queryKey: ['history', annotation.text_id],
-    queryFn: () => fetchHistory(annotation.text_id),
+    queryKey: ['history', annotation.note_uid],
+    queryFn: () => fetchHistory(annotation.note_uid),
   })
   // Ascending — oldest first (nodes.rs:220), so the last row is current.
   const versions = history.data ?? []
@@ -361,9 +361,11 @@ function DetailView({
     ...(d?.ancestors ?? []).map((a) => ({ label: a.name || a.id.slice(0, 8), onClick: () => onOpen(a.id) })),
     ...(d ? [{ label: d.name }] : []),
   ])
-  const description = d?.annotations.find((a) => a.rel_type === 'describes')
-  const instructions = d?.annotations.find((a) => a.rel_type === 'instructs')
-  const comments = (d?.annotations ?? []).filter((a) => a.rel_type === 'comments')
+  // Prose is a note carrying a dictionary label (#278) — `description`,
+  // `instructions`, `comments` — not an edge's rel_type.
+  const description = d?.annotations.find((a) => a.label === 'description')
+  const instructions = d?.annotations.find((a) => a.label === 'instructions')
+  const comments = (d?.annotations ?? []).filter((a) => a.label === 'comments')
 
   // A description can be a whole build spec, so the sections below it
   // are a scroll away even when collapsed. Jump to them (#261).
@@ -524,12 +526,12 @@ function DetailView({
             </Title>
             {comments.length === 0 && (
               <Text size="sm" c="dimmed" mb="xs">
-                no comments yet — the box below posts one as a linked text node
+                no comments yet — the box below adds one to this entity
               </Text>
             )}
             {comments.map((c, i) => (
               <div
-                key={c.text_id}
+                key={c.note_uid}
                 style={{
                   border: '1px solid #3B2449',
                   borderRadius: 6,
@@ -553,7 +555,7 @@ function DetailView({
                     {previewLine(c.content)}
                   </Text>
                   <Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
-                    {c.text_id.slice(0, 8)}
+                    {c.note_uid.slice(0, 8)}
                   </Text>
                 </Group>
                 <LongText markdown={c.content} collapsedHeight={110} compact />

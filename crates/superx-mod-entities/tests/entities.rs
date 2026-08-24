@@ -77,7 +77,9 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
     let d = api::detail(&db, &product).await.expect("detail");
     assert_eq!(d.name, "Widget X");
     assert_eq!(d.entity_type, "product");
-    assert!(d.annotations.iter().any(|a| a.rel_type == "describes"
+    // Prose arrives from the note store under its dictionary label (#278),
+    // not from an edge's rel_type.
+    assert!(d.annotations.iter().any(|a| a.label == "description"
         && a.content.contains("composable")));
     assert!(d.attributes_json.as_deref().unwrap_or("").contains("calexander"));
 
@@ -100,7 +102,7 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
     // Comment lands as an annotation.
     api::comment(&db, &product, "Priority: high").await.expect("comment");
     let d = api::detail(&db, &product).await.expect("detail3");
-    assert!(d.annotations.iter().any(|a| a.rel_type == "comments"));
+    assert!(d.annotations.iter().any(|a| a.label == "comments"));
 
     // The list is entities, not their annotations: the description and
     // comment text nodes stay out of it unless asked for by name.
@@ -268,12 +270,15 @@ async fn ui_graph_leaves_descriptions_and_comments_out_of_it() {
 
     // They are still THERE, on the detail page, which is their place.
     let d = api::detail(&db, &product).await.expect("detail");
-    assert!(d.annotations.iter().any(|a| a.rel_type == "describes"));
-    assert!(d.annotations.iter().any(|a| a.rel_type == "comments"));
+    assert!(d.annotations.iter().any(|a| a.label == "description"));
+    assert!(d.annotations.iter().any(|a| a.label == "comments"));
 
     // Opening the graph ON a text keeps it as the root — you are
-    // looking at it — rather than handing back an empty canvas.
-    let text_id = &d.annotations[0].text_id;
+    // looking at it — rather than handing back an empty canvas. The
+    // carrier's id no longer comes from the annotations, which carry
+    // note uids now, so ask the registry for one directly.
+    let carriers = api::list(&db, Some("text")).await.expect("carriers");
+    let text_id = &carriers.first().expect("a carrier exists").id.clone();
     let tg = api::graph_view(&db, text_id, 2, "both").await.expect("text graph");
     assert_eq!(&tg.root, text_id);
     assert!(tg.nodes.iter().any(|n| n.id == *text_id), "the root survives");

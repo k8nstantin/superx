@@ -17,7 +17,7 @@ use superx_kernel::{Db, KernelError, Result};
 use superx_ops::record_uuid;
 use ts_rs::TS;
 
-use crate::{documents, edges, graph, nodes, registry, texts};
+use crate::{documents, edges, graph, nodes, notes, registry, texts};
 
 /// Depth ceiling for the breadcrumb walk (#253): deep enough for any
 /// real product hierarchy, shallow enough that a pathological graph
@@ -45,9 +45,17 @@ pub struct EntityListItem {
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct AnnotationView {
-    pub rel_type: String,
-    pub text_id: String,
+    /// The dictionary slot this prose sits in — `description`, `spec`,
+    /// `comments`. Not an edge's rel_type: the carrier is the LABEL now.
+    pub label: String,
+    /// The note's chain id, stable across every version of it.
+    pub note_uid: String,
     pub content: String,
+    /// The note this one answers, for a threaded comment.
+    pub parent_uid: Option<String>,
+    /// `operator` | `role` | `agent` | `system`, and the role it acted as.
+    pub author_kind: Option<String>,
+    pub via_uid: Option<String>,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -278,13 +286,19 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
     let state = nodes::current_state(db, &id).await?.ok_or_else(|| {
         KernelError::Module(format!("entity {} has no state chain", record_uuid(&id)))
     })?;
-    let annotations = texts::annotations(db, &id)
+    // Prose comes from the note store (#278). The text carriers still
+    // exist and are still written, but nothing reads them for display any
+    // more — which is what had to become true before they can go.
+    let annotations = notes::for_entity(db, &id, false)
         .await?
         .into_iter()
-        .map(|a| AnnotationView {
-            rel_type: a.rel_type,
-            text_id: record_uuid(&a.text_id),
-            content: a.content,
+        .map(|n| AnnotationView {
+            label: n.label,
+            note_uid: n.uid,
+            content: n.body,
+            parent_uid: n.parent_uid,
+            author_kind: n.author_kind,
+            via_uid: n.via_uid,
         })
         .collect();
 
@@ -486,7 +500,30 @@ pub async fn attachment_file(db: &Db, fragment: &str) -> Result<(String, String,
     ))
 }
 
+/// Version history, for an entity OR for a note.
+///
+/// #262 shipped version viewing and the UI reaches it with the id from
+/// the detail payload. That id is now a note uid, so an endpoint that
+/// only resolved entities would 404 on every description in the system.
+/// Notes are tried first: a note uid is a full uuid and cannot collide
+/// with the fragment-matching an entity lookup does.
 pub async fn history(db: &Db, fragment: &str) -> Result<Vec<VersionView>> {
+    let versions = notes::history(db, fragment).await?;
+    if !versions.is_empty() {
+        return Ok(versions
+            .into_iter()
+            .map(|n| VersionView {
+                name: n.label,
+                content: Some(n.body),
+                attributes_json: None,
+                valid_from: n
+                    .valid_from
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_default(),
+            })
+            .collect());
+    }
+
     let id = nodes::resolve_entity(db, fragment).await?;
     Ok(nodes::state_history(db, &id)
         .await?
