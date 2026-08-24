@@ -224,7 +224,7 @@ async fn the_legacy_carrier_and_the_note_store_are_both_written() {
     let task = create_entity(&db, "task", "Build it", None, None).await.expect("create");
 
     texts::set_role_text(&db, &task, "describes", "what to do").await.expect("describe");
-    texts::add_comment(&db, &task, "a remark").await.expect("comment");
+    texts::add_comment(&db, &task, "a remark", &Author::operator()).await.expect("comment");
 
     // Legacy: the reader that exists today still sees everything.
     let annotations = texts::annotations(&db, &task).await.expect("annotations");
@@ -418,4 +418,46 @@ async fn many_entities_notes_come_back_in_one_read() {
         notes::for_entities(&db, &[], false).await.expect("empty").is_empty(),
         "no entities, no query"
     );
+}
+
+/// An agent's output recorded as the operator's would be a lie in the
+/// one column that exists to be trusted — and it is the column
+/// authorization is decided on, not a label on a card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_comment_can_be_written_as_someone_other_than_the_operator() {
+    let db = fresh_db().await;
+    let task = create_entity(&db, "task", "Build it", None, None).await.expect("create");
+
+    let agent = Author::claimed("agent", Some("run-01a03"), Some("role-engineer"))
+        .expect("a known kind");
+    texts::add_comment(&db, &task, "the build succeeded", &agent)
+        .await
+        .expect("comment");
+
+    let note = &notes::for_entity(&db, &task, false).await.expect("read")[0];
+    assert_eq!(note.author_kind.as_deref(), Some("agent"));
+    assert_eq!(note.author_uid.as_deref(), Some("run-01a03"));
+    assert_eq!(note.via_uid.as_deref(), Some("role-engineer"));
+
+    // The default is still the operator, so nothing that writes a comment
+    // today changes.
+    texts::add_comment(&db, &task, "and a human remark", &Author::operator())
+        .await
+        .expect("comment");
+    assert!(notes::for_entity(&db, &task, false)
+        .await
+        .expect("read")
+        .iter()
+        .any(|n| n.author_kind.as_deref() == Some("operator")));
+}
+
+/// A kind nothing recognises is a column nothing can act on, so it is
+/// refused rather than stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_author_kind_is_refused() {
+    let err = Author::claimed("wizard", None, None).expect_err("not a kind");
+    assert!(err.to_string().contains("wizard"), "the error names it: {err}");
+    for kind in notes::AUTHOR_KINDS {
+        Author::claimed(kind, None, None).expect("every declared kind is accepted");
+    }
 }

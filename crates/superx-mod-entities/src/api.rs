@@ -184,6 +184,11 @@ pub struct UpdateReq {
 #[derive(Debug, Deserialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct TextReq {
+    /// Who is writing. Absent means the operator, which is what a person
+    /// typing into the page is.
+    pub author_kind: Option<String>,
+    pub author_uid: Option<String>,
+    pub via_uid: Option<String>,
     /// Markdown from the standard editor.
     pub text: String,
 }
@@ -562,9 +567,20 @@ pub async fn describe(db: &Db, fragment: &str, text: &str) -> Result<String> {
     Ok(record_uuid(&text_id))
 }
 
-pub async fn comment(db: &Db, fragment: &str, text: &str) -> Result<String> {
+/// Add a comment, optionally as someone other than the operator.
+///
+/// The default stays the operator, so every caller that does not say who
+/// it is keeps behaving as it did. What changes is that a caller which
+/// KNOWS who it is can now say so — an agent's output recorded as the
+/// operator's would be a lie in the column that exists to be trusted.
+pub async fn comment(
+    db: &Db,
+    fragment: &str,
+    text: &str,
+    author: &notes::Author,
+) -> Result<String> {
     let id = nodes::resolve_entity(db, fragment).await?;
-    let text_id = texts::add_comment(db, &id, text).await?;
+    let text_id = texts::add_comment(db, &id, text, author).await?;
     Ok(record_uuid(&text_id))
 }
 

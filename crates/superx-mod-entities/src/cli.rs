@@ -26,7 +26,8 @@ const USAGE: &str = "usage: superx entities <command>\n\
   unlink <from-fragment> <to-fragment> --rel <relation-type>\n\
   describe <uuid-fragment> <text…>     set/evolve the describing text node\n\
   instruct <uuid-fragment> <text…>     set/evolve the instructing text node\n\
-  comment <uuid-fragment> <text…>      add a comment text node (threads: comment a comment)\n\
+  comment <uuid-fragment> <text…>      add a comment\n\
+          [--author-kind operator|role|agent|system] [--author-uid <id>] [--via <role>]\n\
   attach <uuid-fragment> <file-path>   copy a file in; document node + attached edge\n\
   tree <uuid-fragment> [--depth <n>] [--reverse]\n\
   graph <uuid-fragment> [--json] [--depth <n>]   export the reachable subgraph\n\
@@ -624,12 +625,36 @@ async fn role_text_cmd(kernel: &Kernel, args: &[String], role: &str) -> Result<S
 async fn comment_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
     let fragment = args.first().ok_or_else(usage)?;
-    let text = args[1..].join(" ");
+    // Flags are not part of the comment, or `--via` would end up quoted
+    // inside somebody's remark.
+    let flags = ["--author-kind", "--author-uid", "--via"];
+    let mut text_parts: Vec<&str> = Vec::new();
+    let mut skip = false;
+    for arg in &args[1..] {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if flags.contains(&arg.as_str()) {
+            skip = true;
+            continue;
+        }
+        text_parts.push(arg);
+    }
+    let text = text_parts.join(" ");
     if text.is_empty() {
         return Err(usage());
     }
+    let author = match flag(args, "--author-kind") {
+        Some(kind) => notes::Author::claimed(
+            &kind,
+            flag(args, "--author-uid").as_deref(),
+            flag(args, "--via").as_deref(),
+        )?,
+        None => notes::Author::operator(),
+    };
     let target = nodes::resolve_entity(&db, fragment).await?;
-    let node = texts::add_comment(&db, &target, &text).await?;
+    let node = texts::add_comment(&db, &target, &text, &author).await?;
     let node_uuid = record_uuid(&node);
     emit(kernel, "entity_created", &node_uuid, "text", "comment").await;
     emit_link(kernel, &record_uuid(&target), &node_uuid, "comments", "entities_linked").await;
