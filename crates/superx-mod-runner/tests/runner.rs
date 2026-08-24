@@ -252,6 +252,12 @@ mod firing {
         /// Mirrors the live exchange (#286): the output is a COMMENT on
         /// the task, authored by the agent in this run — not a node in
         /// the product graph an agent then has to walk past.
+        ///
+        /// It goes through `texts::add_comment` and returns the CARRIER
+        /// id, exactly as the entities CLI does, because a fixture that
+        /// is kinder than the real path proves a property of itself
+        /// rather than of the runner. Returning the note uid here hid
+        /// both a wrong id and an empty one.
         async fn write_back(
             &self,
             task_uid: &str,
@@ -260,11 +266,8 @@ mod firing {
         ) -> superx_kernel::Result<String> {
             let task = nodes::resolve_entity(&self.edb, task_uid).await?;
             let author = superx_mod_entities::notes::Author::claimed("agent", Some(run_uid), None)?;
-            let (uid, _) = superx_mod_entities::notes::write(
-                &self.edb, &task, "comments", output, &author,
-            )
-            .await?;
-            Ok(uid)
+            let carrier = texts::add_comment(&self.edb, &task, output, &author).await?;
+            Ok(superx_ops::record_uuid(&carrier))
         }
     }
 
@@ -373,7 +376,15 @@ mod firing {
             Some(t1_run.uid.as_str()),
             "and to the run that produced it"
         );
-        assert_eq!(output_ref, output.uid, "the run points at that very note");
+        assert!(
+            !output_ref.is_empty(),
+            "the run points at something — an empty output_ref is a run that recorded nothing"
+        );
+        // While both stores are written this is the comment carrier's id,
+        // which is what the entities CLI reports. It resolves.
+        superx_mod_entities::nodes::resolve_entity(&edb, &output_ref)
+            .await
+            .expect("whatever the run points at can be found");
 
         // And it did NOT become a node in the graph.
         assert!(

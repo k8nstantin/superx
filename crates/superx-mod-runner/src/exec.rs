@@ -60,13 +60,25 @@ impl Exchange for CliExchange {
         )
         .await
         .map_err(KernelError::Module)?;
-        // `comment added: <uuid>` — the note is what the run points at.
-        Ok(posted
-            .rsplit(char::is_whitespace)
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_string())
+
+        // `comment added: <uuid>`. Taking the last WHITESPACE-SEPARATED
+        // token, not the last `rsplit` segment: the line ends in a
+        // newline, so rsplit hands back the empty string after it and
+        // the run would have pointed at nothing at all.
+        //
+        // The id is the comment CARRIER's, because that is what the
+        // entities CLI reports while both stores are written. It
+        // identifies this output and resolves today; it becomes the note
+        // uid when the carrier is retired and the CLI has only one id
+        // left to report.
+        let reference = posted.split_whitespace().next_back().unwrap_or_default();
+        if reference.is_empty() {
+            return Err(KernelError::Module(format!(
+                "wrote the output back but could not tell what it was recorded as, \
+                 from: {posted:?}"
+            )));
+        }
+        Ok(reference.to_string())
     }
 }
 
