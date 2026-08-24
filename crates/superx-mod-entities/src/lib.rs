@@ -15,6 +15,7 @@ pub mod cli;
 pub mod dictionary;
 pub mod documents;
 pub mod edges;
+pub mod fields;
 pub mod graph;
 pub mod nodes;
 pub mod notes;

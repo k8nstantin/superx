@@ -77,8 +77,20 @@ const SEEDED_TYPE_LABELS: &[(&str, &[(&str, bool)])] = &[
     ("rag", &[("description", true), ("comments", false)]),
     ("model", &[("description", true), ("comments", false)]),
     ("document", &[("description", false), ("comments", false)]),
-    ("repo", &[("description", false), ("comments", false)]),
-    ("credential", &[("description", false), ("comments", false)]),
+    (
+        "repo",
+        &[
+            ("description", false),
+            ("url", true),
+            ("branch", false),
+            ("host", false),
+            ("comments", false),
+        ],
+    ),
+    (
+        "credential",
+        &[("description", false), ("secret", true), ("host", false), ("comments", false)],
+    ),
 ];
 
 /// A slot a type carries.
@@ -89,6 +101,9 @@ pub struct TypeSlot {
     pub required: bool,
     pub display_order: i64,
     pub active: bool,
+    /// Who last wrote this binding. `None` means only the seed ever has,
+    /// which is what makes it safe to correct its ordering.
+    pub author_kind: Option<String>,
 }
 
 /// One row of the dictionary, as read back.
@@ -103,6 +118,9 @@ pub struct LabelRow {
     pub value_kind: Option<String>,
     pub cardinality: Option<String>,
     pub writable_by: Option<String>,
+    /// The label's own extensible bag — `enum` options live here,
+    /// because you cannot enumerate in advance what a future label needs.
+    pub attributes: Option<Object>,
     pub archived: bool,
     /// When this version was written. The chain is ordered by
     /// `(valid_from, id)` — the uuid7 row id breaks ties, so "latest
@@ -203,6 +221,56 @@ const SEEDED: &[Seed] = &[
              instruct or excuse — only a binding field binds, only a grant permits.",
         ),
     },
+    // The registry has always DESCRIBED these in prose — "a source-code
+    // repository (url, branch, host in attributes)" — while declaring
+    // nothing, so the keys were folklore and a typo was a new field.
+    Seed {
+        key: "url",
+        kind: SLOT,
+        display: "URL",
+        semantics: "data",
+        value_kind: Some("url"),
+        cardinality: Some("one"),
+        writable_by: Some("any"),
+        description: "where it lives",
+        agent_note: None,
+    },
+    Seed {
+        key: "branch",
+        kind: SLOT,
+        display: "Branch",
+        semantics: "data",
+        value_kind: Some("string"),
+        cardinality: Some("one"),
+        writable_by: Some("any"),
+        description: "the branch to work on",
+        agent_note: None,
+    },
+    Seed {
+        key: "host",
+        kind: SLOT,
+        display: "Host",
+        semantics: "data",
+        value_kind: Some("string"),
+        cardinality: Some("one"),
+        writable_by: Some("any"),
+        description: "the service it lives on",
+        agent_note: None,
+    },
+    Seed {
+        key: "secret",
+        kind: SLOT,
+        display: "Secret",
+        semantics: "secret",
+        value_kind: Some("secret_ref"),
+        cardinality: Some("one"),
+        writable_by: Some("operator"),
+        description: "where to find the secret — env:NAME, keychain:ITEM or vault:ID",
+        agent_note: Some(
+            "This is a POINTER, not the secret. Resolve it at the moment of use \
+             and never print, log or copy what it resolves to.",
+        ),
+    },
     Seed {
         key: "contains",
         kind: LINK,
@@ -291,17 +359,25 @@ pub async fn seed_type_labels(db: &Db) -> Result<usize> {
     for (entity_type, slots) in SEEDED_TYPE_LABELS {
         let existing = slots_for(db, entity_type, true).await?;
         for (order, (label, required)) in slots.iter().enumerate() {
-            if existing.iter().any(|s| &s.label == label) {
-                continue;
+            let order = i64::try_from(order).unwrap_or(i64::MAX);
+            if let Some(prior) = existing.iter().find(|s| &s.label == label) {
+                // Adding a slot to the shipped list mid-way would
+                // otherwise leave an upgraded instance ordering its slots
+                // differently from a fresh one — observed live: `comments`
+                // kept order 1 while a newly added `url` also took 1.
+                //
+                // The shipped position is authoritative, but ONLY for a
+                // binding nobody but the seed has written. Once an
+                // operator has touched it, their order stands.
+                if prior.display_order == order || prior.author_kind.is_some() {
+                    continue;
+                }
             }
             let mut row = Object::new();
             row.insert("entity_type".to_string(), Value::String((*entity_type).to_string()));
             row.insert("label".to_string(), Value::String((*label).to_string()));
             row.insert("required".to_string(), Value::Bool(*required));
-            row.insert(
-                "display_order".to_string(),
-                Value::Number(i64::try_from(order).unwrap_or(i64::MAX).into()),
-            );
+            row.insert("display_order".to_string(), Value::Number(order.into()));
             row.insert("active".to_string(), Value::Bool(true));
             row.insert("valid_from".to_string(), Value::Datetime(chrono::Utc::now().into()));
             db.query("CREATE $id CONTENT $row")
@@ -362,6 +438,7 @@ fn parse_slot(row: &Value) -> Option<TypeSlot> {
             _ => 0,
         },
         active: !matches!(o.get("active"), Some(Value::Bool(false))),
+        author_kind: str_field(o, "author_kind"),
     })
 }
 
@@ -526,6 +603,26 @@ pub async fn bump(db: &Db, reason: &str) -> Result<i64> {
     Ok(next)
 }
 
+/// What a label declares. Eight positional arguments in a row is how a
+/// caller ends up passing `semantics` where `display` belongs, so the
+/// declaration is one value with named parts.
+///
+/// `..Default::default()` covers everything a definition does not say,
+/// and a redefinition carries forward whatever it leaves out.
+#[derive(Debug, Clone, Default)]
+pub struct Definition<'a> {
+    pub key: &'a str,
+    pub kind: &'a str,
+    pub display: &'a str,
+    pub semantics: &'a str,
+    pub description: Option<&'a str>,
+    /// `one` amends the slot that is there; `many` adds another.
+    pub cardinality: Option<&'a str>,
+    /// Decides STORAGE: prose kinds become note chains, value kinds live
+    /// in the entity's attributes bag.
+    pub value_kind: Option<&'a str>,
+}
+
 /// Define or redefine a label. A redefinition appends to the chain —
 /// the old meaning stays readable, because every entity written under
 /// it was written under that meaning.
@@ -534,15 +631,8 @@ pub async fn bump(db: &Db, reason: &str) -> Result<i64> {
 ///
 /// [`KernelError::Module`] for an invalid key, kind or semantics;
 /// [`KernelError::Db`] for engine errors.
-pub async fn define(
-    db: &Db,
-    key: &str,
-    kind: &str,
-    display: &str,
-    semantics: &str,
-    description: Option<&str>,
-    cardinality: Option<&str>,
-) -> Result<()> {
+pub async fn define(db: &Db, d: Definition<'_>) -> Result<()> {
+    let Definition { key, kind, display, semantics, description, cardinality, value_kind } = d;
     if key.is_empty()
         || !key
             .chars()
@@ -593,6 +683,18 @@ pub async fn define(
         }
         row.insert("cardinality".to_string(), Value::String(c.to_string()));
     }
+    // The kind decides STORAGE and rendering: prose kinds become note
+    // chains, value kinds live in the attributes bag. Closed, because a
+    // kind nothing recognises is a slot nothing can read.
+    if let Some(k) = value_kind {
+        if !crate::fields::all_kinds().contains(&k) {
+            return Err(KernelError::Module(format!(
+                "value kind '{k}' is not one a slot may have — pick from: {}",
+                crate::fields::all_kinds().join(", ")
+            )));
+        }
+        row.insert("value_kind".to_string(), Value::String(k.to_string()));
+    }
     // Archiving is its own act; redefining an archived label does not
     // quietly bring it back.
     if !row.contains_key("archived") {
@@ -619,6 +721,10 @@ fn parse_obj(o: &Object) -> Option<LabelRow> {
         value_kind: str_field(o, "value_kind"),
         cardinality: str_field(o, "cardinality"),
         writable_by: str_field(o, "writable_by"),
+        attributes: match o.get("attributes") {
+            Some(Value::Object(a)) => Some(a.clone()),
+            _ => None,
+        },
         archived: matches!(o.get("archived"), Some(Value::Bool(true))),
         valid_from: match o.get("valid_from") {
             Some(Value::Datetime(d)) => Some(**d),
