@@ -322,6 +322,31 @@ pub async fn current_state(db: &Db, anchor: &RecordId) -> Result<Option<StateRow
     Ok(state_rows(db, anchor, "DESC", Some(1)).await?.into_iter().next())
 }
 
+/// The state as it stood at an instant (§14) — its name, attributes and
+/// whether it was archived THEN.
+///
+/// The limit is dropped rather than kept: "the newest row" and "the
+/// newest row at or before an instant" are different questions, and
+/// asking the first with a LIMIT and then filtering would return
+/// nothing whenever the entity has been edited since.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn state_at(
+    db: &Db,
+    anchor: &RecordId,
+    as_of: crate::asof::AsOf,
+) -> Result<Option<StateRow>> {
+    if as_of.is_none() {
+        return current_state(db, anchor).await;
+    }
+    Ok(state_rows(db, anchor, "ASC", None)
+        .await?
+        .into_iter()
+        .rfind(|s| crate::asof::visible(&s.valid_from, as_of)))
+}
+
 /// The full version history of an anchor, oldest first.
 ///
 /// # Errors

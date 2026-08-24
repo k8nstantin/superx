@@ -399,12 +399,26 @@ async fn api_create(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct DetailQuery {
+    /// Read the WHOLE entity as it stood at this instant (§14): state,
+    /// notes, attachments and edges all resolved at the same moment,
+    /// which is what answers "what did the agent see when it did that".
+    /// Absent is now.
+    as_of: Option<String>,
+}
+
 async fn api_detail(
     State(state): State<AppState>,
     AxumPath(frag): AxumPath<String>,
+    Query(q): Query<DetailQuery>,
 ) -> Resp<api::EntityDetail> {
     let db = module_db!(state);
-    match api::detail(&db, &frag).await {
+    let as_of = match crate::asof::parse(q.as_of.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return Resp::err(e.to_string()),
+    };
+    match api::detail_at(&db, &frag, as_of).await {
         Ok(v) => Resp::ok(v),
         Err(e) => Resp::err(e.to_string()),
     }

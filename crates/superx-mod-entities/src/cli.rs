@@ -21,8 +21,11 @@ const USAGE: &str = "usage: superx entities <command>\n\
   create --type <type> [--describe <text>] [--content <text>] [--attrs <json>] <name…>\n\
   update <uuid-fragment> [--name <name>] [--content <text>] [--attrs <json>]\n\
          (--attrs REPLACES the whole attributes object; omit to keep it)\n\
-  show <uuid-fragment> [--history]\n\
-  list [--type <type>]\n\
+  show <uuid-fragment> [--history] [--as-of <rfc3339>]\n\
+       --as-of reads the WHOLE entity as it stood then: its state, notes,\n\
+       attachments and edges at one instant, not a picker per field\n\
+  list [--type <type>] [--archived]\n\
+  archive <uuid-fragment> [--restore]  hide it from the lists; nothing is erased\n\
   link <from-fragment> <to-fragment> --rel <relation-type>\n\
   unlink <from-fragment> <to-fragment> --rel <relation-type>\n\
   describe <uuid-fragment> <text…>     set/evolve the describing text node\n\
@@ -75,6 +78,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("update") => update_cmd(kernel, &args[1..]).await,
         Some("show") => show_cmd(kernel, &args[1..]).await,
         Some("list") => list_cmd(kernel, &args[1..]).await,
+        Some("archive") => archive_cmd(kernel, &args[1..]).await,
         Some("link") => link_cmd(kernel, &args[1..], true).await,
         Some("unlink") => link_cmd(kernel, &args[1..], false).await,
         Some("describe") => role_text_cmd(kernel, &args[1..], "describes").await,
@@ -676,6 +680,13 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
     let fragment = args.first().ok_or_else(usage)?;
     let history = args.iter().any(|a| a == "--history");
+    // §14: ONE instant reaching every chain, not a picker per field. A
+    // field-by-field picker answers "how did this text change"; this
+    // answers "what did the agent see when it did that", and the two
+    // are different questions because each chain moves independently.
+    let as_of = crate::asof::parse(
+        args.iter().position(|a| a == "--as-of").and_then(|i| args.get(i + 1)).map(String::as_str),
+    )?;
 
     let anchor = nodes::resolve_entity(&db, fragment).await?;
     let (entity_type, created_at) = nodes::anchor_info(&db, &anchor).await?;
@@ -700,12 +711,17 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
             out.push_str(&format!("  v{} · {}\n", n + 1, v.valid_from));
             out.push_str(&render_state(v, "    "));
         }
-    } else if let Some(current) = nodes::current_state(&db, &anchor).await? {
+    } else if let Some(current) = nodes::state_at(&db, &anchor, as_of).await? {
+        if as_of.is_some() {
+            out.push_str(&format!("  (as it stood at {})\n", current.valid_from));
+        }
         out.push_str(&render_state(&current, "  "));
+    } else if as_of.is_some() {
+        out.push_str("  (nothing here at that instant — it was created later)\n");
     }
     // Prose from the note store (#278), by label rather than by the edge
     // it used to hang off.
-    let attached = notes::for_entity(&db, &anchor, false).await?;
+    let attached = notes::for_entity_at(&db, &anchor, false, as_of).await?;
     if !attached.is_empty() {
         out.push_str("prose:\n");
         for note in attached {
@@ -719,25 +735,80 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     Ok(out)
 }
 
+/// Hide an entity from the lists, or bring it back (§14).
+///
+/// `archived` answers "should this still be shown by default?" — it is
+/// real, it is true, it is finished with. That is a different question
+/// from `active`, which answers "does this assertion still hold?", and
+/// one flag for both produces filters that mean different things in
+/// different places.
+///
+/// Not a delete: the entity, its history, its notes and its edges are
+/// all still there and still reachable by uuid.
+async fn archive_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let fragment = args.first().ok_or_else(usage)?;
+    let restore = match args.get(1).map(String::as_str) {
+        None => false,
+        Some("--restore") => true,
+        Some(_) => return Err(usage()),
+    };
+    let target = nodes::resolve_entity(&db, fragment).await?;
+    let uuid = record_uuid(&target);
+    let changed = nodes::set_archived(&db, &target, !restore).await?;
+    if !changed {
+        return Ok(format!(
+            "{uuid} is already {}\n",
+            if restore { "in the lists" } else { "archived" }
+        ));
+    }
+    emit(kernel, if restore { "entity_restored" } else { "entity_archived" }, &uuid, "", "").await;
+    Ok(if restore {
+        format!("{uuid} restored to the lists\n")
+    } else {
+        format!("{uuid} archived — hidden from the lists; nothing was erased\n")
+    })
+}
+
 async fn list_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
-    let type_filter = match args.first().map(String::as_str) {
-        Some("--type") => Some(args.get(1).ok_or_else(usage)?.clone()),
-        Some(_) => return Err(usage()),
-        None => None,
-    };
-    let rows = nodes::list_entities(&db, type_filter.as_deref()).await?;
-    if rows.is_empty() {
+    let mut type_filter = None;
+    let mut include_archived = false;
+    let mut rest = args;
+    while let Some(flag) = rest.first().map(String::as_str) {
+        match flag {
+            "--type" => {
+                type_filter = Some(rest.get(1).ok_or_else(usage)?.clone());
+                rest = &rest[2..];
+            }
+            "--archived" => {
+                include_archived = true;
+                rest = &rest[1..];
+            }
+            _ => return Err(usage()),
+        }
+    }
+    let all = nodes::list_entities(&db, type_filter.as_deref()).await?;
+    let hidden = all.iter().filter(|r| r.archived).count();
+    let rows: Vec<_> = all.into_iter().filter(|r| include_archived || !r.archived).collect();
+    if rows.is_empty() && hidden == 0 {
         return Ok("no entities yet — create one with `superx entities create`\n".to_string());
     }
     let mut out = format!("entities ({}):\n", rows.len());
     for row in rows {
         out.push_str(&format!(
-            "  {}  {:<10} {}\n",
+            "  {}  {:<10} {}{}\n",
             record_uuid(&row.id),
             row.entity_type,
-            row.name
+            row.name,
+            if row.archived { "  [archived]" } else { "" }
         ));
+    }
+    // Said out loud. A list that silently drops rows is the same shape
+    // of lie as a graph that silently drops edges: the operator must be
+    // able to tell "nothing there" from "something hidden".
+    if hidden > 0 && !include_archived {
+        out.push_str(&format!("  ({hidden} archived — see them with --archived)\n"));
     }
     Ok(out)
 }

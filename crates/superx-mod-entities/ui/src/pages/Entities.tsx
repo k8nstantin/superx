@@ -886,10 +886,15 @@ function EditModal({
             void (async () => {
               try {
                 const md = (await content.current?.getMarkdown()) ?? ''
+                // §6 compare-and-append: send the version this form
+                // was opened on. If somebody else wrote in between the
+                // save is refused and names their version, instead of
+                // silently overwriting an edit nobody is told about.
                 await updateEntity(frag, {
                   name: name.trim() ? name : null,
                   content: md.trim() ? md : null,
                   attributes_json: attrs.trim() ? attrs : null,
+                  based_on: detail.version,
                 })
                 onClose()
                 onSaved()

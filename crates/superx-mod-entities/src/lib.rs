@@ -11,6 +11,7 @@
 //! own log (`target: "entities"`), own CLI (`superx entities …`).
 
 pub mod api;
+pub mod asof;
 pub mod attachments;
 pub mod cli;
 pub mod dictionary;

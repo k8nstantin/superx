@@ -5,4 +5,12 @@ export type UpdateReq = { name: string | null, content: string | null,
  * REPLACES the whole attributes object when present (the
  * module's update semantics); omit to keep it.
  */
-attributes_json: string | null, };
+attributes_json: string | null, 
+/**
+ * The version this edit was based on (§6). Send it and a write
+ * that would silently clobber somebody else's is refused, with
+ * their version named so you can re-read and merge. Omit it and
+ * the old latest-wins behaviour applies — the guarantee is
+ * offered, never imposed.
+ */
+based_on: string | null, };

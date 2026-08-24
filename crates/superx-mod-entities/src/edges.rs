@@ -207,6 +207,22 @@ async fn current_edges_between(db: &Db, from: &RecordId, to: &RecordId) -> Resul
 ///
 /// [`KernelError::Db`] for engine errors.
 pub async fn expand(db: &Db, frontier: &[RecordId], reverse: bool) -> Result<Vec<EdgeRow>> {
+    expand_at(db, frontier, reverse, None).await
+}
+
+/// The same expansion, as it stood at an instant (§14): edges as they
+/// were active then, not as they are now.
+///
+/// # Errors
+///
+/// [`KernelError::Db`](superx_kernel::KernelError::Db) for engine
+/// errors.
+pub async fn expand_at(
+    db: &Db,
+    frontier: &[RecordId],
+    reverse: bool,
+    as_of: crate::asof::AsOf,
+) -> Result<Vec<EdgeRow>> {
     if frontier.is_empty() {
         return Ok(Vec::new());
     }
@@ -236,7 +252,11 @@ pub async fn expand(db: &Db, frontier: &[RecordId], reverse: bool) -> Result<Vec
         .bind(("ids", edge_ids))
         .await?;
     let rows: Vec<Value> = resp.take(0)?;
-    Ok(latest_per_chain(rows.iter().filter_map(parse_edge)))
+    Ok(latest_per_chain(
+        rows.iter()
+            .filter_map(parse_edge)
+            .filter(|e| crate::asof::visible(&e.valid_from, as_of)),
+    ))
 }
 
 /// Latest row per edge_uid wins. Timestamps are compared as PARSED

@@ -276,6 +276,21 @@ async fn attached_to(db: &Db, note: &Note) -> Result<crate::target::Target> {
 ///
 /// [`KernelError::Db`] for engine errors.
 pub async fn for_entity(db: &Db, entity: &RecordId, include_retracted: bool) -> Result<Vec<Note>> {
+    for_entity_at(db, entity, include_retracted, None).await
+}
+
+/// The same notes, as they stood at an instant (§14). A note written
+/// after it is not there; one retracted after it still stands.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn for_entity_at(
+    db: &Db,
+    entity: &RecordId,
+    include_retracted: bool,
+    as_of: crate::asof::AsOf,
+) -> Result<Vec<Note>> {
     let mut resp = db
         .query(
             "SELECT * FROM note WHERE entity = $entity ORDER BY valid_from ASC, id ASC",
@@ -289,6 +304,11 @@ pub async fn for_entity(db: &Db, entity: &RecordId, include_retracted: bool) -> 
     let mut heads: std::collections::BTreeMap<String, Note> = std::collections::BTreeMap::new();
     for row in &rows {
         if let Some(note) = parse(row) {
+            // Filtered BEFORE the reduction, so the head is the head as
+            // of the instant rather than the current head hidden.
+            if !crate::asof::visible_at(note.valid_from, as_of) {
+                continue;
+            }
             heads.insert(note.uid.clone(), note);
         }
     }

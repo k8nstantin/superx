@@ -354,31 +354,58 @@ async fn ui_attachments_surface_on_the_owner_and_resolve_to_their_file() {
     .expect("owner");
     let owner_id = superx_mod_entities::nodes::resolve_entity(&db, &owner).await.expect("resolve");
 
-    let doc = legacy_document(
+    // Through the real writer: a file is an attachment ROW, never a
+    // node (§6), so there is no `attached` edge to assert any more.
+    let dir = std::env::temp_dir().join(format!("sx-att-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let uid = superx_mod_entities::attachments::attach_bytes(
         &db,
-        &owner_id,
-        "notes.md",
-        "/tmp/entities/files/01a0-notes.md",
-        documents::mime_for("notes.md"),
-        4096,
+        &dir,
+        superx_mod_entities::attachments::Upload {
+            target: &superx_mod_entities::target::Target::Entity(owner_id.clone()),
+            label: "attachments",
+            filename: "notes.md",
+            bytes: &vec![0u8; 4096],
+            author: &Author::operator(),
+        },
     )
-    .await;
+    .await
+    .expect("attach");
 
-    // The owner's detail shows it as an attachment, not just an edge.
+    // The owner's detail shows it as an attachment.
     let d = api::detail(&db, &owner).await.expect("detail");
     assert_eq!(d.attachments.len(), 1, "{:?}", d.attachments);
     let a = &d.attachments[0];
     assert_eq!(a.name, "notes.md");
     assert_eq!(a.mime, "text/markdown");
     assert_eq!(a.size, 4096);
-    assert!(d.edges.iter().any(|e| e.rel_type == "attached" && e.outbound));
+    assert_eq!(a.id, uid);
+    assert!(
+        !d.edges.iter().any(|e| e.rel_type == "attached"),
+        "a file makes no edge: it is content on the entity, not a member of the graph"
+    );
 
-    // The download route resolves the stored path from the substrate.
-    let (path, name, mime) = api::attachment_file(&db, &superx_ops::record_uuid(&doc))
-        .await
-        .expect("file");
-    assert_eq!(path, "/tmp/entities/files/01a0-notes.md");
+    // The download route resolves the stored path from the row.
+    let (path, name, mime) = api::attachment_file(&db, &uid).await.expect("file");
+    assert!(path.ends_with("notes.md"), "{path}");
     assert_eq!((name.as_str(), mime.as_str()), ("notes.md", "text/markdown"));
+
+    // And a LEGACY document node still resolves, so an instance that
+    // has not run the migration keeps its download links working.
+    let legacy = legacy_document(
+        &db,
+        &owner_id,
+        "old.md",
+        "/tmp/entities/files/01a0-old.md",
+        documents::mime_for("old.md"),
+        11,
+    )
+    .await;
+    let (p2, n2, _) = api::attachment_file(&db, &superx_ops::record_uuid(&legacy))
+        .await
+        .expect("legacy file");
+    assert_eq!(p2, "/tmp/entities/files/01a0-old.md");
+    assert_eq!(n2, "old.md");
 
     // An entity that is not an attachment has no file to serve.
     assert!(
@@ -1309,4 +1336,128 @@ async fn a_write_that_claims_nothing_is_not_refused() {
         .expect("no claim, no refusal");
     }
     assert_eq!(api::detail(&db, &id).await.expect("detail").name, "two");
+}
+
+/// §14, the read that matters: "the entity as it stood at an instant —
+/// its state, every note, every attachment and every edge resolved at
+/// the SAME moment."
+///
+/// A field-by-field picker answers "how did this text change". This
+/// answers "what did the agent see when it did that", which cannot be
+/// assembled from separate pickers because each one moves
+/// independently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_instant_reaches_every_chain() {
+    use superx_mod_entities::{api, asof, edges, nodes, texts};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+    texts::set_role_text(&db, &product, "describes", "the first wording").await.expect("d1");
+    let task = nodes::create_entity(&db, "task", "Build it", None, None).await.expect("t");
+    edges::link(&db, &product, &task, "contains").await.expect("link");
+
+    // THE INSTANT, taken from the LAST setup write rather than from
+    // the clock: `set_role_text` appends a note and no state version,
+    // so the anchor's own timestamp predates the prose and would make
+    // this test assert something it never set up.
+    let then = edges::expand(&db, std::slice::from_ref(&product), false)
+        .await
+        .expect("edges")
+        .into_iter()
+        .map(|e| e.valid_from)
+        .max()
+        .expect("the link is the last thing written above");
+
+    // The world moves on: renamed, re-described, a comment added, the
+    // task unlinked.
+    nodes::update_entity(&db, &product, Some("Widget X2".into()), None, None).await.expect("rename");
+    texts::set_role_text(&db, &product, "describes", "a later wording").await.expect("d2");
+    texts::add_comment(&db, &product, "a remark", &Author::operator()).await.expect("c");
+    edges::unlink(&db, &product, &task, "contains").await.expect("unlink");
+
+    // Now is now.
+    let now = api::detail(&db, &frag).await.expect("now");
+    assert_eq!(now.name, "Widget X2");
+    assert!(now.annotations.iter().any(|a| a.content == "a later wording"));
+    assert!(now.annotations.iter().any(|a| a.label == "comments"));
+    assert!(!now.edges.iter().any(|e| e.rel_type == "contains"), "the link is gone now");
+
+    // Then is then — one instant, every chain.
+    let past = api::detail_at(&db, &frag, asof::parse(Some(&then)).expect("parse"))
+        .await
+        .expect("as-of");
+    assert_eq!(past.name, "Widget", "the name it had");
+    assert!(
+        past.annotations.iter().any(|a| a.content == "the first wording"),
+        "the wording it had: {:?}",
+        past.annotations.iter().map(|a| &a.content).collect::<Vec<_>>()
+    );
+    assert!(
+        !past.annotations.iter().any(|a| a.content == "a later wording"),
+        "and not the one written afterwards"
+    );
+    assert!(
+        !past.annotations.iter().any(|a| a.label == "comments"),
+        "a comment written afterwards was not there"
+    );
+    assert!(
+        past.edges.iter().any(|e| e.rel_type == "contains"),
+        "the edge was ACTIVE then, even though it is unlinked now"
+    );
+}
+
+/// An instant before the entity existed is a question about a time when
+/// it did not, and the refusal says so rather than reading as a broken
+/// substrate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_instant_before_it_existed_says_so() {
+    use superx_mod_entities::{api, asof, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    let err = api::detail_at(&db, &frag, asof::parse(Some("2000-01-01T00:00:00Z")).expect("p"))
+        .await
+        .expect_err("there was no Widget in 2000");
+    assert!(err.to_string().contains("created later"), "{err}");
+
+    // And an unreadable instant is refused before anything is read.
+    asof::parse(Some("last tuesday")).expect_err("not an instant");
+}
+
+/// §14: archiving hides, it does not erase — and it is a versioned
+/// change, so an as-of read from before it still shows the thing as
+/// live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archiving_hides_by_default_and_is_itself_a_version() {
+    use superx_mod_entities::{api, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    assert!(api::list(&db, None, false).await.expect("list").iter().any(|e| e.id == frag));
+
+    assert!(nodes::set_archived(&db, &product, true).await.expect("archive"));
+    assert!(
+        !api::list(&db, None, false).await.expect("list").iter().any(|e| e.id == frag),
+        "hidden from the default list"
+    );
+    let shown = api::list(&db, None, true).await.expect("list");
+    let row = shown.iter().find(|e| e.id == frag).expect("still there when asked for");
+    assert!(row.archived, "and it says so, rather than looking ordinary");
+
+    // Restoring changes it back, and restoring AGAIN appends nothing —
+    // a repeated call must not pad the history with rows saying nothing.
+    assert!(nodes::set_archived(&db, &product, false).await.expect("restore"));
+    assert!(!nodes::set_archived(&db, &product, false).await.expect("again"), "no second version");
+
+    // Restored.
+    assert!(api::list(&db, None, false).await.expect("list").iter().any(|e| e.id == frag));
 }

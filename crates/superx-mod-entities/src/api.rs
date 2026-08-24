@@ -723,15 +723,47 @@ pub async fn list(
 }
 
 pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
+    detail_at(db, fragment, None).await
+}
+
+/// THE WHOLE ENTITY AS IT STOOD AT AN INSTANT (§14).
+///
+/// A field-by-field picker answers "how did this text change". This
+/// answers **"what did the agent see when it did that"** — the question
+/// after a bad run — and it cannot be assembled from separate pickers,
+/// because each one moves independently.
+///
+/// One instant reaches every chain: state, notes, attachments and
+/// edges, all resolved at the same moment. `valid_from <= as_of`,
+/// latest wins per chain, edges as they were ACTIVE then.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] when the instant is unreadable or the entity
+/// did not exist yet; verb errors pass through.
+pub async fn detail_at(
+    db: &Db,
+    fragment: &str,
+    as_of: crate::asof::AsOf,
+) -> Result<EntityDetail> {
     let id = nodes::resolve_entity(db, fragment).await?;
     let (entity_type, _created) = nodes::anchor_info(db, &id).await?;
-    let state = nodes::current_state(db, &id).await?.ok_or_else(|| {
-        KernelError::Module(format!("entity {} has no state chain", record_uuid(&id)))
+    let state = nodes::state_at(db, &id, as_of).await?.ok_or_else(|| {
+        // Distinguishing the two is the difference between a broken
+        // substrate and a question about a time before this existed.
+        if as_of.is_some() {
+            KernelError::Module(format!(
+                "entity {} had no version at that instant — it was created later",
+                record_uuid(&id)
+            ))
+        } else {
+            KernelError::Module(format!("entity {} has no state chain", record_uuid(&id)))
+        }
     })?;
     // Prose comes from the note store (#278). The text carriers still
     // exist and are still written, but nothing reads them for display any
     // more — which is what had to become true before they can go.
-    let annotations = notes::for_entity(db, &id, false)
+    let annotations = notes::for_entity_at(db, &id, false, as_of)
         .await?
         .into_iter()
         .map(|n| AnnotationView {
@@ -747,8 +779,8 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
     // Active NON-TEXT edges, both directions, with the far side named.
     let mut views: Vec<(RecordId, EdgeView)> = Vec::new();
     for (rows, outbound) in [
-        (edges::expand(db, std::slice::from_ref(&id), false).await?, true),
-        (edges::expand(db, std::slice::from_ref(&id), true).await?, false),
+        (edges::expand_at(db, std::slice::from_ref(&id), false, as_of).await?, true),
+        (edges::expand_at(db, std::slice::from_ref(&id), true, as_of).await?, false),
     ] {
         for e in rows {
             if !e.active || texts::TEXT_ROLES.contains(&e.rel_type.as_str()) {
@@ -781,7 +813,7 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
         })
         .collect();
 
-    let attachments = attachments_of(db, &edges).await?;
+    let attachments = attachments_of(db, &id, as_of).await?;
     let ancestors = graph::ancestors(db, &id, ANCESTOR_MAX_DEPTH)
         .await?
         .into_iter()
@@ -807,46 +839,33 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
     })
 }
 
-/// Resolve the `attached` edges to their documents' file metadata
-/// (EU4). Attachments are ordinary entities, so they already appear
-/// among the edges — this reads the metadata the download route needs.
-async fn attachments_of(db: &Db, edges: &[EdgeView]) -> Result<Vec<AttachmentView>> {
-    let mut out = Vec::new();
-    for e in edges.iter().filter(|e| e.outbound && e.rel_type == "attached") {
-        let Ok(doc) = nodes::resolve_entity(db, &e.other_id).await else {
-            continue;
-        };
-        let Some(state) = nodes::current_state(db, &doc).await? else {
-            continue;
-        };
-        let attrs = state.attributes.as_ref();
-        out.push(AttachmentView {
-            id: e.other_id.clone(),
-            name: attr_str(attrs, "original_name").unwrap_or_else(|| state.name.clone()),
-            mime: attr_str(attrs, "mime").unwrap_or_else(|| "application/octet-stream".into()),
-            size: attr_int(attrs, "size"),
-        });
-    }
-    Ok(out)
+/// The files on an entity, read from the `attachment` rows.
+///
+/// It used to walk the `attached` edge to a `document` node and read
+/// its attributes. B4 retracted those edges and B6 stopped creating the
+/// nodes, so that walk now finds nothing — the rows are the one place
+/// files live (§3, §6).
+async fn attachments_of(
+    db: &Db,
+    id: &RecordId,
+    as_of: crate::asof::AsOf,
+) -> Result<Vec<AttachmentView>> {
+    Ok(attachments::for_target_at(db, &target::Target::Entity(id.clone()), false, as_of)
+        .await?
+        .into_iter()
+        .map(|a| AttachmentView { id: a.uid, name: a.filename, mime: a.mime, size: a.size })
+        .collect())
 }
 
+/// A string out of an attributes bag, for the legacy document rows the
+/// download route still resolves.
 fn attr_str(attrs: Option<&Value>, key: &str) -> Option<String> {
     match attrs {
         Some(Value::Object(o)) => match o.get(key) {
-            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::String(v)) => Some(v.clone()),
             _ => None,
         },
         _ => None,
-    }
-}
-
-fn attr_int(attrs: Option<&Value>, key: &str) -> i64 {
-    match attrs {
-        Some(Value::Object(o)) => match o.get(key) {
-            Some(Value::Number(n)) => n.to_int().unwrap_or(0),
-            _ => 0,
-        },
-        _ => 0,
     }
 }
 
@@ -923,8 +942,23 @@ pub async fn graph_view(
 /// Where an attachment's bytes live, and what to call them on the way
 /// out. Path resolution stays in the module: the stored path is a
 /// substrate fact written by the attach path, never client input.
-pub async fn attachment_file(db: &Db, fragment: &str) -> Result<(String, String, String)> {
-    let id = nodes::resolve_entity(db, fragment).await?;
+pub async fn attachment_file(db: &Db, uid: &str) -> Result<(String, String, String)> {
+    // An attachment ROW, by uid. It used to resolve a `document` entity
+    // and read its attributes; B4 migrated those into rows and B6
+    // stopped creating them, so the row is where the path is.
+    if let Some(a) = attachments::current(db, uid).await? {
+        if !a.active {
+            return Err(KernelError::Module(
+                "that attachment was retracted — it is on the record, not on the way out".into(),
+            ));
+        }
+        return Ok((a.path, a.filename, a.mime));
+    }
+
+    // A LEGACY document node, for an instance that has not migrated yet.
+    // Reading it keeps every existing download link working across the
+    // upgrade instead of breaking until the operator runs the migration.
+    let id = nodes::resolve_entity(db, uid).await?;
     let state = nodes::current_state(db, &id)
         .await?
         .ok_or_else(|| KernelError::Module("attachment has no state".into()))?;
