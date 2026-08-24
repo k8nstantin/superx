@@ -373,3 +373,48 @@ async fn require_label(db: &Db, label: &str) -> Result<dictionary::LabelRow> {
          nobody defined is a slot nobody can interpret"
     )))
 }
+
+/// The current notes of MANY entities in one read, keyed by entity uuid.
+///
+/// A graph walk resolves each level in one query (#179) so that it costs
+/// the nodes it reaches and never the table. Asking per node would put
+/// that back: fifty nodes, fifty round trips, and the cost growing with
+/// the graph instead of with the level.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn for_entities(
+    db: &Db,
+    entities: &[RecordId],
+    include_retracted: bool,
+) -> Result<std::collections::HashMap<String, Vec<Note>>> {
+    if entities.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut resp = db
+        .query("SELECT * FROM note WHERE entity IN $entities ORDER BY valid_from ASC, id ASC")
+        .bind(("entities", entities.to_vec()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+
+    // Latest row per uid wins, exactly as the single-entity read does;
+    // one ascending scan settles every chain at once.
+    let mut heads: std::collections::BTreeMap<String, Note> = std::collections::BTreeMap::new();
+    for row in &rows {
+        if let Some(note) = parse(row) {
+            heads.insert(note.uid.clone(), note);
+        }
+    }
+
+    let mut out: std::collections::HashMap<String, Vec<Note>> =
+        std::collections::HashMap::new();
+    for note in heads.into_values() {
+        if !include_retracted && !note.active {
+            continue;
+        }
+        let Some(entity) = note.entity.clone() else { continue };
+        out.entry(superx_ops::record_uuid(&entity)).or_default().push(note);
+    }
+    Ok(out)
+}
