@@ -5,9 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use superx_kernel::{Kernel, KernelError, NodeKind, Result};
+use superx_kernel::{Kernel, KernelError, Result};
 
-use crate::MODULE_NAME;
 
 /// Subgraph resolution depth for planning (epic S2).
 pub const PLAN_DEPTH_PARAM: &str = "attr_runner_plan_depth";
@@ -94,27 +93,13 @@ pub async fn resolved_plan_depth(kernel: &Kernel) -> usize {
     if let Some(own) = crate::params::load(kernel).plan_depth {
         return own.max(1);
     }
-    let adopted = kernel_plan_depth(kernel).await;
-    if adopted != DEFAULT_PLAN_DEPTH {
-        crate::params::adopt(kernel, |s| s.plan_depth = Some(adopted));
-    }
-    adopted
-}
-
-async fn kernel_plan_depth(kernel: &Kernel) -> usize {
-    let Ok(Some(entity)) = kernel
-        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
-        .await
-    else {
-        return DEFAULT_PLAN_DEPTH;
-    };
-    match kernel.get_parameter(entity, PLAN_DEPTH_PARAM).await {
-        Ok(Some(superx_kernel::types::Value::Number(n))) => n
-            .to_int()
-            .and_then(|i| usize::try_from(i).ok())
-            .filter(|&d| d > 0)
-            .unwrap_or(DEFAULT_PLAN_DEPTH),
-        _ => DEFAULT_PLAN_DEPTH,
+    match crate::daemon::kernel_u64(kernel, PLAN_DEPTH_PARAM).await {
+        Some(set) => {
+            let adopted = usize::try_from(set).unwrap_or(DEFAULT_PLAN_DEPTH).max(1);
+            crate::params::adopt(kernel, |s| s.plan_depth = Some(adopted));
+            adopted
+        }
+        None => DEFAULT_PLAN_DEPTH,
     }
 }
 

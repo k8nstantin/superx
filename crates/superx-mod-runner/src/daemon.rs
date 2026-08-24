@@ -119,15 +119,14 @@ pub async fn resolved_max_parallel(kernel: &Kernel) -> usize {
     if let Some(own) = crate::params::load(kernel).max_parallel {
         return own.max(1);
     }
-    let adopted = kernel_max_parallel(kernel).await;
-    if adopted != DEFAULT_MAX_PARALLEL {
-        crate::params::adopt(kernel, |s| s.max_parallel = Some(adopted));
+    match kernel_u64(kernel, MAX_PARALLEL_PARAM).await {
+        Some(set) => {
+            let adopted = usize::try_from(set).unwrap_or(DEFAULT_MAX_PARALLEL).max(1);
+            crate::params::adopt(kernel, |s| s.max_parallel = Some(adopted));
+            adopted
+        }
+        None => DEFAULT_MAX_PARALLEL,
     }
-    adopted
-}
-
-async fn kernel_max_parallel(kernel: &Kernel) -> usize {
-    resolved_u64(kernel, MAX_PARALLEL_PARAM, DEFAULT_MAX_PARALLEL as u64).await.max(1) as usize
 }
 
 /// Resolved tick cadence (public for `runner config`).
@@ -135,11 +134,35 @@ pub async fn resolved_tick_secs(kernel: &Kernel) -> u64 {
     if let Some(own) = crate::params::load(kernel).tick_secs {
         return own.max(1);
     }
-    let adopted = resolved_u64(kernel, TICK_PARAM, DEFAULT_TICK_SECS).await.max(1);
-    if adopted != DEFAULT_TICK_SECS {
-        crate::params::adopt(kernel, |s| s.tick_secs = Some(adopted));
+    match kernel_u64(kernel, TICK_PARAM).await {
+        Some(set) => {
+            let adopted = set.max(1);
+            crate::params::adopt(kernel, |s| s.tick_secs = Some(adopted));
+            adopted
+        }
+        None => DEFAULT_TICK_SECS,
     }
-    adopted
+}
+
+/// The kernel's value for a numeric parameter, if it HAS one.
+///
+/// The defaulting reader below cannot distinguish "the operator chose
+/// the default" from "the operator chose nothing", and adoption turns on
+/// exactly that difference: a value set deliberately must move into the
+/// module's own settings even when it happens to equal the default, or
+/// the record of having chosen it is lost when the storage moves.
+pub(crate) async fn kernel_u64(kernel: &Kernel, param: &str) -> Option<u64> {
+    let entity = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+        .ok()
+        .flatten()?;
+    match kernel.get_parameter(entity, param).await {
+        Ok(Some(superx_kernel::types::Value::Number(n))) => {
+            n.to_int().and_then(|i| u64::try_from(i).ok())
+        }
+        _ => None,
+    }
 }
 
 async fn resolved_u64(kernel: &Kernel, param: &str, fallback: u64) -> u64 {
