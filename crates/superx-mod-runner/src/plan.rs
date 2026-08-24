@@ -87,8 +87,21 @@ pub async fn fetch_graph(kernel: &Kernel, fragment: &str, depth: usize) -> Resul
         .map_err(|e| KernelError::Module(format!("unparseable entities graph JSON: {e}")))
 }
 
-/// The planning depth: substrate parameter with the marked fallback.
+/// The planning depth: the module's own setting (#284), falling back to
+/// a kernel parameter set before the module owned its settings, and
+/// adopting it so the next read finds it here.
 pub async fn resolved_plan_depth(kernel: &Kernel) -> usize {
+    if let Some(own) = crate::params::load(kernel).plan_depth {
+        return own.max(1);
+    }
+    let adopted = kernel_plan_depth(kernel).await;
+    if adopted != DEFAULT_PLAN_DEPTH {
+        crate::params::adopt(kernel, |s| s.plan_depth = Some(adopted));
+    }
+    adopted
+}
+
+async fn kernel_plan_depth(kernel: &Kernel) -> usize {
     let Ok(Some(entity)) = kernel
         .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
         .await
