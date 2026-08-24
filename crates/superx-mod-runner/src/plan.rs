@@ -25,6 +25,35 @@ pub struct GraphNode {
     pub version: String,
     #[serde(default)]
     pub depth: usize,
+    /// The prose attached to this entity (#286), carried in the same
+    /// export the graph came from — so a prompt is assembled from the
+    /// notes the walk actually saw, not from whatever a second read
+    /// would return a moment later.
+    #[serde(default)]
+    pub notes: Vec<Note>,
+}
+
+/// One piece of prose on an entity, as the entities module exports it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Note {
+    pub uid: String,
+    /// The dictionary slot: `description`, `instructions`, `comments`.
+    pub label: String,
+    pub body: String,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+impl GraphNode {
+    /// The prose in one slot, if this entity carries it.
+    ///
+    /// A slot is singular by the dictionary's declaration, so the first
+    /// match is the answer; a plural slot is not something a prompt
+    /// reads by label anyway.
+    #[must_use]
+    pub fn note(&self, label: &str) -> Option<&Note> {
+        self.notes.iter().find(|n| n.label == label)
+    }
 }
 
 /// One edge of the graph JSON contract.

@@ -19,9 +19,9 @@ use crate::{run, schedule};
 pub trait Exchange: Send + Sync {
     /// The target's current subgraph (re-read every frontier, D27).
     async fn graph(&self, root: &str, depth: usize) -> Result<Graph>;
-    /// Write a task's output into the graph as a `produced` text
-    /// node; returns the text node's uuid.
-    async fn write_back(&self, task_uid: &str, output: &str) -> Result<String>;
+    /// Record a task's output. Returns whatever identifies it, for
+    /// `run.output_ref`.
+    async fn write_back(&self, task_uid: &str, run_uid: &str, output: &str) -> Result<String>;
 }
 
 /// The live exchange: entities-module CLI through kernel dispatch.
@@ -35,36 +35,38 @@ impl Exchange for CliExchange {
         crate::plan::fetch_graph(&self.kernel, root, depth).await
     }
 
-    async fn write_back(&self, task_uid: &str, output: &str) -> Result<String> {
-        let created = superx_ops::run_module_cli(
+    /// A run's output is a COMMENT on the task (#286), not a node in the
+    /// product graph.
+    ///
+    /// It used to be a `text` entity on a `produced` edge, which put the
+    /// agent's words into the graph an agent walks — so the next run had
+    /// to distinguish work from words about work. As a comment it sits
+    /// where a person would look for it, and it is attributed: written
+    /// by the agent, in this run, rather than by whoever happens to own
+    /// the console.
+    async fn write_back(&self, task_uid: &str, run_uid: &str, output: &str) -> Result<String> {
+        let posted = superx_ops::run_module_cli(
             &self.kernel,
             &[
                 "entities".to_string(),
-                "create".to_string(),
-                "--type".to_string(),
-                "text".to_string(),
-                "--content".to_string(),
-                output.to_string(),
-                "result".to_string(),
-            ],
-        )
-        .await
-        .map_err(KernelError::Module)?;
-        let text_uuid = created.trim().to_string();
-        superx_ops::run_module_cli(
-            &self.kernel,
-            &[
-                "entities".to_string(),
-                "link".to_string(),
+                "comment".to_string(),
                 task_uid.to_string(),
-                text_uuid.clone(),
-                "--rel".to_string(),
-                "produced".to_string(),
+                "--author-kind".to_string(),
+                "agent".to_string(),
+                "--author-uid".to_string(),
+                run_uid.to_string(),
+                output.to_string(),
             ],
         )
         .await
         .map_err(KernelError::Module)?;
-        Ok(text_uuid)
+        // `comment added: <uuid>` — the note is what the run points at.
+        Ok(posted
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string())
     }
 }
 
@@ -89,6 +91,10 @@ pub struct FiringReport {
 
 /// The exact detail string for an unset agent command (spec #193).
 pub const UNSET_CMD_DETAIL: &str = "attr_runner_agent_cmd not set";
+
+/// Why a task with nothing to do is refused rather than dispatched.
+pub const NO_INSTRUCTIONS_DETAIL: &str =
+    "task has neither instructions nor a description — refusing to dispatch an agent with nothing to do"; // skill-allow: §9-const — a failure reason, not a tunable
 
 /// Execute one due schedule end-to-end (S3 firing lifecycle):
 /// append `fired`, then re-plan/dispatch until the graph is spent or
@@ -151,6 +157,25 @@ pub async fn fire(
                 dispatched.insert(task_uid.clone());
                 let run_uid = uuid::Uuid::now_v7().to_string();
                 let (prompt, instruct_version) = build_prompt(&graph, &task_uid);
+
+                // A task with nothing to do used to dispatch with an
+                // empty Instructions section: an agent sent off with a
+                // heading and nothing under it, whose output is then
+                // indistinguishable from work. Refusing says what is
+                // wrong, on the run record, where someone will see it.
+                if instruct_version.is_none() {
+                    run::append_run_row(
+                        db, &run_uid, &due.uid, &firing, &task_uid,
+                        "failed", None, None, Some(NO_INSTRUCTIONS_DETAIL),
+                    )
+                    .await?;
+                    emit(kernel, "run_failed", serde_json::json!({
+                        "firing": firing, "task": task_uid,
+                        "detail": NO_INSTRUCTIONS_DETAIL,
+                    })).await;
+                    failed.insert(task_uid);
+                    continue;
+                }
                 run::append_run_row(
                     db, &run_uid, &due.uid, &firing, &task_uid,
                     "dispatched", instruct_version.as_deref(), None, None,
@@ -192,7 +217,7 @@ pub async fn fire(
         // Await ONE completion, then re-evaluate the frontier (D27).
         if let Some(Ok((task_uid, run_uid, instruct_version, outcome))) = in_flight.join_next().await {
             match outcome {
-                Ok(stdout) => match exchange.write_back(&task_uid, &stdout).await {
+                Ok(stdout) => match exchange.write_back(&task_uid, &run_uid, &stdout).await {
                     Ok(text_uuid) => {
                         run::append_run_row(
                             db, &run_uid, &due.uid, &firing, &task_uid,
@@ -273,6 +298,11 @@ fn task_dependencies(graph: &Graph) -> TaskDeps<'_> {
     (tasks, deps, warnings)
 }
 
+/// Edge names that used to carry prose. Their targets are the legacy
+/// text carriers: still in the graph, no longer where prose is read
+/// from, and never context for a prompt.
+pub const PROSE_ROLES: [&str; 3] = ["describes", "comments", "instructs"]; // skill-allow: §9-const — the entities module's own edge names, not a tunable
+
 /// Assemble the agent prompt (epic S3, exact section order) and pin
 /// the dispatched instructs version (D27).
 #[must_use]
@@ -286,26 +316,39 @@ pub fn build_prompt(graph: &Graph, task_uid: &str) -> (String, Option<String>) {
         task.map_or(task_uid, |t| t.name.as_str())
     ));
 
+    // Prose comes from the note store (#286), by LABEL. Matching edge
+    // names read the text node on the far end; a label reads what the
+    // prose IS, which is what the dictionary declares and what the
+    // export now carries.
+    //
+    // A TASK'S DESCRIPTION IS ITS ORDERS. The entity model says so —
+    // "a task means do what the description says, so instructions ARE
+    // the description" — and the instance agrees: every task in it
+    // carries a description and none carries a separate `instructions`.
+    // Reading only `instructions` would have found nothing to dispatch
+    // on, anywhere.
+    //
+    // `instructions` is still read first, because prose migrated from a
+    // legacy `instructs` edge landed under that label and saying it
+    // explicitly should still win.
     let mut instruct_version = None;
-    for edge in graph.edges.iter().filter(|e| e.from == task_uid && e.rel == "instructs") {
-        if let Some(text) = node_by_uid.get(edge.to.as_str()) {
-            if let Some(content) = &text.content {
-                out.push_str(&format!("\nInstructions:\n{content}\n"));
-            }
-            instruct_version = Some(text.version.clone());
-        }
+    if let Some(orders) = task.and_then(|t| t.note("instructions").or_else(|| t.note("description")))
+    {
+        out.push_str(&format!("\nInstructions:\n{}\n", orders.body));
+        instruct_version = orders.version.clone();
     }
 
-    for edge in graph.edges.iter().filter(|e| e.from == graph.root && e.rel == "describes") {
-        if let Some(text) = node_by_uid.get(edge.to.as_str()) {
-            if let Some(content) = &text.content {
-                out.push_str(&format!("\nAbout the product:\n{content}\n"));
-            }
-        }
+    if let Some(about) = node_by_uid
+        .get(graph.root.as_str())
+        .and_then(|root| root.note("description"))
+    {
+        out.push_str(&format!("\nAbout the product:\n{}\n", about.body));
     }
 
     let mut context = String::new();
-    for edge in graph.edges.iter().filter(|e| e.from == task_uid && e.rel != "instructs") {
+    for edge in graph.edges.iter().filter(|e| {
+        e.from == task_uid && !crate::exec::PROSE_ROLES.contains(&e.rel.as_str())
+    }) {
         if let Some(node) = node_by_uid.get(edge.to.as_str()) {
             context.push_str(&format!(
                 "- [{}] {} ({}){}\n",
