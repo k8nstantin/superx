@@ -362,7 +362,10 @@ async fn every_shipped_type_carries_at_least_a_description_and_a_channel() {
     let bound = dictionary::seed_type_labels(&db).await.expect("slots");
     assert!(bound > 0);
 
-    for entity_type in ["product", "task", "rag", "model", "document", "repo", "credential"] {
+    // `document` is not in this list any more: B6 retired it as an
+    // entity type, because a file is an attachment row and not a thing
+    // you describe and comment on.
+    for entity_type in ["product", "task", "rag", "model", "repo", "credential"] {
         let slots = dictionary::slots_for(&db, entity_type, false).await.expect("slots");
         assert!(
             slots.iter().any(|s| s.label == "description"),

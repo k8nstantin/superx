@@ -814,6 +814,14 @@ async fn attach_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         (Some(f), Some(p)) => (f, std::path::PathBuf::from(p)),
         _ => return Err(usage()),
     };
+    // §5.4: the label is what the file MEANS, and a spec sheet uploaded
+    // as a PDF and labelled `spec` IS the spec. Defaults to the §5.3
+    // `attachments` label when the operator does not say.
+    let label = match (args.get(2).map(String::as_str), args.get(3)) {
+        (Some("--label"), Some(l)) => l.clone(),
+        (None, _) => "attachments".to_string(),
+        _ => return Err(usage()),
+    };
     let owner = nodes::resolve_entity(&db, fragment).await?;
     let size = std::fs::metadata(&path)
         .map_err(|e| KernelError::Module(format!("cannot read {}: {e}", path.display())))?
@@ -824,34 +832,22 @@ async fn attach_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         .unwrap_or("attachment")
         .to_string();
 
-    // The file lands in the module's own dir, keyed by a fresh uuid7
-    // (the historical-log convention extends to stored blobs).
-    let files_dir = kernel.module_dir(MODULE_NAME)?.join("files");
-    std::fs::create_dir_all(&files_dir)
-        .map_err(|e| KernelError::Module(format!("cannot create files dir: {e}")))?;
-    let stored_name = format!("{}-{file_name}", uuid::Uuid::now_v7());
-    let stored = files_dir.join(&stored_name);
-    // Streamed copy — attachments never transit memory whole (#179).
-    std::fs::copy(&path, &stored)
-        .map_err(|e| KernelError::Module(format!("cannot store file: {e}")))?;
-
+    // §6: "a file is attached content: it belongs to the entity and is
+    // never a node." One writer for the CLI and the browser both, so
+    // the two paths cannot drift — the row records the label, and the
+    // label is what says a PDF IS the mandate (§5.4).
     let mime = documents::mime_for(&file_name);
-    let node = documents::attach_document(
+    let uid = crate::attachments::attach(
         &db,
-        &owner,
-        &file_name,
-        &stored.to_string_lossy(),
-        mime,
-        size,
+        &kernel.module_dir(MODULE_NAME)?,
+        &crate::target::Target::Entity(owner.clone()),
+        &label,
+        &path,
+        &crate::notes::Author::operator(),
     )
     .await?;
-    let node_uuid = record_uuid(&node);
-    emit(kernel, "document_attached", &node_uuid, "document", &file_name).await;
-    emit_link(kernel, &record_uuid(&owner), &node_uuid, "attached", "entities_linked").await;
-    Ok(format!(
-        "document {node_uuid} attached ({mime}, {size} bytes) — stored at {}\n",
-        stored.display()
-    ))
+    emit(kernel, "file_attached", &uid, "attachments", &record_uuid(&owner)).await;
+    Ok(format!("attached {uid} ({mime}, {size} bytes) — {file_name}\n"))
 }
 
 async fn tree_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {

@@ -19,6 +19,50 @@ async fn fresh_db() -> superx_kernel::Db {
     db
 }
 
+
+/// Build a document node the way the world before B4 did: a `document`
+/// entity joined by an `attached` edge. `documents::attach_document` is
+/// gone — a file is an attachment row now (§6) — so tests that need the
+/// legacy shape build it directly, past the writer, which is how such a
+/// row got there.
+async fn legacy_document(
+    db: &superx_kernel::Db,
+    owner: &superx_kernel::types::RecordId,
+    name: &str,
+    path: &str,
+    mime: &str,
+    size: u64,
+) -> superx_kernel::types::RecordId {
+    let attributes = superx_kernel::message::value_from_json(&serde_json::json!({
+        "file": path,
+        "original_name": name,
+        "mime": mime,
+        "size": size,
+    }));
+    let _ = superx_mod_entities::registry::add_type(db, "document", "entity", None).await;
+    let node = superx_mod_entities::nodes::create_entity(db, "document", name, None, Some(attributes))
+        .await
+        .expect("legacy document node");
+    superx_mod_entities::edges::link(db, owner, &node, "attached").await.expect("attached edge");
+    node
+}
+
+
+/// Build a text carrier the way the world before #268 did. `text` is no
+/// longer a shipped entity type — B6 retired it — so the legacy shape
+/// registers the legacy type first, which is the honest statement of
+/// what it is: a row a fresh instance would never make.
+async fn legacy_text(
+    db: &superx_kernel::Db,
+    name: &str,
+    body: &str,
+) -> superx_kernel::types::RecordId {
+    let _ = superx_mod_entities::registry::add_type(db, "text", "entity", None).await;
+    superx_mod_entities::nodes::create_entity(db, "text", name, Some(body.to_string()), None)
+        .await
+        .expect("legacy carrier")
+}
+
 #[test]
 fn facilities_declared() {
     let d = EntitiesModule.descriptor();
@@ -43,10 +87,10 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
     );
     let rels = api::rel_types(&db).await.expect("rels");
     assert!(rels.contains(&"depends_on".to_string()));
-    // The text carrier is registered but never hand-created: flagged
-    // so the create form drops it.
-    assert!(types.iter().any(|t| t.name == "text" && t.system));
-    assert!(types.iter().all(|t| t.name == "text" || !t.system));
+    // No kind is a "system" type any more. `text` needed the flag
+    // because writing a description created one behind your back; B6
+    // ended that, so there is nothing the create form has to hide.
+    assert!(types.iter().all(|t| !t.system), "no kind is hidden from the create form");
 
     // Create with a markdown description + JSON attributes.
     let product = api::create(
@@ -107,7 +151,7 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
 
     // The list is entities, not their annotations: the description and
     // comment text nodes stay out of it unless asked for by name.
-    let listed = api::list(&db, None).await.expect("list");
+    let listed = api::list(&db, None, false).await.expect("list");
     assert!(listed.iter().any(|e| e.id == product));
     assert!(
         listed.iter().all(|e| e.entity_type != "text"),
@@ -116,7 +160,7 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
     // Writing prose no longer creates a carrier at all (#302), so
     // there is nothing of that type to return. The prose itself is on
     // the detail page above, under its dictionary label.
-    let texts_only = api::list(&db, Some("text")).await.expect("list text");
+    let texts_only = api::list(&db, Some("text"), true).await.expect("list text");
     assert!(
         texts_only.is_empty(),
         "a description and a comment made no entities: {:?}",
@@ -282,15 +326,7 @@ async fn ui_graph_leaves_descriptions_and_comments_out_of_it() {
     // Writing prose no longer makes one (#302), so this builds the
     // pre-#268 shape directly: ~41 exist on the live instance and
     // clicking one must still open something.
-    let carrier = superx_mod_entities::nodes::create_entity(
-        &db,
-        "text",
-        "an older description",
-        Some("an older description".to_string()),
-        None,
-    )
-    .await
-    .expect("legacy carrier");
+    let carrier = legacy_text(&db, "an older description", "an older description").await;
     let text_id = &superx_ops::record_uuid(&carrier);
     let tg = api::graph_view(&db, text_id, 2, "both").await.expect("text graph");
     assert_eq!(&tg.root, text_id);
@@ -317,7 +353,7 @@ async fn ui_attachments_surface_on_the_owner_and_resolve_to_their_file() {
     .expect("owner");
     let owner_id = superx_mod_entities::nodes::resolve_entity(&db, &owner).await.expect("resolve");
 
-    let doc = documents::attach_document(
+    let doc = legacy_document(
         &db,
         &owner_id,
         "notes.md",
@@ -325,8 +361,7 @@ async fn ui_attachments_surface_on_the_owner_and_resolve_to_their_file() {
         documents::mime_for("notes.md"),
         4096,
     )
-    .await
-    .expect("attach");
+    .await;
 
     // The owner's detail shows it as an attachment, not just an edge.
     let d = api::detail(&db, &owner).await.expect("detail");
@@ -418,7 +453,10 @@ async fn seeding_is_idempotent() {
     assert_eq!(second, 0, "re-seed creates nothing");
     let rows = registry::list_types(&db).await.expect("list");
     assert_eq!(rows.len(), registry::SEEDED_TYPES.len());
-    assert!(rows.iter().any(|r| r.name == "text" && r.category == "entity"));
+    // `text` and `document` are NOT here: B6 retired them, because
+    // prose is a note and a file is an attachment row. An instance that
+    // already has the rows keeps them — the registry is append-only.
+    assert!(rows.iter().all(|r| r.name != "text" && r.name != "document"));
     assert!(rows.iter().any(|r| r.name == "instructs" && r.category == "relation"));
 }
 
@@ -790,7 +828,7 @@ async fn documents_are_graph_nodes() {
     registry::seed_types(&db).await.expect("seed");
 
     let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
-    let doc = documents::attach_document(
+    let doc = legacy_document(
         &db,
         &product,
         "spec.pdf",
@@ -798,8 +836,7 @@ async fn documents_are_graph_nodes() {
         "application/pdf",
         4096,
     )
-    .await
-    .expect("attach");
+    .await;
 
     // The document rides the graph like any node.
     let sub = graph::subgraph(&db, &product, 3, false).await.expect("bfs");
@@ -847,30 +884,33 @@ async fn subgraph_carries_text_content_via_batched_meta() {
     let db = fresh_db().await;
     registry::seed_types(&db).await.expect("seed");
 
-    // A DOCUMENT, not a text carrier. The property under test is that
-    // the batched per-level meta read carries content for
-    // content-bearing kinds — which is unchanged. What changed is that
-    // prose is no longer a member of the graph (#300), so proving this
-    // on a `describes` text node would be proving it about a node the
-    // walk correctly never reaches.
+    // The property is the BATCHED per-level read: one request resolves
+    // the whole frontier's name, attributes, version and notes, so a
+    // walk costs the nodes it reaches rather than the table.
+    //
+    // It no longer carries `content`. The only kinds that had any were
+    // `text` and `document`, and B4 took both out of the graph — so a
+    // field that can never be populated is gone rather than left as a
+    // column that is always null.
     let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
-    let doc = nodes::create_entity(
-        &db,
-        "document",
-        "spec.md",
-        Some("The whole point.".to_string()),
-        None,
-    )
-    .await
-    .expect("d");
-    edges::link(&db, &product, &doc, "attached").await.expect("attach");
+    let attrs = superx_kernel::message::value_from_json(&serde_json::json!({"owner": "cal"}));
+    let part = nodes::create_entity(&db, "product", "Frame", None, Some(attrs)).await.expect("c");
+    edges::link(&db, &product, &part, "contains").await.expect("link");
+    superx_mod_entities::texts::set_role_text(&db, &part, "describes", "the frame")
+        .await
+        .expect("prose");
 
     let sub = graph::subgraph(&db, &product, 3, false).await.expect("bfs");
-    let file = sub.nodes.iter().find(|n| n.entity_type == "document").expect("document node");
-    assert_eq!(file.content.as_deref(), Some("The whole point."));
-    let root = sub.nodes.iter().find(|n| n.entity_type == "product").expect("root");
-    assert_eq!(root.name, "Widget");
-    assert!(root.content.is_none(), "non-content kinds stay lean");
+    let child = sub.nodes.iter().find(|n| n.name == "Frame").expect("reached in one batch");
+    assert!(child.attributes.is_some(), "attributes came with it");
+    assert!(!child.version.is_empty(), "and the version it was read at");
+    assert!(
+        child.notes.iter().any(|n| n.body == "the frame"),
+        "and its prose, from the same read — fetching notes separately would let one \
+         written after the walk slip into a prompt"
+    );
+    let root = sub.nodes.iter().find(|n| n.entity_type == "product" && n.name == "Widget");
+    assert_eq!(root.expect("root").depth, 0);
 }
 
 // -------------------------------------------------------------- #253 --
@@ -908,15 +948,7 @@ async fn ancestor_path_is_root_first_priority_ordered_and_cycle_safe() {
     // made through `set_role_text` — but ~41 of them exist on the live
     // instance and clicking one must still say where it hangs. Built
     // the way the world before #268 built it, straight past the writer.
-    let text = nodes::create_entity(
-        &db,
-        "text",
-        "what to build",
-        Some("what to build".to_string()),
-        None,
-    )
-    .await
-    .expect("legacy carrier");
+    let text = legacy_text(&db, "what to build", "what to build").await;
     edges::link(&db, &task, &text, "describes").await.expect("legacy role edge");
     let trail = graph::ancestors(&db, &text, 12).await.expect("walk");
     assert_eq!(
@@ -974,15 +1006,7 @@ async fn migration_retracts_the_role_edges_and_archives_the_anchors() {
     edges::link(&db, &product, &task, "contains").await.expect("structural");
 
     // Prose as the world before #268 stored it.
-    let carrier = nodes::create_entity(
-        &db,
-        "text",
-        "what this desk is",
-        Some("what this desk is".to_string()),
-        None,
-    )
-    .await
-    .expect("carrier");
+    let carrier = legacy_text(&db, "what this desk is", "what this desk is").await;
     edges::link(&db, &product, &carrier, "describes").await.expect("role edge");
 
     let before = graph::subgraph(&db, &product, 3, false).await.expect("before");
@@ -1011,13 +1035,13 @@ async fn migration_retracts_the_role_edges_and_archives_the_anchors() {
 /// graph or the entity list."
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_document_becomes_an_attachment_row_and_leaves_the_graph() {
-    use superx_mod_entities::{attachments, documents, graph, migrate, nodes, target::Target};
+    use superx_mod_entities::{attachments, graph, migrate, nodes, target::Target};
 
     let db = fresh_db().await;
     registry::seed_types(&db).await.expect("types");
 
     let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
-    let doc = documents::attach_document(
+    let doc = legacy_document(
         &db,
         &product,
         "mandate.pdf",
@@ -1025,8 +1049,7 @@ async fn a_document_becomes_an_attachment_row_and_leaves_the_graph() {
         "application/pdf",
         1234,
     )
-    .await
-    .expect("legacy document node");
+    .await;
 
     assert_eq!(
         graph::subgraph(&db, &product, 2, false).await.expect("before").nodes.len(),
@@ -1060,18 +1083,16 @@ async fn a_document_becomes_an_attachment_row_and_leaves_the_graph() {
 /// history with versions that say nothing new.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_the_migration_twice_changes_nothing_the_second_time() {
-    use superx_mod_entities::{documents, edges, migrate, nodes};
+    use superx_mod_entities::{edges, migrate, nodes};
 
     let db = fresh_db().await;
     registry::seed_types(&db).await.expect("types");
 
     let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
     let carrier =
-        nodes::create_entity(&db, "text", "words", Some("words".to_string()), None).await.expect("c");
+        legacy_text(&db, "words", "words").await;
     edges::link(&db, &product, &carrier, "describes").await.expect("edge");
-    documents::attach_document(&db, &product, "f.pdf", "attachments/x/f.pdf", "application/pdf", 9)
-        .await
-        .expect("doc");
+    legacy_document(&db, &product, "f.pdf", "attachments/x/f.pdf", "application/pdf", 9).await;
 
     let first = migrate::prose(&db, false).await.expect("first");
     assert!(first.versions > 0 && first.documents == 1 && first.edges_retracted == 2);

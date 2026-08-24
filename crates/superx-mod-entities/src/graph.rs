@@ -17,7 +17,6 @@ pub struct GraphNode {
     pub id: RecordId,
     pub entity_type: String,
     pub name: String,
-    pub content: Option<String>,
     /// FLEXIBLE attributes of the current state (prompt context).
     pub attributes: Option<superx_kernel::types::Value>,
     /// Current state's valid_from — the version the reader saw.
@@ -129,29 +128,20 @@ async fn push_level(
     let mut by_entity = crate::notes::for_entities(db, level, false).await?;
     for id in level {
         let uuid = record_uuid(id);
-        let (entity_type, name, content, attributes, version) = match meta.get(&uuid) {
+        let (entity_type, name, attributes, version) = match meta.get(&uuid) {
             Some(m) => (
                 m.entity_type.clone(),
                 m.name.clone(),
-                m.content.clone(),
                 m.attributes.clone(),
                 m.version.clone(),
             ),
-            None => (String::new(), String::new(), None, None, String::new()),
-        };
-        // Content rides along only for content-bearing nodes; other
-        // kinds keep exports lean.
-        let content = if entity_type == "text" || entity_type == "document" {
-            content
-        } else {
-            None
+            None => (String::new(), String::new(), None, String::new()),
         };
         let notes = by_entity.remove(&uuid).unwrap_or_default();
         nodes.push(GraphNode {
             id: id.clone(),
             entity_type,
             name,
-            content,
             attributes,
             version,
             depth,
@@ -225,7 +215,6 @@ pub fn to_json(graph: &Subgraph, root: &RecordId) -> serde_json::Value {
             "uid": record_uuid(&n.id),
             "type": n.entity_type,
             "name": n.name,
-            "content": n.content,
             "attributes": n.attributes.as_ref().map(crate::nodes::value_to_json),
             "version": n.version,
             "depth": n.depth,

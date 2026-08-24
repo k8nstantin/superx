@@ -76,7 +76,6 @@ const SEEDED_TYPE_LABELS: &[(&str, &[(&str, bool)])] = &[
     ("task", &[("description", true), ("instructions", false), ("comments", false)]),
     ("rag", &[("description", true), ("comments", false)]),
     ("model", &[("description", true), ("comments", false)]),
-    ("document", &[("description", false), ("comments", false)]),
     (
         "repo",
         &[

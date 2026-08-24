@@ -30,6 +30,12 @@ async fn legacy_carrier(
     role: &str,
     versions: &[&str],
 ) -> superx_kernel::types::RecordId {
+    // `text` is no longer a shipped type — B6 retired it — so the
+    // legacy shape registers the legacy type first. That IS the honest
+    // statement: a fresh instance would never make one of these.
+    // Create-once, and a test may build several carriers: an
+    // already-registered type is the normal case, not a failure.
+    let _ = superx_mod_entities::registry::add_type(db, "text", "entity", None).await;
     let first = versions.first().copied().unwrap_or_default();
     let node = create_entity(db, "text", first, Some(first.to_string()), None)
         .await
@@ -224,6 +230,8 @@ async fn a_dry_run_reports_the_same_work_and_writes_nothing() {
 async fn what_it_will_not_guess_about_is_reported() {
     let db = fresh_db().await;
     let task = create_entity(&db, "task", "Build", None, None).await.expect("create");
+
+    let _ = superx_mod_entities::registry::add_type(&db, "text", "entity", None).await;
 
     // The runner's output: a text node on a `produced` edge.
     let produced = create_entity(&db, "text", "result", Some("output".into()), None)

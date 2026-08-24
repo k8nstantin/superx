@@ -43,6 +43,8 @@ pub struct EntityListItem {
     pub id: String,
     pub entity_type: String,
     pub name: String,
+    /// Hidden from the default list, still on the record.
+    pub archived: bool,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -232,13 +234,6 @@ fn attrs_to_json(v: &Option<superx_kernel::types::Value>) -> Option<String> {
     serde_json::to_string_pretty(&json).ok()
 }
 
-/// The module's own annotation carrier: descriptions, comments and
-/// instructions are `text` entities hung off their target by a role
-/// edge (`texts::set_role_text` / `add_comment`). It is a real
-/// registered type, but nothing hand-creates one — writing a
-/// description IS creating it.
-const TEXT_TYPE: &str = "text"; // skill-allow: §9-const — the module's own data model (texts.rs, graph.rs), not a tunable
-
 /// ENTITY types only — relation kinds are not "types" (operator
 /// model); they surface solely through [`rel_types`]. The carrier type
 /// is flagged, not hidden: the registry stays honest and the create
@@ -249,7 +244,10 @@ pub async fn types_list(db: &Db) -> Result<Vec<TypeView>> {
         .into_iter()
         .filter(|t| t.category == "entity")
         .map(|t| TypeView {
-            system: t.name == TEXT_TYPE,
+            // Nothing is a "system" type any more: prose and files
+            // stopped being entities, so no kind has to be hidden from
+            // the create form to keep the operator out of trouble.
+            system: false,
             name: t.name,
             description: t.description,
         })
@@ -697,15 +695,23 @@ pub async fn rel_types(db: &Db) -> Result<Vec<String>> {
 /// off — every comment and description would otherwise land here as a
 /// row of its own — so the unfiltered list omits them; asking for the
 /// carrier type by name still returns them.
-pub async fn list(db: &Db, type_filter: Option<&str>) -> Result<Vec<EntityListItem>> {
+pub async fn list(
+    db: &Db,
+    type_filter: Option<&str>,
+    include_archived: bool,
+) -> Result<Vec<EntityListItem>> {
     Ok(nodes::list_entities(db, type_filter)
         .await?
         .into_iter()
-        .filter(|e| type_filter.is_some() || e.entity_type != TEXT_TYPE)
+        // No type filter. The carriers that used to need hiding are
+        // ARCHIVED by B4, and archived is the one question the list
+        // asks — "should this still be shown by default?" (§14).
+        .filter(|e| include_archived || !e.archived)
         .map(|e| EntityListItem {
             id: record_uuid(&e.id),
             entity_type: e.entity_type,
             name: e.name,
+            archived: e.archived,
         })
         .collect())
 }
