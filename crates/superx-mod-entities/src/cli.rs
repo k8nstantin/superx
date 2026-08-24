@@ -538,15 +538,16 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     } else if let Some(current) = nodes::current_state(&db, &anchor).await? {
         out.push_str(&render_state(&current, "  "));
     }
-    let notes = texts::annotations(&db, &anchor).await?;
-    if !notes.is_empty() {
-        out.push_str("texts:\n");
-        for note in notes {
+    // Prose from the note store (#278), by label rather than by the edge
+    // it used to hang off.
+    let attached = notes::for_entity(&db, &anchor, false).await?;
+    if !attached.is_empty() {
+        out.push_str("prose:\n");
+        for note in attached {
+            let who = note.author_kind.as_deref().unwrap_or("?");
             out.push_str(&format!(
-                "  [{}] ({}) {}\n",
-                note.rel_type,
-                record_uuid(&note.text_id),
-                note.content
+                "  [{}] ({}) {}  {}\n",
+                note.label, note.uid, who, note.body
             ));
         }
     }
