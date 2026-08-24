@@ -461,3 +461,55 @@ async fn an_unknown_author_kind_is_refused() {
         Author::claimed(kind, None, None).expect("every declared kind is accepted");
     }
 }
+
+/// Answering a singular slot must not create a second one.
+///
+/// Inheriting the parent's label outright produced TWO live notes
+/// labelled `description` on one product — and the runner reads a task's
+/// description as its orders and takes the first match, so a question
+/// about the work could have become the work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reply_to_a_singular_slot_is_a_comment_on_it_not_a_second_one() {
+    let db = fresh_db().await;
+    let product = create_entity(&db, "product", "Ledger", None, None).await.expect("create");
+
+    let (desc, _) = notes::write(&db, &product, "description", "the real one", &Author::operator())
+        .await
+        .expect("description");
+    let answer = notes::reply(&db, &desc, "why this way?", &Author::operator())
+        .await
+        .expect("reply");
+
+    let live = notes::for_entity(&db, &product, false).await.expect("read");
+    assert_eq!(
+        live.iter().filter(|n| n.label == "description").count(),
+        1,
+        "still exactly one description: {live:?}"
+    );
+
+    // The answer is still an answer — it says what it answers.
+    let reply = live.iter().find(|n| n.uid == answer).expect("the reply is there");
+    assert_eq!(reply.label, "comments");
+    assert_eq!(reply.parent_uid.as_deref(), Some(desc.as_str()));
+
+    // And editing the description still amends the description.
+    let (amended, is_new) =
+        notes::write(&db, &product, "description", "edited", &Author::operator())
+            .await
+            .expect("amend");
+    assert_eq!(amended, desc, "the edit landed on the description, not on the question");
+    assert!(!is_new);
+
+    // A reply to a PLURAL slot keeps its label — a comment answering a
+    // comment is still a comment, and that thread is the point.
+    let (remark, _) = notes::write(&db, &product, "comments", "a remark", &Author::operator())
+        .await
+        .expect("comment");
+    let nested = notes::reply(&db, &remark, "answering the remark", &Author::operator())
+        .await
+        .expect("reply");
+    let live = notes::for_entity(&db, &product, false).await.expect("read");
+    let nested = live.iter().find(|n| n.uid == nested).expect("there");
+    assert_eq!(nested.label, "comments");
+    assert_eq!(nested.parent_uid.as_deref(), Some(remark.as_str()));
+}

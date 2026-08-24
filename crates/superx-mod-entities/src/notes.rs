@@ -40,6 +40,11 @@ pub struct Author {
     pub via: Option<String>,
 }
 
+/// Where a discussion goes. A reply to a slot that may only hold one
+/// thing has to land somewhere that may hold many, or answering
+/// something would replace it.
+pub const DISCUSSION: &str = "comments"; // skill-allow: §9-const — the module's own vocabulary, not a tunable
+
 /// Who a write may claim to be. Closed, because a column that says
 /// something nothing recognises is a column nothing can act on — and
 /// this one is the subject of authorization, not decoration.
@@ -153,10 +158,17 @@ pub async fn write(
 /// and an edge has no fields to put one in, which is why this could not
 /// exist while prose was an entity joined by an edge.
 ///
-/// The entity and the label come from the PARENT, never from the
-/// caller: a thread spanning two entities, or a `spec` answering a
-/// `description`, is not a thing anyone should be able to write by
-/// passing the wrong argument.
+/// The entity comes from the PARENT, never from the caller: a thread
+/// spanning two entities is not a thing anyone should be able to write
+/// by passing the wrong argument.
+///
+/// **A reply to a SINGULAR slot is a comment on it, not a second one.**
+/// Inheriting the label outright looked tidy and broke the invariant
+/// `write` exists to keep: answering a description produced a second
+/// live `description`, and the runner reads a task's description as its
+/// orders and takes the first match — so a question about the work
+/// could become the work. Threading survives; the answer is a comment
+/// pointing at what it answers.
 ///
 /// # Errors
 ///
@@ -167,13 +179,21 @@ pub async fn reply(db: &Db, parent_uid: &str, body: &str, author: &Author) -> Re
         .await?
         .ok_or_else(|| KernelError::Module(format!("no note '{parent_uid}' to reply to")))?;
     let entity = attached_to(&parent)?;
+
+    let singular = dictionary::current(db, &parent.label, SLOT)
+        .await?
+        .and_then(|d| d.cardinality)
+        .as_deref()
+        == Some("one");
+    let label = if singular { DISCUSSION } else { parent.label.as_str() };
+
     let uid = uuid::Uuid::now_v7().to_string();
     append(
         db,
         Version {
             entity: &entity,
             uid: &uid,
-            label: &parent.label,
+            label,
             body,
             parent_uid: Some(parent_uid.to_string()),
             active: true,
