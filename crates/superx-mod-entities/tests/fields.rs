@@ -418,3 +418,72 @@ async fn a_write_cannot_silently_drop_a_required_field() {
         .await
         .expect("an optional field may be cleared by omission");
 }
+
+/// The two doors have to give the same answer, which is the whole point.
+/// `set` refuses a key the TYPE does not carry once the type declares
+/// anything; the bag door did not, so the same key was refused one way
+/// and accepted the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_bag_door_refuses_what_the_field_door_refuses() {
+    let db = fresh_db().await;
+    let repo = create_entity(&db, "repo", "superx", None, None).await.expect("create");
+    dictionary::define(&db, Definition {
+        key: "max_notional",
+        kind: "slot",
+        display: "Max notional",
+        semantics: "data",
+        cardinality: Some("one"),
+        value_kind: Some("number"),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+
+    // `repo` declares slots, and max_notional is not among them.
+    fields::set(&db, &repo, "max_notional", "500")
+        .await
+        .expect_err("the field door refuses it");
+
+    let mut bag = Object::new();
+    bag.insert("url".to_string(), Value::String("https://example.com/r".into()));
+    bag.insert("max_notional".to_string(), Value::String("500".into()));
+    fields::validate_bag(&db, &repo, &bag)
+        .await
+        .expect_err("and so does the bag door");
+}
+
+/// Grandfathered, not refused outright: an entity written under older
+/// declarations may still hold a key its type no longer carries, and
+/// refusing that would make it uneditable (§7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_already_there_may_stay_even_if_the_type_stopped_carrying_it() {
+    let db = fresh_db().await;
+    let repo = create_entity(&db, "repo", "superx", None, None).await.expect("create");
+
+    // Written while the type carried it.
+    let author = superx_mod_entities::notes::Author::operator();
+    dictionary::define(&db, Definition {
+        key: "mirror",
+        kind: "slot",
+        display: "Mirror",
+        semantics: "data",
+        cardinality: Some("one"),
+        value_kind: Some("url"),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+    dictionary::bind_slot(&db, "repo", "mirror", false, None, &author).await.expect("bind");
+    fields::set(&db, &repo, "mirror", "https://mirror.example.com").await.expect("set");
+
+    // The type stops carrying it.
+    dictionary::retire_slot(&db, "repo", "mirror", false, &author).await.expect("retire");
+
+    // The entity can still be saved with the value it already holds.
+    let mut bag = Object::new();
+    bag.insert("url".to_string(), Value::String("https://example.com/r".into()));
+    bag.insert("mirror".to_string(), Value::String("https://mirror.example.com".into()));
+    fields::validate_bag(&db, &repo, &bag)
+        .await
+        .expect("what is already there may stay");
+}

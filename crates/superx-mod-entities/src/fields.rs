@@ -363,6 +363,15 @@ pub async fn validate_bag(
     let (entity_type, _) = crate::nodes::anchor_info(db, entity).await?;
     let slots = dictionary::slots_for(db, &entity_type, false).await?;
 
+    // What the entity already holds, read once: it decides both which
+    // keys are grandfathered and whether a required one is being dropped.
+    let current = current_state(db, entity).await?;
+    let before = match current.and_then(|s| s.attributes) {
+        Some(Value::Object(o)) => o,
+        _ => Object::new(),
+    };
+    let before_keys: std::collections::HashSet<String> = before.keys().cloned().collect();
+
     let mut checked = Object::new();
     for (key, value) in incoming.iter() {
         let declared = dictionary::current(db, key, SLOT).await?;
@@ -384,6 +393,23 @@ pub async fn validate_bag(
             continue;
         }
 
+        // `set` refuses a key the TYPE does not carry once the type
+        // declares anything, and the bag door did not — so the two
+        // disagreed about the same key, which is the thing this was
+        // written to stop.
+        //
+        // Grandfathered rather than refused outright: a key already on
+        // the entity may stay, because refusing it would make an entity
+        // written under older declarations uneditable (§7). What is
+        // refused is ADDING one the type does not carry.
+        if !slots.is_empty() && !slots.iter().any(|s| &s.label == key) && !before_keys.contains(key)
+        {
+            return Err(KernelError::Module(format!(
+                "type '{entity_type}' does not carry '{key}' — it carries: {}",
+                slots.iter().map(|s| s.label.clone()).collect::<Vec<_>>().join(", ")
+            )));
+        }
+
         // A declared VALUE is checked exactly as `set` checks it, so the
         // three doors cannot disagree about what is allowed.
         let as_written = render(value);
@@ -395,11 +421,6 @@ pub async fn validate_bag(
     // deletes it. For an optional field that is how you clear one; for a
     // required field it is a value disappearing because a form did not
     // mention it, which nobody asked for and nobody would notice.
-    let current = current_state(db, entity).await?;
-    let before = match current.and_then(|s| s.attributes) {
-        Some(Value::Object(o)) => o,
-        _ => Object::new(),
-    };
     for slot in slots.iter().filter(|s| s.required) {
         if before.contains_key(&slot.label) && !checked.contains_key(&slot.label) {
             return Err(KernelError::Module(format!(
