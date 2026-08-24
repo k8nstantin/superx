@@ -23,6 +23,12 @@ pub struct GraphNode {
     /// Current state's valid_from — the version the reader saw.
     pub version: String,
     pub depth: usize,
+    /// The prose attached to this entity (#280). Carried in the export
+    /// so a reader assembling a prompt sees the same notes as the graph
+    /// it planned from — fetching them separately would let a note
+    /// written after the walk slip into the prompt, which is exactly
+    /// what the version pin exists to prevent.
+    pub notes: Vec<crate::notes::Note>,
 }
 
 /// An active edge inside the traversed subgraph.
@@ -110,6 +116,8 @@ async fn push_level(
         return Ok(());
     }
     let meta = current_meta(db, level).await?;
+    // One read for the whole level, like the labels above it (#179).
+    let mut by_entity = crate::notes::for_entities(db, level, false).await?;
     for id in level {
         let uuid = record_uuid(id);
         let (entity_type, name, content, attributes, version) = match meta.get(&uuid) {
@@ -129,7 +137,17 @@ async fn push_level(
         } else {
             None
         };
-        nodes.push(GraphNode { id: id.clone(), entity_type, name, content, attributes, version, depth });
+        let notes = by_entity.remove(&uuid).unwrap_or_default();
+        nodes.push(GraphNode {
+            id: id.clone(),
+            entity_type,
+            name,
+            content,
+            attributes,
+            version,
+            depth,
+            notes,
+        });
     }
     Ok(())
 }
@@ -215,6 +233,18 @@ pub fn to_json(graph: &Subgraph, root: &RecordId) -> serde_json::Value {
             "attributes": n.attributes.as_ref().map(crate::nodes::value_to_json),
             "version": n.version,
             "depth": n.depth,
+            // Additive (#280): every existing field above is untouched, so
+            // a reader that does not know about notes keeps working on the
+            // same export it reads today.
+            "notes": n.notes.iter().map(|note| serde_json::json!({
+                "uid": note.uid,
+                "label": note.label,
+                "body": note.body,
+                "parent_uid": note.parent_uid,
+                "author_kind": note.author_kind,
+                "via_uid": note.via_uid,
+                "version": note.valid_from.map(|t| t.to_rfc3339()),
+            })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "edges": graph.edges.iter().map(|e| serde_json::json!({
             "edge_uid": e.edge_uid,

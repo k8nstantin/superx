@@ -380,3 +380,42 @@ async fn a_runtime_label_can_be_declared_singular() {
     assert_eq!(first, second, "singular means the second write amends the first");
     assert!(!is_new);
 }
+
+/// A graph walk resolves each LEVEL in one read (#179) so it costs the
+/// nodes it reaches, never the table. Notes had to join that contract
+/// rather than add a round trip per node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn many_entities_notes_come_back_in_one_read() {
+    let db = fresh_db().await;
+    let a = create_entity(&db, "product", "A", None, None).await.expect("a");
+    let b = create_entity(&db, "product", "B", None, None).await.expect("b");
+    let c = create_entity(&db, "product", "C", None, None).await.expect("c");
+
+    notes::write(&db, &a, "description", "about A", &Author::operator()).await.expect("a");
+    notes::write(&db, &a, "comments", "on A", &Author::operator()).await.expect("a2");
+    notes::write(&db, &b, "description", "about B", &Author::operator()).await.expect("b");
+    let (retracted, _) =
+        notes::write(&db, &c, "comments", "withdrawn", &Author::operator()).await.expect("c");
+    notes::retract(&db, &retracted, &Author::operator()).await.expect("retract");
+
+    let ids = [a.clone(), b.clone(), c.clone()];
+    let batched = notes::for_entities(&db, &ids, false).await.expect("batch");
+
+    let key = |r: &superx_kernel::types::RecordId| superx_ops::record_uuid(r);
+    assert_eq!(batched.get(&key(&a)).map(Vec::len), Some(2));
+    assert_eq!(batched.get(&key(&b)).map(Vec::len), Some(1));
+    assert!(!batched.contains_key(&key(&c)), "a retracted note is not live");
+
+    // And it agrees with the per-entity read, which is the contract that
+    // matters: batching must not change what anyone sees.
+    for id in &ids {
+        let one = notes::for_entity(&db, id, false).await.expect("single");
+        let many = batched.get(&key(id)).cloned().unwrap_or_default();
+        assert_eq!(one, many, "batched and single reads disagree for {}", key(id));
+    }
+
+    assert!(
+        notes::for_entities(&db, &[], false).await.expect("empty").is_empty(),
+        "no entities, no query"
+    );
+}
