@@ -5,7 +5,7 @@
 //! else, so these pin the properties a reader depends on — including
 //! the one that is a security property rather than a convenience.
 
-use superx_mod_entities::dictionary::{self, LINK, SLOT};
+use superx_mod_entities::dictionary::{self, Definition, LINK, SLOT};
 use superx_mod_entities::SCHEMA_DDL;
 
 async fn fresh_db() -> superx_kernel::Db {
@@ -143,10 +143,24 @@ async fn defining_a_label_appends_a_version_rather_than_editing_one() {
     dictionary::seed(&db).await.expect("seed");
     let before = dictionary::revision(&db).await.expect("rev");
 
-    dictionary::define(&db, "risk_note", SLOT, "Risk note", "context", Some("v1"), None)
+    dictionary::define(&db, Definition {
+        key: "risk_note",
+        kind: SLOT,
+        display: "Risk note",
+        semantics: "context",
+        description: Some("v1"),
+        ..Default::default()
+    })
         .await
         .expect("define");
-    dictionary::define(&db, "risk_note", SLOT, "Risk note", "guidance", Some("v2"), None)
+    dictionary::define(&db, Definition {
+        key: "risk_note",
+        kind: SLOT,
+        display: "Risk note",
+        semantics: "guidance",
+        description: Some("v2"),
+        ..Default::default()
+    })
         .await
         .expect("redefine");
 
@@ -169,16 +183,34 @@ async fn defining_a_label_appends_a_version_rather_than_editing_one() {
 async fn a_label_outside_the_closed_vocabulary_is_refused() {
     let db = fresh_db().await;
 
-    let err = dictionary::define(&db, "wishful", SLOT, "Wishful", "vibes", None, None)
+    let err = dictionary::define(&db, Definition {
+        key: "wishful",
+        kind: SLOT,
+        display: "Wishful",
+        semantics: "vibes",
+        ..Default::default()
+    })
         .await
         .expect_err("unknown semantics is refused");
     assert!(err.to_string().contains("vibes"), "the error names it: {err}");
 
-    dictionary::define(&db, "audits", LINK, "audits", "binding", None, None)
+    dictionary::define(&db, Definition {
+        key: "audits",
+        kind: LINK,
+        display: "audits",
+        semantics: "binding",
+        ..Default::default()
+    })
         .await
         .expect_err("a slot semantic is not a link semantic");
 
-    dictionary::define(&db, "Risk Note", SLOT, "Risk", "context", None, None)
+    dictionary::define(&db, Definition {
+        key: "Risk Note",
+        kind: SLOT,
+        display: "Risk",
+        semantics: "context",
+        ..Default::default()
+    })
         .await
         .expect_err("one spelling per term, or the dictionary defeats itself");
 }
@@ -212,15 +244,14 @@ async fn redefining_preserves_what_it_does_not_mention() {
     let db = fresh_db().await;
     dictionary::seed(&db).await.expect("seed");
 
-    dictionary::define(
-        &db,
-        "mandate",
-        SLOT,
-        "Mandate",
-        "binding",
-        Some("reworded, same meaning"),
-        None,
-    )
+    dictionary::define(&db, Definition {
+        key: "mandate",
+        kind: SLOT,
+        display: "Mandate",
+        semantics: "binding",
+        description: Some("reworded, same meaning"),
+        ..Default::default()
+    })
     .await
     .expect("redefine");
 
@@ -295,7 +326,14 @@ async fn history_reads_every_version_oldest_first() {
     let db = fresh_db().await;
     dictionary::seed(&db).await.expect("seed");
 
-    dictionary::define(&db, "spec", SLOT, "Spec", "binding", Some("now binding"), None)
+    dictionary::define(&db, Definition {
+        key: "spec",
+        kind: SLOT,
+        display: "Spec",
+        semantics: "binding",
+        description: Some("now binding"),
+        ..Default::default()
+    })
         .await
         .expect("redefine");
 
@@ -360,10 +398,24 @@ async fn every_shipped_type_carries_at_least_a_description_and_a_channel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cardinality_is_one_or_many_and_nothing_else() {
     let db = fresh_db().await;
-    dictionary::define(&db, "risk_note", SLOT, "Risk", "context", None, Some("some"))
+    dictionary::define(&db, Definition {
+        key: "risk_note",
+        kind: SLOT,
+        display: "Risk",
+        semantics: "context",
+        cardinality: Some("some"),
+        ..Default::default()
+    })
         .await
         .expect_err("'some' is not a cardinality");
-    dictionary::define(&db, "risk_note", SLOT, "Risk", "context", None, Some("one"))
+    dictionary::define(&db, Definition {
+        key: "risk_note",
+        kind: SLOT,
+        display: "Risk",
+        semantics: "context",
+        cardinality: Some("one"),
+        ..Default::default()
+    })
         .await
         .expect("one is");
     assert_eq!(
@@ -374,5 +426,43 @@ async fn cardinality_is_one_or_many_and_nothing_else() {
             .cardinality
             .as_deref(),
         Some("one")
+    );
+}
+
+/// Adding a slot to the shipped list mid-way must not leave an upgraded
+/// instance ordering its slots differently from a fresh one. Observed
+/// live before this was fixed: `comments` kept order 1 from an earlier
+/// release while a newly shipped `url` was written at 1 as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_added_to_the_shipped_list_does_not_scramble_the_order() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+    dictionary::seed_type_labels(&db).await.expect("slots");
+
+    // Every shipped binding sits at its shipped position, and no two
+    // share one — which is what "ordered" has to mean.
+    for entity_type in ["product", "task", "repo", "credential"] {
+        let slots = dictionary::slots_for(&db, entity_type, false).await.expect("slots");
+        let orders: Vec<i64> = slots.iter().map(|s| s.display_order).collect();
+        let mut unique = orders.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            orders.len(),
+            unique.len(),
+            "{entity_type} has two slots claiming one position: {slots:?}"
+        );
+    }
+
+    // A repo reads in the order the shipped list declares it.
+    let repo = dictionary::slots_for(&db, "repo", false).await.expect("slots");
+    let keys: Vec<String> = repo.iter().map(|s| s.label.clone()).collect();
+    assert_eq!(keys, vec!["description", "url", "branch", "host", "comments"]);
+
+    // Re-seeding is still a no-op once everything sits where it belongs.
+    assert_eq!(
+        dictionary::seed_type_labels(&db).await.expect("reseed"),
+        0,
+        "nothing left to correct"
     );
 }

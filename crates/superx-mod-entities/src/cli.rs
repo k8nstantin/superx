@@ -6,7 +6,7 @@ use superx_kernel::types::Value;
 use superx_kernel::{Kernel, KernelError, NodeKind, Result};
 use superx_ops::record_uuid;
 
-use crate::{documents, edges, graph, nodes, notes, registry, texts, MODULE_NAME};
+use crate::{documents, edges, fields, graph, nodes, notes, registry, texts, MODULE_NAME};
 
 /// Traversal depth ceiling parameter on the module's registry entity.
 pub const MAX_DEPTH_PARAM: &str = "attr_entities_max_depth";
@@ -31,8 +31,10 @@ const USAGE: &str = "usage: superx entities <command>\n\
   types                                list the type registry\n\
   types add <name> --category entity|relation [--description <text>]\n\
   labels [--all] [--for <type>]        the dictionary: what the terminology means\n\
+  fields <uuid-fragment>               the declared values of an entity\n\
+  set <uuid-fragment> <key> <value>    set one declared value, checked against its kind\n\
   labels define <key> --kind slot|link --semantics <s> [--cardinality one|many]\n\
-                       [--display <d>] [--description <text>]\n\
+                       [--value-kind <k>] [--display <d>] [--description <text>]\n\
   labels history <key> --kind slot|link      every version of one label, oldest first\n\
   labels archive <key> --kind slot|link [--restore]\n\
   notes <uuid-fragment> [--all]        the prose attached to an entity, by label\n\
@@ -53,6 +55,8 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("types") => types_cmd(kernel, &args[1..]).await,
         Some("labels") => labels_cmd(kernel, &args[1..]).await,
         Some("notes") => notes_cmd(kernel, &args[1..]).await,
+        Some("fields") => fields_cmd(kernel, &args[1..]).await,
+        Some("set") => set_cmd(kernel, &args[1..]).await,
         Some("create") => create_cmd(kernel, &args[1..]).await,
         Some("update") => update_cmd(kernel, &args[1..]).await,
         Some("show") => show_cmd(kernel, &args[1..]).await,
@@ -86,14 +90,18 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         let display = flag(args, "--display").unwrap_or_else(|| key.clone());
         let description = flag(args, "--description");
         let cardinality = flag(args, "--cardinality");
+        let value_kind = flag(args, "--value-kind");
         crate::dictionary::define(
             &db,
-            key,
-            &kind,
-            &display,
-            &semantics,
-            description.as_deref(),
-            cardinality.as_deref(),
+            crate::dictionary::Definition {
+                key,
+                kind: &kind,
+                display: &display,
+                semantics: &semantics,
+                description: description.as_deref(),
+                cardinality: cardinality.as_deref(),
+                value_kind: value_kind.as_deref(),
+            },
         )
         .await?;
         let revision = crate::dictionary::revision(&db).await?;
@@ -303,6 +311,52 @@ fn rest(args: &[String], from: usize) -> Result<String> {
         return Err(usage());
     }
     Ok(text)
+}
+
+/// `superx entities fields` — the declared values of an entity (#274).
+///
+/// A field is a slot label whose kind is a value kind. Reads never fail:
+/// a key the type no longer declares still shows, marked, because a
+/// removed declaration must not look like deleted data.
+async fn fields_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let fragment = args.first().ok_or_else(usage)?;
+    let anchor = nodes::resolve_entity(&db, fragment).await?;
+    let all = fields::of(&db, &anchor).await?;
+    if all.is_empty() {
+        return Ok("this type declares no values — only prose\n".to_string());
+    }
+    let mut out = format!("{} field(s)\n\n", all.len());
+    for f in &all {
+        let value = f.value.as_deref().unwrap_or("—");
+        let note = if f.undeclared {
+            "  [no longer declared]"
+        } else if f.required && f.value.is_none() {
+            "  [required, unset]"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "  {:<14} {:<11} {}{}\n",
+            f.key,
+            if f.value_kind.is_empty() { "?" } else { &f.value_kind },
+            value,
+            note
+        ));
+    }
+    Ok(out)
+}
+
+/// `superx entities set` — write one declared value.
+async fn set_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let fragment = args.first().ok_or_else(usage)?;
+    let key = args.get(1).ok_or_else(usage)?;
+    let value = rest(args, 2)?;
+    let anchor = nodes::resolve_entity(&db, fragment).await?;
+    fields::set(&db, &anchor, key, &value).await?;
+    emit(kernel, "entity_updated", &record_uuid(&anchor), "", key).await;
+    Ok(format!("{key} set\n"))
 }
 
 async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {

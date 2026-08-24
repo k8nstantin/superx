@@ -6,7 +6,7 @@
 //! product can carry BOTH a description and a spec, which is
 //! impossible while the carrier is an edge's rel_type.
 
-use superx_mod_entities::dictionary;
+use superx_mod_entities::dictionary::{self, Definition};
 use superx_mod_entities::nodes::create_entity;
 use superx_mod_entities::notes::{self, Author};
 use superx_mod_entities::registry;
@@ -360,7 +360,14 @@ async fn a_runtime_label_can_be_declared_singular() {
     let db = fresh_db().await;
     let product = create_entity(&db, "product", "Ledger", None, None).await.expect("create");
 
-    dictionary::define(&db, "risk_note", "slot", "Risk note", "context", None, Some("one"))
+    dictionary::define(&db, Definition {
+        key: "risk_note",
+        kind: "slot",
+        display: "Risk note",
+        semantics: "context",
+        cardinality: Some("one"),
+        ..Default::default()
+    })
         .await
         .expect("define");
 
