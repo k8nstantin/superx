@@ -375,6 +375,91 @@ const SEEDED: &[Seed] = &[
         description: "the source runs only after the target completes",
         agent_note: None,
     },
+    // The registry carried these as relation types with nothing in the
+    // dictionary saying so, which is how `attached` came to hold two of
+    // the operator's documents while counting as undeclared. A graph
+    // that walks declared link labels would have dropped them, so they
+    // are declared here — the same facts, in the place that decides.
+    //
+    // ENDPOINTS STAY OPEN, deliberately. These are declared to say they
+    // are STRUCTURAL, not to say what may sit at each end. Narrowing
+    // them from the registry's one-line description is shipping an
+    // illustration as policy: `consults` reads "task consults a rag or
+    // model", and restricting the target to those refused a `rag
+    // consults task` edge that already existed. Same mistake as
+    // `depends_on` in #298. Narrowing is the operator's to declare, and
+    // #293 gave them the page to declare it on.
+    Seed {
+        key: "attached",
+        // A file is a SOURCE, not the meaning of the thing it hangs
+        // off: the label on the attachment says what it is (§5.4), and
+        // the same document may back several entities.
+        source_types: &[],
+        target_types: &[],
+        inverse: Some("{target} is attached to {source}"),
+        acyclic: false,
+        kind: LINK,
+        display: "attached",
+        semantics: "reference",
+        value_kind: None,
+        cardinality: None,
+        writable_by: Some("owner"),
+        description: "a file-backed source hanging off this entity",
+        agent_note: None,
+    },
+    Seed {
+        key: "authenticates",
+        // Reach, not composition: a credential is not part of the thing
+        // it opens, and the same credential opens several.
+        source_types: &[],
+        target_types: &[],
+        inverse: Some("{target} is opened by {source}"),
+        acyclic: false,
+        kind: LINK,
+        display: "authenticates",
+        semantics: "reach",
+        value_kind: None,
+        cardinality: None,
+        writable_by: Some("operator"),
+        description: "the source credential opens the target service",
+        agent_note: Some(
+            "This names WHERE a secret is, never the secret. Resolve it              through the OS and never print, log or copy the value.",
+        ),
+    },
+    Seed {
+        key: "consults",
+        source_types: &[],
+        target_types: &[],
+        inverse: Some("{target} is consulted by {source}"),
+        acyclic: false,
+        kind: LINK,
+        display: "consults",
+        semantics: "reference",
+        value_kind: None,
+        cardinality: None,
+        writable_by: Some("owner"),
+        description: "the source reads the target when it thinks",
+        agent_note: None,
+    },
+    Seed {
+        key: "linked",
+        // Deliberately says nothing: the escape hatch for a relation
+        // nobody has named yet. Undeclared would have meant INVISIBLE
+        // once the graph walks declared labels, and a generic
+        // association that silently disappears is worse than none.
+        source_types: &[],
+        target_types: &[],
+        inverse: Some("{target} is linked to {source}"),
+        acyclic: false,
+        kind: LINK,
+        display: "linked",
+        semantics: "reference",
+        value_kind: None,
+        cardinality: None,
+        writable_by: Some("any"),
+        description: "an association with no stronger word for it yet",
+        agent_note: None,
+    },
     Seed {
         key: "then",
         source_types: &[],
