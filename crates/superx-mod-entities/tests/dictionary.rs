@@ -800,3 +800,59 @@ async fn redefining_a_link_label_keeps_endpoints_it_does_not_mention() {
     assert!(now.acyclic, "and so does acyclic");
     assert_eq!(now.description.as_deref(), Some("an independent check"));
 }
+
+/// An instance seeded before a shipped label gained its declaration
+/// would never receive it: the seed skips what already exists. So the
+/// acyclic flag protecting the runner would be real on a fresh install
+/// and silently absent on every instance that has been running — which
+/// is exactly the instance that has a graph worth protecting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeding_gives_an_older_link_label_the_rules_it_predates() {
+    let db = fresh_db().await;
+
+    // A label as an older build wrote it: no endpoints, no acyclic.
+    dictionary::define(&db, Definition {
+        key: "depends_on",
+        kind: LINK,
+        display: "depends on",
+        semantics: "ordering",
+        ..Default::default()
+    })
+    .await
+    .expect("the old shape");
+
+    let before = dictionary::current(&db, "depends_on", LINK).await.expect("r").expect("t");
+    assert!(!before.acyclic, "nothing protects the graph yet");
+
+    dictionary::seed(&db).await.expect("seed");
+
+    let after = dictionary::current(&db, "depends_on", LINK).await.expect("r").expect("t");
+    assert!(after.acyclic, "the rule reaches an instance that predates it");
+    assert_eq!(after.semantics, "ordering", "and says nothing new about anything else");
+}
+
+/// The seed fills gaps; it does not overrule. A value somebody set —
+/// including a deliberate `false` — is a decision, and re-provisioning
+/// must not quietly undo it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeding_does_not_overrule_a_rule_somebody_set() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("seed");
+
+    // The operator decides their `contains` may hold a loop.
+    dictionary::define(&db, Definition {
+        key: "contains",
+        kind: LINK,
+        display: "contains",
+        semantics: "composition",
+        acyclic: Some(false),
+        ..Default::default()
+    })
+    .await
+    .expect("their decision");
+
+    dictionary::seed(&db).await.expect("re-provision");
+
+    let now = dictionary::current(&db, "contains", LINK).await.expect("r").expect("t");
+    assert!(!now.acyclic, "their decision survives re-provisioning");
+}

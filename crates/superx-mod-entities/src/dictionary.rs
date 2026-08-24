@@ -402,7 +402,19 @@ const SEEDED: &[Seed] = &[
 pub async fn seed(db: &Db) -> Result<usize> {
     let mut created = 0;
     for s in SEEDED {
-        if current(db, s.key, s.kind).await?.is_some() {
+        if let Some(existing) = current_object(db, s.key, s.kind).await? {
+            // An instance seeded before a shipped label gained a
+            // declaration would never receive it: the seed skips what
+            // exists, so the acyclic flag and the endpoints added here
+            // would be real on a fresh instance and absent on every
+            // instance that has been running.
+            //
+            // Filled in only where the row says NOTHING on the subject.
+            // A value somebody set — including a deliberate `false` — is
+            // a decision, and the seed does not overrule decisions.
+            if top_up_link_rules(db, s, &existing).await? {
+                created += 1;
+            }
             continue;
         }
         let mut row = Object::new();
@@ -734,6 +746,52 @@ fn parse_slot(row: &Value) -> Option<TypeSlot> {
         author_kind: str_field(o, "author_kind"),
         semantics_override: str_field(o, "semantics_override"),
     })
+}
+
+/// Give an already-seeded LINK label the declarations it predates.
+///
+/// Returns whether anything was written. Silent when the row already
+/// says something on each subject — the seed fills gaps, it does not
+/// overrule.
+async fn top_up_link_rules(db: &Db, seed: &Seed, existing: &Object) -> Result<bool> {
+    if seed.kind != LINK {
+        return Ok(false);
+    }
+    let missing_acyclic = seed.acyclic && !existing.contains_key("acyclic");
+    let missing_inverse = seed.inverse.is_some() && !existing.contains_key("inverse");
+    let missing_source = !seed.source_types.is_empty() && !existing.contains_key("source_types");
+    let missing_target = !seed.target_types.is_empty() && !existing.contains_key("target_types");
+    if !(missing_acyclic || missing_inverse || missing_source || missing_target) {
+        return Ok(false);
+    }
+
+    let mut row = existing.clone();
+    // The new version is a new row: these belong to the row, not to the
+    // definition.
+    row.remove("id");
+    row.remove("valid_from");
+    if missing_acyclic {
+        row.insert("acyclic".to_string(), Value::Bool(true));
+    }
+    if missing_inverse {
+        if let Some(text) = seed.inverse {
+            row.insert("inverse".to_string(), Value::String(text.to_string()));
+        }
+    }
+    if missing_source {
+        row.insert(
+            "source_types".to_string(),
+            str_values(&seed.source_types.iter().map(ToString::to_string).collect::<Vec<_>>()),
+        );
+    }
+    if missing_target {
+        row.insert(
+            "target_types".to_string(),
+            str_values(&seed.target_types.iter().map(ToString::to_string).collect::<Vec<_>>()),
+        );
+    }
+    append(db, row).await?;
+    Ok(true)
 }
 
 /// Append a label row and bump the revision. Every write is a new row

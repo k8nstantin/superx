@@ -8,6 +8,7 @@ import {
   Checkbox,
   Grid,
   Group,
+  MultiSelect,
   ScrollArea,
   Select,
   Table,
@@ -95,7 +96,11 @@ export default function DictionaryPage() {
   return (
     <Grid gap="md">
       <Grid.Col span={{ base: 12, md: 5 }}>
-        <DefineLabel vocab={vocab.data} onDone={refresh} />
+        <DefineLabel
+          vocab={vocab.data}
+          types={(types.data ?? []).map((t) => t.name)}
+          onDone={refresh}
+        />
       </Grid.Col>
 
       <Grid.Col span={{ base: 12, md: 7 }}>
@@ -162,9 +167,11 @@ export default function DictionaryPage() {
 /// Defining a term and using it are one act, not two screens.
 function DefineLabel({
   vocab,
+  types,
   onDone,
 }: {
   vocab: VocabularyView | undefined
+  types: string[]
   onDone: () => void
 }) {
   const [kind, setKind] = useState<string>('slot')
@@ -175,6 +182,13 @@ function DefineLabel({
   const [cardinality, setCardinality] = useState<string | null>('one')
   const [description, setDescription] = useState('')
   const [error, setError] = useState<string | null>(null)
+  // Link labels: what may sit at each end, and whether it may close a
+  // loop. A mislabelled edge is a wrong graph, and the graph is what
+  // agents execute (§5.5).
+  const [sourceTypes, setSourceTypes] = useState<string[]>([])
+  const [targetTypes, setTargetTypes] = useState<string[]>([])
+  const [inverse, setInverse] = useState('')
+  const [acyclic, setAcyclic] = useState(false)
 
   const isSlot = kind === 'slot'
   const semanticsChoices = (isSlot ? vocab?.slot_semantics : vocab?.link_semantics) ?? []
@@ -193,6 +207,10 @@ function DefineLabel({
         description: description.trim() ? description.trim() : null,
         cardinality: isSlot ? cardinality : null,
         value_kind: isSlot ? valueKind : null,
+        source_types: isSlot ? null : sourceTypes,
+        target_types: isSlot ? null : targetTypes,
+        inverse: !isSlot && inverse.trim() ? inverse.trim() : null,
+        acyclic: isSlot ? null : acyclic,
       }),
     onSuccess: () => {
       setKey('')
@@ -252,7 +270,7 @@ function DefineLabel({
         onChange={setSemantics}
         mb="xs"
       />
-      {isSlot && (
+      {isSlot ? (
         <>
           <Select
             label="Kind"
@@ -268,6 +286,41 @@ function DefineLabel({
             data={vocab?.cardinalities ?? []}
             value={cardinality}
             onChange={setCardinality}
+            mb="xs"
+          />
+        </>
+      ) : (
+        <>
+          <MultiSelect
+            label="Starts at"
+            description="leave empty to accept anything — enforcement arrives with the declaration"
+            data={types}
+            value={sourceTypes}
+            onChange={setSourceTypes}
+            searchable
+            mb="xs"
+          />
+          <MultiSelect
+            label="Points at"
+            description="a link that does not fit is refused when somebody tries to make it"
+            data={types}
+            value={targetTypes}
+            onChange={setTargetTypes}
+            searchable
+            mb="xs"
+          />
+          <TextInput
+            label="Reads the other way as"
+            placeholder="{target} is required by {source}"
+            value={inverse}
+            onChange={(e) => setInverse(e.currentTarget.value)}
+            mb="xs"
+          />
+          <Checkbox
+            label="Acyclic — refuse a link that would close a loop"
+            description="a cycle in an ordering label does not read oddly: the runner drops every task in it"
+            checked={acyclic}
+            onChange={(e) => setAcyclic(e.currentTarget.checked)}
             mb="xs"
           />
         </>
@@ -492,7 +545,7 @@ function LabelTable({
               <Table.Th>Term</Table.Th>
               <Table.Th>Kind</Table.Th>
               <Table.Th>Treated as</Table.Th>
-              <Table.Th>Storage</Table.Th>
+              <Table.Th>Storage / endpoints</Table.Th>
               <Table.Th>Means</Table.Th>
             </Table.Tr>
           </Table.Thead>
@@ -523,10 +576,19 @@ function LabelTable({
                   </Text>
                 </Table.Td>
                 <Table.Td>
-                  <Text size="xs" ff="monospace">
-                    {l.value_kind ?? '—'}
-                    {l.cardinality ? ` · ${l.cardinality}` : ''}
-                  </Text>
+                  {l.label_kind === 'link' ? (
+                    <Text size="xs" ff="monospace">
+                      {l.source_types.length ? l.source_types.join('|') : 'any'}
+                      {' → '}
+                      {l.target_types.length ? l.target_types.join('|') : 'any'}
+                      {l.acyclic ? ' · acyclic' : ''}
+                    </Text>
+                  ) : (
+                    <Text size="xs" ff="monospace">
+                      {l.value_kind ?? '—'}
+                      {l.cardinality ? ` · ${l.cardinality}` : ''}
+                    </Text>
+                  )}
                 </Table.Td>
                 <Table.Td>
                   <Text size="sm">{l.description ?? '—'}</Text>
