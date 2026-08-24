@@ -505,6 +505,17 @@ async fn update_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let attributes = attrs.as_deref().map(parse_attrs).transpose()?;
 
     let anchor = nodes::resolve_entity(&db, &fragment).await?;
+
+    // The third door (#294). `--attrs` used to write whatever JSON it was
+    // handed, so every rule fields::set enforces could be walked around by
+    // sending the same value one command over.
+    let attributes = match attributes {
+        Some(superx_kernel::types::Value::Object(bag)) => Some(
+            superx_kernel::types::Value::Object(fields::validate_bag(&db, &anchor, &bag).await?),
+        ),
+        other => other,
+    };
+
     nodes::update_entity(&db, &anchor, name, content, attributes).await?;
     let (entity_type, _) = nodes::anchor_info(&db, &anchor).await?;
     let current = nodes::current_state(&db, &anchor).await?;

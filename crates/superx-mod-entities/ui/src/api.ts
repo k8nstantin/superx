@@ -15,6 +15,8 @@ import type { SlotView } from './generated/SlotView'
 import type { VocabularyView } from './generated/VocabularyView'
 import type { LabelReq } from './generated/LabelReq'
 import type { SlotReq } from './generated/SlotReq'
+import type { FieldView } from './generated/FieldView'
+import type { FieldReq } from './generated/FieldReq'
 
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(path)
@@ -119,3 +121,10 @@ export const fetchSlots = (type: string, retired = false) =>
 
 export const bindSlot = (type: string, req: SlotReq) =>
   post<{ type: string; label: string }>(`/api/types/${encodeURIComponent(type)}/slots`, req)
+
+/// Declared fields of one entity, typed (#294).
+export const fetchFields = (frag: string) =>
+  get<FieldView[]>(`/api/entities/${encodeURIComponent(frag)}/fields`)
+
+export const setField = (frag: string, req: FieldReq) =>
+  post<{ key: string }>(`/api/entities/${encodeURIComponent(frag)}/fields`, req)

@@ -335,3 +335,100 @@ async fn refuse_if_it_names_an_entity(db: &Db, key: &str, value: &str) -> Result
     // want.
     Ok(())
 }
+
+/// Check a whole attributes bag before it is written.
+///
+/// `fields::set` guarded one door. The other two — `entities update
+/// --attrs` and the UI's attributes box, which are the same code path —
+/// wrote whatever JSON they were handed, so the rules this module states
+/// without exception held in one place out of three. A raw credential
+/// could be pasted into the graph from a browser, which is the exact
+/// thing the secret-reference rule exists to prevent.
+///
+/// **Undeclared keys pass through untouched.** A type that declares
+/// nothing accepts anything, an entity written under older declarations
+/// still holds keys nobody declares now, and reads must never fail — so
+/// this validates what is declared and carries the rest.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] when a declared key's value does not fit what
+/// its label declares, or when the write would drop a required field
+/// that is currently set.
+pub async fn validate_bag(
+    db: &Db,
+    entity: &RecordId,
+    incoming: &Object,
+) -> Result<Object> {
+    let (entity_type, _) = crate::nodes::anchor_info(db, entity).await?;
+    let slots = dictionary::slots_for(db, &entity_type, false).await?;
+
+    // What the entity already holds, read once: it decides both which
+    // keys are grandfathered and whether a required one is being dropped.
+    let current = current_state(db, entity).await?;
+    let before = match current.and_then(|s| s.attributes) {
+        Some(Value::Object(o)) => o,
+        _ => Object::new(),
+    };
+    let before_keys: std::collections::HashSet<String> = before.keys().cloned().collect();
+
+    let mut checked = Object::new();
+    for (key, value) in incoming.iter() {
+        let declared = dictionary::current(db, key, SLOT).await?;
+        let kind = declared
+            .as_ref()
+            .and_then(|d| d.value_kind.clone())
+            .unwrap_or_default();
+
+        // Undeclared, or declared as prose, or declared with no value
+        // kind: not this function's business. Prose in the bag is odd but
+        // it is the operator's odd, and refusing it here would make an
+        // existing entity uneditable.
+        let Some(declared) = declared else {
+            checked.insert(key.clone(), value.clone());
+            continue;
+        };
+        if !is_value_kind(&kind) {
+            checked.insert(key.clone(), value.clone());
+            continue;
+        }
+
+        // `set` refuses a key the TYPE does not carry once the type
+        // declares anything, and the bag door did not — so the two
+        // disagreed about the same key, which is the thing this was
+        // written to stop.
+        //
+        // Grandfathered rather than refused outright: a key already on
+        // the entity may stay, because refusing it would make an entity
+        // written under older declarations uneditable (§7). What is
+        // refused is ADDING one the type does not carry.
+        if !slots.is_empty() && !slots.iter().any(|s| &s.label == key) && !before_keys.contains(key)
+        {
+            return Err(KernelError::Module(format!(
+                "type '{entity_type}' does not carry '{key}' — it carries: {}",
+                slots.iter().map(|s| s.label.clone()).collect::<Vec<_>>().join(", ")
+            )));
+        }
+
+        // A declared VALUE is checked exactly as `set` checks it, so the
+        // three doors cannot disagree about what is allowed.
+        let as_written = render(value);
+        checked.insert(key.clone(), check(&declared, key, &kind, &as_written)?);
+        refuse_if_it_names_an_entity(db, key, &as_written).await?;
+    }
+
+    // The bag REPLACES what was there, so an update that omits a key
+    // deletes it. For an optional field that is how you clear one; for a
+    // required field it is a value disappearing because a form did not
+    // mention it, which nobody asked for and nobody would notice.
+    for slot in slots.iter().filter(|s| s.required) {
+        if before.contains_key(&slot.label) && !checked.contains_key(&slot.label) {
+            return Err(KernelError::Module(format!(
+                "'{}' is required on {entity_type} and this write drops it — send it \
+                 with the rest, or retire the slot if it is no longer required",
+                slot.label
+            )));
+        }
+    }
+    Ok(checked)
+}

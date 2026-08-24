@@ -332,3 +332,158 @@ async fn a_number_field_refuses_what_a_number_cannot_mean() {
         "the engine's float marker is notation, not the operator's value"
     );
 }
+
+/// The rules held at ONE door out of three. `fields::set` checked
+/// everything; `entities update --attrs` and the UI's attributes box —
+/// which are the same code path — wrote whatever JSON they were handed.
+///
+/// So a raw credential could be pasted into the graph from a browser,
+/// which is the exact thing the secret-reference rule exists to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bag_write_is_checked_exactly_as_a_field_write_is() {
+    let db = fresh_db().await;
+    let cred = create_entity(&db, "credential", "github", None, None).await.expect("create");
+
+    let bag = |pairs: &[(&str, &str)]| {
+        let mut o = Object::new();
+        for (k, v) in pairs {
+            o.insert((*k).to_string(), Value::String((*v).to_string()));
+        }
+        o
+    };
+
+    // The refusals, through the OTHER door.
+    fields::validate_bag(&db, &cred, &bag(&[("secret", "ghp_rawTokenPasted")]))
+        .await
+        .expect_err("a pasted token is refused wherever it comes from");
+
+    let repo = create_entity(&db, "repo", "superx", None, None).await.expect("create");
+    fields::validate_bag(&db, &repo, &bag(&[("url", "github.com/x")]))
+        .await
+        .expect_err("not an http(s) url");
+
+    let other = create_entity(&db, "product", "P", None, None).await.expect("p");
+    let uuid = superx_ops::record_uuid(&other);
+    fields::validate_bag(&db, &repo, &bag(&[("branch", &uuid)]))
+        .await
+        .expect_err("a bare id of something that exists is a link, not a value");
+
+    // And a legal bag comes back typed.
+    let checked = fields::validate_bag(&db, &cred, &bag(&[("secret", "keychain:github-pat")]))
+        .await
+        .expect("a pointer is fine");
+    assert!(matches!(checked.get("secret"), Some(Value::String(s)) if s == "keychain:github-pat"));
+}
+
+/// A type that declares nothing accepts anything, and an entity written
+/// under older declarations still holds keys nobody declares now — so
+/// the bag check must carry what it does not recognise rather than
+/// refusing it and making an existing entity uneditable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undeclared_key_passes_through_untouched() {
+    let db = fresh_db().await;
+    let repo = create_entity(&db, "repo", "superx", None, None).await.expect("create");
+
+    let mut incoming = Object::new();
+    incoming.insert("url".to_string(), Value::String("https://example.com/r".into()));
+    incoming.insert("legacy_mirror".to_string(), Value::String("git://old".into()));
+
+    let checked = fields::validate_bag(&db, &repo, &incoming).await.expect("carried");
+    assert!(matches!(checked.get("legacy_mirror"), Some(Value::String(s)) if s == "git://old"));
+    assert!(checked.contains_key("url"));
+}
+
+/// The bag REPLACES what was there, so an update that omits a key
+/// deletes it. For an optional field that is how you clear one; for a
+/// required field it is a value disappearing because a form did not
+/// mention it, which nobody asked for and nobody would notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_cannot_silently_drop_a_required_field() {
+    let db = fresh_db().await;
+    let repo = create_entity(&db, "repo", "superx", None, None).await.expect("create");
+    fields::set(&db, &repo, "url", "https://example.com/r").await.expect("url");
+    fields::set(&db, &repo, "branch", "main").await.expect("branch");
+
+    let mut without_url = Object::new();
+    without_url.insert("branch".to_string(), Value::String("develop".into()));
+    let err = fields::validate_bag(&db, &repo, &without_url)
+        .await
+        .expect_err("url is required on repo and this write drops it");
+    assert!(err.to_string().contains("url"), "the error names it: {err}");
+
+    // Clearing an OPTIONAL field by omission is still how you clear one.
+    let mut without_branch = Object::new();
+    without_branch.insert("url".to_string(), Value::String("https://example.com/r".into()));
+    fields::validate_bag(&db, &repo, &without_branch)
+        .await
+        .expect("an optional field may be cleared by omission");
+}
+
+/// The two doors have to give the same answer, which is the whole point.
+/// `set` refuses a key the TYPE does not carry once the type declares
+/// anything; the bag door did not, so the same key was refused one way
+/// and accepted the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_bag_door_refuses_what_the_field_door_refuses() {
+    let db = fresh_db().await;
+    let repo = create_entity(&db, "repo", "superx", None, None).await.expect("create");
+    dictionary::define(&db, Definition {
+        key: "max_notional",
+        kind: "slot",
+        display: "Max notional",
+        semantics: "data",
+        cardinality: Some("one"),
+        value_kind: Some("number"),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+
+    // `repo` declares slots, and max_notional is not among them.
+    fields::set(&db, &repo, "max_notional", "500")
+        .await
+        .expect_err("the field door refuses it");
+
+    let mut bag = Object::new();
+    bag.insert("url".to_string(), Value::String("https://example.com/r".into()));
+    bag.insert("max_notional".to_string(), Value::String("500".into()));
+    fields::validate_bag(&db, &repo, &bag)
+        .await
+        .expect_err("and so does the bag door");
+}
+
+/// Grandfathered, not refused outright: an entity written under older
+/// declarations may still hold a key its type no longer carries, and
+/// refusing that would make it uneditable (§7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_already_there_may_stay_even_if_the_type_stopped_carrying_it() {
+    let db = fresh_db().await;
+    let repo = create_entity(&db, "repo", "superx", None, None).await.expect("create");
+
+    // Written while the type carried it.
+    let author = superx_mod_entities::notes::Author::operator();
+    dictionary::define(&db, Definition {
+        key: "mirror",
+        kind: "slot",
+        display: "Mirror",
+        semantics: "data",
+        cardinality: Some("one"),
+        value_kind: Some("url"),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+    dictionary::bind_slot(&db, "repo", "mirror", false, None, &author).await.expect("bind");
+    fields::set(&db, &repo, "mirror", "https://mirror.example.com").await.expect("set");
+
+    // The type stops carrying it.
+    dictionary::retire_slot(&db, "repo", "mirror", false, &author).await.expect("retire");
+
+    // The entity can still be saved with the value it already holds.
+    let mut bag = Object::new();
+    bag.insert("url".to_string(), Value::String("https://example.com/r".into()));
+    bag.insert("mirror".to_string(), Value::String("https://mirror.example.com".into()));
+    fields::validate_bag(&db, &repo, &bag)
+        .await
+        .expect("what is already there may stay");
+}

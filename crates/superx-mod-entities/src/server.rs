@@ -52,6 +52,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/entities", get(api_list).post(api_create))
         .route("/api/entities/{frag}", get(api_detail))
         .route("/api/entities/{frag}/history", get(api_history))
+        .route("/api/entities/{frag}/fields", get(api_fields).post(api_set_field))
         .route("/api/entities/{frag}/update", post(api_update))
         .route("/api/entities/{frag}/describe", post(api_describe))
         .route("/api/entities/{frag}/comment", post(api_comment))
@@ -141,6 +142,32 @@ async fn api_types(State(state): State<AppState>) -> Resp<Vec<api::TypeView>> {
     let db = module_db!(state);
     match api::types_list(&db).await {
         Ok(v) => Resp::ok(v),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_fields(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+) -> Resp<Vec<api::FieldView>> {
+    let db = module_db!(state);
+    match api::entity_fields(&db, &frag).await {
+        Ok(rows) => Resp::ok(rows),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_set_field(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+    Json(req): Json<api::FieldReq>,
+) -> Resp<serde_json::Value> {
+    let db = module_db!(state);
+    match api::set_field(&db, &frag, &req.key, &req.value).await {
+        Ok(()) => {
+            emit(&state.kernel, "entity_updated", frag.clone()).await;
+            Resp::ok(serde_json::json!({ "key": req.key }))
+        }
         Err(e) => Resp::err(e.to_string()),
     }
 }
