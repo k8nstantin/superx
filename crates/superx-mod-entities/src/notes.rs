@@ -84,8 +84,12 @@ impl Author {
 pub struct Note {
     /// Stable across versions — the chain key.
     pub uid: String,
-    /// What the note is attached to.
+    /// The typed link, where the target is an entity.
     pub entity: Option<RecordId>,
+    /// `entity` | `type` | `label`. A note on a type has no entity link,
+    /// so this is the only thing that says where it belongs.
+    pub target_kind: Option<String>,
+    pub target_uid: Option<String>,
     pub label: String,
     pub body: String,
     pub parent_uid: Option<String>,
@@ -186,7 +190,7 @@ pub async fn reply(db: &Db, parent_uid: &str, body: &str, author: &Author) -> Re
     let parent = current(db, parent_uid)
         .await?
         .ok_or_else(|| KernelError::Module(format!("no note '{parent_uid}' to reply to")))?;
-    let entity = attached_to(&parent)?;
+    let target = attached_to(db, &parent).await?;
 
     let singular = dictionary::current(db, &parent.label, SLOT)
         .await?
@@ -199,7 +203,7 @@ pub async fn reply(db: &Db, parent_uid: &str, body: &str, author: &Author) -> Re
     append(
         db,
         Version {
-            target: &crate::target::Target::Entity(entity.clone()),
+            target: &target,
             uid: &uid,
             label,
             body,
@@ -228,11 +232,11 @@ pub async fn retract(db: &Db, uid: &str, author: &Author) -> Result<()> {
     let Some(note) = current(db, uid).await? else {
         return Err(KernelError::Module(format!("no note '{uid}'")));
     };
-    let entity = attached_to(&note)?;
+    let target = attached_to(db, &note).await?;
     append(
         db,
         Version {
-            target: &crate::target::Target::Entity(entity.clone()),
+            target: &target,
             uid,
             label: &note.label,
             body: &note.body,
@@ -244,12 +248,24 @@ pub async fn retract(db: &Db, uid: &str, author: &Author) -> Result<()> {
     .await
 }
 
-/// What a note hangs off. The column is `record<entity>` and required,
-/// so an absence here means the row was written outside these verbs.
-fn attached_to(note: &Note) -> Result<RecordId> {
-    note.entity.clone().ok_or_else(|| {
-        KernelError::Module(format!("note '{}' is attached to nothing", note.uid))
-    })
+/// What a note hangs off — an entity, a type or a label.
+///
+/// This used to return the typed `record<entity>` link alone, so a note
+/// on a TYPE could be neither retracted nor replied to: both said
+/// "attached to nothing" about something plainly attached to a type. A
+/// thread you cannot answer is not a thread, which is the one thing §3
+/// says a type needs.
+async fn attached_to(db: &Db, note: &Note) -> Result<crate::target::Target> {
+    if let (Some(kind), Some(uid)) = (note.target_kind.as_deref(), note.target_uid.as_deref()) {
+        return crate::target::Target::resolve(db, kind, uid).await;
+    }
+    // Rows written before the polymorphic columns carry only the link.
+    note.entity
+        .clone()
+        .map(crate::target::Target::Entity)
+        .ok_or_else(|| {
+            KernelError::Module(format!("note '{}' is attached to nothing", note.uid))
+        })
 }
 
 /// Every current note on an entity, oldest first. Retracted notes are
@@ -475,6 +491,8 @@ fn parse(row: &Value) -> Option<Note> {
             Some(Value::RecordId(r)) => Some(r.clone()),
             _ => None,
         },
+        target_kind: str_field(o, "target_kind"),
+        target_uid: str_field(o, "target_uid"),
         label: str_field(o, "label")?,
         body: str_field(o, "body").unwrap_or_default(),
         parent_uid: str_field(o, "parent_uid"),
