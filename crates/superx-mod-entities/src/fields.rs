@@ -297,7 +297,10 @@ fn render(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
+        // SurrealDB marks a float with a trailing `f`. That is the
+        // engine's notation, not the operator's value: a max_notional of
+        // 50000 should read as 50000, not `50000f`.
+        Value::Number(n) => n.to_string().trim_end_matches('f').to_string(),
         Value::Datetime(d) => d.to_string(),
         // A nested value reaches here only from an UNDECLARED key — a
         // field's own kinds are all scalar. Rendering it as Rust debug

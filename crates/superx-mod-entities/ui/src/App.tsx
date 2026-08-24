@@ -4,6 +4,7 @@ import { Anchor, AppShell, Box, Group, NavLink, Text } from '@mantine/core'
 import { fetchPing } from './api'
 import EntitiesPage from './pages/Entities'
 import TypesPage from './pages/Types'
+import DictionaryPage from './pages/Dictionary'
 import GraphFull, { graphRouteId } from './pages/GraphFull'
 import { BreadcrumbProvider, BreadcrumbTrail } from './Breadcrumbs'
 
@@ -12,7 +13,9 @@ import { BreadcrumbProvider, BreadcrumbTrail } from './Breadcrumbs'
 // the substrate), Entities and Types — the graph is per entity, so
 // there is no Graph menu.
 
-const PAGES = ['Entities', 'Types'] as const
+// types -> labels -> entities is a dependency, not a convention, so the
+// tabs read in that order (#292).
+const PAGES = ['Types', 'Dictionary', 'Entities'] as const
 type Page = (typeof PAGES)[number]
 
 /// One route, so one `pathname` check rather than a router dependency
@@ -79,6 +82,7 @@ function Shell() {
       <AppShell.Main>
         {page === 'Entities' && <EntitiesPage />}
         {page === 'Types' && <TypesPage />}
+        {page === 'Dictionary' && <DictionaryPage />}
       </AppShell.Main>
     </AppShell>
   )

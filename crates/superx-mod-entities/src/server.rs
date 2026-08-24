@@ -44,6 +44,11 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/ping", get(api_ping))
         .route("/api/types", get(api_types).post(api_types_add))
         .route("/api/rel-types", get(api_rel_types))
+        // The dictionary, designable (#292): types → labels → entities is
+        // the order everything else depends on, so it needs a surface.
+        .route("/api/labels", get(api_labels).post(api_define_label))
+        .route("/api/vocabulary", get(api_vocabulary))
+        .route("/api/types/{name}/slots", get(api_slots).post(api_bind_slot))
         .route("/api/entities", get(api_list).post(api_create))
         .route("/api/entities/{frag}", get(api_detail))
         .route("/api/entities/{frag}/history", get(api_history))
@@ -136,6 +141,68 @@ async fn api_types(State(state): State<AppState>) -> Resp<Vec<api::TypeView>> {
     let db = module_db!(state);
     match api::types_list(&db).await {
         Ok(v) => Resp::ok(v),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_labels(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Resp<Vec<api::LabelView>> {
+    let db = module_db!(state);
+    let archived = q.get("archived").is_some_and(|v| v == "true");
+    match api::labels(&db, archived).await {
+        Ok(rows) => Resp::ok(rows),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_vocabulary(State(state): State<AppState>) -> Resp<api::VocabularyView> {
+    let db = module_db!(state);
+    match api::vocabulary(&db).await {
+        Ok(v) => Resp::ok(v),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_define_label(
+    State(state): State<AppState>,
+    Json(req): Json<api::LabelReq>,
+) -> Resp<serde_json::Value> {
+    let db = module_db!(state);
+    match api::define_label(&db, &req).await {
+        Ok(()) => {
+            emit(&state.kernel, "label_defined", req.key.clone()).await;
+            Resp::ok(serde_json::json!({ "key": req.key }))
+        }
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_slots(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Resp<Vec<api::SlotView>> {
+    let db = module_db!(state);
+    let retired = q.get("retired").is_some_and(|v| v == "true");
+    match api::slots(&db, &name, retired).await {
+        Ok(rows) => Resp::ok(rows),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_bind_slot(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<api::SlotReq>,
+) -> Resp<serde_json::Value> {
+    let db = module_db!(state);
+    match api::bind_slot(&db, &name, &req).await {
+        Ok(()) => {
+            emit(&state.kernel, "type_slot_bound", format!("{name}.{}", req.label)).await;
+            Resp::ok(serde_json::json!({ "type": name, "label": req.label }))
+        }
         Err(e) => Resp::err(e.to_string()),
     }
 }

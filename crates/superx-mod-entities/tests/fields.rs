@@ -328,6 +328,7 @@ async fn a_number_field_refuses_what_a_number_cannot_mean() {
     fields::set(&db, &e, "temperature", "0.7").await.expect("a real number is fine");
     assert_eq!(
         fields::of(&db, &e).await.expect("read")[0].value.as_deref(),
-        Some("0.7f")
+        Some("0.7"),
+        "the engine's float marker is notation, not the operator's value"
     );
 }

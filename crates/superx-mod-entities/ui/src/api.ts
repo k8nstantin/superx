@@ -10,6 +10,11 @@ import type { UpdateReq } from './generated/UpdateReq'
 import type { LinkReq } from './generated/LinkReq'
 import type { TypeReq } from './generated/TypeReq'
 import type { GraphView } from './generated/GraphView'
+import type { LabelView } from './generated/LabelView'
+import type { SlotView } from './generated/SlotView'
+import type { VocabularyView } from './generated/VocabularyView'
+import type { LabelReq } from './generated/LabelReq'
+import type { SlotReq } from './generated/SlotReq'
 
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(path)
@@ -93,3 +98,24 @@ export function typeColor(name: string): string {
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0
   return TYPE_COLORS[h % TYPE_COLORS.length]
 }
+
+// ── The dictionary, designable (#292) ────────────────────────────────
+// types -> labels -> entities is the order everything else depends on,
+// so all three are edited from the same surface.
+
+export const fetchLabels = (archived = false) =>
+  get<LabelView[]>(`/api/labels${archived ? '?archived=true' : ''}`)
+
+/// Every closed vocabulary comes from the substrate, never from a list
+/// hardcoded in the frontend — the dictionary owns what a semantics or a
+/// kind may be, and a second copy here would rot the moment it changes.
+export const fetchVocabulary = () => get<VocabularyView>('/api/vocabulary')
+
+export const defineLabel = (req: LabelReq) =>
+  post<{ key: string }>('/api/labels', req)
+
+export const fetchSlots = (type: string, retired = false) =>
+  get<SlotView[]>(`/api/types/${encodeURIComponent(type)}/slots${retired ? '?retired=true' : ''}`)
+
+export const bindSlot = (type: string, req: SlotReq) =>
+  post<{ type: string; label: string }>(`/api/types/${encodeURIComponent(type)}/slots`, req)
