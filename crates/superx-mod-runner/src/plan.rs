@@ -5,9 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use superx_kernel::{Kernel, KernelError, NodeKind, Result};
+use superx_kernel::{Kernel, KernelError, Result};
 
-use crate::MODULE_NAME;
 
 /// Subgraph resolution depth for planning (epic S2).
 pub const PLAN_DEPTH_PARAM: &str = "attr_runner_plan_depth";
@@ -87,21 +86,20 @@ pub async fn fetch_graph(kernel: &Kernel, fragment: &str, depth: usize) -> Resul
         .map_err(|e| KernelError::Module(format!("unparseable entities graph JSON: {e}")))
 }
 
-/// The planning depth: substrate parameter with the marked fallback.
+/// The planning depth: the module's own setting (#284), falling back to
+/// a kernel parameter set before the module owned its settings, and
+/// adopting it so the next read finds it here.
 pub async fn resolved_plan_depth(kernel: &Kernel) -> usize {
-    let Ok(Some(entity)) = kernel
-        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
-        .await
-    else {
-        return DEFAULT_PLAN_DEPTH;
-    };
-    match kernel.get_parameter(entity, PLAN_DEPTH_PARAM).await {
-        Ok(Some(superx_kernel::types::Value::Number(n))) => n
-            .to_int()
-            .and_then(|i| usize::try_from(i).ok())
-            .filter(|&d| d > 0)
-            .unwrap_or(DEFAULT_PLAN_DEPTH),
-        _ => DEFAULT_PLAN_DEPTH,
+    if let Some(own) = crate::params::load(kernel).plan_depth {
+        return own.max(1);
+    }
+    match crate::daemon::kernel_u64(kernel, PLAN_DEPTH_PARAM).await {
+        Some(set) => {
+            let adopted = usize::try_from(set).unwrap_or(DEFAULT_PLAN_DEPTH).max(1);
+            crate::params::adopt(kernel, |s| s.plan_depth = Some(adopted));
+            adopted
+        }
+        None => DEFAULT_PLAN_DEPTH,
     }
 }
 

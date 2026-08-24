@@ -9,6 +9,7 @@
 pub mod cli;
 pub mod daemon;
 pub mod exec;
+pub mod params;
 pub mod plan;
 pub mod recurrence;
 pub mod run;

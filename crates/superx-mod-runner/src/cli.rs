@@ -14,7 +14,9 @@ const USAGE: &str = "usage: superx runner <command>\n\
   plan <entity-fragment>       DRY RUN: the execution waves the graph implies\n\
   runs [<schedule-fragment>]   firing history: task · status · versions\n\
   config [agent_cmd <cmd…> | max_parallel <n> | tick_secs <n> | plan_depth <n>]\n\
-set attr_runner_agent_cmd (substrate parameter) to enable dispatch — unset refuses loudly";
+  config <knob> --unset                 back to the default; agent_cmd --unset stops dispatch\n\
+set the agent command to enable dispatch — unset refuses loudly:\n\
+  superx runner config agent_cmd <cmd…>";
 
 /// Route a `superx runner …` invocation.
 ///
@@ -127,45 +129,67 @@ async fn plan_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     Ok(crate::plan::render_plan(&plan))
 }
 
+/// `superx runner config` — the module's OWN settings (#284).
+///
+/// They live in this module's directory, not in the kernel's parameter
+/// store: a module that owns its database, its schema and its directory
+/// should not keep its knobs in somebody else's namespace, prefixed to
+/// stay out of the way.
 async fn config_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
-    use superx_kernel::types::Value;
-    let entity = kernel
-        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
-        .await?
-        .ok_or_else(|| KernelError::Module("runner not registered — boot the OS once first".to_string()))?;
     match args.first().map(String::as_str) {
         None => {
             let cmd = crate::daemon::resolved_agent_cmd(kernel).await;
+            let where_ = crate::params::path_for(kernel)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(no instance home — defaults only)".to_string());
             Ok(format!(
-                "runner config (substrate parameters):\n  agent_cmd:    {}\n  max_parallel: {}\n  tick_secs:    {}\n  plan_depth:   {}\n",
+                "runner config ({where_}):\n  agent_cmd:    {}\n  max_parallel: {}\n  tick_secs:    {}\n  plan_depth:   {}\n",
                 cmd.unwrap_or_else(|| "(unset — dispatch refuses; set it to enable execution)".to_string()),
                 crate::daemon::resolved_max_parallel(kernel).await,
                 crate::daemon::resolved_tick_secs(kernel).await,
                 crate::plan::resolved_plan_depth(kernel).await,
             ))
         }
+        // A knob that can be set and never cleared is a one-way door,
+        // and for `agent_cmd` that door is "agents run": an operator who
+        // turned dispatch on for one experiment could not turn it off
+        // again without editing the file by hand.
+        Some(knob @ ("agent_cmd" | "max_parallel" | "tick_secs" | "plan_depth"))
+            if args.get(1).map(String::as_str) == Some("--unset") =>
+        {
+            crate::params::update(kernel, |s| match knob {
+                "agent_cmd" => s.agent_cmd = None,
+                "max_parallel" => s.max_parallel = None,
+                "tick_secs" => s.tick_secs = None,
+                _ => s.plan_depth = None,
+            })?;
+            let consequence = if knob == "agent_cmd" {
+                " — dispatch refuses again until it is set"
+            } else {
+                " — back to the default"
+            };
+            Ok(format!("{knob} unset{consequence}\n"))
+        }
         Some("agent_cmd") => {
             let value = args[1..].join(" ");
             if value.is_empty() {
                 return Err(usage());
             }
-            kernel
-                .set_parameter(entity, crate::daemon::AGENT_CMD_PARAM, Value::String(value.clone()))
-                .await?;
+            let set = value.clone();
+            crate::params::update(kernel, |s| s.agent_cmd = Some(set))?;
             Ok(format!("agent_cmd = {value}\n"))
         }
         Some(knob @ ("max_parallel" | "tick_secs" | "plan_depth")) => {
-            let n: i64 = args
+            let n: usize = args
                 .get(1)
                 .and_then(|v| v.parse().ok())
                 .filter(|&n| n > 0)
                 .ok_or_else(usage)?;
-            let param = match knob {
-                "max_parallel" => crate::daemon::MAX_PARALLEL_PARAM,
-                "tick_secs" => crate::daemon::TICK_PARAM,
-                _ => crate::plan::PLAN_DEPTH_PARAM,
-            };
-            kernel.set_parameter(entity, param, Value::Number(n.into())).await?;
+            crate::params::update(kernel, |s| match knob {
+                "max_parallel" => s.max_parallel = Some(n),
+                "tick_secs" => s.tick_secs = Some(n as u64),
+                _ => s.plan_depth = Some(n),
+            })?;
             Ok(format!("{knob} = {n}\n"))
         }
         _ => Err(usage()),

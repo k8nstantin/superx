@@ -13,6 +13,11 @@ use crate::{plan, schedule, MODULE_NAME};
 /// Executor command parameter — NO fallback by design (epic S2): an
 /// unset command makes dispatch fail loudly; nothing spawns agents
 /// the operator never configured.
+///
+/// The kernel parameter names below are no longer where these settings
+/// LIVE (#284) — they are where they may still be found, once, so a
+/// value set before the module owned its settings is adopted rather
+/// than lost.
 pub const AGENT_CMD_PARAM: &str = "attr_runner_agent_cmd";
 /// Concurrent dispatch ceiling per firing.
 pub const MAX_PARALLEL_PARAM: &str = "attr_runner_max_parallel";
@@ -98,17 +103,66 @@ fn is_due(run_at: &str) -> bool {
 
 /// Resolved executor command (public for `runner config`).
 pub async fn resolved_agent_cmd(kernel: &Kernel) -> Option<String> {
-    resolved_string(kernel, AGENT_CMD_PARAM).await
+    if let Some(own) = crate::params::load(kernel).agent_cmd {
+        return Some(own);
+    }
+    if let Some(adopted) = resolved_string(kernel, AGENT_CMD_PARAM).await {
+        let value = adopted.clone();
+        crate::params::adopt(kernel, |s| s.agent_cmd = Some(value));
+        return Some(adopted);
+    }
+    None
 }
 
 /// Resolved parallel ceiling (public for `runner config`).
 pub async fn resolved_max_parallel(kernel: &Kernel) -> usize {
-    resolved_u64(kernel, MAX_PARALLEL_PARAM, DEFAULT_MAX_PARALLEL as u64).await.max(1) as usize
+    if let Some(own) = crate::params::load(kernel).max_parallel {
+        return own.max(1);
+    }
+    match kernel_u64(kernel, MAX_PARALLEL_PARAM).await {
+        Some(set) => {
+            let adopted = usize::try_from(set).unwrap_or(DEFAULT_MAX_PARALLEL).max(1);
+            crate::params::adopt(kernel, |s| s.max_parallel = Some(adopted));
+            adopted
+        }
+        None => DEFAULT_MAX_PARALLEL,
+    }
 }
 
 /// Resolved tick cadence (public for `runner config`).
 pub async fn resolved_tick_secs(kernel: &Kernel) -> u64 {
-    resolved_u64(kernel, TICK_PARAM, DEFAULT_TICK_SECS).await.max(1)
+    if let Some(own) = crate::params::load(kernel).tick_secs {
+        return own.max(1);
+    }
+    match kernel_u64(kernel, TICK_PARAM).await {
+        Some(set) => {
+            let adopted = set.max(1);
+            crate::params::adopt(kernel, |s| s.tick_secs = Some(adopted));
+            adopted
+        }
+        None => DEFAULT_TICK_SECS,
+    }
+}
+
+/// The kernel's value for a numeric parameter, if it HAS one.
+///
+/// The defaulting reader below cannot distinguish "the operator chose
+/// the default" from "the operator chose nothing", and adoption turns on
+/// exactly that difference: a value set deliberately must move into the
+/// module's own settings even when it happens to equal the default, or
+/// the record of having chosen it is lost when the storage moves.
+pub(crate) async fn kernel_u64(kernel: &Kernel, param: &str) -> Option<u64> {
+    let entity = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+        .ok()
+        .flatten()?;
+    match kernel.get_parameter(entity, param).await {
+        Ok(Some(superx_kernel::types::Value::Number(n))) => {
+            n.to_int().and_then(|i| u64::try_from(i).ok())
+        }
+        _ => None,
+    }
 }
 
 async fn resolved_u64(kernel: &Kernel, param: &str, fallback: u64) -> u64 {
