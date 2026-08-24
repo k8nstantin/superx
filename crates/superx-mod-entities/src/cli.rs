@@ -7,7 +7,8 @@ use superx_kernel::{Kernel, KernelError, NodeKind, Result};
 use superx_ops::record_uuid;
 
 use crate::{
-    documents, edges, fields, graph, migrate, nodes, notes, registry, texts, MODULE_NAME,
+    attachments, documents, edges, fields, graph, migrate, nodes, notes, registry, texts,
+    MODULE_NAME,
 };
 
 /// Traversal depth ceiling parameter on the module's registry entity.
@@ -42,6 +43,10 @@ const USAGE: &str = "usage: superx entities <command>\n\
   labels archive <key> --kind slot|link [--restore]\n\
   migrate-prose [--dry-run]            move text carriers into the note store, history and all\n\
   notes <uuid-fragment> [--all]        the prose attached to an entity, by label\n\
+  note --on entity|type|label <id> --label <l> <text…>   prose on a type or a label too\n\
+  files --on entity|type|label <id>    what is attached, and what each file MEANS\n\
+  file --on entity|type|label <id> --label <l> <path>    attach a file AS that label\n\
+  file retract <attachment-uid>\n\
   notes history <note-uid>             every version of one note\n\
   notes reply <note-uid> <text…>       a comment on a comment\n\
   notes retract <note-uid>             it no longer stands; it stays on the record\n\
@@ -59,6 +64,9 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("types") => types_cmd(kernel, &args[1..]).await,
         Some("labels") => labels_cmd(kernel, &args[1..]).await,
         Some("notes") => notes_cmd(kernel, &args[1..]).await,
+        Some("note") => note_on_cmd(kernel, &args[1..]).await,
+        Some("files") => files_cmd(kernel, &args[1..]).await,
+        Some("file") => file_cmd(kernel, &args[1..]).await,
         Some("migrate-prose") => migrate_cmd(kernel, &args[1..]).await,
         Some("fields") => fields_cmd(kernel, &args[1..]).await,
         Some("set") => set_cmd(kernel, &args[1..]).await,
@@ -421,6 +429,132 @@ async fn migrate_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     }
     out.push_str("\nthe text nodes and their edges are untouched — this adds, it does not move\n");
     Ok(out)
+}
+
+/// `--on <kind> <id>`: what the content belongs to (#296).
+async fn target_from(db: &superx_kernel::Db, args: &[String]) -> Result<crate::target::Target> {
+    let kind = flag(args, "--on").ok_or_else(usage)?;
+    // The id is the argument after the kind, so `--on type product` reads
+    // as one phrase rather than two flags that must agree.
+    let at = args.iter().position(|a| a == "--on").ok_or_else(usage)?;
+    let id = args.get(at + 2).ok_or_else(usage)?;
+    crate::target::Target::resolve(db, &kind, id).await
+}
+
+/// The prose belonging to a target, whichever of the three it is.
+fn render_notes(all: &[notes::Note]) -> String {
+    let mut out = format!("{} note(s)\n", all.len());
+    for n in all {
+        let who = n.author_kind.as_deref().unwrap_or("?");
+        let when = n
+            .valid_from
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        out.push_str(&format!("\n  {}  {when}  {who}\n    {}\n    uid {}\n", n.label, n.body, n.uid));
+    }
+    out
+}
+
+/// `superx entities note --on type product --label description <text>`
+///
+/// A type is exactly the thing people argue about (§3), and until now it
+/// had nowhere to hold the argument.
+async fn note_on_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let target = target_from(&db, args).await?;
+    let label = flag(args, "--label").ok_or_else(usage)?;
+    let text = rest_after_flags(args, &["--on", "--label"])?;
+    if text.is_empty() {
+        // Nothing to write means this is a read.
+        let all = notes::for_target(&db, &target, false).await?;
+        return Ok(render_notes(&all));
+    }
+    let (uid, is_new) =
+        notes::write_to_target(&db, &target, &label, &text, &notes::Author::operator()).await?;
+    Ok(format!(
+        "{} on {} '{}' — note {uid}\n",
+        if is_new { "wrote" } else { "amended" },
+        target.kind(),
+        target.uid()
+    ))
+}
+
+/// What is attached to a target, and what each file MEANS.
+async fn files_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let target = target_from(&db, args).await?;
+    let all = attachments::for_target(&db, &target, args.iter().any(|a| a == "--all")).await?;
+    if all.is_empty() {
+        return Ok("nothing attached\n".to_string());
+    }
+    let mut out = format!("{} file(s)\n", all.len());
+    for a in &all {
+        let retracted = if a.active { "" } else { "  [retracted]" };
+        out.push_str(&format!(
+            "\n  [{}] {}  {}  {} bytes{}\n    uid {}\n",
+            a.label, a.filename, a.mime, a.size, retracted, a.uid
+        ));
+    }
+    out.push_str("\nthe label is what the file MEANS — a spec sheet as a PDF is still a spec\n");
+    Ok(out)
+}
+
+/// Attach a file AS a label — a mandate can be typed inline on one role
+/// and uploaded as a PDF on another (§5.4).
+async fn file_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+
+    if args.first().map(String::as_str) == Some("retract") {
+        let uid = args.get(1).ok_or_else(usage)?;
+        attachments::retract(&db, uid, &notes::Author::operator()).await?;
+        return Ok(format!(
+            "retracted {uid} — the bytes stay on disk and every version is still readable\n"
+        ));
+    }
+
+    let target = target_from(&db, args).await?;
+    let label = flag(args, "--label").ok_or_else(usage)?;
+    let path = rest_after_flags(args, &["--on", "--label"])?;
+    if path.is_empty() {
+        return Err(usage());
+    }
+    let dir = kernel.module_dir(MODULE_NAME)?;
+    let uid = attachments::attach(
+        &db,
+        &dir,
+        &target,
+        &label,
+        std::path::Path::new(&path),
+        &notes::Author::operator(),
+    )
+    .await?;
+    Ok(format!(
+        "attached as '{label}' on {} '{}' — {uid}\n",
+        target.kind(),
+        target.uid()
+    ))
+}
+
+/// Everything that is not a flag or a flag's value, joined.
+///
+/// `--on` takes TWO words (kind and id), which is why this cannot be the
+/// generic leading-flag parser used elsewhere.
+fn rest_after_flags(args: &[String], flags: &[&str]) -> Result<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut skip = 0usize;
+    for (i, arg) in args.iter().enumerate() {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        if flags.contains(&arg.as_str()) {
+            skip = if arg == "--on" { 2 } else { 1 };
+            continue;
+        }
+        let _ = i;
+        parts.push(arg);
+    }
+    Ok(parts.join(" "))
 }
 
 async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {

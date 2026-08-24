@@ -11,6 +11,7 @@
 //! own log (`target: "entities"`), own CLI (`superx entities …`).
 
 pub mod api;
+pub mod attachments;
 pub mod cli;
 pub mod dictionary;
 pub mod documents;
@@ -21,6 +22,7 @@ pub mod migrate;
 pub mod nodes;
 pub mod notes;
 pub mod registry;
+pub mod target;
 mod server;
 pub mod texts;
 

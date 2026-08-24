@@ -131,7 +131,7 @@ pub async fn write(
             append(
                 db,
                 Version {
-                    entity,
+                    target: &crate::target::Target::Entity(entity.clone()),
                     uid: &existing.uid,
                     label,
                     body,
@@ -148,7 +148,15 @@ pub async fn write(
     let uid = uuid::Uuid::now_v7().to_string();
     append(
         db,
-        Version { entity, uid: &uid, label, body, parent_uid: None, active: true, author },
+        Version {
+            target: &crate::target::Target::Entity(entity.clone()),
+            uid: &uid,
+            label,
+            body,
+            parent_uid: None,
+            active: true,
+            author,
+        },
     )
     .await?;
     Ok((uid, true))
@@ -191,7 +199,7 @@ pub async fn reply(db: &Db, parent_uid: &str, body: &str, author: &Author) -> Re
     append(
         db,
         Version {
-            entity: &entity,
+            target: &crate::target::Target::Entity(entity.clone()),
             uid: &uid,
             label,
             body,
@@ -224,7 +232,7 @@ pub async fn retract(db: &Db, uid: &str, author: &Author) -> Result<()> {
     append(
         db,
         Version {
-            entity: &entity,
+            target: &crate::target::Target::Entity(entity.clone()),
             uid,
             label: &note.label,
             body: &note.body,
@@ -274,6 +282,102 @@ pub async fn for_entity(db: &Db, entity: &RecordId, include_retracted: bool) -> 
         .collect())
 }
 
+/// Every current note on any target — an entity, a type or a label
+/// (#296). A type is exactly the thing people argue about, and this is
+/// where the argument lives.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn for_target(
+    db: &Db,
+    target: &crate::target::Target,
+    include_retracted: bool,
+) -> Result<Vec<Note>> {
+    // An entity's notes may predate the polymorphic columns, so they are
+    // still found by the typed link; a type's or a label's can only be
+    // found by the pair.
+    if let Some(entity) = target.entity() {
+        return for_entity(db, &entity, include_retracted).await;
+    }
+    let mut resp = db
+        .query(
+            "SELECT * FROM note WHERE target_uid = $uid AND target_kind = $kind \
+             ORDER BY valid_from ASC, id ASC",
+        )
+        .bind(("uid", target.uid()))
+        .bind(("kind", target.kind().to_string()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    Ok(heads_of(&rows, include_retracted))
+}
+
+/// Attach prose to a type or a label.
+///
+/// Entities go through [`write`], which also keeps the typed link. This
+/// is the same act for the two things that are not nodes.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] for an undefined label; [`KernelError::Db`]
+/// for engine errors.
+pub async fn write_to_target(
+    db: &Db,
+    target: &crate::target::Target,
+    label: &str,
+    body: &str,
+    author: &Author,
+) -> Result<(String, bool)> {
+    if let Some(entity) = target.entity() {
+        return write(db, &entity, label, body, author).await;
+    }
+    let defined = require_label(db, label).await?;
+
+    if defined.cardinality.as_deref() == Some("one") {
+        if let Some(existing) = for_target(db, target, false)
+            .await?
+            .into_iter()
+            .find(|n| n.label == label)
+        {
+            append(
+                db,
+                Version {
+                    target,
+                    uid: &existing.uid,
+                    label,
+                    body,
+                    parent_uid: existing.parent_uid,
+                    active: true,
+                    author,
+                },
+            )
+            .await?;
+            return Ok((existing.uid, false));
+        }
+    }
+    let uid = uuid::Uuid::now_v7().to_string();
+    append(
+        db,
+        Version { target, uid: &uid, label, body, parent_uid: None, active: true, author },
+    )
+    .await?;
+    Ok((uid, true))
+}
+
+/// Latest row per uid, filtered.
+fn heads_of(rows: &[Value], include_retracted: bool) -> Vec<Note> {
+    let mut heads: std::collections::BTreeMap<String, Note> = std::collections::BTreeMap::new();
+    for row in rows {
+        if let Some(note) = parse(row) {
+            heads.insert(note.uid.clone(), note);
+        }
+    }
+    heads
+        .into_values()
+        .filter(|n| include_retracted || n.active)
+        .collect()
+}
+
 /// The current version of one note.
 ///
 /// # Errors
@@ -316,7 +420,10 @@ async fn current_for_label(db: &Db, entity: &RecordId, label: &str) -> Result<Op
 /// One appended version, as a value. Seven positional arguments in a
 /// row is how a caller ends up silently swapping `label` and `body`.
 struct Version<'a> {
-    entity: &'a RecordId,
+    /// An entity, a type or a label. The typed `record<entity>` link is
+    /// written only when there IS one, so a note on a type is the same
+    /// row shape without pretending to point at a node.
+    target: &'a crate::target::Target,
     uid: &'a str,
     label: &'a str,
     body: &'a str,
@@ -326,10 +433,18 @@ struct Version<'a> {
 }
 
 async fn append(db: &Db, v: Version<'_>) -> Result<()> {
-    let Version { entity, uid, label, body, parent_uid, active, author } = v;
+    let Version { target, uid, label, body, parent_uid, active, author } = v;
     let mut row = Object::new();
     row.insert("uid".to_string(), Value::String(uid.to_string()));
-    row.insert("entity".to_string(), Value::RecordId(entity.clone()));
+    // Both forms (#296): the typed link where there IS one, so those rows
+    // keep the engine's integrity check and readers that only know about
+    // entities keep working — and the polymorphic pair always, so a note
+    // on a type or a label is the same shape as a note on an entity.
+    if let Some(entity) = target.entity() {
+        row.insert("entity".to_string(), Value::RecordId(entity));
+    }
+    row.insert("target_kind".to_string(), Value::String(target.kind().to_string()));
+    row.insert("target_uid".to_string(), Value::String(target.uid()));
     row.insert("label".to_string(), Value::String(label.to_string()));
     row.insert("body".to_string(), Value::String(body.to_string()));
     if let Some(parent) = parent_uid {

@@ -263,3 +263,61 @@ DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE note TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS idx_note_chain  ON TABLE note FIELDS uid, valid_from;
 -- Every note on one entity, which is the read a detail page makes.
 DEFINE INDEX IF NOT EXISTS idx_note_entity ON TABLE note FIELDS entity, valid_from;
+
+-- ------------------------------------------------- content on anything --
+-- Notes and attachments are ONE IDEA IN TWO SHAPES (issue #296, spec §3):
+-- content that belongs to something and is never a node. One is inline
+-- text, the other a file; identical discipline — chained, versioned,
+-- authored, retractable.
+--
+-- `target_kind` is 'entity', 'type' or 'label', because a TYPE is exactly
+-- the thing people argue about and needs a thread of its own. The cost,
+-- stated rather than discovered: a polymorphic target cannot be a typed
+-- `record<>` link, so the engine's referential-integrity check does not
+-- cover that column and the verbs carry it instead.
+DEFINE FIELD IF NOT EXISTS target_kind ON TABLE note TYPE option<string>
+    ASSERT $value = NONE OR $value INSIDE ['entity', 'type', 'label'];
+DEFINE FIELD IF NOT EXISTS target_uid  ON TABLE note TYPE option<string>;
+
+-- `entity` was REQUIRED, which is what stopped a note attaching to a type
+-- or a label at all. It is relaxed here, and OVERWRITE is deliberate: this
+-- file is re-applied verbatim on every provision, and `IF NOT EXISTS` on
+-- an existing field is ACCEPTED AND DOES NOT AMEND — probed on this
+-- engine, not assumed. Left as `option<record<entity>>` rather than
+-- dropped, so every row written before this keeps its typed link and old
+-- readers keep working.
+DEFINE FIELD OVERWRITE entity ON TABLE note TYPE option<record<entity>>;
+
+DEFINE INDEX IF NOT EXISTS idx_note_target ON TABLE note FIELDS target_uid, valid_from;
+
+-- Files, with the same discipline. The bytes live under the module's own
+-- directory; this records where and what it MEANS.
+DEFINE TABLE IF NOT EXISTS attachment SCHEMAFULL
+    PERMISSIONS
+        FOR select FULL
+        FOR create FULL
+        FOR update NONE
+        FOR delete NONE;
+
+DEFINE FIELD IF NOT EXISTS uid         ON TABLE attachment TYPE string;
+DEFINE FIELD IF NOT EXISTS target_kind ON TABLE attachment TYPE string
+    ASSERT $value INSIDE ['entity', 'type', 'label'];
+DEFINE FIELD IF NOT EXISTS target_uid  ON TABLE attachment TYPE string;
+-- The label is what makes a PDF *the mandate* rather than a file next to
+-- one: source is separate from meaning (§5.4).
+DEFINE FIELD IF NOT EXISTS label       ON TABLE attachment TYPE string;
+DEFINE FIELD IF NOT EXISTS filename    ON TABLE attachment TYPE string;
+DEFINE FIELD IF NOT EXISTS mime        ON TABLE attachment TYPE string;
+DEFINE FIELD IF NOT EXISTS size        ON TABLE attachment TYPE int;
+-- Relative to the module's own directory, never absolute: an instance
+-- that moves must not take a dead path with it.
+DEFINE FIELD IF NOT EXISTS path        ON TABLE attachment TYPE string;
+DEFINE FIELD IF NOT EXISTS active      ON TABLE attachment TYPE bool;
+DEFINE FIELD IF NOT EXISTS attributes  ON TABLE attachment TYPE option<object> FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS valid_from  ON TABLE attachment TYPE datetime;
+DEFINE FIELD IF NOT EXISTS author_kind ON TABLE attachment TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS author_uid  ON TABLE attachment TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE attachment TYPE option<string>;
+
+DEFINE INDEX IF NOT EXISTS idx_attachment_chain  ON TABLE attachment FIELDS uid, valid_from;
+DEFINE INDEX IF NOT EXISTS idx_attachment_target ON TABLE attachment FIELDS target_uid, valid_from;
