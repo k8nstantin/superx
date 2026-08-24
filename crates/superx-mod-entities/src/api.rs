@@ -1009,8 +1009,11 @@ pub async fn update(db: &Db, fragment: &str, req: &UpdateReq) -> Result<String> 
 
 pub async fn describe(db: &Db, fragment: &str, text: &str) -> Result<String> {
     let id = nodes::resolve_entity(db, fragment).await?;
-    let (text_id, _new) = texts::set_role_text(db, &id, "describes", text).await?;
-    Ok(record_uuid(&text_id))
+    // The note's uid, not a carrier's. Prose stopped being an entity
+    // in #302; returning a node id here would name something that is
+    // no longer created.
+    let (note_uid, _new) = texts::set_role_text(db, &id, "describes", text).await?;
+    Ok(note_uid)
 }
 
 /// Add a comment, optionally as someone other than the operator.
@@ -1026,8 +1029,8 @@ pub async fn comment(
     author: &notes::Author,
 ) -> Result<String> {
     let id = nodes::resolve_entity(db, fragment).await?;
-    let text_id = texts::add_comment(db, &id, text, author).await?;
-    Ok(record_uuid(&text_id))
+    let note_uid = texts::add_comment(db, &id, text, author).await?;
+    Ok(note_uid)
 }
 
 pub async fn link(db: &Db, fragment: &str, req: &LinkReq) -> Result<String> {

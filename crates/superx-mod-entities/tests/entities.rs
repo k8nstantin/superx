@@ -113,11 +113,14 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
         listed.iter().all(|e| e.entity_type != "text"),
         "text carriers must not show as entity rows"
     );
+    // Writing prose no longer creates a carrier at all (#302), so
+    // there is nothing of that type to return. The prose itself is on
+    // the detail page above, under its dictionary label.
     let texts_only = api::list(&db, Some("text")).await.expect("list text");
     assert!(
-        texts_only.len() >= 2,
-        "asking for the carrier type still returns them: {}",
-        texts_only.len()
+        texts_only.is_empty(),
+        "a description and a comment made no entities: {:?}",
+        texts_only.iter().map(|e| &e.name).collect::<Vec<_>>()
     );
 
     // Link task depends_on... task depends on nothing here — link the
@@ -274,12 +277,21 @@ async fn ui_graph_leaves_descriptions_and_comments_out_of_it() {
     assert!(d.annotations.iter().any(|a| a.label == "description"));
     assert!(d.annotations.iter().any(|a| a.label == "comments"));
 
-    // Opening the graph ON a text keeps it as the root — you are
-    // looking at it — rather than handing back an empty canvas. The
-    // carrier's id no longer comes from the annotations, which carry
-    // note uids now, so ask the registry for one directly.
-    let carriers = api::list(&db, Some("text")).await.expect("carriers");
-    let text_id = &carriers.first().expect("a carrier exists").id.clone();
+    // Opening the graph ON a legacy carrier keeps it as the root — you
+    // are looking at it — rather than handing back an empty canvas.
+    // Writing prose no longer makes one (#302), so this builds the
+    // pre-#268 shape directly: ~41 exist on the live instance and
+    // clicking one must still open something.
+    let carrier = superx_mod_entities::nodes::create_entity(
+        &db,
+        "text",
+        "an older description",
+        Some("an older description".to_string()),
+        None,
+    )
+    .await
+    .expect("legacy carrier");
+    let text_id = &superx_ops::record_uuid(&carrier);
     let tg = api::graph_view(&db, text_id, 2, "both").await.expect("text graph");
     assert_eq!(&tg.root, text_id);
     assert!(tg.nodes.iter().any(|n| n.id == *text_id), "the root survives");
@@ -723,35 +735,50 @@ async fn describe_evolves_comment_multiplies() {
 
     let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
 
-    let (text1, created) = texts::set_role_text(&db, &product, "describes", "First description.")
+    // CARDINALITY IS THE PROPERTY, and it comes from the dictionary:
+    // `description` is `one` so it amends in place, `comments` is `many`
+    // so each adds a chain. That was true when both stores were written
+    // and it is true now that only the note store is (#302) — what
+    // changed is that these uids name notes, not text entities.
+    let (d1, created) = texts::set_role_text(&db, &product, "describes", "First description.")
         .await
         .expect("describe");
     assert!(created);
-    let (text2, created_again) =
+    let (d2, created_again) =
         texts::set_role_text(&db, &product, "describes", "Better description.")
             .await
             .expect("re-describe");
-    assert!(!created_again, "same text node evolves");
-    assert_eq!(
-        superx_ops::record_uuid(&text1),
-        superx_ops::record_uuid(&text2)
-    );
-    let history = nodes::state_history(&db, &text1).await.expect("history");
-    assert_eq!(history.len(), 2, "description evolution is the text node's history");
-    assert_eq!(history[1].content.as_deref(), Some("Better description."));
+    assert!(!created_again, "the same chain is amended");
+    assert_eq!(d1, d2, "a `one` label keeps its uid across versions");
+
+    let history = superx_mod_entities::notes::history(&db, &d1).await.expect("history");
+    assert_eq!(history.len(), 2, "the wording that was replaced is still readable");
+    assert_eq!(history[1].body, "Better description.");
 
     let c1 = texts::add_comment(&db, &product, "looks good", &Author::operator()).await.expect("c1");
     let c2 = texts::add_comment(&db, &product, "ship it", &Author::operator()).await.expect("c2");
-    assert_ne!(superx_ops::record_uuid(&c1), superx_ops::record_uuid(&c2));
+    assert_ne!(c1, c2, "a `many` label adds rather than amends");
 
-    // Thread: comment on a comment.
-    texts::add_comment(&db, &c1, "replying to the first comment", &Author::operator())
+    // Thread: a reply to a comment, which is a note on the same entity
+    // carrying its parent — not a comment on a carrier, since there is
+    // no carrier any more.
+    superx_mod_entities::notes::reply(&db, &c1, "replying to the first", &Author::operator())
         .await
         .expect("thread");
 
-    let notes = texts::annotations(&db, &product).await.expect("notes");
-    assert_eq!(notes.len(), 3, "one describes + two comments on the product");
-    assert!(notes.iter().any(|n| n.content == "Better description."));
+    let stored = superx_mod_entities::notes::for_entity(&db, &product, false).await.expect("notes");
+    assert_eq!(stored.len(), 4, "one description + two comments + one reply");
+    assert!(stored.iter().any(|n| n.body == "Better description."));
+    assert!(
+        stored.iter().any(|n| n.parent_uid.as_deref() == Some(c1.as_str())),
+        "the reply says what it is replying to"
+    );
+
+    // And no carrier was created for any of it.
+    assert!(
+        superx_mod_entities::nodes::list_entities(&db, Some("text")).await.expect("list").is_empty(),
+        "prose is not an entity any more"
+    );
 }
 
 // ---------------------------------------------------------------- E4 --
@@ -850,7 +877,7 @@ async fn subgraph_carries_text_content_via_batched_meta() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ancestor_path_is_root_first_priority_ordered_and_cycle_safe() {
-    use superx_mod_entities::{edges, graph, nodes, texts};
+    use superx_mod_entities::{edges, graph, nodes};
     let db = fresh_db().await;
     registry::seed_types(&db).await.expect("seed");
 
@@ -876,8 +903,21 @@ async fn ancestor_path_is_root_first_priority_ordered_and_cycle_safe() {
         "contains wins the parent slot"
     );
 
-    // A text node's parent is the entity it annotates.
-    let (text, _) = texts::set_role_text(&db, &task, "describes", "what to build").await.expect("d");
+    // A LEGACY text carrier's parent is the entity it annotates. Prose
+    // stopped being an entity in #302, so this shape can no longer be
+    // made through `set_role_text` — but ~41 of them exist on the live
+    // instance and clicking one must still say where it hangs. Built
+    // the way the world before #268 built it, straight past the writer.
+    let text = nodes::create_entity(
+        &db,
+        "text",
+        "what to build",
+        Some("what to build".to_string()),
+        None,
+    )
+    .await
+    .expect("legacy carrier");
+    edges::link(&db, &task, &text, "describes").await.expect("legacy role edge");
     let trail = graph::ancestors(&db, &text, 12).await.expect("walk");
     assert_eq!(
         trail.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
@@ -935,8 +975,23 @@ async fn both_views_walk_the_same_graph() {
     let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("t");
     edges::link(&db, &product, &task, "contains").await.expect("structural");
 
-    // Prose, attached the way the CLI attaches it: a text node on a
-    // `describes` edge. This is the shape that used to differ.
+    // Prose as the world before #268 stored it: a `text` entity on a
+    // `describes` edge. Writing prose stopped making one in #302, so
+    // this is built directly — and it has to be, because the shape
+    // still exists on the live instance and is exactly what the two
+    // views used to disagree about.
+    let carrier = nodes::create_entity(
+        &db,
+        "text",
+        "what this desk is",
+        Some("what this desk is".to_string()),
+        None,
+    )
+    .await
+    .expect("legacy carrier");
+    edges::link(&db, &product, &carrier, "describes").await.expect("legacy role edge");
+
+    // And prose as it is stored now, which creates no node to filter.
     texts::set_role_text(&db, &product, "describes", "what this desk is").await.expect("prose");
     texts::add_comment(&db, &product, "a remark", &superx_mod_entities::notes::Author::operator())
         .await
