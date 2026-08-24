@@ -299,7 +299,11 @@ fn render(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::Datetime(d) => d.to_string(),
-        other => format!("{other:?}"),
+        // A nested value reaches here only from an UNDECLARED key — a
+        // field's own kinds are all scalar. Rendering it as Rust debug
+        // would show the operator `Array(Array([...]))` where their data
+        // should be, so it goes back out as the JSON it came in as.
+        other => crate::nodes::value_to_json(other).to_string(),
     }
 }
 
