@@ -4,13 +4,17 @@
 
 use superx_kernel::types::Value;
 use superx_kernel::KernelModule as _;
-use superx_mod_entities::{registry, EntitiesModule, MODULE_NAME, SCHEMA_DDL};
+use superx_mod_entities::{dictionary, registry, EntitiesModule, MODULE_NAME, SCHEMA_DDL};
 
 async fn fresh_db() -> superx_kernel::Db {
     let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
     db.use_ns("superx").use_db("entities").await.expect("nsdb");
     let ddl = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "test-password");
     db.query(ddl).await.expect("ddl").check().expect("schema applies clean");
+    // Startup seeds the dictionary before serving (#266/#268), and prose
+    // writes refuse a label it does not define — so a test database
+    // without it is not a smaller instance, it is a broken one.
+    dictionary::seed(&db).await.expect("dictionary");
     db
 }
 

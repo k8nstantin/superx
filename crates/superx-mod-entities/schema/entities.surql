@@ -208,3 +208,58 @@ DEFINE FIELD IF NOT EXISTS archived    ON TABLE entity_type TYPE option<bool>;
 DEFINE FIELD IF NOT EXISTS author_kind ON TABLE entity_type TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS author_uid  ON TABLE entity_type TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE entity_type TYPE option<string>;
+
+-- ---------------------------------------------------------------- notes --
+-- Prose (issue #268). A description, a spec, a mandate, a playbook and a
+-- comment are the SAME mechanism with a different LABEL — the dictionary
+-- entry (#266) decides how each is treated, so a new kind of attached prose
+-- is a label, not a migration. One level down from types-as-data.
+--
+-- Prose does not belong in `entity_state`: SCD-2 copies the whole row, so a
+-- 35KB description would be rewritten on every unrelated attribute tweak.
+-- And it does not belong in the graph as an entity, which is what it is
+-- today: a product's description is currently a node in its own product
+-- graph, and every reader has to know that some nodes are not real nodes.
+--
+-- Append-only, one chain per `uid`; current is the latest `(valid_from, id)`.
+-- `active = false` retracts a note without erasing that it was said.
+DEFINE TABLE IF NOT EXISTS note SCHEMAFULL
+    PERMISSIONS
+        FOR select FULL
+        FOR create FULL
+        FOR update NONE
+        FOR delete NONE;
+
+-- The note's identity ACROSS versions — the chain key. The row id changes
+-- every version; this does not.
+DEFINE FIELD IF NOT EXISTS uid         ON TABLE note TYPE string;
+-- What it is attached to. A typed record link, so a note pointing at an
+-- entity that does not exist is refused by the engine rather than found
+-- later (§12).
+DEFINE FIELD IF NOT EXISTS entity      ON TABLE note TYPE record<entity>;
+-- The dictionary slot label: description | spec | mandate | playbook |
+-- comments | … . This is the whole difference between a paragraph for a
+-- human and the contract the work is judged by.
+DEFINE FIELD IF NOT EXISTS label       ON TABLE note TYPE string;
+DEFINE FIELD IF NOT EXISTS body        ON TABLE note TYPE string;
+-- Threading: a comment on a comment. Edges have no fields, which is why
+-- this could not exist while prose was an entity joined by an edge.
+DEFINE FIELD IF NOT EXISTS parent_uid  ON TABLE note TYPE option<string>;
+-- Retracted, not erased. Distinct from the entity-level `archived`: this
+-- says "no longer stands", not "hide it from the list".
+DEFINE FIELD IF NOT EXISTS active      ON TABLE note TYPE bool;
+DEFINE FIELD IF NOT EXISTS attributes  ON TABLE note TYPE option<object> FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS valid_from  ON TABLE note TYPE datetime;
+-- Authorship is not only provenance — it is the subject of authorization.
+-- "A role may not edit another role's mandate" is enforceable precisely
+-- because every write records who wrote it. `via_uid` is the role context,
+-- which yields "agent X, acting as role Y". Plain uuid strings, never
+-- record<> FKs: an author may live in another database entirely.
+DEFINE FIELD IF NOT EXISTS author_kind ON TABLE note TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS author_uid  ON TABLE note TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE note TYPE option<string>;
+
+-- The version chain of one note.
+DEFINE INDEX IF NOT EXISTS idx_note_chain  ON TABLE note FIELDS uid, valid_from;
+-- Every note on one entity, which is the read a detail page makes.
+DEFINE INDEX IF NOT EXISTS idx_note_entity ON TABLE note FIELDS entity, valid_from;

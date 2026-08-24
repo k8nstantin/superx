@@ -17,6 +17,7 @@ pub mod documents;
 pub mod edges;
 pub mod graph;
 pub mod nodes;
+pub mod notes;
 pub mod registry;
 mod server;
 pub mod texts;
@@ -152,9 +153,12 @@ impl KernelModule for EntitiesModule {
                 // (#266): types say what a thing is, labels say what the
                 // terminology means.
                 let labels = dictionary::seed(&db).await?;
+                // A type that declares no slots is inert — nothing can be
+                // attached to one of its entities, so nothing can act on it.
+                let slots = dictionary::seed_type_labels(&db).await?;
                 let revision = dictionary::revision(&db).await?;
-                if labels > 0 {
-                    tracing::info!(target: "entities", labels, revision, "dictionary seeded");
+                if labels > 0 || slots > 0 {
+                    tracing::info!(target: "entities", labels, slots, revision, "dictionary seeded");
                 } else {
                     tracing::info!(target: "entities", revision, "dictionary current");
                 }

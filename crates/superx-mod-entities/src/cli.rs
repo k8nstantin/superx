@@ -6,7 +6,7 @@ use superx_kernel::types::Value;
 use superx_kernel::{Kernel, KernelError, NodeKind, Result};
 use superx_ops::record_uuid;
 
-use crate::{documents, edges, graph, nodes, registry, texts, MODULE_NAME};
+use crate::{documents, edges, graph, nodes, notes, registry, texts, MODULE_NAME};
 
 /// Traversal depth ceiling parameter on the module's registry entity.
 pub const MAX_DEPTH_PARAM: &str = "attr_entities_max_depth";
@@ -30,10 +30,15 @@ const USAGE: &str = "usage: superx entities <command>\n\
   graph <uuid-fragment> [--json] [--depth <n>]   export the reachable subgraph\n\
   types                                list the type registry\n\
   types add <name> --category entity|relation [--description <text>]\n\
-  labels [--all]                       the dictionary: what the terminology means\n\
-  labels define <key> --kind slot|link --semantics <s> [--display <d>] [--description <text>]\n\
+  labels [--all] [--for <type>]        the dictionary: what the terminology means\n\
+  labels define <key> --kind slot|link --semantics <s> [--cardinality one|many]\n\
+                       [--display <d>] [--description <text>]\n\
   labels history <key> --kind slot|link      every version of one label, oldest first\n\
   labels archive <key> --kind slot|link [--restore]\n\
+  notes <uuid-fragment> [--all]        the prose attached to an entity, by label\n\
+  notes history <note-uid>             every version of one note\n\
+  notes reply <note-uid> <text…>       a comment on a comment\n\
+  notes retract <note-uid>             it no longer stands; it stays on the record\n\
   url                                  where this module's own UI lives\n\
 each write emits telemetry into the kernel firehose";
 
@@ -47,6 +52,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
     match args.first().map(String::as_str) {
         Some("types") => types_cmd(kernel, &args[1..]).await,
         Some("labels") => labels_cmd(kernel, &args[1..]).await,
+        Some("notes") => notes_cmd(kernel, &args[1..]).await,
         Some("create") => create_cmd(kernel, &args[1..]).await,
         Some("update") => update_cmd(kernel, &args[1..]).await,
         Some("show") => show_cmd(kernel, &args[1..]).await,
@@ -79,8 +85,17 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         let semantics = flag(args, "--semantics").ok_or_else(usage)?;
         let display = flag(args, "--display").unwrap_or_else(|| key.clone());
         let description = flag(args, "--description");
-        crate::dictionary::define(&db, key, &kind, &display, &semantics, description.as_deref())
-            .await?;
+        let cardinality = flag(args, "--cardinality");
+        crate::dictionary::define(
+            &db,
+            key,
+            &kind,
+            &display,
+            &semantics,
+            description.as_deref(),
+            cardinality.as_deref(),
+        )
+        .await?;
         let revision = crate::dictionary::revision(&db).await?;
         return Ok(format!(
             "defined {kind} label '{key}' ({semantics}) — dictionary revision {revision}\n"
@@ -129,6 +144,36 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         ));
     }
 
+    if let Some(entity_type) = flag(args, "--for") {
+        let slots = crate::dictionary::slots_for(&db, &entity_type, false).await?;
+        if slots.is_empty() {
+            return Ok(format!(
+                "type '{entity_type}' declares no slots — nothing can be attached to \
+                 one of its entities, so nothing can act on it\n"
+            ));
+        }
+        let mut out = format!("type '{entity_type}' carries {} slot(s)\n\n", slots.len());
+        for slot in &slots {
+            let defined = crate::dictionary::current(&db, &slot.label, crate::dictionary::SLOT)
+                .await?;
+            let semantics = defined
+                .as_ref()
+                .map_or("?".to_string(), |d| d.semantics.clone());
+            let card = defined
+                .as_ref()
+                .and_then(|d| d.cardinality.clone())
+                .unwrap_or_else(|| "-".to_string());
+            out.push_str(&format!(
+                "  {:<14} {:<11} {:<5} {}\n",
+                slot.label,
+                semantics,
+                card,
+                if slot.required { "required" } else { "" }
+            ));
+        }
+        return Ok(out);
+    }
+
     let include_archived = args.iter().any(|a| a == "--all");
     let labels = crate::dictionary::list(&db, include_archived).await?;
     let revision = crate::dictionary::revision(&db).await?;
@@ -154,6 +199,110 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     }
     out.push_str("\nsemantics decide how an agent must TREAT a label, not just its shape\n");
     Ok(out)
+}
+
+/// `superx entities notes` — the prose store (#268).
+///
+/// A description, a spec, a mandate and a comment are the same
+/// mechanism with a different LABEL. This reads the note store
+/// directly; the detail page still reads the legacy carrier until the
+/// readers are switched over in their own PR.
+async fn notes_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    match args.first().map(String::as_str) {
+        Some("history") => {
+            let uid = args.get(1).ok_or_else(usage)?;
+            let versions = notes::history(&db, uid).await?;
+            if versions.is_empty() {
+                return Err(KernelError::Module(format!("no note '{uid}'")));
+            }
+            let mut out = format!("note {uid} — {} version(s)\n", versions.len());
+            for (n, v) in versions.iter().enumerate() {
+                out.push_str(&format!(
+                    "\n  v{}  {}  {}{}\n      {}\n",
+                    n + 1,
+                    stamp(v),
+                    v.label,
+                    if v.active { "" } else { "  [retracted]" },
+                    v.body
+                ));
+            }
+            Ok(out)
+        }
+        Some("reply") => {
+            let parent = args.get(1).ok_or_else(usage)?;
+            let text = rest(args, 2)?;
+            let uid = notes::reply(&db, parent, &text, &notes::Author::operator()).await?;
+            Ok(format!("replied to {parent} — note {uid}\n"))
+        }
+        Some("retract") => {
+            let uid = args.get(1).ok_or_else(usage)?;
+            notes::retract(&db, uid, &notes::Author::operator()).await?;
+            Ok(format!(
+                "retracted note {uid} — it no longer stands, and every version is \
+                 still readable via notes history\n"
+            ))
+        }
+        _ => {
+            let fragment = args.first().ok_or_else(usage)?;
+            let include_retracted = args.iter().any(|a| a == "--all");
+            let anchor = nodes::resolve_entity(&db, fragment).await?;
+            let all = notes::for_entity(&db, &anchor, include_retracted).await?;
+            if all.is_empty() {
+                return Ok("no notes on this entity yet\n".to_string());
+            }
+            let mut out = format!("{} note(s)\n", all.len());
+            // Threads render under their parent; a reply whose parent is
+            // filtered out still shows, because losing a reply because
+            // someone retracted the thing it answered would lose the
+            // answer too.
+            let shown: std::collections::HashSet<&str> =
+                all.iter().map(|n| n.uid.as_str()).collect();
+            for note in all.iter().filter(|n| {
+                n.parent_uid.as_deref().is_none_or(|p| !shown.contains(p))
+            }) {
+                render_note(&mut out, note, &all, 0);
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// One note and its replies, indented by depth.
+fn render_note(out: &mut String, note: &notes::Note, all: &[notes::Note], depth: usize) {
+    let pad = "  ".repeat(depth + 1);
+    let who = note.author_kind.as_deref().unwrap_or("?");
+    let via = note
+        .via_uid
+        .as_deref()
+        .map(|r| format!(" as {r}"))
+        .unwrap_or_default();
+    out.push_str(&format!(
+        "\n{pad}{}  {}  {who}{via}{}\n{pad}  {}\n{pad}  uid {}\n",
+        note.label,
+        stamp(note),
+        if note.active { "" } else { "  [retracted]" },
+        note.body,
+        note.uid
+    ));
+    for reply in all.iter().filter(|n| n.parent_uid.as_deref() == Some(note.uid.as_str())) {
+        render_note(out, reply, all, depth + 1);
+    }
+}
+
+fn stamp(note: &notes::Note) -> String {
+    note.valid_from
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// The remaining args joined as one text payload.
+fn rest(args: &[String], from: usize) -> Result<String> {
+    let text = args[from.min(args.len())..].join(" ");
+    if text.trim().is_empty() {
+        return Err(usage());
+    }
+    Ok(text)
 }
 
 async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {

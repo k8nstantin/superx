@@ -9,9 +9,32 @@ use superx_kernel::{Db, Result};
 
 use crate::edges::{expand, link};
 use crate::nodes::{create_entity, current_state, update_entity};
+use crate::notes::{self, Author};
 
 /// The role edges whose targets are inline text nodes.
 pub const TEXT_ROLES: [&str; 3] = ["describes", "comments", "instructs"];
+
+/// The dictionary slot label each legacy role carries (#268).
+///
+/// The roles are edge names — verbs, from when prose was an entity on
+/// the far end of an edge. The labels are what the prose IS, which is
+/// what the dictionary defines and what the note store records.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] for a role with no label, which would mean
+/// prose written under a term nothing can interpret.
+pub fn label_for_role(role: &str) -> Result<&'static str> {
+    match role {
+        "describes" => Ok("description"),
+        "instructs" => Ok("instructions"),
+        "comments" => Ok("comments"),
+        other => Err(superx_kernel::KernelError::Module(format!(
+            "'{other}' is not a prose role — expected one of {}",
+            TEXT_ROLES.join(", ")
+        ))),
+    }
+}
 
 /// One annotation on an entity, resolved for display.
 pub struct Annotation {
@@ -35,6 +58,11 @@ pub async fn set_role_text(
     role: &str,
     text: &str,
 ) -> Result<(RecordId, bool)> {
+    // The note store first (#268). It consults the dictionary, so an
+    // undefined label is refused BEFORE a legacy node is created —
+    // failing closed rather than leaving a half-written pair.
+    notes::write(db, target, label_for_role(role)?, text, &Author::operator()).await?;
+
     let existing = expand(db, std::slice::from_ref(target), false)
         .await?
         .into_iter()
@@ -54,6 +82,7 @@ pub async fn set_role_text(
 ///
 /// Verb errors pass through.
 pub async fn add_comment(db: &Db, target: &RecordId, text: &str) -> Result<RecordId> {
+    notes::write(db, target, label_for_role("comments")?, text, &Author::operator()).await?;
     let node = create_entity(db, "text", &label_for(text), Some(text.to_string()), None).await?;
     link(db, target, &node, "comments").await?;
     Ok(node)

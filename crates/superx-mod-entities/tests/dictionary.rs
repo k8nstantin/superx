@@ -143,10 +143,10 @@ async fn defining_a_label_appends_a_version_rather_than_editing_one() {
     dictionary::seed(&db).await.expect("seed");
     let before = dictionary::revision(&db).await.expect("rev");
 
-    dictionary::define(&db, "risk_note", SLOT, "Risk note", "context", Some("v1"))
+    dictionary::define(&db, "risk_note", SLOT, "Risk note", "context", Some("v1"), None)
         .await
         .expect("define");
-    dictionary::define(&db, "risk_note", SLOT, "Risk note", "guidance", Some("v2"))
+    dictionary::define(&db, "risk_note", SLOT, "Risk note", "guidance", Some("v2"), None)
         .await
         .expect("redefine");
 
@@ -169,16 +169,16 @@ async fn defining_a_label_appends_a_version_rather_than_editing_one() {
 async fn a_label_outside_the_closed_vocabulary_is_refused() {
     let db = fresh_db().await;
 
-    let err = dictionary::define(&db, "wishful", SLOT, "Wishful", "vibes", None)
+    let err = dictionary::define(&db, "wishful", SLOT, "Wishful", "vibes", None, None)
         .await
         .expect_err("unknown semantics is refused");
     assert!(err.to_string().contains("vibes"), "the error names it: {err}");
 
-    dictionary::define(&db, "audits", LINK, "audits", "binding", None)
+    dictionary::define(&db, "audits", LINK, "audits", "binding", None, None)
         .await
         .expect_err("a slot semantic is not a link semantic");
 
-    dictionary::define(&db, "Risk Note", SLOT, "Risk", "context", None)
+    dictionary::define(&db, "Risk Note", SLOT, "Risk", "context", None, None)
         .await
         .expect_err("one spelling per term, or the dictionary defeats itself");
 }
@@ -219,6 +219,7 @@ async fn redefining_preserves_what_it_does_not_mention() {
         "Mandate",
         "binding",
         Some("reworded, same meaning"),
+        None,
     )
     .await
     .expect("redefine");
@@ -294,7 +295,7 @@ async fn history_reads_every_version_oldest_first() {
     let db = fresh_db().await;
     dictionary::seed(&db).await.expect("seed");
 
-    dictionary::define(&db, "spec", SLOT, "Spec", "binding", Some("now binding"))
+    dictionary::define(&db, "spec", SLOT, "Spec", "binding", Some("now binding"), None)
         .await
         .expect("redefine");
 
@@ -309,5 +310,69 @@ async fn history_reads_every_version_oldest_first() {
     assert!(
         versions.iter().all(|v| v.valid_from.is_some()),
         "every version is dated"
+    );
+}
+
+/// A type that declares no slots is inert: there is nowhere to put
+/// anything, so nothing can be said about one of its entities and
+/// nothing can act on it. Every shipped entity type therefore carries at
+/// least something to say what it is and a channel to discuss it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_shipped_type_carries_at_least_a_description_and_a_channel() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+    let bound = dictionary::seed_type_labels(&db).await.expect("slots");
+    assert!(bound > 0);
+
+    for entity_type in ["product", "task", "rag", "model", "document", "repo", "credential"] {
+        let slots = dictionary::slots_for(&db, entity_type, false).await.expect("slots");
+        assert!(
+            slots.iter().any(|s| s.label == "description"),
+            "{entity_type} can say what it is"
+        );
+        assert!(
+            slots.iter().any(|s| s.label == "comments"),
+            "{entity_type} can be discussed"
+        );
+    }
+
+    // The motivating pair, declared where it belongs: a product carries
+    // both, a task carries the assignment instead of the contract.
+    let product = dictionary::slots_for(&db, "product", false).await.expect("slots");
+    assert!(product.iter().any(|s| s.label == "spec"));
+    let task = dictionary::slots_for(&db, "task", false).await.expect("slots");
+    assert!(task.iter().any(|s| s.label == "instructions"));
+
+    // Display order is declared, not incidental: description leads.
+    assert_eq!(product[0].label, "description");
+    assert!(product[0].required, "a product with no description says nothing");
+
+    // Idempotent, like every other seed.
+    assert_eq!(
+        dictionary::seed_type_labels(&db).await.expect("reseed"),
+        0,
+        "a binding the operator retired is not resurrected"
+    );
+}
+
+/// Cardinality decides whether a write amends or adds, so it is a closed
+/// choice like every other thing the dictionary declares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cardinality_is_one_or_many_and_nothing_else() {
+    let db = fresh_db().await;
+    dictionary::define(&db, "risk_note", SLOT, "Risk", "context", None, Some("some"))
+        .await
+        .expect_err("'some' is not a cardinality");
+    dictionary::define(&db, "risk_note", SLOT, "Risk", "context", None, Some("one"))
+        .await
+        .expect("one is");
+    assert_eq!(
+        dictionary::current(&db, "risk_note", SLOT)
+            .await
+            .expect("read")
+            .expect("defined")
+            .cardinality
+            .as_deref(),
+        Some("one")
     );
 }
