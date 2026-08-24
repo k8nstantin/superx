@@ -13,6 +13,10 @@ pub struct StateRow {
     pub name: String,
     pub content: Option<String>,
     pub attributes: Option<Value>,
+    /// Hidden from the lists, still on the record. Absent on every row
+    /// written before #304, which reads as not archived — the honest
+    /// answer, since append-only forbids inventing one.
+    pub archived: bool,
     pub valid_from: String,
 }
 
@@ -21,6 +25,7 @@ pub struct EntityRow {
     pub id: RecordId,
     pub entity_type: String,
     pub name: String,
+    pub archived: bool,
 }
 
 /// Current metadata of an anchor, batch-resolved (issue #179): one
@@ -31,6 +36,7 @@ pub struct NodeMeta {
     pub name: String,
     pub content: Option<String>,
     pub attributes: Option<Value>,
+    pub archived: bool,
     /// `valid_from` of the current state row — the version stamp.
     pub version: String,
 }
@@ -60,7 +66,7 @@ pub async fn current_meta(
     for i in 0..ids.len() {
         statements.push_str(&format!(
             "SELECT id, entity_type FROM $id{i};\
-             SELECT name, content, attributes, valid_from \
+             SELECT name, content, attributes, archived, valid_from \
              FROM entity_state WHERE entity = $id{i};"
         ));
     }
@@ -76,18 +82,19 @@ pub async fn current_meta(
         let Some(anchor) = anchors.first() else { continue };
         let Some(id) = obj_record(anchor, "id") else { continue };
         let Some(entity_type) = obj_str(anchor, "entity_type") else { continue };
-        let (name, content, attributes, version) = match newest_by_valid_from(&states) {
+        let (name, content, attributes, archived, version) = match newest_by_valid_from(&states) {
             Some(s) => (
                 obj_str(s, "name").unwrap_or_default(),
                 obj_str(s, "content"),
                 obj_get(s, "attributes"),
+                obj_bool(s, "archived"),
                 obj_display(s, "valid_from").unwrap_or_default(),
             ),
-            None => (String::new(), None, None, String::new()),
+            None => (String::new(), None, None, false, String::new()),
         };
         out.insert(
             record_uuid(&id),
-            NodeMeta { entity_type, name, content, attributes, version },
+            NodeMeta { entity_type, name, content, attributes, archived, version },
         );
     }
     Ok(out)
@@ -137,7 +144,7 @@ pub async fn create_entity(
         .bind(("entity_type", entity_type.to_string()))
         .await?
         .check()?;
-    append_state(db, &anchor, name, content, attributes).await?;
+    append_state(db, &anchor, name, content, attributes, false).await?;
     Ok(anchor)
 }
 
@@ -167,8 +174,42 @@ pub async fn update_entity(
         &name.unwrap_or(current.name),
         content.or(current.content),
         attributes.or(current.attributes),
+        // An edit is not an un-archiving. Renaming an archived thing
+        // must not quietly bring it back into every list — two
+        // decisions, and only one of them was made here. Same rule the
+        // dictionary already applies to a retired slot.
+        current.archived,
     )
     .await
+}
+
+/// Archive or restore an entity: hidden from the lists, still on the
+/// record.
+///
+/// Append-only, so this is a NEW version carrying the flag rather than
+/// a field somebody flipped — the decision is dated and sits in the
+/// history beside every other. Restoring is another version, not an
+/// erasure of this one.
+///
+/// Idempotent: archiving what is already archived appends nothing, so a
+/// repeated call does not pad the history with rows that say nothing.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] if the anchor has no state chain;
+/// [`KernelError::Db`] for engine errors.
+pub async fn set_archived(db: &Db, anchor: &RecordId, archived: bool) -> Result<bool> {
+    let current = current_state(db, anchor).await?.ok_or_else(|| {
+        KernelError::Module(format!(
+            "entity {} has no state chain — corrupt substrate?",
+            record_uuid(anchor)
+        ))
+    })?;
+    if current.archived == archived {
+        return Ok(false);
+    }
+    append_state(db, anchor, &current.name, current.content, current.attributes, archived).await?;
+    Ok(true)
 }
 
 async fn append_state(
@@ -177,10 +218,20 @@ async fn append_state(
     name: &str,
     content: Option<String>,
     attributes: Option<Value>,
+    archived: bool,
 ) -> Result<()> {
     let mut statement = String::from(
         "CREATE $id SET entity = $entity, name = $name, valid_from = time::now()",
     );
+    // Written ONLY when true. `archived` is an `option<>` column added
+    // in #304, and an instance that has not re-provisioned does not
+    // have it yet — writing it unconditionally would refuse every
+    // create and update until the operator ran provisioning, which is
+    // the opposite of "everything is additive, so everything is
+    // revertible" (§15). Absent reads as not archived.
+    if archived {
+        statement.push_str(", archived = $archived");
+    }
     if content.is_some() {
         statement.push_str(", content = $content");
     }
@@ -192,6 +243,9 @@ async fn append_state(
         .bind(("id", new_id("entity_state")))
         .bind(("entity", anchor.clone()))
         .bind(("name", name.to_string()));
+    if archived {
+        query = query.bind(("archived", true));
+    }
     if let Some(c) = content {
         query = query.bind(("content", c));
     }
@@ -229,7 +283,7 @@ async fn state_rows(
     // `valid_from` is projected because every ORDER BY idiom must
     // appear in the selection. Order/limit are code-controlled.
     let statement = format!(
-        "SELECT name, content, attributes, valid_from FROM entity_state \
+        "SELECT name, content, attributes, archived, valid_from FROM entity_state \
          WHERE entity = $entity ORDER BY valid_from {order}{}",
         limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default()
     );
@@ -269,6 +323,7 @@ pub async fn list_entities(db: &Db, type_filter: Option<&str>) -> Result<Vec<Ent
             EntityRow {
                 entity_type: m.map(|m| m.entity_type.clone()).unwrap_or_default(),
                 name: m.map(|m| m.name.clone()).unwrap_or_default(),
+                archived: m.is_some_and(|m| m.archived),
                 id,
             }
         })
@@ -330,8 +385,16 @@ fn parse_state(row: &Value) -> Option<StateRow> {
         name: obj_str(row, "name")?,
         content: obj_str(row, "content"),
         attributes: obj_get(row, "attributes"),
+        archived: obj_bool(row, "archived"),
         valid_from: obj_display(row, "valid_from").unwrap_or_default(),
     })
+}
+
+/// A `bool` column that may be absent. Absent is `false`, and that is
+/// the whole upgrade story for `archived`: rows written before the
+/// column existed say nothing, and saying nothing means not archived.
+fn obj_bool(row: &Value, key: &str) -> bool {
+    matches!(obj_get(row, key), Some(Value::Bool(true)))
 }
 
 /// The newest row of a small state set, compared as PARSED datetimes

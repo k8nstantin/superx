@@ -152,11 +152,6 @@ pub struct GraphView {
     /// The walk stopped at the depth limit — there is more out there.
     pub truncated: bool,
     pub depth: i64,
-    /// Labels on active edges the walk did not follow, because they are
-    /// not declared link labels. Sent to the page rather than dropped:
-    /// an edge that silently vanishes is how this view and the CLI's
-    /// came to disagree (#300).
-    pub unwalked_labels: Vec<String>,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -865,15 +860,9 @@ pub async fn graph_view(
     let mut truncated = false;
     let mut seen_nodes: HashSet<String> = HashSet::new();
     let mut seen_edges: HashSet<String> = HashSet::new();
-    let mut unwalked: Vec<String> = Vec::new();
     for &reverse in walks {
         let sub = graph::subgraph(db, &id, depth, reverse).await?;
         truncated |= sub.truncated_at_depth;
-        for label in &sub.unwalked_labels {
-            if !unwalked.contains(label) {
-                unwalked.push(label.clone());
-            }
-        }
         for n in sub.nodes {
             // The type check that used to live here is gone. Prose is
             // not a member of the product graph (operator, issue #246)
@@ -916,7 +905,6 @@ pub async fn graph_view(
         edges: edges_out,
         truncated,
         depth: depth as i64,
-        unwalked_labels: unwalked,
     })
 }
 

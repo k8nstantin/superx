@@ -12,9 +12,15 @@
 //! node becomes a version of the note, carrying its ORIGINAL
 //! `valid_from` — the chain reads exactly as it always did.
 //!
-//! **Nothing is deleted.** The text nodes and their edges stay where
-//! they are, still readable, still exported. This adds; a later PR stops
-//! reading them, and only after that does anything retire.
+//! **Nothing is deleted.** The anchors stay where they are, still
+//! readable by uuid, still in their own history. What B4 does at the
+//! end is RETRACT the role edges and ARCHIVE the anchors — the spec's
+//! words — so prose leaves the graph because it is no longer linked
+//! into it, not because every reader learned to skip it.
+//!
+//! Reversible by un-retracting: the edge rows are still there with
+//! `active = false`, and archiving is a version that another version
+//! undoes.
 //!
 //! Idempotent by construction: each migrated version records where it
 //! came from, so running it twice moves nothing the second time.
@@ -47,6 +53,13 @@ pub struct Report {
     /// Carriers written while both stores were live, whose prose is
     /// already a note. Moving them would duplicate it.
     pub dual_written: usize,
+    /// Document nodes moved into `attachment` rows.
+    pub documents: usize,
+    /// Role edges retracted, so prose and files stop hanging off the
+    /// graph as members of it.
+    pub edges_retracted: usize,
+    /// Anchors archived — hidden from the lists, still on the record.
+    pub anchors_archived: usize,
 }
 
 /// Move every text carrier into the note store, history and all.
@@ -59,6 +72,11 @@ pub struct Report {
 /// [`KernelError::Db`](superx_kernel::KernelError::Db) for engine errors.
 pub async fn prose(db: &Db, dry_run: bool) -> Result<Report> {
     let mut report = Report::default();
+    // Anchors whose content is safely in the new tables, collected as
+    // we go and retired only at the END. Retracting an edge before the
+    // content is copied would take prose out of the graph without
+    // putting it anywhere, and a re-run could not find it again.
+    let mut migrated: Vec<(RecordId, RecordId, String)> = Vec::new();
 
     for carrier in nodes::list_entities(db, Some("text")).await? {
         // Who points at this text node, and calling it what?
@@ -133,8 +151,153 @@ pub async fn prose(db: &Db, dry_run: bool) -> Result<Report> {
             }
             write_version(db, &owner, &uid, label, &body, &source, &version.valid_from).await?;
         }
+        migrated.push((carrier.id.clone(), owner.clone(), edge.rel_type.clone()));
     }
+
+    documents(db, dry_run, &mut report, &mut migrated).await?;
+    retire(db, dry_run, &mut report, &migrated).await?;
     Ok(report)
+}
+
+/// §6: "A file is attached content: it belongs to the entity and is
+/// never a node." So a `document` anchor becomes an `attachment` row on
+/// its owner, under the `attachments` label of §5.3, carrying its
+/// ORIGINAL `valid_from` exactly as prose does.
+///
+/// The bytes are not touched. The old node recorded where they live and
+/// the attachment row records the same path, so both point at one file
+/// and un-retracting restores the old reading.
+async fn documents(
+    db: &Db,
+    dry_run: bool,
+    report: &mut Report,
+    migrated: &mut Vec<(RecordId, RecordId, String)>,
+) -> Result<()> {
+    for node in nodes::list_entities(db, Some("document")).await? {
+        let inbound = edges::expand(db, std::slice::from_ref(&node.id), true).await?;
+        let Some(edge) = inbound.iter().find(|e| e.active && e.rel_type == "attached") else {
+            if !inbound.iter().any(|e| e.active) {
+                report.orphans.push(record_uuid(&node.id));
+            } else {
+                report.other_roles.push(record_uuid(&node.id));
+            }
+            continue;
+        };
+        let owner = edge.from.clone();
+        let source = record_uuid(&node.id);
+        if attachment_already_moved(db, &source).await? {
+            continue;
+        }
+        let Some(state) = nodes::current_state(db, &node.id).await? else { continue };
+        report.documents += 1;
+        if !dry_run {
+            write_attachment(db, &owner, &state, &source).await?;
+        }
+        migrated.push((node.id.clone(), owner, edge.rel_type.clone()));
+    }
+    Ok(())
+}
+
+/// The end of B4: "Retract the role edges, archive the old anchors."
+///
+/// Both are appends. The edge row gets a new version with
+/// `active = false` and the anchor gets a state version with
+/// `archived = true`, so the whole step is undone by appending the
+/// opposite — which is what "reversible by un-retracting" means.
+async fn retire(
+    db: &Db,
+    dry_run: bool,
+    report: &mut Report,
+    migrated: &[(RecordId, RecordId, String)],
+) -> Result<()> {
+    for (anchor, owner, rel) in migrated {
+        let still_linked = edges::expand(db, std::slice::from_ref(anchor), true)
+            .await?
+            .into_iter()
+            .any(|e| e.active && &e.rel_type == rel);
+        if still_linked {
+            report.edges_retracted += 1;
+            if !dry_run {
+                edges::unlink(db, owner, anchor, rel).await?;
+            }
+        }
+        let already = nodes::current_state(db, anchor).await?.is_some_and(|s| s.archived);
+        if !already {
+            report.anchors_archived += 1;
+            if !dry_run {
+                nodes::set_archived(db, anchor, true).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Has this document node already become an attachment row? The row
+/// records where it came from, so a second run moves nothing.
+async fn attachment_already_moved(db: &Db, source: &str) -> Result<bool> {
+    let mut resp = db
+        .query("SELECT attributes FROM attachment WHERE attributes.migrated_from = $source")
+        .bind(("source", source.to_string()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    Ok(!rows.is_empty())
+}
+
+/// One attachment row from a document node's current state, carrying
+/// the node's own `valid_from` rather than now().
+async fn write_attachment(
+    db: &Db,
+    owner: &RecordId,
+    state: &nodes::StateRow,
+    source: &str,
+) -> Result<()> {
+    let attrs = match &state.attributes {
+        Some(Value::Object(o)) => o.clone(),
+        _ => Object::new(),
+    };
+    let text = |k: &str| match attrs.get(k) {
+        Some(Value::String(v)) => v.clone(),
+        _ => String::new(),
+    };
+    let filename = match text("original_name").as_str() {
+        "" => state.name.clone(),
+        n => n.to_string(),
+    };
+    let size = match attrs.get("size") {
+        Some(Value::Number(n)) => n.to_string().parse::<i64>().unwrap_or(0),
+        _ => 0,
+    };
+    let mime = match text("mime").as_str() {
+        "" => crate::documents::mime_for(&filename).to_string(),
+        m => m.to_string(),
+    };
+
+    let mut provenance = Object::new();
+    provenance.insert("migrated_from".to_string(), Value::String(source.to_string()));
+
+    let mut row = Object::new();
+    row.insert("uid".to_string(), Value::String(uuid::Uuid::now_v7().to_string()));
+    row.insert("target_kind".to_string(), Value::String("entity".to_string()));
+    row.insert("target_uid".to_string(), Value::String(record_uuid(owner)));
+    row.insert("label".to_string(), Value::String("attachments".to_string()));
+    row.insert("filename".to_string(), Value::String(filename));
+    row.insert("mime".to_string(), Value::String(mime));
+    row.insert("size".to_string(), Value::Number(size.into()));
+    row.insert("path".to_string(), Value::String(text("file")));
+    row.insert("active".to_string(), Value::Bool(true));
+    row.insert("attributes".to_string(), Value::Object(provenance));
+    row.insert("author_kind".to_string(), Value::String("system".to_string()));
+    let written_at = chrono::DateTime::parse_from_rfc3339(&state.valid_from)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+    row.insert("valid_from".to_string(), Value::Datetime(written_at.into()));
+
+    db.query("CREATE $id CONTENT $row")
+        .bind(("id", new_id("attachment")))
+        .bind(("row", Value::Object(row)))
+        .await?
+        .check()?;
+    Ok(())
 }
 
 /// The uid of the note already carrying this label on this entity, if

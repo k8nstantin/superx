@@ -117,7 +117,13 @@ async fn running_it_twice_moves_nothing_the_second_time() {
 
     let second = migrate::prose(&db, false).await.expect("second");
     assert_eq!(second.versions, 0, "nothing moved twice");
-    assert_eq!(second.already, 3, "and it says why");
+    // B4 retracted the role edges on the first run, so the second run
+    // finds carriers nothing active points at. They are REPORTED as
+    // unclaimed rather than silently skipped — and reported is how the
+    // operator can tell "already done" from "never seen".
+    assert_eq!(second.orphans.len(), 2, "their role edges are retracted, so nothing claims them");
+    assert_eq!(second.edges_retracted, 0, "an edge already retracted is not retracted again");
+    assert_eq!(second.anchors_archived, 0, "an anchor already archived is left alone");
 
     assert_eq!(
         notes::for_entity(&db, &product, false).await.expect("read").len(),
@@ -126,9 +132,9 @@ async fn running_it_twice_moves_nothing_the_second_time() {
     );
 }
 
-/// Nothing is deleted. The text nodes and their edges stay exactly where
-/// they are: this PR adds a second representation, a later one stops
-/// reading the first, and only after that does anything retire.
+/// Nothing is deleted — §13: the anchors are "archived rather than
+/// deleted, so it reads correctly in both directions", and the
+/// retraction is "reversible by un-retracting".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nothing_is_deleted() {
     let db = fresh_db().await;
@@ -140,13 +146,28 @@ async fn nothing_is_deleted() {
     assert_eq!(
         list_entities(&db, Some("text")).await.expect("list").len(),
         1,
-        "the carrier survives the migration"
+        "the carrier row still exists"
     );
-    assert_eq!(state_history(&db, &carrier).await.expect("history").len(), 1);
-    assert!(
-        texts::annotations(&db, &product).await.expect("annotations").len() == 1,
-        "and the reader that exists today still sees it"
-    );
+
+    // Its history GREW by the archiving version rather than losing the
+    // original: archiving is an append like everything else.
+    let history = state_history(&db, &carrier).await.expect("history");
+    assert_eq!(history.len(), 2, "original wording + the archiving version");
+    assert_eq!(history[0].content.as_deref(), Some("still here"), "the words are untouched");
+    assert!(!history[0].archived, "the original version does not retroactively become archived");
+    assert!(history[1].archived, "the new version is what hides it");
+
+    // The role edge is retracted, not removed: the row is still there
+    // with active = false, which is what makes un-retracting possible.
+    let inbound = superx_mod_entities::edges::expand(
+        &db,
+        std::slice::from_ref(&carrier),
+        true,
+    )
+    .await
+    .expect("expand");
+    assert!(!inbound.is_empty(), "the edge history survives");
+    assert!(inbound.iter().all(|e| !e.active), "and every version of it is retracted");
 }
 
 /// A description written since #268 already has a note. Its older

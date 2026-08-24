@@ -247,6 +247,21 @@ const SEEDED: &[Seed] = &[
         ),
     },
     Seed {
+        key: "attachments",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
+        kind: SLOT,
+        display: "Attachments",
+        semantics: "context",
+        value_kind: None,
+        cardinality: Some("many"),
+        writable_by: Some("any"),
+        description: "what files belong to it",
+        agent_note: None,
+    },
+    Seed {
         key: "comments",
         source_types: &[],
         target_types: &[],
@@ -375,91 +390,6 @@ const SEEDED: &[Seed] = &[
         description: "the source runs only after the target completes",
         agent_note: None,
     },
-    // The registry carried these as relation types with nothing in the
-    // dictionary saying so, which is how `attached` came to hold two of
-    // the operator's documents while counting as undeclared. A graph
-    // that walks declared link labels would have dropped them, so they
-    // are declared here — the same facts, in the place that decides.
-    //
-    // ENDPOINTS STAY OPEN, deliberately. These are declared to say they
-    // are STRUCTURAL, not to say what may sit at each end. Narrowing
-    // them from the registry's one-line description is shipping an
-    // illustration as policy: `consults` reads "task consults a rag or
-    // model", and restricting the target to those refused a `rag
-    // consults task` edge that already existed. Same mistake as
-    // `depends_on` in #298. Narrowing is the operator's to declare, and
-    // #293 gave them the page to declare it on.
-    Seed {
-        key: "attached",
-        // A file is a SOURCE, not the meaning of the thing it hangs
-        // off: the label on the attachment says what it is (§5.4), and
-        // the same document may back several entities.
-        source_types: &[],
-        target_types: &[],
-        inverse: Some("{target} is attached to {source}"),
-        acyclic: false,
-        kind: LINK,
-        display: "attached",
-        semantics: "reference",
-        value_kind: None,
-        cardinality: None,
-        writable_by: Some("owner"),
-        description: "a file-backed source hanging off this entity",
-        agent_note: None,
-    },
-    Seed {
-        key: "authenticates",
-        // Reach, not composition: a credential is not part of the thing
-        // it opens, and the same credential opens several.
-        source_types: &[],
-        target_types: &[],
-        inverse: Some("{target} is opened by {source}"),
-        acyclic: false,
-        kind: LINK,
-        display: "authenticates",
-        semantics: "reach",
-        value_kind: None,
-        cardinality: None,
-        writable_by: Some("operator"),
-        description: "the source credential opens the target service",
-        agent_note: Some(
-            "This names WHERE a secret is, never the secret. Resolve it              through the OS and never print, log or copy the value.",
-        ),
-    },
-    Seed {
-        key: "consults",
-        source_types: &[],
-        target_types: &[],
-        inverse: Some("{target} is consulted by {source}"),
-        acyclic: false,
-        kind: LINK,
-        display: "consults",
-        semantics: "reference",
-        value_kind: None,
-        cardinality: None,
-        writable_by: Some("owner"),
-        description: "the source reads the target when it thinks",
-        agent_note: None,
-    },
-    Seed {
-        key: "linked",
-        // Deliberately says nothing: the escape hatch for a relation
-        // nobody has named yet. Undeclared would have meant INVISIBLE
-        // once the graph walks declared labels, and a generic
-        // association that silently disappears is worse than none.
-        source_types: &[],
-        target_types: &[],
-        inverse: Some("{target} is linked to {source}"),
-        acyclic: false,
-        kind: LINK,
-        display: "linked",
-        semantics: "reference",
-        value_kind: None,
-        cardinality: None,
-        writable_by: Some("any"),
-        description: "an association with no stronger word for it yet",
-        agent_note: None,
-    },
     Seed {
         key: "then",
         source_types: &[],
@@ -487,19 +417,7 @@ const SEEDED: &[Seed] = &[
 pub async fn seed(db: &Db) -> Result<usize> {
     let mut created = 0;
     for s in SEEDED {
-        if let Some(existing) = current_object(db, s.key, s.kind).await? {
-            // An instance seeded before a shipped label gained a
-            // declaration would never receive it: the seed skips what
-            // exists, so the acyclic flag and the endpoints added here
-            // would be real on a fresh instance and absent on every
-            // instance that has been running.
-            //
-            // Filled in only where the row says NOTHING on the subject.
-            // A value somebody set — including a deliberate `false` — is
-            // a decision, and the seed does not overrule decisions.
-            if top_up_link_rules(db, s, &existing).await? {
-                created += 1;
-            }
+        if current(db, s.key, s.kind).await?.is_some() {
             continue;
         }
         let mut row = Object::new();
@@ -831,52 +749,6 @@ fn parse_slot(row: &Value) -> Option<TypeSlot> {
         author_kind: str_field(o, "author_kind"),
         semantics_override: str_field(o, "semantics_override"),
     })
-}
-
-/// Give an already-seeded LINK label the declarations it predates.
-///
-/// Returns whether anything was written. Silent when the row already
-/// says something on each subject — the seed fills gaps, it does not
-/// overrule.
-async fn top_up_link_rules(db: &Db, seed: &Seed, existing: &Object) -> Result<bool> {
-    if seed.kind != LINK {
-        return Ok(false);
-    }
-    let missing_acyclic = seed.acyclic && !existing.contains_key("acyclic");
-    let missing_inverse = seed.inverse.is_some() && !existing.contains_key("inverse");
-    let missing_source = !seed.source_types.is_empty() && !existing.contains_key("source_types");
-    let missing_target = !seed.target_types.is_empty() && !existing.contains_key("target_types");
-    if !(missing_acyclic || missing_inverse || missing_source || missing_target) {
-        return Ok(false);
-    }
-
-    let mut row = existing.clone();
-    // The new version is a new row: these belong to the row, not to the
-    // definition.
-    row.remove("id");
-    row.remove("valid_from");
-    if missing_acyclic {
-        row.insert("acyclic".to_string(), Value::Bool(true));
-    }
-    if missing_inverse {
-        if let Some(text) = seed.inverse {
-            row.insert("inverse".to_string(), Value::String(text.to_string()));
-        }
-    }
-    if missing_source {
-        row.insert(
-            "source_types".to_string(),
-            str_values(&seed.source_types.iter().map(ToString::to_string).collect::<Vec<_>>()),
-        );
-    }
-    if missing_target {
-        row.insert(
-            "target_types".to_string(),
-            str_values(&seed.target_types.iter().map(ToString::to_string).collect::<Vec<_>>()),
-        );
-    }
-    append(db, row).await?;
-    Ok(true)
 }
 
 /// Append a label row and bump the revision. Every write is a new row
