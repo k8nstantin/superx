@@ -4,7 +4,7 @@
 //! comment always mints a new node — many comments coexist, and a
 //! comment on a comment is a thread.
 
-use superx_kernel::types::RecordId;
+use superx_kernel::types::{Object, RecordId, Value};
 use superx_kernel::{Db, Result};
 
 use crate::edges::{expand, link};
@@ -61,7 +61,8 @@ pub async fn set_role_text(
     // The note store first (#268). It consults the dictionary, so an
     // undefined label is refused BEFORE a legacy node is created —
     // failing closed rather than leaving a half-written pair.
-    notes::write(db, target, label_for_role(role)?, text, &Author::operator()).await?;
+    let (note_uid, _) =
+        notes::write(db, target, label_for_role(role)?, text, &Author::operator()).await?;
 
     let existing = expand(db, std::slice::from_ref(target), false)
         .await?
@@ -71,7 +72,14 @@ pub async fn set_role_text(
         update_entity(db, &edge.to, Some(label_for(text)), Some(text.to_string()), None).await?;
         return Ok((edge.to, false));
     }
-    let node = create_entity(db, "text", &label_for(text), Some(text.to_string()), None).await?;
+    let node = create_entity(
+        db,
+        "text",
+        &label_for(text),
+        Some(text.to_string()),
+        Some(carries(&note_uid)),
+    )
+    .await?;
     link(db, target, &node, role).await?;
     Ok((node, true))
 }
@@ -82,8 +90,16 @@ pub async fn set_role_text(
 ///
 /// Verb errors pass through.
 pub async fn add_comment(db: &Db, target: &RecordId, text: &str) -> Result<RecordId> {
-    notes::write(db, target, label_for_role("comments")?, text, &Author::operator()).await?;
-    let node = create_entity(db, "text", &label_for(text), Some(text.to_string()), None).await?;
+    let (note_uid, _) =
+        notes::write(db, target, label_for_role("comments")?, text, &Author::operator()).await?;
+    let node = create_entity(
+        db,
+        "text",
+        &label_for(text),
+        Some(text.to_string()),
+        Some(carries(&note_uid)),
+    )
+    .await?;
     link(db, target, &node, "comments").await?;
     Ok(node)
 }
@@ -118,4 +134,18 @@ fn label_for(text: &str) -> String {
     } else {
         line.to_string()
     }
+}
+
+/// Mark a carrier with the note it duplicates.
+///
+/// While both stores are written, a carrier created today ALREADY has
+/// its prose in the note store. Without this the migration would move it
+/// a second time and the entity would show the same comment twice — and
+/// for a plural label there is no cardinality rule to collapse them
+/// back. Recording the pairing makes the migration exact instead of
+/// guessing from the text.
+fn carries(note_uid: &str) -> Value {
+    let mut attrs = Object::new();
+    attrs.insert("note_uid".to_string(), Value::String(note_uid.to_string()));
+    Value::Object(attrs)
 }

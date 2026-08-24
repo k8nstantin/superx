@@ -6,7 +6,9 @@ use superx_kernel::types::Value;
 use superx_kernel::{Kernel, KernelError, NodeKind, Result};
 use superx_ops::record_uuid;
 
-use crate::{documents, edges, fields, graph, nodes, notes, registry, texts, MODULE_NAME};
+use crate::{
+    documents, edges, fields, graph, migrate, nodes, notes, registry, texts, MODULE_NAME,
+};
 
 /// Traversal depth ceiling parameter on the module's registry entity.
 pub const MAX_DEPTH_PARAM: &str = "attr_entities_max_depth";
@@ -37,6 +39,7 @@ const USAGE: &str = "usage: superx entities <command>\n\
                        [--value-kind <k>] [--display <d>] [--description <text>]\n\
   labels history <key> --kind slot|link      every version of one label, oldest first\n\
   labels archive <key> --kind slot|link [--restore]\n\
+  migrate-prose [--dry-run]            move text carriers into the note store, history and all\n\
   notes <uuid-fragment> [--all]        the prose attached to an entity, by label\n\
   notes history <note-uid>             every version of one note\n\
   notes reply <note-uid> <text…>       a comment on a comment\n\
@@ -55,6 +58,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("types") => types_cmd(kernel, &args[1..]).await,
         Some("labels") => labels_cmd(kernel, &args[1..]).await,
         Some("notes") => notes_cmd(kernel, &args[1..]).await,
+        Some("migrate-prose") => migrate_cmd(kernel, &args[1..]).await,
         Some("fields") => fields_cmd(kernel, &args[1..]).await,
         Some("set") => set_cmd(kernel, &args[1..]).await,
         Some("create") => create_cmd(kernel, &args[1..]).await,
@@ -357,6 +361,59 @@ async fn set_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     fields::set(&db, &anchor, key, &value).await?;
     emit(kernel, "entity_updated", &record_uuid(&anchor), "", key).await;
     Ok(format!("{key} set\n"))
+}
+
+/// `superx entities migrate-prose` — move the old text carriers into
+/// the note store (#276).
+///
+/// Nothing is deleted: the text nodes and their edges stay exactly where
+/// they are. Every VERSION moves, carrying its original timestamp, so
+/// the evolution reads as it always did rather than collapsing into the
+/// instant the migration ran.
+async fn migrate_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let r = migrate::prose(&db, dry_run).await?;
+
+    let mut out = if dry_run {
+        String::from("dry run — nothing written\n\n")
+    } else {
+        String::new()
+    };
+    out.push_str(&format!(
+        "  {:<28} {}\n  {:<28} {}\n  {:<28} {}\n",
+        "text carriers", r.carriers,
+        if dry_run { "versions to move" } else { "versions moved" }, r.versions,
+        "already moved", r.already,
+    ));
+    if r.dual_written > 0 {
+        out.push_str(&format!(
+            "  {:<28} {}\n",
+            "already a note (dual-write)", r.dual_written
+        ));
+    }
+    if !r.other_roles.is_empty() {
+        out.push_str(&format!(
+            "\n  {} text node(s) reached by a NON-prose edge (the runner's \
+             `produced`) — out of scope here, left alone:\n",
+            r.other_roles.len()
+        ));
+        for id in r.other_roles.iter().take(10) {
+            out.push_str(&format!("    {id}\n"));
+        }
+    }
+    if !r.orphans.is_empty() {
+        out.push_str(&format!(
+            "\n  {} text node(s) nothing active points at — nothing claims them, \
+             so nothing is guessed:\n",
+            r.orphans.len()
+        ));
+        for id in r.orphans.iter().take(10) {
+            out.push_str(&format!("    {id}\n"));
+        }
+    }
+    out.push_str("\nthe text nodes and their edges are untouched — this adds, it does not move\n");
+    Ok(out)
 }
 
 async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
