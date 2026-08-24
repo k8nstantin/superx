@@ -26,6 +26,7 @@ pub mod registry;
 pub mod target;
 mod server;
 pub mod texts;
+pub mod validate;
 
 use async_trait::async_trait;
 use superx_kernel::types::Value;

@@ -1461,3 +1461,130 @@ async fn archiving_hides_by_default_and_is_itself_a_version() {
     // Restored.
     assert!(api::list(&db, None, false).await.expect("list").iter().any(|e| e.id == frag));
 }
+
+/// §5.5: "once cardinality, endpoints and acyclicity are DATA, 'does
+/// this graph make sense?' derives from the dictionary alone … exactly
+/// the check to run before dispatching agents at a graph one of them
+/// designed."
+///
+/// The point is that a graph can be wrong without any single write
+/// being wrong: a label narrowed after its edges exist, a type given a
+/// required slot after its entities were made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_graph_is_checked_against_the_dictionary_it_was_built_under() {
+    use superx_mod_entities::dictionary::{Definition, LINK};
+    use superx_mod_entities::{dictionary, edges, nodes, validate};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("t");
+    edges::link(&db, &product, &task, "contains").await.expect("legal when written");
+
+    // Clean under the dictionary as it stands.
+    assert!(
+        validate::subgraph(&db, &product, 3).await.expect("check").is_empty(),
+        "nothing wrong yet"
+    );
+
+    // NOW the operator narrows the label — every write so far was
+    // legal, and the graph is wrong the moment the rule changes.
+    dictionary::define(&db, Definition {
+        key: "contains",
+        kind: LINK,
+        display: "contains",
+        semantics: "composition",
+        source_types: Some(&["role".to_string()]),
+        ..Default::default()
+    })
+    .await
+    .expect("narrow it");
+
+    let findings = validate::subgraph(&db, &product, 3).await.expect("check");
+    assert_eq!(findings.len(), 1, "{:?}", findings.iter().map(|f| &f.detail).collect::<Vec<_>>());
+    assert!(findings[0].detail.contains("starts at role"), "{}", findings[0].detail);
+}
+
+/// A required slot added to a type after its entities were made: every
+/// entity written before it is now missing something it was promised,
+/// and no single write was wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entity_missing_what_its_type_requires_is_reported() {
+    use superx_mod_entities::{dictionary, nodes, validate};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed_type_labels(&db).await.expect("slots");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    // The shipped bindings already require something of a product, so
+    // the baseline is what they require — not zero. Naming it here
+    // rather than asserting emptiness keeps the test about the ONE slot
+    // it adds below.
+    let baseline = validate::subgraph(&db, &product, 1).await.expect("check").len();
+
+    dictionary::bind_slot(&db, "product", "spec", true, None, &Author::operator())
+        .await
+        .expect("now every product needs one");
+
+    let findings = validate::subgraph(&db, &product, 1).await.expect("check");
+    assert!(
+        findings.iter().any(|f| f.detail.contains("carries no 'spec'")),
+        "{:?}",
+        findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
+    );
+
+    // Writing one clears it.
+    superx_mod_entities::notes::write(
+        &db,
+        &product,
+        "spec",
+        "what to build",
+        &Author::operator(),
+    )
+    .await
+    .expect("write the spec");
+    assert_eq!(
+        validate::subgraph(&db, &product, 1).await.expect("check").len(),
+        baseline,
+        "writing the spec cleared the finding it caused, and nothing else"
+    );
+}
+
+/// A cycle written before the label was marked acyclic. `link` refuses
+/// to create one now, so the only way in is data that predates the
+/// rule — which is exactly the case this check exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cycle_that_predates_the_rule_is_found() {
+    use superx_mod_entities::{edges, nodes, validate};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let a = nodes::create_entity(&db, "task", "A", None, None).await.expect("a");
+    let b = nodes::create_entity(&db, "task", "B", None, None).await.expect("b");
+    edges::link(&db, &a, &b, "depends_on").await.expect("a waits on b");
+
+    // Straight into the substrate, past the guard — how such a row got
+    // there before the rule existed.
+    let uid = uuid::Uuid::now_v7().to_string();
+    db.query(
+        "RELATE $from->edge->$to SET edge_uid = $uid, rel_type = 'depends_on', \
+         active = true, valid_from = time::now()",
+    )
+    .bind(("from", b.clone()))
+    .bind(("to", a.clone()))
+    .bind(("uid", uid))
+    .await
+    .expect("write")
+    .check()
+    .expect("the pre-rule shape");
+
+    let findings = validate::subgraph(&db, &a, 5).await.expect("check");
+    assert!(
+        findings.iter().any(|f| f.detail.contains("acyclic")),
+        "{:?}",
+        findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
+    );
+}

@@ -26,6 +26,7 @@ const USAGE: &str = "usage: superx entities <command>\n\
        attachments and edges at one instant, not a picker per field\n\
   list [--type <type>] [--archived]\n\
   archive <uuid-fragment> [--restore]  hide it from the lists; nothing is erased\n\
+  validate [<uuid-fragment>] [--depth <n>]   does this graph make sense? (§5.5)\n\
   link <from-fragment> <to-fragment> --rel <relation-type>\n\
   unlink <from-fragment> <to-fragment> --rel <relation-type>\n\
   describe <uuid-fragment> <text…>     set/evolve the describing text node\n\
@@ -79,6 +80,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("show") => show_cmd(kernel, &args[1..]).await,
         Some("list") => list_cmd(kernel, &args[1..]).await,
         Some("archive") => archive_cmd(kernel, &args[1..]).await,
+        Some("validate") => validate_cmd(kernel, &args[1..]).await,
         Some("link") => link_cmd(kernel, &args[1..], true).await,
         Some("unlink") => link_cmd(kernel, &args[1..], false).await,
         Some("describe") => role_text_cmd(kernel, &args[1..], "describes").await,
@@ -733,6 +735,44 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+/// Does this graph make sense? (§5.5)
+///
+/// The check to run BEFORE dispatching agents at a graph one of them
+/// designed. Every rule comes from the dictionary, so a label narrowed
+/// today is enforced today with no code change.
+///
+/// Exit is non-zero when anything is wrong, so it can gate a dispatch
+/// in a script rather than being read by eye.
+async fn validate_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let depth = args
+        .iter()
+        .position(|a| a == "--depth")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|d| d.parse::<usize>().ok())
+        .unwrap_or(resolved_max_depth(kernel).await);
+    let fragment = args.first().filter(|a| !a.starts_with("--"));
+
+    let findings = match fragment {
+        Some(f) => {
+            let root = nodes::resolve_entity(&db, f).await?;
+            crate::validate::subgraph(&db, &root, depth).await?
+        }
+        None => crate::validate::everything(&db, depth).await?,
+    };
+
+    if findings.is_empty() {
+        return Ok("the graph fits the dictionary — nothing to fix\n".to_string());
+    }
+    let mut out = format!("{} problem(s):\n", findings.len());
+    for f in &findings {
+        out.push_str(&format!("  {}\n    {}\n", f.subject, f.detail));
+    }
+    // A refusal, not a report: an operator who scripted this wants a
+    // non-zero exit before the dispatch, not a message they might miss.
+    Err(KernelError::Module(out))
 }
 
 /// Hide an entity from the lists, or bring it back (§14).
