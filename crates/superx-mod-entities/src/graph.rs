@@ -44,6 +44,14 @@ pub struct Subgraph {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     pub truncated_at_depth: bool,
+    /// Labels found on active edges out of the walked nodes that are
+    /// NOT declared link labels, so the walk did not follow them.
+    ///
+    /// Reported rather than swallowed: an edge that silently vanishes
+    /// is how the two views came to disagree in the first place (#300),
+    /// and a reader that says "3 edges not shown, their labels are
+    /// prose" teaches the difference instead of lying about it.
+    pub unwalked_labels: Vec<String>,
 }
 
 /// BFS from a root. Cycles are legal in the graph; the visited set
@@ -64,6 +72,34 @@ pub async fn subgraph(
     let mut edges: Vec<GraphEdge> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut truncated = false;
+    let mut unwalked: HashSet<String> = HashSet::new();
+
+    // WHICH EDGES ARE STRUCTURAL IS DATA, NOT A TYPE CHECK.
+    //
+    // The dictionary already separates link labels (contains,
+    // depends_on, attached) from slot labels (description, comments) —
+    // so the rule is read from the place the operator designs it,
+    // and both readers of this walk get it without either of them
+    // remembering to filter. `api.rs` used to drop nodes whose type was
+    // `text` and the CLI did not, which is precisely how the operator's
+    // graph came to hold 1 node where the runner's held 4 (#300).
+    //
+    // Archived labels COUNT AS STRUCTURAL. Archiving stops a label
+    // being offered for new edges; it does not make the edges it
+    // already made stop being part of the shape. Excluding them would
+    // erase every hierarchy from both views the moment somebody
+    // archived `contains`.
+    let declared = crate::dictionary::list(db, true).await?;
+    let structural: HashSet<String> = declared
+        .iter()
+        .filter(|l| l.label_kind == crate::dictionary::LINK)
+        .map(|l| l.key.clone())
+        .collect();
+    // An unprovisioned database declares nothing, and a graph that
+    // walked nothing would read as an empty instance rather than an
+    // unseeded one. Enforcement arrives with the declaration — the same
+    // rule as a type that declares no slots accepting anything (§7).
+    let filtering = !structural.is_empty();
 
     let mut frontier: Vec<RecordId> = vec![root.clone()];
     visited.insert(record_uuid(root));
@@ -82,6 +118,13 @@ pub async fn subgraph(
             .await?
             .into_iter()
             .filter(|e| e.active)
+            .filter(|e| {
+                if !filtering || structural.contains(&e.rel_type) {
+                    return true;
+                }
+                unwalked.insert(e.rel_type.clone());
+                false
+            })
             .collect();
         let mut next: Vec<RecordId> = Vec::new();
         for edge in level {
@@ -101,7 +144,9 @@ pub async fn subgraph(
         depth += 1;
     }
 
-    Ok(Subgraph { nodes, edges, truncated_at_depth: truncated })
+    let mut unwalked_labels: Vec<String> = unwalked.into_iter().collect();
+    unwalked_labels.sort();
+    Ok(Subgraph { nodes, edges, truncated_at_depth: truncated, unwalked_labels })
 }
 
 /// Resolve one BFS level's metadata in a single batched read and
@@ -174,6 +219,14 @@ pub fn render_tree(graph: &Subgraph, root: &RecordId) -> String {
     if graph.truncated_at_depth {
         out.push_str("(deeper levels exist — raise --depth)\n");
     }
+    if !graph.unwalked_labels.is_empty() {
+        // Said out loud rather than swallowed: these are the labels that
+        // used to make the CLI graph disagree with the operator's.
+        out.push_str(&format!(
+            "(not part of the shape, so not walked: {} — prose lives on the entity, not in the graph)\n",
+            graph.unwalked_labels.join(", ")
+        ));
+    }
     out
 }
 
@@ -190,9 +243,6 @@ fn render_children(
         let last = i == edges.len() - 1;
         let branch = if last { "└─" } else { "├─" };
         let label = match by_uuid.get(&edge.to) {
-            Some(n) if n.entity_type == "text" => {
-                format!("text \"{}\"", first_line(n.content.as_deref().unwrap_or(&n.name)))
-            }
             Some(n) => format!("{} {}", n.entity_type, n.name),
             None => "?".to_string(),
         };
@@ -204,16 +254,6 @@ fn render_children(
             let next_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
             out.push_str(&format!("{next_prefix}(already shown above — cycle)\n"));
         }
-    }
-}
-
-fn first_line(s: &str) -> String {
-    let line = s.lines().next().unwrap_or("");
-    if line.chars().count() > 60 {
-        let cut: String = line.chars().take(60).collect();
-        format!("{cut}…")
-    } else {
-        line.to_string()
     }
 }
 

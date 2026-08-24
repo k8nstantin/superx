@@ -816,16 +816,31 @@ async fn deep_version_chains_list_only_currents() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subgraph_carries_text_content_via_batched_meta() {
-    use superx_mod_entities::{graph, nodes, texts};
+    use superx_mod_entities::{edges, graph, nodes};
     let db = fresh_db().await;
     registry::seed_types(&db).await.expect("seed");
 
+    // A DOCUMENT, not a text carrier. The property under test is that
+    // the batched per-level meta read carries content for
+    // content-bearing kinds — which is unchanged. What changed is that
+    // prose is no longer a member of the graph (#300), so proving this
+    // on a `describes` text node would be proving it about a node the
+    // walk correctly never reaches.
     let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
-    texts::set_role_text(&db, &product, "describes", "The whole point.").await.expect("t");
+    let doc = nodes::create_entity(
+        &db,
+        "document",
+        "spec.md",
+        Some("The whole point.".to_string()),
+        None,
+    )
+    .await
+    .expect("d");
+    edges::link(&db, &product, &doc, "attached").await.expect("attach");
 
     let sub = graph::subgraph(&db, &product, 3, false).await.expect("bfs");
-    let text = sub.nodes.iter().find(|n| n.entity_type == "text").expect("text node");
-    assert_eq!(text.content.as_deref(), Some("The whole point."));
+    let file = sub.nodes.iter().find(|n| n.entity_type == "document").expect("document node");
+    assert_eq!(file.content.as_deref(), Some("The whole point."));
     let root = sub.nodes.iter().find(|n| n.entity_type == "product").expect("root");
     assert_eq!(root.name, "Widget");
     assert!(root.content.is_none(), "non-content kinds stay lean");
@@ -898,4 +913,135 @@ async fn ancestor_path_is_root_first_priority_ordered_and_cycle_safe() {
     .expect("a cycle that predates the rule");
     let trail = graph::ancestors(&db, &task, 12).await.expect("walk");
     assert!(trail.len() <= 3, "visited set stops the cycle: {}", trail.len());
+}
+
+/// THE INVARIANT THIS FILE EXISTS FOR (#300): the operator's view and
+/// the runner's view are the same graph.
+///
+/// They were not. Measured on the live instance, one product at depth
+/// 3: the CLI walk returned 4 nodes and 3 edges, the API returned 1 and
+/// 0. The type check lived in `api.rs` and nowhere in the CLI path, so
+/// a design approved from the API view was a design nobody had seen the
+/// whole of — and the runner builds its prompt by walking the graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_views_walk_the_same_graph() {
+    use superx_mod_entities::{api, dictionary, edges, graph, nodes, registry, texts};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed(&db).await.expect("labels");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("t");
+    edges::link(&db, &product, &task, "contains").await.expect("structural");
+
+    // Prose, attached the way the CLI attaches it: a text node on a
+    // `describes` edge. This is the shape that used to differ.
+    texts::set_role_text(&db, &product, "describes", "what this desk is").await.expect("prose");
+    texts::add_comment(&db, &product, "a remark", &superx_mod_entities::notes::Author::operator())
+        .await
+        .expect("comment");
+
+    let walk = graph::subgraph(&db, &product, 3, false).await.expect("walk");
+    let view = api::graph_view(&db, &superx_ops::record_uuid(&product), 3, "out").await.expect("view");
+
+    assert_eq!(
+        walk.nodes.len(),
+        view.nodes.len(),
+        "the two views disagree on how many nodes are in the graph: CLI {:?} vs API {:?}",
+        walk.nodes.iter().map(|n| (&n.entity_type, &n.name)).collect::<Vec<_>>(),
+        view.nodes.iter().map(|n| (&n.entity_type, &n.name)).collect::<Vec<_>>(),
+    );
+    assert_eq!(walk.edges.len(), view.edges.len(), "and on how many edges");
+
+    // Two nodes, one edge: the product and its task. The description
+    // and the comment are attached to the product, not members of it.
+    assert_eq!(walk.nodes.len(), 2, "prose is not in the shape");
+    assert_eq!(walk.edges.len(), 1);
+    assert!(
+        walk.nodes.iter().all(|n| n.entity_type != "text"),
+        "no prose carrier reached the walk"
+    );
+
+    // And the walk SAYS what it did not follow, rather than swallowing
+    // it — a silently vanishing edge is the original bug.
+    assert!(
+        walk.unwalked_labels.iter().any(|l| l == "describes"),
+        "the walk reports the prose labels it skipped: {:?}",
+        walk.unwalked_labels
+    );
+    assert_eq!(view.unwalked_labels, walk.unwalked_labels, "and both views report the same");
+}
+
+/// `attached` was a registered relation type that the dictionary never
+/// declared, while holding two of the operator's documents. A walk that
+/// followed only declared labels would have deleted those documents
+/// from BOTH views — the fix quietly causing the very loss it exists to
+/// prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attached_document_stays_in_the_shape() {
+    use superx_mod_entities::{dictionary, edges, graph, nodes, registry};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed(&db).await.expect("labels");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let doc = nodes::create_entity(&db, "document", "mandate.pdf", None, None).await.expect("d");
+    edges::link(&db, &product, &doc, "attached").await.expect("attach");
+
+    let walk = graph::subgraph(&db, &product, 2, false).await.expect("walk");
+    assert!(
+        walk.nodes.iter().any(|n| n.entity_type == "document"),
+        "the document is part of the shape — a file labelled a mandate IS the mandate (§5.4)"
+    );
+    assert!(walk.unwalked_labels.is_empty(), "and nothing was skipped: {:?}", walk.unwalked_labels);
+}
+
+/// An unprovisioned database declares nothing. A walk that filtered on
+/// an empty dictionary would return a bare root and read as an empty
+/// instance rather than an unseeded one — enforcement arrives with the
+/// declaration, never before it (§7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undeclared_dictionary_does_not_blank_the_graph() {
+    use superx_mod_entities::{edges, graph, nodes, registry};
+
+    // NOT `fresh_db` — that seeds the dictionary, which is the whole
+    // thing this test needs absent. A test that claims to prove the
+    // unseeded path while running the seeded one proves nothing.
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("entities").await.expect("nsdb");
+    let ddl = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "test-password");
+    db.query(ddl).await.expect("ddl").check().expect("schema");
+    registry::seed_types(&db).await.expect("types");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("t");
+    edges::link(&db, &product, &task, "contains").await.expect("link");
+
+    let walk = graph::subgraph(&db, &product, 2, false).await.expect("walk");
+    assert_eq!(walk.nodes.len(), 2, "the walk still walks");
+    assert_eq!(walk.edges.len(), 1);
+}
+
+/// Archiving a label stops it being OFFERED. It does not make the edges
+/// it already made stop being part of the shape — otherwise archiving
+/// `contains` would erase every hierarchy from both views at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archiving_a_link_label_does_not_erase_its_edges_from_the_graph() {
+    use superx_mod_entities::{dictionary, edges, graph, nodes, registry};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed(&db).await.expect("labels");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("t");
+    edges::link(&db, &product, &task, "contains").await.expect("link");
+
+    dictionary::archive(&db, "contains", dictionary::LINK, true).await.expect("archive");
+
+    let walk = graph::subgraph(&db, &product, 2, false).await.expect("walk");
+    assert_eq!(walk.nodes.len(), 2, "the hierarchy survives archiving the label");
+    assert_eq!(walk.edges.len(), 1);
 }

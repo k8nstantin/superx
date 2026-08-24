@@ -152,6 +152,11 @@ pub struct GraphView {
     /// The walk stopped at the depth limit — there is more out there.
     pub truncated: bool,
     pub depth: i64,
+    /// Labels on active edges the walk did not follow, because they are
+    /// not declared link labels. Sent to the page rather than dropped:
+    /// an edge that silently vanishes is how this view and the CLI's
+    /// came to disagree (#300).
+    pub unwalked_labels: Vec<String>,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -860,20 +865,23 @@ pub async fn graph_view(
     let mut truncated = false;
     let mut seen_nodes: HashSet<String> = HashSet::new();
     let mut seen_edges: HashSet<String> = HashSet::new();
+    let mut unwalked: Vec<String> = Vec::new();
     for &reverse in walks {
         let sub = graph::subgraph(db, &id, depth, reverse).await?;
         truncated |= sub.truncated_at_depth;
-        for n in sub.nodes {
-            // Descriptions and comments organize TEXT; they are not
-            // members of the product graph (operator, issue #246).
-            // They are always leaves — set_role_text and add_comment
-            // link target→text and nothing links out of one — so
-            // dropping them cannot cut a path. The detail page is
-            // where they belong, and shows them.
-            let uuid = record_uuid(&n.id);
-            if n.entity_type == TEXT_TYPE && uuid != root_uuid {
-                continue;
+        for label in &sub.unwalked_labels {
+            if !unwalked.contains(label) {
+                unwalked.push(label.clone());
             }
+        }
+        for n in sub.nodes {
+            // The type check that used to live here is gone. Prose is
+            // not a member of the product graph (operator, issue #246)
+            // — and the walk now knows that from the dictionary, so it
+            // never arrives to be filtered. The rule held HERE and
+            // nowhere in the CLI path is exactly why the operator's
+            // graph showed 1 node where the runner's showed 4 (#300).
+            let uuid = record_uuid(&n.id);
             // A node reached by both walks keeps its SHALLOWEST depth.
             if let Some(prev) = nodes_out.iter_mut().find(|p| p.id == uuid) {
                 prev.depth = prev.depth.min(n.depth as i64);
@@ -908,6 +916,7 @@ pub async fn graph_view(
         edges: edges_out,
         truncated,
         depth: depth as i64,
+        unwalked_labels: unwalked,
     })
 }
 
