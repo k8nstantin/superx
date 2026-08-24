@@ -74,6 +74,34 @@ DEFINE FIELD IF NOT EXISTS name       ON TABLE entity_state TYPE string;
 DEFINE FIELD IF NOT EXISTS content    ON TABLE entity_state TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS attributes ON TABLE entity_state TYPE option<object> FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS valid_from ON TABLE entity_state TYPE datetime;
+-- Hidden, not erased: archiving takes a thing out of the lists without
+-- taking it out of the record. Append-only, so archiving is a NEW
+-- version with archived = true and un-archiving is another — which is
+-- why this is not a mutable flag and why the decision is dated and
+-- attributed like every other.
+--
+-- Distinct from `note.active`, which says "no longer stands". A thing
+-- can be archived and still true; a note can be retracted and still
+-- visible. Two decisions, and the schema keeps them apart. The note
+-- table's own comment has referred to "the entity-level `archived`"
+-- since #268; this is the column it was talking about.
+--
+-- option<> because every row written before today has no value, and
+-- append-only forbids backfilling them. Absent reads as not archived.
+DEFINE FIELD IF NOT EXISTS archived   ON TABLE entity_state TYPE option<bool>;
+-- Authorship is not only provenance — it is the subject of
+-- authorization. "A role may not edit another role's mandate" is
+-- enforceable precisely because every write records who wrote it.
+-- `via_uid` is the role context, which yields "agent X, acting as role
+-- Y". Plain uuid strings, never record<> FKs: an author may live in
+-- another database entirely.
+--
+-- Every other versioned table in this file already carries these three.
+-- `entity_state` did not, so who renamed a thing, who changed its
+-- attributes, and who archived it were all unanswerable.
+DEFINE FIELD IF NOT EXISTS author_kind ON TABLE entity_state TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS author_uid  ON TABLE entity_state TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE entity_state TYPE option<string>;
 
 DEFINE INDEX IF NOT EXISTS idx_entity_state_chain ON TABLE entity_state FIELDS entity, valid_from;
 
@@ -94,6 +122,22 @@ DEFINE FIELD IF NOT EXISTS edge_uid   ON TABLE edge TYPE string;
 DEFINE FIELD IF NOT EXISTS rel_type   ON TABLE edge TYPE string;
 DEFINE FIELD IF NOT EXISTS active     ON TABLE edge TYPE bool;
 DEFINE FIELD IF NOT EXISTS valid_from ON TABLE edge TYPE datetime;
+-- THE MOST SECURITY-RELEVANT COLUMNS IN THE SYSTEM, and until now the
+-- only versioned table without them.
+--
+-- Granting reach IS an edge: a role linked to a grant linked to a
+-- target. So "who linked this role to this grant" is not metadata, it
+-- is the authorization record itself — and an unlink is equally a
+-- decision somebody made. Without these, a role acquiring reach is a
+-- fact with no author, which is the one shape an audit cannot work
+-- with.
+--
+-- Same contract as everywhere else in this file: plain uuid strings,
+-- `via_uid` for the role context, option<> because rows written before
+-- today have no value and append-only forbids inventing one.
+DEFINE FIELD IF NOT EXISTS author_kind ON TABLE edge TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS author_uid  ON TABLE edge TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE edge TYPE option<string>;
 
 DEFINE INDEX IF NOT EXISTS idx_edge_chain ON TABLE edge FIELDS edge_uid, valid_from;
 
