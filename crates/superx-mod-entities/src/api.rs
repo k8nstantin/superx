@@ -184,6 +184,12 @@ pub struct UpdateReq {
     /// REPLACES the whole attributes object when present (the
     /// module's update semantics); omit to keep it.
     pub attributes_json: Option<String>,
+    /// The version this edit was based on (§6). Send it and a write
+    /// that would silently clobber somebody else's is refused, with
+    /// their version named so you can re-read and merge. Omit it and
+    /// the old latest-wins behaviour applies — the guarantee is
+    /// offered, never imposed.
+    pub based_on: Option<String>,
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -984,6 +990,9 @@ pub async fn create(db: &Db, req: &CreateReq) -> Result<String> {
 
 pub async fn update(db: &Db, fragment: &str, req: &UpdateReq) -> Result<String> {
     let id = nodes::resolve_entity(db, fragment).await?;
+    // Before anything is validated or written: did the thing move under
+    // the writer's feet? Refusing here means no half-applied edit.
+    nodes::check_fresh(db, &id, req.based_on.as_deref()).await?;
     let attrs = attrs_from_json(&req.attributes_json)?;
 
     // Every declared key goes through the same check whichever door it

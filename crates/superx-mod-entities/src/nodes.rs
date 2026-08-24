@@ -148,6 +148,63 @@ pub async fn create_entity(
     Ok(anchor)
 }
 
+/// The write was based on a version that is no longer the head.
+///
+/// §6: "Every write carries the `valid_from` it was based on. If the
+/// chain head has moved, the write is refused and the current version
+/// comes back with the refusal." The current version travels WITH the
+/// refusal, because a role that is only told "no" has nothing to do,
+/// while a role handed the version that beat it can re-read, merge and
+/// retry.
+#[derive(Debug, Clone)]
+pub struct Stale {
+    /// What the writer thought it was amending.
+    pub based_on: String,
+    /// What is actually there now.
+    pub current: String,
+}
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this was written against version {} but the current version is {} — \
+             somebody else wrote in between. Re-read it, merge what you meant, \
+             and write again; overwriting theirs would lose an edit nobody is \
+             told about",
+            self.based_on, self.current
+        )
+    }
+}
+
+/// Refuse the write if the chain head has moved since `based_on`.
+///
+/// Latest-wins is the default everywhere in this substrate, and for one
+/// human it is nearly always right. With perpetual roles writing
+/// continuously it is routine for two writers to hold the same version,
+/// and the loser's edit vanishes with nobody told — which in a system
+/// whose premise is "the graph is the truth" means an agent builds the
+/// wrong thing for a reason nobody can find.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] carrying the current version when the head
+/// has moved; [`KernelError::Db`] for engine errors.
+pub async fn check_fresh(db: &Db, anchor: &RecordId, based_on: Option<&str>) -> Result<()> {
+    // A writer that says nothing about what it read is not making the
+    // claim, so nothing is checked. The guarantee is offered, never
+    // imposed — imposing it would break every caller that has no
+    // version to quote, which is most of them today.
+    let Some(based_on) = based_on else { return Ok(()) };
+    let current = current_state(db, anchor).await?.map(|s| s.valid_from).unwrap_or_default();
+    if current == based_on {
+        return Ok(());
+    }
+    Err(KernelError::Module(
+        Stale { based_on: based_on.to_string(), current }.to_string(),
+    ))
+}
+
 /// Append a new state version. Unset fields carry forward from the
 /// current version (an update never loses what it didn't mention).
 ///

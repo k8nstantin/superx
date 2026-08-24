@@ -136,6 +136,7 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
             name: Some("Widget X2".into()),
             content: None,
             attributes_json: None,
+            based_on: None,
         },
     )
     .await
@@ -1179,4 +1180,133 @@ async fn the_new_columns_do_not_invalidate_rows_written_before_them() {
     edges::link(&db, &product, &another, "contains").await.expect("write after upgrade");
     let out = edges::expand(&db, std::slice::from_ref(&product), false).await.expect("expand2");
     assert_eq!(out.len(), 2);
+}
+
+/// §6 compare-and-append: "Every write carries the `valid_from` it was
+/// based on. If the chain head has moved, the write is refused and the
+/// current version comes back with the refusal."
+///
+/// The scenario is the spec's: the operator saves an edit based on v3
+/// while a role, also holding v3, saves a moment later. Without this the
+/// role's row wins, the operator's is invisible, and nobody is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_against_a_version_that_has_moved_is_refused() {
+    use superx_mod_entities::{api, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let id = api::create(
+        &db,
+        &api::CreateReq {
+            entity_type: "product".into(),
+            name: "Widget".into(),
+            description: None,
+            content: None,
+            attributes_json: None,
+        },
+    )
+    .await
+    .expect("create");
+    let anchor = nodes::resolve_entity(&db, &id).await.expect("resolve");
+    let v1 = nodes::current_state(&db, &anchor).await.expect("read").expect("state").valid_from;
+
+    // A role writes first, holding v1.
+    api::update(
+        &db,
+        &id,
+        &api::UpdateReq {
+            name: Some("Widget, by the role".into()),
+            content: None,
+            attributes_json: None,
+            based_on: Some(v1.clone()),
+        },
+    )
+    .await
+    .expect("the first writer wins");
+
+    // The operator, also holding v1, saves a moment later.
+    let err = api::update(
+        &db,
+        &id,
+        &api::UpdateReq {
+            name: Some("Widget, by the operator".into()),
+            content: None,
+            attributes_json: None,
+            based_on: Some(v1.clone()),
+        },
+    )
+    .await
+    .expect_err("the second writer is refused rather than silently winning");
+
+    // The refusal CARRIES the version that beat it — a role told only
+    // "no" has nothing to do; one handed the current version can
+    // re-read, merge and retry.
+    let text = err.to_string();
+    assert!(text.contains(&v1), "it names what the write was based on: {text}");
+    let head = nodes::current_state(&db, &anchor).await.expect("read").expect("state").valid_from;
+    assert!(text.contains(&head), "and the version that is actually there: {text}");
+
+    // Nothing was half-applied: the role's write stands untouched.
+    assert_eq!(
+        api::detail(&db, &id).await.expect("detail").name,
+        "Widget, by the role",
+        "the refused edit changed nothing"
+    );
+
+    // And re-reading, then writing against the CURRENT version, works.
+    api::update(
+        &db,
+        &id,
+        &api::UpdateReq {
+            name: Some("Widget, merged".into()),
+            content: None,
+            attributes_json: None,
+            based_on: Some(head),
+        },
+    )
+    .await
+    .expect("a writer that re-read is not blocked");
+    assert_eq!(api::detail(&db, &id).await.expect("detail").name, "Widget, merged");
+}
+
+/// The guarantee is OFFERED, never imposed. A caller with no version to
+/// quote — which is most callers today, and every older client — keeps
+/// the latest-wins behaviour rather than being refused for not making a
+/// claim it never made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_that_claims_nothing_is_not_refused() {
+    use superx_mod_entities::api;
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let id = api::create(
+        &db,
+        &api::CreateReq {
+            entity_type: "product".into(),
+            name: "Widget".into(),
+            description: None,
+            content: None,
+            attributes_json: None,
+        },
+    )
+    .await
+    .expect("create");
+
+    for name in ["one", "two"] {
+        api::update(
+            &db,
+            &id,
+            &api::UpdateReq {
+                name: Some(name.to_string()),
+                content: None,
+                attributes_json: None,
+                based_on: None,
+            },
+        )
+        .await
+        .expect("no claim, no refusal");
+    }
+    assert_eq!(api::detail(&db, &id).await.expect("detail").name, "two");
 }
