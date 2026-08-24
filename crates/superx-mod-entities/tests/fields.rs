@@ -112,10 +112,26 @@ async fn a_field_that_names_an_entity_is_refused_because_it_is_an_edge() {
     let db = fresh_db().await;
     let repo = create_entity(&db, "repo", "superx", None, None).await.expect("create");
 
-    let err = fields::set(&db, &repo, "branch", "entity:01a02e5c-f63a")
+    let other = create_entity(&db, "product", "Ledger", None, None).await.expect("create");
+    let uuid = superx_ops::record_uuid(&other);
+
+    // Prefixed, which is the polite way to write the mistake.
+    let err = fields::set(&db, &repo, "branch", &format!("entity:{uuid}"))
         .await
         .expect_err("that is a link, not a value");
     assert!(err.to_string().contains("EDGE"), "the error says why: {err}");
+
+    // And bare, which is the way anyone would actually write it. Matching
+    // the prefix alone was not the rule it claimed to be.
+    fields::set(&db, &repo, "branch", &uuid)
+        .await
+        .expect_err("a bare id of something that exists is still a link");
+
+    // A uuid that resolves to nothing is just a string — a field must be
+    // able to hold another system's id.
+    fields::set(&db, &repo, "branch", "01a00000-0000-7000-8000-000000000000")
+        .await
+        .expect("an id of nothing in this graph is not a link");
 }
 
 /// The secret itself lives in the tool that uses it. What the graph
@@ -281,4 +297,37 @@ async fn define_with_options(db: &superx_kernel::Db, key: &str, attributes: Obje
         .expect("create")
         .check()
         .expect("ok");
+}
+
+/// `"NaN"`, `"inf"` and `1e400` all parse as f64. None survives a JSON
+/// round trip, every comparison against one is false, and arithmetic on
+/// one poisons whatever it touches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_number_field_refuses_what_a_number_cannot_mean() {
+    let db = fresh_db().await;
+    registry::add_type(&db, "experiment", "entity", None).await.expect("type");
+    let e = create_entity(&db, "experiment", "e1", None, None).await.expect("create");
+    dictionary::define(&db, Definition {
+        key: "temperature",
+        kind: "slot",
+        display: "Temperature",
+        semantics: "data",
+        cardinality: Some("one"),
+        value_kind: Some("number"),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+
+    for refused in ["NaN", "inf", "-inf", "infinity", "1e400"] {
+        assert!(
+            fields::set(&db, &e, "temperature", refused).await.is_err(),
+            "{refused} must be refused"
+        );
+    }
+    fields::set(&db, &e, "temperature", "0.7").await.expect("a real number is fine");
+    assert_eq!(
+        fields::of(&db, &e).await.expect("read")[0].value.as_deref(),
+        Some("0.7f")
+    );
 }

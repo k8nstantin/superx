@@ -130,6 +130,7 @@ pub async fn set(db: &Db, entity: &RecordId, key: &str, value: &str) -> Result<(
     }
 
     let checked = check(&declared, key, &kind, value)?;
+    refuse_if_it_names_an_entity(db, key, value).await?;
 
     // The bag is replaced wholesale by `update_entity`, so read, set one
     // key, write back. Everything else in it carries forward untouched.
@@ -209,25 +210,20 @@ fn check(declared: &dictionary::LabelRow, key: &str, kind: &str, value: &str) ->
         KernelError::Module(format!("'{key}' is {kind}: {why}"))
     };
 
-    // Composition must never hide inside JSON. A field that names an
-    // entity is an edge someone wrote in the wrong place, and an agent
-    // walking the graph would never find it.
-    if value.starts_with("entity:") {
-        return Err(KernelError::Module(format!(
-            "'{key}' names an entity — that is an EDGE, not a field; \
-             link it so the graph can traverse it"
-        )));
-    }
-
     match kind {
         "integer" => value
             .parse::<i64>()
             .map(|n| Value::Number(n.into()))
             .map_err(|_| bad("not a whole number")),
-        "number" => value
-            .parse::<f64>()
-            .map(|n| Value::Number(n.into()))
-            .map_err(|_| bad("not a number")),
+        "number" => match value.parse::<f64>() {
+            // `"NaN"`, `"inf"` and `1e400` all parse. None of them survives a
+            // JSON round trip, every comparison against them is false, and
+            // arithmetic on one poisons whatever it touches — so a value the
+            // engine cannot meaningfully hold is refused at the door.
+            Ok(n) if n.is_finite() => Ok(Value::Number(n.into())),
+            Ok(_) => Err(bad("not a finite number")),
+            Err(_) => Err(bad("not a number")),
+        },
         "boolean" => match value {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
@@ -305,4 +301,30 @@ fn render(v: &Value) -> String {
         Value::Datetime(d) => d.to_string(),
         other => format!("{other:?}"),
     }
+}
+
+/// Composition must never hide inside JSON: the graph cannot traverse a
+/// field, so a link written as one is invisible to anything walking the
+/// graph — which is every agent.
+///
+/// Matching the `entity:` prefix alone was not the rule it claimed to
+/// be, because the obvious way to write the same mistake is to paste the
+/// bare uuid. What settles it is whether the value IDENTIFIES SOMETHING
+/// THAT EXISTS: if it does, it is a link, wherever it was typed.
+async fn refuse_if_it_names_an_entity(db: &Db, key: &str, value: &str) -> Result<()> {
+    let candidate = value.strip_prefix("entity:").unwrap_or(value);
+    let Ok(uuid) = candidate.parse::<uuid::Uuid>() else {
+        return Ok(());
+    };
+    let target = RecordId::new("entity", superx_kernel::types::Uuid::from(uuid));
+    if crate::nodes::anchor_info(db, &target).await.is_ok() {
+        return Err(KernelError::Module(format!(
+            "'{key}' names an entity that exists — that is an EDGE, not a field; \
+             link it so the graph can traverse it and an agent can follow it"
+        )));
+    }
+    // A uuid that resolves to nothing is just a string. Refusing it would
+    // stop a field holding another system's id, which is a real thing to
+    // want.
+    Ok(())
 }
