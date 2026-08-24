@@ -214,7 +214,7 @@ mod firing {
 
     use superx_kernel::types::RecordId;
     use superx_mod_entities::{edges, graph, nodes, texts};
-    use superx_mod_runner::exec::{fire, Exchange, FiringConfig, UNSET_CMD_DETAIL};
+    use superx_mod_runner::exec::{fire, Exchange, FiringConfig, NO_INSTRUCTIONS_DETAIL, UNSET_CMD_DETAIL};
     use superx_mod_runner::{run, schedule};
 
     use super::{entities_db, fresh_db};
@@ -249,11 +249,25 @@ mod firing {
             Ok(serde_json::from_value(json).expect("contract parses"))
         }
 
-        async fn write_back(&self, task_uid: &str, output: &str) -> superx_kernel::Result<String> {
+        /// Mirrors the live exchange (#286): the output is a COMMENT on
+        /// the task, authored by the agent in this run — not a node in
+        /// the product graph an agent then has to walk past.
+        ///
+        /// It goes through `texts::add_comment` and returns the CARRIER
+        /// id, exactly as the entities CLI does, because a fixture that
+        /// is kinder than the real path proves a property of itself
+        /// rather than of the runner. Returning the note uid here hid
+        /// both a wrong id and an empty one.
+        async fn write_back(
+            &self,
+            task_uid: &str,
+            run_uid: &str,
+            output: &str,
+        ) -> superx_kernel::Result<String> {
             let task = nodes::resolve_entity(&self.edb, task_uid).await?;
-            let text = nodes::create_entity(&self.edb, "text", "result", Some(output.to_string()), None).await?;
-            edges::link(&self.edb, &task, &text, "produced").await?;
-            Ok(superx_ops::record_uuid(&text))
+            let author = superx_mod_entities::notes::Author::claimed("agent", Some(run_uid), None)?;
+            let carrier = texts::add_comment(&self.edb, &task, output, &author).await?;
+            Ok(superx_ops::record_uuid(&carrier))
         }
     }
 
@@ -303,12 +317,28 @@ mod firing {
 
         let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
         let t1 = nodes::create_entity(&edb, "task", "first", None, None).await.expect("t1");
+        texts::set_role_text(&edb, &t1, "describes", "do the thing")
+            .await
+            .expect("orders");
         let t2 = nodes::create_entity(&edb, "task", "second", None, None).await.expect("t2");
+        texts::set_role_text(&edb, &t2, "describes", "do the thing")
+            .await
+            .expect("orders");
         edges::link(&edb, &product, &t1, "contains").await.expect("c1");
         edges::link(&edb, &product, &t2, "contains").await.expect("c2");
         edges::link(&edb, &t2, &t1, "depends_on").await.expect("d");
-        let (instruct, _) = texts::set_role_text(&edb, &t1, "instructs", "do the first thing").await.expect("i");
-        let instruct_version = nodes::current_state(&edb, &instruct).await.expect("q").expect("s").valid_from;
+        texts::set_role_text(&edb, &t1, "instructs", "do the first thing").await.expect("i");
+        // The run pins the version of the NOTE it was dispatched under
+        // (#286), so that is what the expectation reads — and it reads it
+        // from the export, which is what the runner actually saw.
+        let instruct_version = superx_mod_entities::notes::for_entity(&edb, &t1, false)
+            .await
+            .expect("notes")
+            .into_iter()
+            .find(|n| n.label == "instructions")
+            .and_then(|n| n.valid_from)
+            .expect("the instructions note is dated")
+            .to_rfc3339();
 
         let exchange = FixtureExchange::new(edb.clone(), product.clone());
         let due = due_row(&rdb, &product).await;
@@ -329,17 +359,42 @@ mod firing {
         let t1_run = runs.iter().find(|r| r.task == t1_uuid).expect("t1 run");
         assert_eq!(t1_run.status, "done");
         assert_eq!(t1_run.instruct_version.as_deref(), Some(instruct_version.as_str()));
-        assert!(t1_run.output_ref.is_some());
+        let output_ref = t1_run.output_ref.clone().expect("the run points at its output");
 
-        // The result is IN THE GRAPH: task —produced→ text with output.
-        let produced = edges::expand(&edb, std::slice::from_ref(&t1), false)
+        // The result is a COMMENT ON THE TASK (#286), authored by the
+        // agent — not a node in the product graph the next agent then has
+        // to walk past and recognise as words rather than work.
+        let notes = superx_mod_entities::notes::for_entity(&edb, &t1, false).await.expect("notes");
+        let output = notes
+            .iter()
+            .find(|n| n.label == "comments")
+            .expect("the run's output is a comment on the task");
+        assert!(output.body.contains("did it"));
+        assert_eq!(output.author_kind.as_deref(), Some("agent"), "attributed to the agent");
+        assert_eq!(
+            output.author_uid.as_deref(),
+            Some(t1_run.uid.as_str()),
+            "and to the run that produced it"
+        );
+        assert!(
+            !output_ref.is_empty(),
+            "the run points at something — an empty output_ref is a run that recorded nothing"
+        );
+        // While both stores are written this is the comment carrier's id,
+        // which is what the entities CLI reports. It resolves.
+        superx_mod_entities::nodes::resolve_entity(&edb, &output_ref)
             .await
-            .expect("expand")
-            .into_iter()
-            .find(|e| e.rel_type == "produced" && e.active)
-            .expect("produced edge");
-        let text = nodes::current_state(&edb, &produced.to).await.expect("q").expect("s");
-        assert!(text.content.as_deref().unwrap_or("").contains("did it"));
+            .expect("whatever the run points at can be found");
+
+        // And it did NOT become a node in the graph.
+        assert!(
+            !edges::expand(&edb, std::slice::from_ref(&t1), false)
+                .await
+                .expect("expand")
+                .into_iter()
+                .any(|e| e.rel_type == "produced" && e.active),
+            "a run's output no longer hangs off the task as an entity"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -352,6 +407,9 @@ mod firing {
         for name in ["a", "b"] {
             let t = nodes::create_entity(&edb, "task", name, None, None).await.expect("t");
             edges::link(&edb, &product, &t, "contains").await.expect("c");
+            // A task's description IS its orders, so a task without one
+            // is not a task anybody could run.
+            texts::set_role_text(&edb, &t, "describes", "do the thing").await.expect("d");
         }
         let log = std::env::temp_dir().join(format!("sx-log-{}", uuid::Uuid::now_v7()));
         let script = stub_script(&format!(
@@ -379,7 +437,13 @@ mod firing {
 
         let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
         let t1 = nodes::create_entity(&edb, "task", "breaks", None, None).await.expect("t1");
+        texts::set_role_text(&edb, &t1, "describes", "do the thing")
+            .await
+            .expect("orders");
         let t2 = nodes::create_entity(&edb, "task", "after", None, None).await.expect("t2");
+        texts::set_role_text(&edb, &t2, "describes", "do the thing")
+            .await
+            .expect("orders");
         edges::link(&edb, &product, &t1, "contains").await.expect("c1");
         edges::link(&edb, &product, &t2, "contains").await.expect("c2");
         edges::link(&edb, &t2, &t1, "depends_on").await.expect("d");
@@ -397,6 +461,35 @@ mod firing {
         assert!(detail.contains("exit") && detail.contains("boom"), "{detail}");
     }
 
+    /// A task with nothing to do used to dispatch anyway, with an empty
+    /// Instructions section — an agent sent off with a heading and
+    /// nothing under it, whose output is then indistinguishable from
+    /// work actually done.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_task_with_no_orders_is_refused_rather_than_dispatched() {
+        let edb = entities_db().await;
+        let rdb = fresh_db().await;
+        let kernel = superx_kernel::Kernel::from_db(rdb.clone());
+
+        let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
+        let t = nodes::create_entity(&edb, "task", "nothing to do", None, None).await.expect("t");
+        edges::link(&edb, &product, &t, "contains").await.expect("c");
+
+        let exchange = FixtureExchange::new(edb.clone(), product.clone());
+        let due = due_row(&rdb, &product).await;
+        let script = stub_script("echo ran");
+        let report = fire(&kernel, &rdb, &exchange, &config(Some(script)), &due).await.expect("fire");
+
+        assert_eq!((report.done, report.failed), (0, 1));
+        let runs = run::current_runs(&rdb, None).await.expect("runs");
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].detail.as_deref(), Some(NO_INSTRUCTIONS_DETAIL));
+        assert!(
+            superx_mod_entities::notes::for_entity(&edb, &t, false).await.expect("notes").is_empty(),
+            "nothing was written back, because nothing ran"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn unset_agent_cmd_fails_loudly() {
         let edb = entities_db().await;
@@ -404,6 +497,9 @@ mod firing {
         let kernel = superx_kernel::Kernel::from_db(rdb.clone());
         let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
         let t = nodes::create_entity(&edb, "task", "t", None, None).await.expect("t");
+        texts::set_role_text(&edb, &t, "describes", "do the thing")
+            .await
+            .expect("orders");
         edges::link(&edb, &product, &t, "contains").await.expect("c");
 
         let exchange = FixtureExchange::new(edb.clone(), product.clone());
@@ -421,7 +517,13 @@ mod firing {
         let kernel = superx_kernel::Kernel::from_db(rdb.clone());
         let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
         let t1 = nodes::create_entity(&edb, "task", "slow", None, None).await.expect("t1");
+        texts::set_role_text(&edb, &t1, "describes", "do the thing")
+            .await
+            .expect("orders");
         let t2 = nodes::create_entity(&edb, "task", "never", None, None).await.expect("t2");
+        texts::set_role_text(&edb, &t2, "describes", "do the thing")
+            .await
+            .expect("orders");
         edges::link(&edb, &product, &t1, "contains").await.expect("c1");
         edges::link(&edb, &product, &t2, "contains").await.expect("c2");
         edges::link(&edb, &t2, &t1, "depends_on").await.expect("d");
@@ -453,7 +555,13 @@ mod firing {
         let kernel = superx_kernel::Kernel::from_db(rdb.clone());
         let product = nodes::create_entity(&edb, "product", "P", None, None).await.expect("p");
         let t1 = nodes::create_entity(&edb, "task", "one", None, None).await.expect("t1");
+        texts::set_role_text(&edb, &t1, "describes", "do the thing")
+            .await
+            .expect("orders");
         let t2 = nodes::create_entity(&edb, "task", "two", None, None).await.expect("t2");
+        texts::set_role_text(&edb, &t2, "describes", "do the thing")
+            .await
+            .expect("orders");
         edges::link(&edb, &product, &t1, "contains").await.expect("c1");
         edges::link(&edb, &product, &t2, "contains").await.expect("c2");
         edges::link(&edb, &t2, &t1, "depends_on").await.expect("d");
