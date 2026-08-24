@@ -15,9 +15,14 @@ content: string | null,
  */
 attributes_json: string | null, 
 /**
- * valid_from of the current state row — the version stamp.
+ * valid_from of the current state row — the version stamp. Send
+ * it back as `based_on` to make a write compare-and-append (§6).
  */
-version: string, annotations: Array<AnnotationView>, 
+version: string, 
+/**
+ * Hidden from the lists, still on the record (§14).
+ */
+archived: boolean, annotations: Array<AnnotationView>, 
 /**
  * Active NON-TEXT edges, both directions (text-role edges show
  * as annotations instead).

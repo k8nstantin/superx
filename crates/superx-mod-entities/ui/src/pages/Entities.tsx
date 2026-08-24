@@ -27,6 +27,7 @@ import {
   downloadUrl,
   describeEntity,
   fetchDetail,
+  setArchived,
   fetchEntities,
   fetchHistory,
   fetchRelTypes,
@@ -339,7 +340,15 @@ function DetailView({
   onOpen: (frag: string) => void
 }) {
   const qc = useQueryClient()
-  const detail = useQuery({ queryKey: ['entity', frag], queryFn: () => fetchDetail(frag) })
+  // §14: ONE instant reaching every chain — state, notes, attachments
+  // and edges resolved at the same moment. A picker per field answers
+  // "how did this text change"; this answers "what did the agent see
+  // when it did that", which is the question after a bad run.
+  const [asOf, setAsOf] = useState<string | null>(null)
+  const detail = useQuery({
+    queryKey: ['entity', frag, asOf],
+    queryFn: () => fetchDetail(frag, asOf ?? undefined),
+  })
   const [historyOpen, setHistoryOpen] = useState(false)
   const [editOpen, setEditOpen] = useState(false)
   const [linkOpen, setLinkOpen] = useState(false)
@@ -404,9 +413,47 @@ function DetailView({
           </Text>
         </Group>
         <Group gap="xs">
-          <Button size="compact-sm" onClick={() => setEditOpen(true)}>
+          {/* One control for the whole entity, not one per field: each
+              chain moves independently, so field-by-field pickers can
+              never show a moment that actually happened. */}
+          <TextInput
+            size="xs"
+            w={230}
+            placeholder="as of… 2026-08-24T17:00:00Z"
+            value={asOf ?? ''}
+            onChange={(e) => setAsOf(e.currentTarget.value || null)}
+          />
+          {asOf && (
+            <Button size="compact-sm" variant="subtle" onClick={() => setAsOf(null)}>
+              now
+            </Button>
+          )}
+          <Button size="compact-sm" onClick={() => setEditOpen(true)} disabled={!!asOf}>
             Edit
           </Button>
+          {d?.archived ? (
+            <Button
+              size="compact-sm"
+              variant="default"
+              onClick={() => {
+                void setArchived(frag, false).then(refresh)
+              }}
+            >
+              Restore
+            </Button>
+          ) : (
+            <Tooltip label="Hide it from the lists. Nothing is erased — its history, notes and edges all stay.">
+              <Button
+                size="compact-sm"
+                variant="default"
+                onClick={() => {
+                  void setArchived(frag, true).then(refresh)
+                }}
+              >
+                Archive
+              </Button>
+            </Tooltip>
+          )}
           <Button size="compact-sm" variant="default" onClick={() => setLinkOpen(true)}>
             + Link
           </Button>

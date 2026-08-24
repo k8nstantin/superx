@@ -64,6 +64,8 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/entities/{frag}/history", get(api_history))
         .route("/api/entities/{frag}/fields", get(api_fields).post(api_set_field))
         .route("/api/entities/{frag}/update", post(api_update))
+        .route("/api/entities/{frag}/archive", post(api_archive))
+        .route("/api/labels/{key}/archive", post(api_label_archive))
         .route("/api/entities/{frag}/describe", post(api_describe))
         .route("/api/entities/{frag}/comment", post(api_comment))
         .route("/api/entities/{frag}/link", post(api_link))
@@ -406,6 +408,44 @@ struct DetailQuery {
     /// which is what answers "what did the agent see when it did that".
     /// Absent is now.
     as_of: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ArchiveReq {
+    /// `true` archives, `false` restores. Explicit rather than a
+    /// toggle: a toggle sent twice by a retried request undoes itself,
+    /// and the caller always knows which it meant.
+    archived: bool,
+}
+
+async fn api_archive(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+    Json(req): Json<ArchiveReq>,
+) -> Resp<bool> {
+    let db = module_db!(state);
+    match api::set_archived(&db, &frag, req.archived).await {
+        Ok(changed) => Resp::ok(changed),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LabelArchiveReq {
+    kind: String,
+    archived: bool,
+}
+
+async fn api_label_archive(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+    Json(req): Json<LabelArchiveReq>,
+) -> Resp<bool> {
+    let db = module_db!(state);
+    match api::set_label_archived(&db, &key, &req.kind, req.archived).await {
+        Ok(()) => Resp::ok(true),
+        Err(e) => Resp::err(e.to_string()),
+    }
 }
 
 async fn api_detail(

@@ -99,8 +99,11 @@ pub struct EntityDetail {
     pub content: Option<String>,
     /// Pretty-printed attributes JSON, absent when empty.
     pub attributes_json: Option<String>,
-    /// valid_from of the current state row — the version stamp.
+    /// valid_from of the current state row — the version stamp. Send
+    /// it back as `based_on` to make a write compare-and-append (§6).
     pub version: String,
+    /// Hidden from the lists, still on the record (§14).
+    pub archived: bool,
     pub annotations: Vec<AnnotationView>,
     /// Active NON-TEXT edges, both directions (text-role edges show
     /// as annotations instead).
@@ -527,6 +530,33 @@ pub async fn write_content_note(
 /// # Errors
 ///
 /// Verb errors pass through.
+/// Archive or restore an entity (§14). Returns whether anything
+/// changed — archiving what is already archived is a no-op, not an
+/// error.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn set_archived(db: &Db, fragment: &str, archived: bool) -> Result<bool> {
+    let id = nodes::resolve_entity(db, fragment).await?;
+    nodes::set_archived(db, &id, archived).await
+}
+
+/// Archive or restore a label (§14): a term superseded by a better one
+/// stops being offered without the dictionary losing what it meant.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn set_label_archived(
+    db: &Db,
+    key: &str,
+    kind: &str,
+    archived: bool,
+) -> Result<()> {
+    dictionary::archive(db, key, kind, archived).await
+}
+
 pub async fn labels(db: &Db, include_archived: bool) -> Result<Vec<LabelView>> {
     Ok(dictionary::list(db, include_archived)
         .await?
@@ -831,6 +861,7 @@ pub async fn detail_at(
         name: state.name,
         content: state.content,
         attributes_json: attrs_to_json(&state.attributes),
+        archived: state.archived,
         version: state.valid_from,
         annotations,
         edges,

@@ -11,6 +11,7 @@ import {
   MultiSelect,
   ScrollArea,
   Select,
+  Switch,
   Table,
   Text,
   TextInput,
@@ -75,7 +76,14 @@ export default function DictionaryPage() {
   useBreadcrumb([{ label: 'Dictionary' }])
   const qc = useQueryClient()
   const vocab = useQuery({ queryKey: ['vocabulary'], queryFn: fetchVocabulary })
-  const labels = useQuery({ queryKey: ['labels'], queryFn: () => fetchLabels(false) })
+  // §14: "the dictionary's type and label lists gain a show-archived
+  // toggle that is OFF by default" — a term superseded by a better one
+  // stops being offered without the dictionary losing what it meant.
+  const [showArchived, setShowArchived] = useState(false)
+  const labels = useQuery({
+    queryKey: ['labels', showArchived],
+    queryFn: () => fetchLabels(showArchived),
+  })
   const types = useQuery({ queryKey: ['types'], queryFn: fetchTypes })
   const [forType, setForType] = useState<string | null>(null)
   // A label is argued about too — §3 gives it a thread of its own.
@@ -158,7 +166,13 @@ export default function DictionaryPage() {
       </Grid.Col>
 
       <Grid.Col span={12}>
-        <LabelTable labels={labels.data ?? []} onPick={setForLabel} picked={forLabel} />
+        <LabelTable
+          labels={labels.data ?? []}
+          onPick={setForLabel}
+          picked={forLabel}
+          showArchived={showArchived}
+          onShowArchived={setShowArchived}
+        />
       </Grid.Col>
     </Grid>
   )
@@ -527,17 +541,27 @@ function SlotEditor({
 function LabelTable({
   labels,
   onPick,
+  showArchived,
+  onShowArchived,
   picked,
 }: {
   labels: LabelView[]
   onPick: (key: string) => void
+  showArchived: boolean
+  onShowArchived: (v: boolean) => void
   picked: string | null
 }) {
   return (
     <Card withBorder padding="md">
-      <Title order={4} mb="xs">
-        The dictionary
-      </Title>
+      <Group justify="space-between" mb="xs">
+        <Title order={4}>The dictionary</Title>
+        <Switch
+          size="xs"
+          label="Show archived"
+          checked={showArchived}
+          onChange={(e) => onShowArchived(e.currentTarget.checked)}
+        />
+      </Group>
       <ScrollArea.Autosize mah={460}>
         <Table striped withTableBorder>
           <Table.Thead>
@@ -547,6 +571,7 @@ function LabelTable({
               <Table.Th>Treated as</Table.Th>
               <Table.Th>Storage / endpoints</Table.Th>
               <Table.Th>Means</Table.Th>
+              <Table.Th w={90} />
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
@@ -554,13 +579,20 @@ function LabelTable({
               <Table.Tr
                 key={`${l.label_kind}:${l.key}`}
                 onClick={() => onPick(l.key)}
-                style={{ cursor: 'pointer' }}
+                style={{ cursor: 'pointer', opacity: l.archived ? 0.55 : 1 }}
                 bg={picked === l.key ? 'rgba(122, 74, 143, 0.18)' : undefined}
               >
                 <Table.Td>
-                  <Text ff="monospace" size="sm">
-                    {l.key}
-                  </Text>
+                  <Group gap={6}>
+                    <Text ff="monospace" size="sm">
+                      {l.key}
+                    </Text>
+                    {l.archived && (
+                      <Badge size="xs" variant="light" color="gray">
+                        archived
+                      </Badge>
+                    )}
+                  </Group>
                 </Table.Td>
                 <Table.Td>
                   <Badge size="xs" variant="light">
