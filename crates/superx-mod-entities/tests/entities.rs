@@ -1100,3 +1100,74 @@ async fn archiving_a_link_label_does_not_erase_its_edges_from_the_graph() {
     assert_eq!(walk.nodes.len(), 2, "the hierarchy survives archiving the label");
     assert_eq!(walk.edges.len(), 1);
 }
+
+/// THE UPGRADE PATH, not the fresh-install path (#304).
+///
+/// Every test above applies the schema to an empty database, which is
+/// the one case that cannot fail. The operator's instance is not empty:
+/// it holds entity_state and edge rows written before these columns
+/// existed, and provisioning re-applies this file verbatim over them.
+///
+/// So this writes rows under the OLD shape, applies the NEW schema on
+/// top, and checks the old rows still read. #158 was exactly this
+/// failure — a schema that was correct for a fresh install and wrong
+/// for an instance that had been running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_new_columns_do_not_invalidate_rows_written_before_them() {
+    use superx_mod_entities::{edges, nodes};
+
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("entities").await.expect("nsdb");
+
+    // The schema WITHOUT the new columns: the shape the operator's
+    // instance is running right now.
+    let old = SCHEMA_DDL
+        .replace("$SUPERX_MODULE_PASSWORD", "test-password")
+        .lines()
+        .filter(|l| {
+            !(l.contains("ON TABLE entity_state") || l.contains("ON TABLE edge"))
+                || !(l.contains("author_kind")
+                    || l.contains("author_uid")
+                    || l.contains("via_uid")
+                    || l.contains("archived"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // A filter that quietly matched nothing would leave this test
+    // applying the NEW schema twice and proving nothing at all.
+    let removed = SCHEMA_DDL.lines().count() - old.lines().count();
+    assert_eq!(removed, 7, "4 on entity_state + 3 on edge were actually taken out");
+    assert!(
+        !old.contains("archived   ON TABLE entity_state"),
+        "the old shape really is missing them"
+    );
+    assert!(!old.contains("author_kind ON TABLE edge"));
+
+    db.query(old).await.expect("old ddl").check().expect("the shape that exists today");
+
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed(&db).await.expect("labels");
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    let task = nodes::create_entity(&db, "task", "Build it", None, None).await.expect("t");
+    edges::link(&db, &product, &task, "contains").await.expect("edge");
+
+    // Now provisioning runs again with the new file, verbatim.
+    let new = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "test-password");
+    db.query(new).await.expect("new ddl").check().expect("applies over a populated database");
+
+    // The rows written before the columns existed still read.
+    let state = nodes::current_state(&db, &product).await.expect("read").expect("still there");
+    assert_eq!(state.name, "Widget");
+    let out = edges::expand(&db, std::slice::from_ref(&product), false).await.expect("expand");
+    assert_eq!(out.len(), 1, "the edge survives the upgrade");
+    assert!(out[0].active);
+
+    // And writing after the upgrade still works — the new columns are
+    // optional, so a writer that says nothing about authorship is not
+    // refused. Whether it SHOULD say something is a code question for
+    // the PR that follows this one; the schema does not force a flag day.
+    let another = nodes::create_entity(&db, "task", "Ship it", None, None).await.expect("t2");
+    edges::link(&db, &product, &another, "contains").await.expect("write after upgrade");
+    let out = edges::expand(&db, std::slice::from_ref(&product), false).await.expect("expand2");
+    assert_eq!(out.len(), 2);
+}
