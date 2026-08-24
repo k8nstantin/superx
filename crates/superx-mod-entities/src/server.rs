@@ -250,7 +250,18 @@ async fn api_comment(
     Json(req): Json<api::TextReq>,
 ) -> Resp<serde_json::Value> {
     let db = module_db!(state);
-    match api::comment(&db, &frag, &req.text).await {
+    let author = match req.author_kind.as_deref() {
+        Some(kind) => match crate::notes::Author::claimed(
+            kind,
+            req.author_uid.as_deref(),
+            req.via_uid.as_deref(),
+        ) {
+            Ok(a) => a,
+            Err(e) => return Resp::err(e.to_string()),
+        },
+        None => crate::notes::Author::operator(),
+    };
+    match api::comment(&db, &frag, &req.text, &author).await {
         Ok(id) => {
             emit(&state.kernel, "entity_commented", frag).await;
             Resp::ok(serde_json::json!({ "text_id": id }))

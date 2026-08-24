@@ -2,6 +2,11 @@
 
 export type TextReq = { 
 /**
+ * Who is writing. Absent means the operator, which is what a person
+ * typing into the page is.
+ */
+author_kind: string | null, author_uid: string | null, via_uid: string | null, 
+/**
  * Markdown from the standard editor.
  */
 text: string, };

@@ -40,11 +40,37 @@ pub struct Author {
     pub via: Option<String>,
 }
 
+/// Who a write may claim to be. Closed, because a column that says
+/// something nothing recognises is a column nothing can act on — and
+/// this one is the subject of authorization, not decoration.
+pub const AUTHOR_KINDS: [&str; 4] = ["operator", "role", "agent", "system"];
+
 impl Author {
     /// The operator, at the console. What a CLI write is.
     #[must_use]
     pub fn operator() -> Self {
         Self { kind: "operator".to_string(), uid: None, via: None }
+    }
+
+    /// An author claimed by a caller.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::Module`] for a kind outside the closed set. A write
+    /// recorded as something nobody can interpret is worse than one
+    /// recorded as unknown.
+    pub fn claimed(kind: &str, uid: Option<&str>, via: Option<&str>) -> Result<Self> {
+        if !AUTHOR_KINDS.contains(&kind) {
+            return Err(KernelError::Module(format!(
+                "author kind '{kind}' is not one of: {}",
+                AUTHOR_KINDS.join(", ")
+            )));
+        }
+        Ok(Self {
+            kind: kind.to_string(),
+            uid: uid.map(str::to_string),
+            via: via.map(str::to_string),
+        })
     }
 }
 

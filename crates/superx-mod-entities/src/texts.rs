@@ -89,9 +89,13 @@ pub async fn set_role_text(
 /// # Errors
 ///
 /// Verb errors pass through.
-pub async fn add_comment(db: &Db, target: &RecordId, text: &str) -> Result<RecordId> {
-    let (note_uid, _) =
-        notes::write(db, target, label_for_role("comments")?, text, &Author::operator()).await?;
+pub async fn add_comment(
+    db: &Db,
+    target: &RecordId,
+    text: &str,
+    author: &Author,
+) -> Result<RecordId> {
+    let (note_uid, _) = notes::write(db, target, label_for_role("comments")?, text, author).await?;
     let node = create_entity(
         db,
         "text",

@@ -4,6 +4,7 @@
 
 use superx_kernel::types::Value;
 use superx_kernel::KernelModule as _;
+use superx_mod_entities::notes::Author;
 use superx_mod_entities::{dictionary, registry, EntitiesModule, MODULE_NAME, SCHEMA_DDL};
 
 async fn fresh_db() -> superx_kernel::Db {
@@ -100,7 +101,7 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
     assert_eq!(api::detail(&db, &product).await.expect("detail2").name, "Widget X2");
 
     // Comment lands as an annotation.
-    api::comment(&db, &product, "Priority: high").await.expect("comment");
+    api::comment(&db, &product, "Priority: high", &Author::operator()).await.expect("comment");
     let d = api::detail(&db, &product).await.expect("detail3");
     assert!(d.annotations.iter().any(|a| a.label == "comments"));
 
@@ -237,7 +238,7 @@ async fn ui_graph_leaves_descriptions_and_comments_out_of_it() {
     )
     .await
     .expect("create");
-    api::comment(&db, &product, "ship it by friday").await.expect("comment");
+    api::comment(&db, &product, "ship it by friday", &Author::operator()).await.expect("comment");
     let task = api::create(
         &db,
         &api::CreateReq {
@@ -739,12 +740,14 @@ async fn describe_evolves_comment_multiplies() {
     assert_eq!(history.len(), 2, "description evolution is the text node's history");
     assert_eq!(history[1].content.as_deref(), Some("Better description."));
 
-    let c1 = texts::add_comment(&db, &product, "looks good").await.expect("c1");
-    let c2 = texts::add_comment(&db, &product, "ship it").await.expect("c2");
+    let c1 = texts::add_comment(&db, &product, "looks good", &Author::operator()).await.expect("c1");
+    let c2 = texts::add_comment(&db, &product, "ship it", &Author::operator()).await.expect("c2");
     assert_ne!(superx_ops::record_uuid(&c1), superx_ops::record_uuid(&c2));
 
     // Thread: comment on a comment.
-    texts::add_comment(&db, &c1, "replying to the first comment").await.expect("thread");
+    texts::add_comment(&db, &c1, "replying to the first comment", &Author::operator())
+        .await
+        .expect("thread");
 
     let notes = texts::annotations(&db, &product).await.expect("notes");
     assert_eq!(notes.len(), 3, "one describes + two comments on the product");

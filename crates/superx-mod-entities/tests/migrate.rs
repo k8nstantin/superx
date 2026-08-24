@@ -7,6 +7,7 @@
 
 use superx_mod_entities::dictionary::{self, Definition};
 use superx_mod_entities::nodes::{create_entity, list_entities, state_history};
+use superx_mod_entities::notes::Author;
 use superx_mod_entities::{edges, migrate, notes, registry, texts, SCHEMA_DDL};
 
 async fn fresh_db() -> superx_kernel::Db {
@@ -283,7 +284,7 @@ async fn comments_stay_separate_and_do_not_collapse_into_one_chain() {
     legacy_carrier(&db, &product, "comments", &["first remark"]).await;
     legacy_carrier(&db, &product, "comments", &["second remark"]).await;
     legacy_carrier(&db, &product, "comments", &["third remark"]).await;
-    texts::add_comment(&db, &product, "a recent remark").await.expect("comment");
+    texts::add_comment(&db, &product, "a recent remark", &Author::operator()).await.expect("comment");
 
     migrate::prose(&db, false).await.expect("migrate");
 

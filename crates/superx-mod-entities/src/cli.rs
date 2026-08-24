@@ -26,7 +26,8 @@ const USAGE: &str = "usage: superx entities <command>\n\
   unlink <from-fragment> <to-fragment> --rel <relation-type>\n\
   describe <uuid-fragment> <text…>     set/evolve the describing text node\n\
   instruct <uuid-fragment> <text…>     set/evolve the instructing text node\n\
-  comment <uuid-fragment> <text…>      add a comment text node (threads: comment a comment)\n\
+  comment <uuid-fragment> [--author-kind operator|role|agent|system]\n\
+          [--author-uid <id>] [--via <role>] <text…>\n\
   attach <uuid-fragment> <file-path>   copy a file in; document node + attached edge\n\
   tree <uuid-fragment> [--depth <n>] [--reverse]\n\
   graph <uuid-fragment> [--json] [--depth <n>]   export the reachable subgraph\n\
@@ -624,12 +625,18 @@ async fn role_text_cmd(kernel: &Kernel, args: &[String], role: &str) -> Result<S
 async fn comment_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
     let fragment = args.first().ok_or_else(usage)?;
-    let text = args[1..].join(" ");
+    // Flags come FIRST and the prose is everything after them, which is
+    // this CLI's existing shape (`create --type <t> … <name…>`).
+    //
+    // Scanning the whole line for flags instead would eat a comment that
+    // happens to say "route --via the proxy" — the token AND the word
+    // after it — and the author would never know two words went missing.
+    let (author, text) = leading_author(&args[1..])?;
     if text.is_empty() {
         return Err(usage());
     }
     let target = nodes::resolve_entity(&db, fragment).await?;
-    let node = texts::add_comment(&db, &target, &text).await?;
+    let node = texts::add_comment(&db, &target, &text, &author).await?;
     let node_uuid = record_uuid(&node);
     emit(kernel, "entity_created", &node_uuid, "text", "comment").await;
     emit_link(kernel, &record_uuid(&target), &node_uuid, "comments", "entities_linked").await;
@@ -837,6 +844,44 @@ fn next_value(args: &[String], i: usize) -> Result<String> {
 
 fn usage() -> KernelError {
     KernelError::Module(USAGE.to_string())
+}
+
+/// Read the author flags off the FRONT of a comment, and return them
+/// with the prose that follows.
+///
+/// Stops at the first argument that is not one of these flags, so
+/// everything from there on is the comment verbatim — including a word
+/// that happens to look like a flag.
+fn leading_author(args: &[String]) -> Result<(notes::Author, String)> {
+    let mut kind: Option<&str> = None;
+    let mut uid: Option<&str> = None;
+    let mut via: Option<&str> = None;
+    let mut at = 0;
+
+    while at < args.len() {
+        let slot = match args[at].as_str() {
+            "--author-kind" => &mut kind,
+            "--author-uid" => &mut uid,
+            "--via" => &mut via,
+            _ => break,
+        };
+        let value = args.get(at + 1).ok_or_else(usage)?;
+        *slot = Some(value.as_str());
+        at += 2;
+    }
+
+    let author = match kind {
+        Some(k) => notes::Author::claimed(k, uid, via)?,
+        // Absent means the operator, which is what a person typing this
+        // is. Naming a uid without a kind is a mistake, not a default.
+        None if uid.is_some() || via.is_some() => {
+            return Err(KernelError::Module(
+                "--author-uid and --via need --author-kind to say what is writing".to_string(),
+            ))
+        }
+        None => notes::Author::operator(),
+    };
+    Ok((author, args[at..].join(" ")))
 }
 
 /// The value after a `--flag`, if it is present and followed by one.
