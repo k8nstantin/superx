@@ -315,6 +315,10 @@ fn task_dependencies(graph: &Graph) -> TaskDeps<'_> {
 /// from, and never context for a prompt.
 pub const PROSE_ROLES: [&str; 3] = ["describes", "comments", "instructs"]; // skill-allow: §9-const — the entities module's own edge names, not a tunable
 
+/// The legacy carrier type. Its rows are prose, never something a task
+/// works with, whichever edge happens to reach them.
+pub const CARRIER_TYPE: &str = "text"; // skill-allow: §9-const — the entities module's own type name, not a tunable
+
 /// Assemble the agent prompt (epic S3, exact section order) and pin
 /// the dispatched instructs version (D27).
 #[must_use]
@@ -350,11 +354,18 @@ pub fn build_prompt(graph: &Graph, task_uid: &str) -> (String, Option<String>) {
         instruct_version = orders.version.clone();
     }
 
-    if let Some(about) = node_by_uid
-        .get(graph.root.as_str())
-        .and_then(|root| root.note("description"))
-    {
-        out.push_str(&format!("\nAbout the product:\n{}\n", about.body));
+    // A task scheduled on its own IS the root of its own graph, and its
+    // description is already the orders above. Printing it again under
+    // "About the product" told the agent the same thing twice and called
+    // the second one context — which the old code avoided only because
+    // the two sections came from two different text nodes.
+    if graph.root != task_uid {
+        if let Some(about) = node_by_uid
+            .get(graph.root.as_str())
+            .and_then(|root| root.note("description"))
+        {
+            out.push_str(&format!("\nAbout the product:\n{}\n", about.body));
+        }
     }
 
     let mut context = String::new();
@@ -362,6 +373,13 @@ pub fn build_prompt(graph: &Graph, task_uid: &str) -> (String, Option<String>) {
         e.from == task_uid && !crate::exec::PROSE_ROLES.contains(&e.rel.as_str())
     }) {
         if let Some(node) = node_by_uid.get(edge.to.as_str()) {
+            // A text carrier is words, not a thing to work with. Filtering
+            // by ROLE alone let a previous run's output back in through
+            // `produced` — the graph pollution this whole change exists to
+            // end, arriving as "linked context".
+            if node.kind == CARRIER_TYPE {
+                continue;
+            }
             context.push_str(&format!(
                 "- [{}] {} ({}){}\n",
                 edge.rel,

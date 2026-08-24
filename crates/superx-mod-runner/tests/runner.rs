@@ -209,6 +209,122 @@ async fn non_tasks_never_execute_and_external_deps_warn() {
 // The firing engine against REAL entity graphs and stub executor
 // scripts (spec #193/#194 acceptance floors).
 
+mod prompt {
+    use superx_mod_runner::exec::build_prompt;
+    use superx_mod_runner::plan::Graph;
+
+    fn graph(json: serde_json::Value) -> Graph {
+        serde_json::from_value(json).expect("the export contract parses")
+    }
+
+    fn note(uid: &str, label: &str, body: &str, version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "uid": uid, "label": label, "body": body, "parent_uid": null,
+            "author_kind": "operator", "via_uid": null, "version": version
+        })
+    }
+
+    /// A task scheduled on its own IS the root of its own graph. Its
+    /// description is the orders; printing it again as "About the
+    /// product" tells the agent the same thing twice and calls the
+    /// second one context.
+    #[test]
+    fn a_task_that_is_its_own_root_is_not_told_its_orders_twice() {
+        let g = graph(serde_json::json!({
+            "root": "task-1", "truncated_at_depth": false, "edges": [],
+            "nodes": [{
+                "uid": "task-1", "type": "task", "name": "Build it",
+                "content": null, "attributes": null, "version": "", "depth": 0,
+                "notes": [note("n1", "description", "DO THE THING", "v1")]
+            }],
+        }));
+        let (prompt, version) = build_prompt(&g, "task-1");
+        assert_eq!(prompt.matches("DO THE THING").count(), 1, "{prompt}");
+        assert_eq!(version.as_deref(), Some("v1"), "and the run still pins what it read");
+        assert!(!prompt.contains("About the product"), "{prompt}");
+    }
+
+    /// Under a product, the product's description IS context and belongs
+    /// in the prompt — the deduplication must not cost that.
+    #[test]
+    fn a_task_under_a_product_still_gets_the_product_description() {
+        let g = graph(serde_json::json!({
+            "root": "prod-1", "truncated_at_depth": false,
+            "edges": [{ "edge_uid": "e1", "from": "prod-1", "to": "task-1", "rel": "contains" }],
+            "nodes": [
+                { "uid": "prod-1", "type": "product", "name": "P", "content": null,
+                  "attributes": null, "version": "", "depth": 0,
+                  "notes": [note("n0", "description", "THE PRODUCT", "v0")] },
+                { "uid": "task-1", "type": "task", "name": "Build it", "content": null,
+                  "attributes": null, "version": "", "depth": 1,
+                  "notes": [note("n1", "description", "DO THE THING", "v1")] },
+            ],
+        }));
+        let (prompt, _) = build_prompt(&g, "task-1");
+        assert!(prompt.contains("Instructions:\nDO THE THING"), "{prompt}");
+        assert!(prompt.contains("About the product:\nTHE PRODUCT"), "{prompt}");
+    }
+
+    /// An explicit `instructions` note wins over the description, because
+    /// prose migrated from a legacy `instructs` edge landed there and
+    /// saying it explicitly should still count.
+    #[test]
+    fn explicit_instructions_win_over_the_description() {
+        let g = graph(serde_json::json!({
+            "root": "prod-1", "truncated_at_depth": false, "edges": [],
+            "nodes": [{
+                "uid": "task-1", "type": "task", "name": "Build it", "content": null,
+                "attributes": null, "version": "", "depth": 1,
+                "notes": [
+                    note("n1", "description", "WHAT IT IS", "v1"),
+                    note("n2", "instructions", "WHAT TO DO", "v2"),
+                ]
+            }],
+        }));
+        let (prompt, version) = build_prompt(&g, "task-1");
+        assert!(prompt.contains("Instructions:\nWHAT TO DO"), "{prompt}");
+        assert!(!prompt.contains("WHAT IT IS"), "{prompt}");
+        assert_eq!(version.as_deref(), Some("v2"), "the pin follows what was actually sent");
+    }
+
+    /// A previous run's output used to arrive as "linked context" through
+    /// a `produced` edge — the graph pollution this change exists to end,
+    /// coming back in by a different door.
+    #[test]
+    fn a_text_carrier_never_becomes_linked_context() {
+        let g = graph(serde_json::json!({
+            "root": "prod-1", "truncated_at_depth": false,
+            "edges": [
+                { "edge_uid": "e1", "from": "task-1", "to": "old-output", "rel": "produced" },
+                { "edge_uid": "e2", "from": "task-1", "to": "repo-1", "rel": "consults" },
+            ],
+            "nodes": [
+                { "uid": "task-1", "type": "task", "name": "Build it", "content": null,
+                  "attributes": null, "version": "", "depth": 1,
+                  "notes": [note("n1", "description", "DO IT", "v1")] },
+                { "uid": "old-output", "type": "text", "name": "result",
+                  "content": "LAST RUN SAID THIS", "attributes": null,
+                  "version": "", "depth": 2, "notes": [] },
+                { "uid": "repo-1", "type": "repo", "name": "superx", "content": null,
+                  "attributes": null, "version": "", "depth": 2, "notes": [] },
+            ],
+        }));
+        let (prompt, _) = build_prompt(&g, "task-1");
+        assert!(
+            !prompt.contains("[produced]"),
+            "a carrier is words, not context: {prompt}"
+        );
+        assert!(
+            !prompt.contains("LAST RUN SAID THIS"),
+            "and its words do not leak in either: {prompt}"
+        );
+        assert!(
+            prompt.contains("- [consults] superx (repo)"),
+            "a real linked entity still is: {prompt}"
+        );
+    }
+}
+
 mod firing {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
