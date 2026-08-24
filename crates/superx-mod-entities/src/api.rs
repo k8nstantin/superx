@@ -17,7 +17,10 @@ use superx_kernel::{Db, KernelError, Result};
 use superx_ops::record_uuid;
 use ts_rs::TS;
 
-use crate::{dictionary, documents, edges, fields, graph, nodes, notes, registry, texts};
+use crate::{
+    attachments, dictionary, documents, edges, fields, graph, nodes, notes, registry, target,
+    texts,
+};
 
 /// Depth ceiling for the breadcrumb walk (#253): deep enough for any
 /// real product hierarchy, shallow enough that a pathological graph
@@ -408,6 +411,99 @@ pub async fn set_field(db: &Db, fragment: &str, key: &str, value: &str) -> Resul
 pub struct FieldReq {
     pub key: String,
     pub value: String,
+}
+
+/// A file attached to something, as the page shows it.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct AttachedView {
+    pub uid: String,
+    /// What the file MEANS — a PDF labelled `mandate` IS the mandate.
+    pub label: String,
+    pub filename: String,
+    pub mime: String,
+    pub size: i64,
+    pub active: bool,
+    pub author_kind: Option<String>,
+    pub valid_from: Option<String>,
+}
+
+/// Everything that belongs to one target — an entity, a type or a label.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ContentView {
+    pub target_kind: String,
+    pub target_uid: String,
+    pub notes: Vec<AnnotationView>,
+    pub files: Vec<AttachedView>,
+}
+
+/// Prose written on a target.
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ContentNoteReq {
+    pub label: String,
+    pub body: String,
+}
+
+/// The content of an entity, a type or a label (#296).
+///
+/// A type is exactly the thing people argue about, and this is where the
+/// argument lives.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn content(db: &Db, kind: &str, uid: &str) -> Result<ContentView> {
+    let target = target::Target::resolve(db, kind, uid).await?;
+    Ok(ContentView {
+        notes: notes::for_target(db, &target, false)
+            .await?
+            .into_iter()
+            .map(|n| AnnotationView {
+                label: n.label,
+                note_uid: n.uid,
+                content: n.body,
+                parent_uid: n.parent_uid,
+                author_kind: n.author_kind,
+                via_uid: n.via_uid,
+            })
+            .collect(),
+        files: attachments::for_target(db, &target, false)
+            .await?
+            .into_iter()
+            .map(|a| AttachedView {
+                uid: a.uid,
+                label: a.label,
+                filename: a.filename,
+                mime: a.mime,
+                size: a.size,
+                active: a.active,
+                author_kind: a.author_kind,
+                valid_from: a.valid_from.map(|t| t.to_rfc3339()),
+            })
+            .collect(),
+        target_kind: target.kind().to_string(),
+        target_uid: target.uid(),
+    })
+}
+
+/// Write prose on any target.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn write_content_note(
+    db: &Db,
+    kind: &str,
+    uid: &str,
+    req: &ContentNoteReq,
+) -> Result<String> {
+    let target = target::Target::resolve(db, kind, uid).await?;
+    let (note_uid, _) =
+        notes::write_to_target(db, &target, &req.label, &req.body, &notes::Author::operator())
+            .await?;
+    Ok(note_uid)
 }
 
 /// The whole dictionary, for the design surface.

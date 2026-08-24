@@ -84,8 +84,12 @@ impl Author {
 pub struct Note {
     /// Stable across versions — the chain key.
     pub uid: String,
-    /// What the note is attached to.
+    /// The typed link, where the target is an entity.
     pub entity: Option<RecordId>,
+    /// `entity` | `type` | `label`. A note on a type has no entity link,
+    /// so this is the only thing that says where it belongs.
+    pub target_kind: Option<String>,
+    pub target_uid: Option<String>,
     pub label: String,
     pub body: String,
     pub parent_uid: Option<String>,
@@ -131,7 +135,7 @@ pub async fn write(
             append(
                 db,
                 Version {
-                    entity,
+                    target: &crate::target::Target::Entity(entity.clone()),
                     uid: &existing.uid,
                     label,
                     body,
@@ -148,7 +152,15 @@ pub async fn write(
     let uid = uuid::Uuid::now_v7().to_string();
     append(
         db,
-        Version { entity, uid: &uid, label, body, parent_uid: None, active: true, author },
+        Version {
+            target: &crate::target::Target::Entity(entity.clone()),
+            uid: &uid,
+            label,
+            body,
+            parent_uid: None,
+            active: true,
+            author,
+        },
     )
     .await?;
     Ok((uid, true))
@@ -178,7 +190,7 @@ pub async fn reply(db: &Db, parent_uid: &str, body: &str, author: &Author) -> Re
     let parent = current(db, parent_uid)
         .await?
         .ok_or_else(|| KernelError::Module(format!("no note '{parent_uid}' to reply to")))?;
-    let entity = attached_to(&parent)?;
+    let target = attached_to(db, &parent).await?;
 
     let singular = dictionary::current(db, &parent.label, SLOT)
         .await?
@@ -191,7 +203,7 @@ pub async fn reply(db: &Db, parent_uid: &str, body: &str, author: &Author) -> Re
     append(
         db,
         Version {
-            entity: &entity,
+            target: &target,
             uid: &uid,
             label,
             body,
@@ -220,11 +232,11 @@ pub async fn retract(db: &Db, uid: &str, author: &Author) -> Result<()> {
     let Some(note) = current(db, uid).await? else {
         return Err(KernelError::Module(format!("no note '{uid}'")));
     };
-    let entity = attached_to(&note)?;
+    let target = attached_to(db, &note).await?;
     append(
         db,
         Version {
-            entity: &entity,
+            target: &target,
             uid,
             label: &note.label,
             body: &note.body,
@@ -236,12 +248,24 @@ pub async fn retract(db: &Db, uid: &str, author: &Author) -> Result<()> {
     .await
 }
 
-/// What a note hangs off. The column is `record<entity>` and required,
-/// so an absence here means the row was written outside these verbs.
-fn attached_to(note: &Note) -> Result<RecordId> {
-    note.entity.clone().ok_or_else(|| {
-        KernelError::Module(format!("note '{}' is attached to nothing", note.uid))
-    })
+/// What a note hangs off — an entity, a type or a label.
+///
+/// This used to return the typed `record<entity>` link alone, so a note
+/// on a TYPE could be neither retracted nor replied to: both said
+/// "attached to nothing" about something plainly attached to a type. A
+/// thread you cannot answer is not a thread, which is the one thing §3
+/// says a type needs.
+async fn attached_to(db: &Db, note: &Note) -> Result<crate::target::Target> {
+    if let (Some(kind), Some(uid)) = (note.target_kind.as_deref(), note.target_uid.as_deref()) {
+        return crate::target::Target::resolve(db, kind, uid).await;
+    }
+    // Rows written before the polymorphic columns carry only the link.
+    note.entity
+        .clone()
+        .map(crate::target::Target::Entity)
+        .ok_or_else(|| {
+            KernelError::Module(format!("note '{}' is attached to nothing", note.uid))
+        })
 }
 
 /// Every current note on an entity, oldest first. Retracted notes are
@@ -272,6 +296,102 @@ pub async fn for_entity(db: &Db, entity: &RecordId, include_retracted: bool) -> 
         .into_values()
         .filter(|n| include_retracted || n.active)
         .collect())
+}
+
+/// Every current note on any target — an entity, a type or a label
+/// (#296). A type is exactly the thing people argue about, and this is
+/// where the argument lives.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn for_target(
+    db: &Db,
+    target: &crate::target::Target,
+    include_retracted: bool,
+) -> Result<Vec<Note>> {
+    // An entity's notes may predate the polymorphic columns, so they are
+    // still found by the typed link; a type's or a label's can only be
+    // found by the pair.
+    if let Some(entity) = target.entity() {
+        return for_entity(db, &entity, include_retracted).await;
+    }
+    let mut resp = db
+        .query(
+            "SELECT * FROM note WHERE target_uid = $uid AND target_kind = $kind \
+             ORDER BY valid_from ASC, id ASC",
+        )
+        .bind(("uid", target.uid()))
+        .bind(("kind", target.kind().to_string()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    Ok(heads_of(&rows, include_retracted))
+}
+
+/// Attach prose to a type or a label.
+///
+/// Entities go through [`write`], which also keeps the typed link. This
+/// is the same act for the two things that are not nodes.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] for an undefined label; [`KernelError::Db`]
+/// for engine errors.
+pub async fn write_to_target(
+    db: &Db,
+    target: &crate::target::Target,
+    label: &str,
+    body: &str,
+    author: &Author,
+) -> Result<(String, bool)> {
+    if let Some(entity) = target.entity() {
+        return write(db, &entity, label, body, author).await;
+    }
+    let defined = require_label(db, label).await?;
+
+    if defined.cardinality.as_deref() == Some("one") {
+        if let Some(existing) = for_target(db, target, false)
+            .await?
+            .into_iter()
+            .find(|n| n.label == label)
+        {
+            append(
+                db,
+                Version {
+                    target,
+                    uid: &existing.uid,
+                    label,
+                    body,
+                    parent_uid: existing.parent_uid,
+                    active: true,
+                    author,
+                },
+            )
+            .await?;
+            return Ok((existing.uid, false));
+        }
+    }
+    let uid = uuid::Uuid::now_v7().to_string();
+    append(
+        db,
+        Version { target, uid: &uid, label, body, parent_uid: None, active: true, author },
+    )
+    .await?;
+    Ok((uid, true))
+}
+
+/// Latest row per uid, filtered.
+fn heads_of(rows: &[Value], include_retracted: bool) -> Vec<Note> {
+    let mut heads: std::collections::BTreeMap<String, Note> = std::collections::BTreeMap::new();
+    for row in rows {
+        if let Some(note) = parse(row) {
+            heads.insert(note.uid.clone(), note);
+        }
+    }
+    heads
+        .into_values()
+        .filter(|n| include_retracted || n.active)
+        .collect()
 }
 
 /// The current version of one note.
@@ -316,7 +436,10 @@ async fn current_for_label(db: &Db, entity: &RecordId, label: &str) -> Result<Op
 /// One appended version, as a value. Seven positional arguments in a
 /// row is how a caller ends up silently swapping `label` and `body`.
 struct Version<'a> {
-    entity: &'a RecordId,
+    /// An entity, a type or a label. The typed `record<entity>` link is
+    /// written only when there IS one, so a note on a type is the same
+    /// row shape without pretending to point at a node.
+    target: &'a crate::target::Target,
     uid: &'a str,
     label: &'a str,
     body: &'a str,
@@ -326,10 +449,18 @@ struct Version<'a> {
 }
 
 async fn append(db: &Db, v: Version<'_>) -> Result<()> {
-    let Version { entity, uid, label, body, parent_uid, active, author } = v;
+    let Version { target, uid, label, body, parent_uid, active, author } = v;
     let mut row = Object::new();
     row.insert("uid".to_string(), Value::String(uid.to_string()));
-    row.insert("entity".to_string(), Value::RecordId(entity.clone()));
+    // Both forms (#296): the typed link where there IS one, so those rows
+    // keep the engine's integrity check and readers that only know about
+    // entities keep working — and the polymorphic pair always, so a note
+    // on a type or a label is the same shape as a note on an entity.
+    if let Some(entity) = target.entity() {
+        row.insert("entity".to_string(), Value::RecordId(entity));
+    }
+    row.insert("target_kind".to_string(), Value::String(target.kind().to_string()));
+    row.insert("target_uid".to_string(), Value::String(target.uid()));
     row.insert("label".to_string(), Value::String(label.to_string()));
     row.insert("body".to_string(), Value::String(body.to_string()));
     if let Some(parent) = parent_uid {
@@ -360,6 +491,8 @@ fn parse(row: &Value) -> Option<Note> {
             Some(Value::RecordId(r)) => Some(r.clone()),
             _ => None,
         },
+        target_kind: str_field(o, "target_kind"),
+        target_uid: str_field(o, "target_uid"),
         label: str_field(o, "label")?,
         body: str_field(o, "body").unwrap_or_default(),
         parent_uid: str_field(o, "parent_uid"),
