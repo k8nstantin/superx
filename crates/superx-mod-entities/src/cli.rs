@@ -38,6 +38,7 @@ const USAGE: &str = "usage: superx entities <command>\n\
   fields <uuid-fragment>               the declared values of an entity\n\
   set <uuid-fragment> <key> <value>    set one declared value, checked against its kind\n\
   labels define <key> --kind slot|link --semantics <s> [--cardinality one|many]\n\
+          [--source-types a,b] [--target-types a,b] [--acyclic] [--inverse <text>]\n\
                        [--value-kind <k>] [--display <d>] [--description <text>]\n\
   labels history <key> --kind slot|link      every version of one label, oldest first\n\
   labels archive <key> --kind slot|link [--restore]\n\
@@ -104,6 +105,10 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         let description = flag(args, "--description");
         let cardinality = flag(args, "--cardinality");
         let value_kind = flag(args, "--value-kind");
+        let inverse = flag(args, "--inverse");
+        let source_types = flag(args, "--source-types").map(|v| csv(&v));
+        let target_types = flag(args, "--target-types").map(|v| csv(&v));
+        let acyclic = args.iter().any(|a| a == "--acyclic").then_some(true);
         crate::dictionary::define(
             &db,
             crate::dictionary::Definition {
@@ -114,6 +119,10 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
                 description: description.as_deref(),
                 cardinality: cardinality.as_deref(),
                 value_kind: value_kind.as_deref(),
+                source_types: source_types.as_deref(),
+                target_types: target_types.as_deref(),
+                inverse: inverse.as_deref(),
+                acyclic,
             },
         )
         .await?;
@@ -1033,6 +1042,15 @@ fn leading_author(args: &[String]) -> Result<(notes::Author, String)> {
         None => notes::Author::operator(),
     };
     Ok((author, args[at..].join(" ")))
+}
+
+/// A comma-separated list, as a flag carries one.
+fn csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The value after a `--flag`, if it is present and followed by one.

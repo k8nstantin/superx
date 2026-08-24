@@ -16,4 +16,9 @@ semantics: string, description: string | null,
  * Decides storage: prose kinds become note chains, value kinds live
  * in the attributes bag.
  */
-value_kind: string | null, cardinality: string | null, archived: boolean, };
+value_kind: string | null, cardinality: string | null, archived: boolean, 
+/**
+ * Link labels: what this edge will accept at each end, how it reads
+ * the other way, and whether it may close a loop.
+ */
+source_types: Array<string>, target_types: Array<string>, inverse: string | null, acyclic: boolean, };

@@ -664,3 +664,195 @@ async fn editing_a_retired_slot_does_not_restore_it() {
         "back when somebody actually asks for it"
     );
 }
+
+/// §5.5: a mislabelled field is a confusing entity; a mislabelled edge
+/// is a WRONG GRAPH, and the graph is what agents execute. The endpoint
+/// columns existed since #266 and nothing read them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_label_refuses_endpoints_it_does_not_accept() {
+    use superx_mod_entities::{edges, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed(&db).await.expect("labels");
+
+    dictionary::define(&db, Definition {
+        key: "audits",
+        kind: LINK,
+        display: "audits",
+        semantics: "governance",
+        source_types: Some(&["role".to_string()]),
+        target_types: Some(&["task".to_string()]),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+    registry::add_type(&db, "role", "entity", None).await.expect("role");
+    registry::add_type(&db, "audits", "relation", None).await.expect("relation kind");
+
+    let role = nodes::create_entity(&db, "role", "auditor", None, None).await.expect("role");
+    let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("task");
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+
+    edges::link(&db, &role, &task, "audits").await.expect("role audits task");
+
+    let err = edges::link(&db, &product, &task, "audits")
+        .await
+        .expect_err("a product does not audit");
+    assert!(err.to_string().contains("role"), "the error says what it should be: {err}");
+
+    edges::link(&db, &role, &product, "audits")
+        .await
+        .expect_err("and it does not audit a product");
+}
+
+/// A label nobody has finished describing must not block work — the same
+/// rule as a type that declares no slots accepting anything (§7).
+/// Enforcement arrives with the declaration, never before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_label_with_no_declared_endpoints_stays_permissive() {
+    use superx_mod_entities::{edges, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed(&db).await.expect("labels");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("t");
+
+    // `contains` declares no endpoints: any hierarchy is one edge, and
+    // privileging one is what the model exists to avoid.
+    edges::link(&db, &product, &task, "contains").await.expect("anything contains anything");
+
+    // And `depends_on` stays open too — this instance has products
+    // depending on products, so shipping the spec's [task] example as
+    // policy would have refused links the operator already makes.
+    let other = nodes::create_entity(&db, "product", "Other", None, None).await.expect("p2");
+    edges::link(&db, &product, &other, "depends_on")
+        .await
+        .expect("a product may wait on a product");
+}
+
+/// A cycle in `depends_on` does not read oddly: the runner's wave pass
+/// drops every task in the loop, so the work never runs and nothing says
+/// why. Refused before the edge exists rather than discovered when a
+/// plan comes back short.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_acyclic_label_refuses_a_link_that_would_close_a_loop() {
+    use superx_mod_entities::{edges, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed(&db).await.expect("labels");
+
+    let a = nodes::create_entity(&db, "task", "A", None, None).await.expect("a");
+    let b = nodes::create_entity(&db, "task", "B", None, None).await.expect("b");
+    let c = nodes::create_entity(&db, "task", "C", None, None).await.expect("c");
+
+    edges::link(&db, &a, &b, "depends_on").await.expect("a waits on b");
+    edges::link(&db, &b, &c, "depends_on").await.expect("b waits on c");
+
+    // The loop is two hops away, not adjacent — a check that only looked
+    // at the pair would miss it.
+    let err = edges::link(&db, &c, &a, "depends_on")
+        .await
+        .expect_err("c waiting on a closes the loop");
+    assert!(err.to_string().contains("acyclic"), "the error says why: {err}");
+
+    // A link that does NOT close one is still fine.
+    let d = nodes::create_entity(&db, "task", "D", None, None).await.expect("d");
+    edges::link(&db, &c, &d, "depends_on").await.expect("c waits on d");
+}
+
+/// A redefinition that does not mention endpoints must not silently
+/// widen the label back to accepting anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redefining_a_link_label_keeps_endpoints_it_does_not_mention() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+
+    dictionary::define(&db, Definition {
+        key: "audits",
+        kind: LINK,
+        display: "audits",
+        semantics: "governance",
+        source_types: Some(&["role".to_string()]),
+        acyclic: Some(true),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+
+    // Reworded, saying nothing about endpoints.
+    dictionary::define(&db, Definition {
+        key: "audits",
+        kind: LINK,
+        display: "audits",
+        semantics: "governance",
+        description: Some("an independent check"),
+        ..Default::default()
+    })
+    .await
+    .expect("redefine");
+
+    let now = dictionary::current(&db, "audits", LINK).await.expect("read").expect("there");
+    assert_eq!(now.source_types, vec!["role".to_string()], "endpoints survive a rewording");
+    assert!(now.acyclic, "and so does acyclic");
+    assert_eq!(now.description.as_deref(), Some("an independent check"));
+}
+
+/// An instance seeded before a shipped label gained its declaration
+/// would never receive it: the seed skips what already exists. So the
+/// acyclic flag protecting the runner would be real on a fresh install
+/// and silently absent on every instance that has been running — which
+/// is exactly the instance that has a graph worth protecting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeding_gives_an_older_link_label_the_rules_it_predates() {
+    let db = fresh_db().await;
+
+    // A label as an older build wrote it: no endpoints, no acyclic.
+    dictionary::define(&db, Definition {
+        key: "depends_on",
+        kind: LINK,
+        display: "depends on",
+        semantics: "ordering",
+        ..Default::default()
+    })
+    .await
+    .expect("the old shape");
+
+    let before = dictionary::current(&db, "depends_on", LINK).await.expect("r").expect("t");
+    assert!(!before.acyclic, "nothing protects the graph yet");
+
+    dictionary::seed(&db).await.expect("seed");
+
+    let after = dictionary::current(&db, "depends_on", LINK).await.expect("r").expect("t");
+    assert!(after.acyclic, "the rule reaches an instance that predates it");
+    assert_eq!(after.semantics, "ordering", "and says nothing new about anything else");
+}
+
+/// The seed fills gaps; it does not overrule. A value somebody set —
+/// including a deliberate `false` — is a decision, and re-provisioning
+/// must not quietly undo it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeding_does_not_overrule_a_rule_somebody_set() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("seed");
+
+    // The operator decides their `contains` may hold a loop.
+    dictionary::define(&db, Definition {
+        key: "contains",
+        kind: LINK,
+        display: "contains",
+        semantics: "composition",
+        acyclic: Some(false),
+        ..Default::default()
+    })
+    .await
+    .expect("their decision");
+
+    dictionary::seed(&db).await.expect("re-provision");
+
+    let now = dictionary::current(&db, "contains", LINK).await.expect("r").expect("t");
+    assert!(!now.acyclic, "their decision survives re-provisioning");
+}

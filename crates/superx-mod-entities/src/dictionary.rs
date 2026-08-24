@@ -122,6 +122,15 @@ pub struct LabelRow {
     pub value_kind: Option<String>,
     pub cardinality: Option<String>,
     pub writable_by: Option<String>,
+    /// Link labels only: which types may sit at each end. Empty means
+    /// undeclared, which stays permissive — a label somebody has not
+    /// finished describing must not block work.
+    pub source_types: Vec<String>,
+    pub target_types: Vec<String>,
+    /// How the edge reads the other way, for a human or an agent.
+    pub inverse: Option<String>,
+    /// Refuse a link that would close a loop.
+    pub acyclic: bool,
     /// The label's own extensible bag — `enum` options live here,
     /// because you cannot enumerate in advance what a future label needs.
     pub attributes: Option<Object>,
@@ -135,6 +144,12 @@ pub struct LabelRow {
 /// A seeded label: the vocabulary SuperX ships with.
 struct Seed {
     key: &'static str,
+    /// Link labels: what may sit at each end, how it reads the other
+    /// way, and whether it may close a loop (§5.5).
+    source_types: &'static [&'static str],
+    target_types: &'static [&'static str],
+    inverse: Option<&'static str>,
+    acyclic: bool,
     kind: &'static str,
     display: &'static str,
     semantics: &'static str,
@@ -152,6 +167,10 @@ struct Seed {
 const SEEDED: &[Seed] = &[
     Seed {
         key: "description",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
         kind: SLOT,
         display: "Description",
         semantics: "context",
@@ -163,6 +182,10 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "spec",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
         kind: SLOT,
         display: "Spec",
         semantics: "context",
@@ -174,6 +197,10 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "mandate",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
         kind: SLOT,
         display: "Mandate",
         semantics: "binding",
@@ -188,6 +215,10 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "playbook",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
         kind: SLOT,
         display: "Playbook",
         semantics: "guidance",
@@ -199,6 +230,10 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "instructions",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
         kind: SLOT,
         display: "Instructions",
         semantics: "directive",
@@ -213,6 +248,10 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "comments",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
         kind: SLOT,
         display: "Comments",
         semantics: "dialogue",
@@ -230,6 +269,10 @@ const SEEDED: &[Seed] = &[
     // nothing, so the keys were folklore and a typo was a new field.
     Seed {
         key: "url",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
         kind: SLOT,
         display: "URL",
         semantics: "data",
@@ -241,6 +284,10 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "branch",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
         kind: SLOT,
         display: "Branch",
         semantics: "data",
@@ -252,6 +299,10 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "host",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
         kind: SLOT,
         display: "Host",
         semantics: "data",
@@ -263,6 +314,10 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "secret",
+        source_types: &[],
+        target_types: &[],
+        inverse: None,
+        acyclic: false,
         kind: SLOT,
         display: "Secret",
         semantics: "secret",
@@ -277,6 +332,14 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "contains",
+        // Anything may contain anything: a role has subroles, a product
+        // has components, and privileging one hierarchy is what the
+        // model exists to avoid. Acyclic though — a thing cannot contain
+        // its own container.
+        source_types: &[],
+        target_types: &[],
+        inverse: Some("{target} is part of {source}"),
+        acyclic: true,
         kind: LINK,
         display: "contains",
         semantics: "composition",
@@ -288,6 +351,21 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "depends_on",
+        // The spec's §5.5 EXAMPLE shows [task] -> [task], and this
+        // instance has three `product depends_on product` edges — a
+        // sub-product waiting on another is a reasonable thing to say.
+        // Shipping the example as policy would have refused links the
+        // operator already makes, so the endpoints stay open and the
+        // narrowing is theirs to declare.
+        //
+        // Acyclic is not optional though: the runner's wave pass reads
+        // this and nothing else for order, and a cycle does not read
+        // oddly — it drops every task in the loop, so the work never runs
+        // and nothing says why.
+        source_types: &[],
+        target_types: &[],
+        inverse: Some("{target} is required by {source}"),
+        acyclic: true,
         kind: LINK,
         display: "depends on",
         semantics: "ordering",
@@ -299,6 +377,10 @@ const SEEDED: &[Seed] = &[
     },
     Seed {
         key: "then",
+        source_types: &[],
+        target_types: &[],
+        inverse: Some("{target} follows {source}"),
+        acyclic: true,
         kind: LINK,
         display: "then",
         semantics: "sequence",
@@ -320,7 +402,19 @@ const SEEDED: &[Seed] = &[
 pub async fn seed(db: &Db) -> Result<usize> {
     let mut created = 0;
     for s in SEEDED {
-        if current(db, s.key, s.kind).await?.is_some() {
+        if let Some(existing) = current_object(db, s.key, s.kind).await? {
+            // An instance seeded before a shipped label gained a
+            // declaration would never receive it: the seed skips what
+            // exists, so the acyclic flag and the endpoints added here
+            // would be real on a fresh instance and absent on every
+            // instance that has been running.
+            //
+            // Filled in only where the row says NOTHING on the subject.
+            // A value somebody set — including a deliberate `false` — is
+            // a decision, and the seed does not overrule decisions.
+            if top_up_link_rules(db, s, &existing).await? {
+                created += 1;
+            }
             continue;
         }
         let mut row = Object::new();
@@ -340,6 +434,24 @@ pub async fn seed(db: &Db) -> Result<usize> {
         }
         if let Some(who) = s.writable_by {
             row.insert("writable_by".to_string(), Value::String(who.to_string()));
+        }
+        if !s.source_types.is_empty() {
+            row.insert(
+                "source_types".to_string(),
+                str_values(&s.source_types.iter().map(ToString::to_string).collect::<Vec<_>>()),
+            );
+        }
+        if !s.target_types.is_empty() {
+            row.insert(
+                "target_types".to_string(),
+                str_values(&s.target_types.iter().map(ToString::to_string).collect::<Vec<_>>()),
+            );
+        }
+        if let Some(text) = s.inverse {
+            row.insert("inverse".to_string(), Value::String(text.to_string()));
+        }
+        if s.acyclic {
+            row.insert("acyclic".to_string(), Value::Bool(true));
         }
         row.insert("archived".to_string(), Value::Bool(false));
         append(db, row).await?;
@@ -636,6 +748,52 @@ fn parse_slot(row: &Value) -> Option<TypeSlot> {
     })
 }
 
+/// Give an already-seeded LINK label the declarations it predates.
+///
+/// Returns whether anything was written. Silent when the row already
+/// says something on each subject — the seed fills gaps, it does not
+/// overrule.
+async fn top_up_link_rules(db: &Db, seed: &Seed, existing: &Object) -> Result<bool> {
+    if seed.kind != LINK {
+        return Ok(false);
+    }
+    let missing_acyclic = seed.acyclic && !existing.contains_key("acyclic");
+    let missing_inverse = seed.inverse.is_some() && !existing.contains_key("inverse");
+    let missing_source = !seed.source_types.is_empty() && !existing.contains_key("source_types");
+    let missing_target = !seed.target_types.is_empty() && !existing.contains_key("target_types");
+    if !(missing_acyclic || missing_inverse || missing_source || missing_target) {
+        return Ok(false);
+    }
+
+    let mut row = existing.clone();
+    // The new version is a new row: these belong to the row, not to the
+    // definition.
+    row.remove("id");
+    row.remove("valid_from");
+    if missing_acyclic {
+        row.insert("acyclic".to_string(), Value::Bool(true));
+    }
+    if missing_inverse {
+        if let Some(text) = seed.inverse {
+            row.insert("inverse".to_string(), Value::String(text.to_string()));
+        }
+    }
+    if missing_source {
+        row.insert(
+            "source_types".to_string(),
+            str_values(&seed.source_types.iter().map(ToString::to_string).collect::<Vec<_>>()),
+        );
+    }
+    if missing_target {
+        row.insert(
+            "target_types".to_string(),
+            str_values(&seed.target_types.iter().map(ToString::to_string).collect::<Vec<_>>()),
+        );
+    }
+    append(db, row).await?;
+    Ok(true)
+}
+
 /// Append a label row and bump the revision. Every write is a new row
 /// on the `(key, label_kind)` chain — a label's meaning is never
 /// edited in place, because changing what a term means retroactively
@@ -815,6 +973,14 @@ pub struct Definition<'a> {
     /// Decides STORAGE: prose kinds become note chains, value kinds live
     /// in the entity's attributes bag.
     pub value_kind: Option<&'a str>,
+    /// Link labels only: which types may sit at each end. `None` leaves
+    /// whatever is there; an empty slice clears it back to permissive.
+    pub source_types: Option<&'a [String]>,
+    pub target_types: Option<&'a [String]>,
+    /// How the edge reads the other way.
+    pub inverse: Option<&'a str>,
+    /// Refuse a link that would close a loop.
+    pub acyclic: Option<bool>,
 }
 
 /// Define or redefine a label. A redefinition appends to the chain —
@@ -826,7 +992,19 @@ pub struct Definition<'a> {
 /// [`KernelError::Module`] for an invalid key, kind or semantics;
 /// [`KernelError::Db`] for engine errors.
 pub async fn define(db: &Db, d: Definition<'_>) -> Result<()> {
-    let Definition { key, kind, display, semantics, description, cardinality, value_kind } = d;
+    let Definition {
+        key,
+        kind,
+        display,
+        semantics,
+        description,
+        cardinality,
+        value_kind,
+        source_types,
+        target_types,
+        inverse,
+        acyclic,
+    } = d;
     if key.is_empty()
         || !key
             .chars()
@@ -889,6 +1067,22 @@ pub async fn define(db: &Db, d: Definition<'_>) -> Result<()> {
         }
         row.insert("value_kind".to_string(), Value::String(k.to_string()));
     }
+    // A mislabelled edge is a wrong graph, so a link label gets to say
+    // what it will accept (§5.5). Absent leaves what is there — a
+    // redefinition that does not mention endpoints must not silently
+    // widen the label back to accepting anything.
+    if let Some(types) = source_types {
+        row.insert("source_types".to_string(), str_values(types));
+    }
+    if let Some(types) = target_types {
+        row.insert("target_types".to_string(), str_values(types));
+    }
+    if let Some(text) = inverse {
+        row.insert("inverse".to_string(), Value::String(text.to_string()));
+    }
+    if let Some(no_cycles) = acyclic {
+        row.insert("acyclic".to_string(), Value::Bool(no_cycles));
+    }
     // Archiving is its own act; redefining an archived label does not
     // quietly bring it back.
     if !row.contains_key("archived") {
@@ -915,6 +1109,10 @@ fn parse_obj(o: &Object) -> Option<LabelRow> {
         value_kind: str_field(o, "value_kind"),
         cardinality: str_field(o, "cardinality"),
         writable_by: str_field(o, "writable_by"),
+        source_types: str_array(o, "source_types"),
+        target_types: str_array(o, "target_types"),
+        inverse: str_field(o, "inverse"),
+        acyclic: matches!(o.get("acyclic"), Some(Value::Bool(true))),
         attributes: match o.get("attributes") {
             Some(Value::Object(a)) => Some(a.clone()),
             _ => None,
@@ -925,6 +1123,19 @@ fn parse_obj(o: &Object) -> Option<LabelRow> {
             _ => None,
         },
     })
+}
+
+fn str_array(o: &Object, key: &str) -> Vec<String> {
+    match o.get(key) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn str_field(o: &Object, key: &str) -> Option<String> {
@@ -940,4 +1151,15 @@ fn int_field(row: &Value) -> Option<i64> {
         Some(Value::Number(n)) => n.to_int(),
         _ => None,
     }
+}
+
+/// A list of strings, as the engine stores it.
+fn str_values(items: &[String]) -> Value {
+    Value::Array(
+        items
+            .iter()
+            .map(|s| Value::String(s.clone()))
+            .collect::<Vec<_>>()
+            .into(),
+    )
 }
