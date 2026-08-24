@@ -104,6 +104,10 @@ pub struct TypeSlot {
     /// Who last wrote this binding. `None` means only the seed ever has,
     /// which is what makes it safe to correct its ordering.
     pub author_kind: Option<String>,
+    /// How THIS type treats the label (§5.2): `description` is `context`
+    /// on a product and `directive` on a task. Absent means the label's
+    /// own semantics stand.
+    pub semantics_override: Option<String>,
 }
 
 /// One row of the dictionary, as read back.
@@ -347,6 +351,193 @@ pub async fn seed(db: &Db) -> Result<usize> {
     Ok(created)
 }
 
+/// Give a type a slot, or change the one it has (issue #292).
+///
+/// A type that declares nothing is inert, and until now only the startup
+/// seed could declare anything — so a type an operator invented could
+/// never carry a field, which is the opposite of "a type can carry
+/// whatever fields it needs".
+///
+/// Appends, like every other change. `display_order` defaults to the end
+/// so adding a slot never reorders the ones already there.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] when the label is not in the dictionary, or
+/// the semantics override is not one a slot label may have;
+/// [`KernelError::Db`] for engine errors.
+pub async fn bind_slot(
+    db: &Db,
+    entity_type: &str,
+    label: &str,
+    required: bool,
+    semantics_override: Option<&str>,
+    author: &crate::notes::Author,
+) -> Result<()> {
+    // types → labels → entities: a type cannot adopt a term the
+    // dictionary has not defined, or the slot means nothing to read.
+    if current(db, label, SLOT).await?.is_none() {
+        return Err(KernelError::Module(format!(
+            "the dictionary defines no slot label '{label}' — define it before a \
+             type adopts it, because the order types → labels → entities is what \
+             stops terminology rotting"
+        )));
+    }
+    if let Some(over) = semantics_override {
+        if !SLOT_SEMANTICS.contains(&over) {
+            return Err(KernelError::Module(format!(
+                "semantics '{over}' is not one a slot label may have — pick from: {}",
+                SLOT_SEMANTICS.join(", ")
+            )));
+        }
+    }
+
+    let existing = slots_for(db, entity_type, true).await?;
+    let order = existing
+        .iter()
+        .find(|s| s.label == label)
+        .map_or_else(
+            // New slots land at the end: adding one must never silently
+            // reorder what the operator already arranged.
+            || existing.iter().map(|s| s.display_order).max().map_or(0, |m| m + 1),
+            |prior| prior.display_order,
+        );
+
+    append_slot(
+        db,
+        Binding {
+            entity_type,
+            label,
+            required,
+            display_order: order,
+            active: true,
+            semantics_override,
+            author,
+        },
+    )
+    .await
+}
+
+/// Move a slot in the reading order of its type.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] when the type does not carry the slot;
+/// [`KernelError::Db`] for engine errors.
+pub async fn order_slot(
+    db: &Db,
+    entity_type: &str,
+    label: &str,
+    display_order: i64,
+    author: &crate::notes::Author,
+) -> Result<()> {
+    let Some(prior) = slots_for(db, entity_type, true).await?.into_iter().find(|s| s.label == label)
+    else {
+        return Err(KernelError::Module(format!(
+            "type '{entity_type}' does not carry '{label}'"
+        )));
+    };
+    append_slot(
+        db,
+        Binding {
+            entity_type,
+            label,
+            required: prior.required,
+            display_order,
+            active: prior.active,
+            semantics_override: prior.semantics_override.as_deref(),
+            author,
+        },
+    )
+    .await
+}
+
+/// Retire a slot, or bring one back. The binding is not erased —
+/// entities written while it stood still hold values in it, and a
+/// declaration that vanishes makes those look like junk.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] when the type does not carry the slot;
+/// [`KernelError::Db`] for engine errors.
+pub async fn retire_slot(
+    db: &Db,
+    entity_type: &str,
+    label: &str,
+    active: bool,
+    author: &crate::notes::Author,
+) -> Result<()> {
+    let Some(prior) = slots_for(db, entity_type, true).await?.into_iter().find(|s| s.label == label)
+    else {
+        return Err(KernelError::Module(format!(
+            "type '{entity_type}' does not carry '{label}'"
+        )));
+    };
+    append_slot(
+        db,
+        Binding {
+            entity_type,
+            label,
+            required: prior.required,
+            display_order: prior.display_order,
+            active,
+            semantics_override: prior.semantics_override.as_deref(),
+            author,
+        },
+    )
+    .await
+}
+
+/// One binding, as a value. Eight positional arguments is how a caller
+/// ends up passing `active` where `required` belongs — two bools in a
+/// row that mean opposite things.
+struct Binding<'a> {
+    entity_type: &'a str,
+    label: &'a str,
+    required: bool,
+    display_order: i64,
+    active: bool,
+    semantics_override: Option<&'a str>,
+    author: &'a crate::notes::Author,
+}
+
+/// One appended binding row.
+async fn append_slot(db: &Db, b: Binding<'_>) -> Result<()> {
+    let Binding {
+        entity_type,
+        label,
+        required,
+        display_order,
+        active,
+        semantics_override,
+        author,
+    } = b;
+    let mut row = Object::new();
+    row.insert("entity_type".to_string(), Value::String(entity_type.to_string()));
+    row.insert("label".to_string(), Value::String(label.to_string()));
+    row.insert("required".to_string(), Value::Bool(required));
+    row.insert("display_order".to_string(), Value::Number(display_order.into()));
+    row.insert("active".to_string(), Value::Bool(active));
+    if let Some(over) = semantics_override {
+        row.insert("semantics_override".to_string(), Value::String(over.to_string()));
+    }
+    row.insert("valid_from".to_string(), Value::Datetime(chrono::Utc::now().into()));
+    row.insert("author_kind".to_string(), Value::String(author.kind.clone()));
+    if let Some(uid) = &author.uid {
+        row.insert("author_uid".to_string(), Value::String(uid.clone()));
+    }
+    if let Some(via) = &author.via {
+        row.insert("via_uid".to_string(), Value::String(via.clone()));
+    }
+    db.query("CREATE $id CONTENT $row")
+        .bind(("id", new_id("type_label")))
+        .bind(("row", Value::Object(row)))
+        .await?
+        .check()?;
+    bump(db, &format!("type '{entity_type}' carries '{label}'")).await?;
+    Ok(())
+}
+
 /// Bind the shipped types to the slots they carry; returns how many
 /// bindings were new. Idempotent, like every other seed — a binding the
 /// operator has since retired is not resurrected.
@@ -439,6 +630,7 @@ fn parse_slot(row: &Value) -> Option<TypeSlot> {
         },
         active: !matches!(o.get("active"), Some(Value::Bool(false))),
         author_kind: str_field(o, "author_kind"),
+        semantics_override: str_field(o, "semantics_override"),
     })
 }
 

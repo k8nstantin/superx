@@ -17,7 +17,7 @@ use superx_kernel::{Db, KernelError, Result};
 use superx_ops::record_uuid;
 use ts_rs::TS;
 
-use crate::{documents, edges, graph, nodes, notes, registry, texts};
+use crate::{dictionary, documents, edges, fields, graph, nodes, notes, registry, texts};
 
 /// Depth ceiling for the breadcrumb walk (#253): deep enough for any
 /// real product hierarchy, shallow enough that a pathological graph
@@ -251,6 +251,219 @@ pub async fn types_list(db: &Db) -> Result<Vec<TypeView>> {
             description: t.description,
         })
         .collect())
+}
+
+/// One term in the dictionary, as the design surface shows it.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct LabelView {
+    pub key: String,
+    /// `slot` (what an entity carries) or `link` (how entities connect).
+    pub label_kind: String,
+    pub display: String,
+    /// How a reader must TREAT it — the closed vocabulary.
+    pub semantics: String,
+    pub description: Option<String>,
+    /// Decides storage: prose kinds become note chains, value kinds live
+    /// in the attributes bag.
+    pub value_kind: Option<String>,
+    pub cardinality: Option<String>,
+    pub archived: bool,
+}
+
+/// A slot a type carries, resolved against the label it names.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct SlotView {
+    pub label: String,
+    pub required: bool,
+    pub display_order: i64,
+    pub active: bool,
+    /// The label's own semantics, or this type's override of them.
+    pub semantics: String,
+    pub semantics_override: Option<String>,
+    pub value_kind: Option<String>,
+    pub cardinality: Option<String>,
+}
+
+/// What the design surface needs to choose from: every closed vocabulary
+/// in one read, so the UI never hardcodes a list the substrate owns.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct VocabularyView {
+    pub slot_semantics: Vec<String>,
+    pub link_semantics: Vec<String>,
+    pub value_kinds: Vec<String>,
+    pub prose_kinds: Vec<String>,
+    pub cardinalities: Vec<String>,
+    pub revision: i64,
+}
+
+/// Define or redefine a label.
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct LabelReq {
+    pub key: String,
+    pub label_kind: String,
+    pub display: Option<String>,
+    pub semantics: String,
+    pub description: Option<String>,
+    pub cardinality: Option<String>,
+    pub value_kind: Option<String>,
+}
+
+/// Give a type a slot, or change the one it has.
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct SlotReq {
+    pub label: String,
+    pub required: Option<bool>,
+    pub semantics_override: Option<String>,
+    /// Absent leaves the slot where it is; present moves it.
+    pub display_order: Option<i64>,
+    /// Absent leaves it as it is; `false` retires it.
+    pub active: Option<bool>,
+}
+
+/// The whole dictionary, for the design surface.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn labels(db: &Db, include_archived: bool) -> Result<Vec<LabelView>> {
+    Ok(dictionary::list(db, include_archived)
+        .await?
+        .into_iter()
+        .map(|l| LabelView {
+            key: l.key,
+            label_kind: l.label_kind,
+            display: l.display,
+            semantics: l.semantics,
+            description: l.description,
+            value_kind: l.value_kind,
+            cardinality: l.cardinality,
+            archived: l.archived,
+        })
+        .collect())
+}
+
+/// Every closed vocabulary the design surface offers.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn vocabulary(db: &Db) -> Result<VocabularyView> {
+    Ok(VocabularyView {
+        slot_semantics: dictionary::SLOT_SEMANTICS.iter().map(ToString::to_string).collect(),
+        link_semantics: dictionary::LINK_SEMANTICS.iter().map(ToString::to_string).collect(),
+        value_kinds: fields::VALUE_KINDS
+            .iter()
+            .chain(std::iter::once(&fields::SECRET_KIND))
+            .map(ToString::to_string)
+            .collect(),
+        prose_kinds: fields::PROSE_KINDS.iter().map(ToString::to_string).collect(),
+        cardinalities: vec!["one".to_string(), "many".to_string()],
+        revision: dictionary::revision(db).await?,
+    })
+}
+
+/// Define or redefine a label.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn define_label(db: &Db, req: &LabelReq) -> Result<()> {
+    dictionary::define(
+        db,
+        dictionary::Definition {
+            key: &req.key,
+            kind: &req.label_kind,
+            display: req.display.as_deref().unwrap_or(&req.key),
+            semantics: &req.semantics,
+            description: req.description.as_deref(),
+            cardinality: req.cardinality.as_deref(),
+            value_kind: req.value_kind.as_deref(),
+        },
+    )
+    .await
+}
+
+/// The slots a type carries, resolved against the dictionary.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn slots(db: &Db, entity_type: &str, include_retired: bool) -> Result<Vec<SlotView>> {
+    let mut out = Vec::new();
+    for slot in dictionary::slots_for(db, entity_type, include_retired).await? {
+        let defined = dictionary::current(db, &slot.label, dictionary::SLOT).await?;
+        out.push(SlotView {
+            semantics: slot
+                .semantics_override
+                .clone()
+                .or_else(|| defined.as_ref().map(|d| d.semantics.clone()))
+                .unwrap_or_default(),
+            value_kind: defined.as_ref().and_then(|d| d.value_kind.clone()),
+            cardinality: defined.and_then(|d| d.cardinality),
+            label: slot.label,
+            required: slot.required,
+            display_order: slot.display_order,
+            active: slot.active,
+            semantics_override: slot.semantics_override,
+        });
+    }
+    Ok(out)
+}
+
+/// Give a type a slot, move it, or retire it.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn bind_slot(db: &Db, entity_type: &str, req: &SlotReq) -> Result<()> {
+    let author = notes::Author::operator();
+    let existing = dictionary::slots_for(db, entity_type, true)
+        .await?
+        .into_iter()
+        .find(|s| s.label == req.label);
+
+    match existing {
+        // Already there: this is an edit, and each part is optional so a
+        // form that only changes the order does not also reset the rest.
+        Some(prior) => {
+            if req.required.is_some_and(|r| r != prior.required)
+                || req.semantics_override != prior.semantics_override
+            {
+                dictionary::bind_slot(
+                    db,
+                    entity_type,
+                    &req.label,
+                    req.required.unwrap_or(prior.required),
+                    req.semantics_override.as_deref(),
+                    &author,
+                )
+                .await?;
+            }
+            if let Some(order) = req.display_order {
+                dictionary::order_slot(db, entity_type, &req.label, order, &author).await?;
+            }
+            if let Some(active) = req.active {
+                dictionary::retire_slot(db, entity_type, &req.label, active, &author).await?;
+            }
+            Ok(())
+        }
+        None => {
+            dictionary::bind_slot(
+                db,
+                entity_type,
+                &req.label,
+                req.required.unwrap_or(false),
+                req.semantics_override.as_deref(),
+                &author,
+            )
+            .await
+        }
+    }
 }
 
 /// Create a new ENTITY type (the UI never creates relation kinds).

@@ -169,9 +169,15 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         for slot in &slots {
             let defined = crate::dictionary::current(&db, &slot.label, crate::dictionary::SLOT)
                 .await?;
-            let semantics = defined
-                .as_ref()
-                .map_or("?".to_string(), |d| d.semantics.clone());
+            // The TYPE's override wins (§5.2): `description` is context on
+            // a product and directive on a task. Printing the label's own
+            // semantics here showed the wrong one — and semantics is the
+            // thing an agent acts on.
+            let semantics = slot
+                .semantics_override
+                .clone()
+                .or_else(|| defined.as_ref().map(|d| d.semantics.clone()))
+                .unwrap_or_else(|| "?".to_string());
             let card = defined
                 .as_ref()
                 .and_then(|d| d.cardinality.clone())

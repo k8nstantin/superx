@@ -6,7 +6,7 @@
 //! the one that is a security property rather than a convenience.
 
 use superx_mod_entities::dictionary::{self, Definition, LINK, SLOT};
-use superx_mod_entities::SCHEMA_DDL;
+use superx_mod_entities::{registry, SCHEMA_DDL};
 
 async fn fresh_db() -> superx_kernel::Db {
     let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
@@ -464,5 +464,170 @@ async fn a_slot_added_to_the_shipped_list_does_not_scramble_the_order() {
         dictionary::seed_type_labels(&db).await.expect("reseed"),
         0,
         "nothing left to correct"
+    );
+}
+
+/// The spec's loop, which was not buildable at all: design a type, define
+/// a term, say the type carries it, and only then does an entity of that
+/// type mean anything when read.
+///
+/// Before this, `type_label` had one writer — the startup seed, over a
+/// hardcoded list — so a type an operator invented could never carry a
+/// field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_type_invented_at_runtime_can_be_given_slots() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+    let author = superx_mod_entities::notes::Author::operator();
+
+    registry::add_type(&db, "desk", "entity", Some("a trading desk")).await.expect("type");
+    assert!(
+        dictionary::slots_for(&db, "desk", false).await.expect("slots").is_empty(),
+        "inert until it declares something"
+    );
+
+    dictionary::define(&db, Definition {
+        key: "max_notional",
+        kind: SLOT,
+        display: "Max notional",
+        semantics: "data",
+        cardinality: Some("one"),
+        value_kind: Some("number"),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+
+    dictionary::bind_slot(&db, "desk", "max_notional", true, None, &author)
+        .await
+        .expect("bind");
+
+    let slots = dictionary::slots_for(&db, "desk", false).await.expect("slots");
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].label, "max_notional");
+    assert!(slots[0].required);
+}
+
+/// types → labels → entities is a dependency, not a convention: a type
+/// cannot adopt a term the dictionary has not defined, or the slot means
+/// nothing to whoever reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_type_cannot_adopt_a_term_nobody_defined() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+    registry::add_type(&db, "desk", "entity", None).await.expect("type");
+
+    let err = dictionary::bind_slot(
+        &db,
+        "desk",
+        "vibes",
+        false,
+        None,
+        &superx_mod_entities::notes::Author::operator(),
+    )
+    .await
+    .expect_err("undefined term");
+    assert!(err.to_string().contains("vibes"), "the error names it: {err}");
+}
+
+/// §5.2: `description` is `context` on a product and `directive` on a
+/// task — the same label treated differently by what carries it,
+/// declared where the type adopts it rather than fixed globally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_type_can_override_how_its_slot_is_treated() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+    let author = superx_mod_entities::notes::Author::operator();
+    registry::add_type(&db, "desk", "entity", None).await.expect("type");
+
+    dictionary::bind_slot(&db, "desk", "description", false, Some("directive"), &author)
+        .await
+        .expect("bind");
+
+    let slots = dictionary::slots_for(&db, "desk", false).await.expect("slots");
+    assert_eq!(slots[0].semantics_override.as_deref(), Some("directive"));
+    // The label itself is untouched — a product still reads it as context.
+    assert_eq!(
+        dictionary::current(&db, "description", SLOT).await.expect("read").expect("there").semantics,
+        "context"
+    );
+
+    dictionary::bind_slot(&db, "desk", "description", false, Some("vibes"), &author)
+        .await
+        .expect_err("an override is closed like every other semantics");
+}
+
+/// Adding a slot must never silently reorder the ones already arranged,
+/// and retiring one must never erase it: entities written while it stood
+/// still hold values in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slots_keep_their_order_and_retire_without_erasing() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+    let author = superx_mod_entities::notes::Author::operator();
+    registry::add_type(&db, "desk", "entity", None).await.expect("type");
+
+    for label in ["description", "spec", "comments"] {
+        dictionary::bind_slot(&db, "desk", label, false, None, &author).await.expect("bind");
+    }
+    let keys = |v: Vec<dictionary::TypeSlot>| v.into_iter().map(|s| s.label).collect::<Vec<_>>();
+    assert_eq!(
+        keys(dictionary::slots_for(&db, "desk", false).await.expect("slots")),
+        vec!["description", "spec", "comments"],
+        "added in the order they were declared"
+    );
+
+    // Editing one leaves the order alone.
+    dictionary::bind_slot(&db, "desk", "spec", true, None, &author).await.expect("edit");
+    assert_eq!(
+        keys(dictionary::slots_for(&db, "desk", false).await.expect("slots")),
+        vec!["description", "spec", "comments"],
+        "an edit is not a reorder"
+    );
+
+    dictionary::order_slot(&db, "desk", "comments", 0, &author).await.expect("move");
+    assert_eq!(
+        keys(dictionary::slots_for(&db, "desk", false).await.expect("slots"))[0],
+        "comments",
+        "and a move IS a move"
+    );
+
+    dictionary::retire_slot(&db, "desk", "spec", false, &author).await.expect("retire");
+    assert!(
+        !keys(dictionary::slots_for(&db, "desk", false).await.expect("slots"))
+            .contains(&"spec".to_string()),
+        "gone from the live declaration"
+    );
+    assert!(
+        keys(dictionary::slots_for(&db, "desk", true).await.expect("all"))
+            .contains(&"spec".to_string()),
+        "still on the record — an entity may hold a value in it"
+    );
+
+    dictionary::retire_slot(&db, "desk", "spec", true, &author).await.expect("restore");
+    assert!(keys(dictionary::slots_for(&db, "desk", false).await.expect("slots"))
+        .contains(&"spec".to_string()));
+}
+
+/// A binding an operator wrote is theirs: the seed corrects its own
+/// ordering but must not overrule a person who arranged it deliberately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_seed_does_not_overrule_an_operator() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+    dictionary::seed_type_labels(&db).await.expect("slots");
+    let author = superx_mod_entities::notes::Author::operator();
+
+    dictionary::order_slot(&db, "product", "comments", 0, &author).await.expect("move");
+    assert_eq!(
+        dictionary::slots_for(&db, "product", false).await.expect("slots")[0].label,
+        "comments"
+    );
+
+    dictionary::seed_type_labels(&db).await.expect("reseed");
+    assert_eq!(
+        dictionary::slots_for(&db, "product", false).await.expect("slots")[0].label,
+        "comments",
+        "the seed corrects its own ordering, never an operator's"
     );
 }
