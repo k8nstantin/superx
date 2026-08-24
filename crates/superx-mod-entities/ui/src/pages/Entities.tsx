@@ -41,6 +41,7 @@ import { LongText, previewLine } from '../LongText'
 import type { EntityDetail } from '../generated/EntityDetail'
 import type { AnnotationView } from '../generated/AnnotationView'
 import { useBreadcrumb } from '../Breadcrumbs'
+import { Fields } from '../Fields'
 
 // The Entities page (issue #231, approved design): list with a type
 // DROPDOWN + search + New entity; click a row → the entity's detail
@@ -641,7 +642,16 @@ function DetailView({
           </Card>
           <Card withBorder>
             <Title order={6} tt="uppercase" c="dimmed" mb="xs">
-              Attributes
+              Fields
+            </Title>
+            {/* Declared fields, rendered as what they are (#294). The raw
+                bag below stays reachable for whatever nothing declares —
+                reads must never fail — but it is no longer the only door. */}
+            <Fields entityId={d.id} />
+          </Card>
+          <Card withBorder>
+            <Title order={6} tt="uppercase" c="dimmed" mb="xs">
+              Attributes (raw)
             </Title>
             <Text size="sm" ff="monospace" style={{ whiteSpace: 'pre-wrap' }}>
               {d.attributes_json ?? '—'}

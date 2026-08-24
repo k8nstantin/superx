@@ -330,6 +330,86 @@ pub struct SlotReq {
     pub clear_semantics_override: Option<bool>,
 }
 
+/// A declared field of an entity, with what it holds.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct FieldView {
+    pub key: String,
+    /// Empty when the entity holds a key its type no longer declares.
+    pub value_kind: String,
+    pub required: bool,
+    pub value: Option<String>,
+    /// True when nothing declares this key any more. Reads never fail,
+    /// so it surfaces rather than disappearing.
+    pub undeclared: bool,
+    /// How this type treats it — the override where there is one.
+    pub semantics: String,
+    /// What `enum` allows, empty for every other kind.
+    pub options: Vec<String>,
+}
+
+/// Every field of an entity: declared, typed, and what it holds.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn entity_fields(db: &Db, fragment: &str) -> Result<Vec<FieldView>> {
+    let id = nodes::resolve_entity(db, fragment).await?;
+    let (entity_type, _) = nodes::anchor_info(db, &id).await?;
+    let slots = dictionary::slots_for(db, &entity_type, false).await?;
+
+    let mut out = Vec::new();
+    for f in fields::of(db, &id).await? {
+        let slot = slots.iter().find(|s| s.label == f.key);
+        let defined = dictionary::current(db, &f.key, dictionary::SLOT).await?;
+        out.push(FieldView {
+            semantics: slot
+                .and_then(|s| s.semantics_override.clone())
+                .or_else(|| defined.as_ref().map(|d| d.semantics.clone()))
+                .unwrap_or_default(),
+            options: defined
+                .as_ref()
+                .and_then(|d| d.attributes.as_ref())
+                .and_then(|a| a.get("options"))
+                .map(|v| match v {
+                    superx_kernel::types::Value::Array(items) => items
+                        .iter()
+                        .filter_map(|i| match i {
+                            superx_kernel::types::Value::String(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default(),
+            key: f.key,
+            value_kind: f.value_kind,
+            required: f.required,
+            value: f.value,
+            undeclared: f.undeclared,
+        });
+    }
+    Ok(out)
+}
+
+/// Set one declared field, checked against what its label declares.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn set_field(db: &Db, fragment: &str, key: &str, value: &str) -> Result<()> {
+    let id = nodes::resolve_entity(db, fragment).await?;
+    fields::set(db, &id, key, value).await
+}
+
+/// One typed value, from the entity page.
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct FieldReq {
+    pub key: String,
+    pub value: String,
+}
+
 /// The whole dictionary, for the design surface.
 ///
 /// # Errors
@@ -786,6 +866,18 @@ pub async fn create(db: &Db, req: &CreateReq) -> Result<String> {
 pub async fn update(db: &Db, fragment: &str, req: &UpdateReq) -> Result<String> {
     let id = nodes::resolve_entity(db, fragment).await?;
     let attrs = attrs_from_json(&req.attributes_json)?;
+
+    // Every declared key goes through the same check whichever door it
+    // came in by (#294). Without this the attributes box was a way round
+    // every rule `fields::set` enforces — including the one that keeps a
+    // raw credential out of the graph.
+    let attrs = match attrs {
+        Some(superx_kernel::types::Value::Object(bag)) => Some(
+            superx_kernel::types::Value::Object(fields::validate_bag(db, &id, &bag).await?),
+        ),
+        other => other,
+    };
+
     nodes::update_entity(db, &id, req.name.clone(), req.content.clone(), attrs).await?;
     Ok(record_uuid(&id))
 }
