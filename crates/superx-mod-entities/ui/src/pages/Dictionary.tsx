@@ -348,7 +348,15 @@ function SlotEditor({
                   data={slotSemantics}
                   value={s.semantics}
                   onChange={(v) =>
-                    v && change.mutate({ label: s.label, semantics_override: v, required: s.required, display_order: null, active: null })
+                    v &&
+                    change.mutate({
+                      label: s.label,
+                      semantics_override: v,
+                      required: null,
+                      display_order: null,
+                      active: null,
+                      clear_semantics_override: null,
+                    })
                   }
                   w={130}
                 />
@@ -365,9 +373,10 @@ function SlotEditor({
                     change.mutate({
                       label: s.label,
                       required: e.currentTarget.checked,
-                      semantics_override: s.semantics_override,
+                      semantics_override: null,
                       display_order: null,
                       active: null,
+                      clear_semantics_override: null,
                     })
                   }
                 />
@@ -384,6 +393,7 @@ function SlotEditor({
                       required: null,
                       semantics_override: null,
                       display_order: null,
+                      clear_semantics_override: null,
                     })
                   }
                 >
@@ -425,6 +435,7 @@ function SlotEditor({
               semantics_override: null,
               display_order: null,
               active: null,
+              clear_semantics_override: null,
             })
           }
         >

@@ -393,15 +393,13 @@ pub async fn bind_slot(
     }
 
     let existing = slots_for(db, entity_type, true).await?;
-    let order = existing
-        .iter()
-        .find(|s| s.label == label)
-        .map_or_else(
-            // New slots land at the end: adding one must never silently
-            // reorder what the operator already arranged.
-            || existing.iter().map(|s| s.display_order).max().map_or(0, |m| m + 1),
-            |prior| prior.display_order,
-        );
+    let prior = existing.iter().find(|s| s.label == label);
+    let order = prior.map_or_else(
+        // New slots land at the end: adding one must never silently
+        // reorder what the operator already arranged.
+        || existing.iter().map(|s| s.display_order).max().map_or(0, |m| m + 1),
+        |p| p.display_order,
+    );
 
     append_slot(
         db,
@@ -410,7 +408,11 @@ pub async fn bind_slot(
             label,
             required,
             display_order: order,
-            active: true,
+            // Editing a RETIRED slot must not quietly bring it back.
+            // Asserting `true` here meant changing whether a slot was
+            // required also un-retired it — two decisions, one of which
+            // nobody made.
+            active: prior.is_none_or(|p| p.active),
             semantics_override,
             author,
         },

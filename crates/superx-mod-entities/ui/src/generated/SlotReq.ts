@@ -11,4 +11,11 @@ display_order: bigint | null,
 /**
  * Absent leaves it as it is; `false` retires it.
  */
-active: boolean | null, };
+active: boolean | null, 
+/**
+ * Say so explicitly to remove a semantics override. Absent means
+ * "leave it alone" — omitting a field must never be how something
+ * gets cleared, because a form that mentions one thing would erase
+ * the others.
+ */
+clear_semantics_override: boolean | null, };

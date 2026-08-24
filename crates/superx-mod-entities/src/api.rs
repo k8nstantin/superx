@@ -323,6 +323,11 @@ pub struct SlotReq {
     pub display_order: Option<i64>,
     /// Absent leaves it as it is; `false` retires it.
     pub active: Option<bool>,
+    /// Say so explicitly to remove a semantics override. Absent means
+    /// "leave it alone" — omitting a field must never be how something
+    /// gets cleared, because a form that mentions one thing would erase
+    /// the others.
+    pub clear_semantics_override: Option<bool>,
 }
 
 /// The whole dictionary, for the design surface.
@@ -431,15 +436,26 @@ pub async fn bind_slot(db: &Db, entity_type: &str, req: &SlotReq) -> Result<()> 
         // Already there: this is an edit, and each part is optional so a
         // form that only changes the order does not also reset the rest.
         Some(prior) => {
-            if req.required.is_some_and(|r| r != prior.required)
-                || req.semantics_override != prior.semantics_override
-            {
+            // ABSENT MEANS UNCHANGED. Treating a missing field as "clear
+            // it" meant a request that only set `required` also wiped the
+            // §5.2 semantics override — the value that decides how an
+            // agent treats the slot — with nothing in the request saying
+            // so and nothing in the response admitting it.
+            let clearing = req.clear_semantics_override.unwrap_or(false);
+            let semantics_override = if clearing {
+                None
+            } else {
+                req.semantics_override.clone().or_else(|| prior.semantics_override.clone())
+            };
+            let required = req.required.unwrap_or(prior.required);
+
+            if required != prior.required || semantics_override != prior.semantics_override {
                 dictionary::bind_slot(
                     db,
                     entity_type,
                     &req.label,
-                    req.required.unwrap_or(prior.required),
-                    req.semantics_override.as_deref(),
+                    required,
+                    semantics_override.as_deref(),
                     &author,
                 )
                 .await?;

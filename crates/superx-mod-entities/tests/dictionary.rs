@@ -631,3 +631,36 @@ async fn the_seed_does_not_overrule_an_operator() {
         "the seed corrects its own ordering, never an operator's"
     );
 }
+
+/// Editing a RETIRED slot must not quietly bring it back. `bind_slot`
+/// asserted `active: true`, so changing whether a slot was required also
+/// un-retired it — two decisions, one of which nobody made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editing_a_retired_slot_does_not_restore_it() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+    let author = superx_mod_entities::notes::Author::operator();
+    registry::add_type(&db, "desk", "entity", None).await.expect("type");
+
+    dictionary::bind_slot(&db, "desk", "description", false, None, &author).await.expect("bind");
+    dictionary::retire_slot(&db, "desk", "description", false, &author).await.expect("retire");
+
+    // An edit that says nothing about retirement.
+    dictionary::bind_slot(&db, "desk", "description", true, None, &author).await.expect("edit");
+
+    let all = dictionary::slots_for(&db, "desk", true).await.expect("all");
+    let slot = all.iter().find(|s| s.label == "description").expect("still there");
+    assert!(!slot.active, "it stays retired: {slot:?}");
+    assert!(slot.required, "and the edit still took effect");
+
+    // Restoring is its own act, and it works.
+    dictionary::retire_slot(&db, "desk", "description", true, &author).await.expect("restore");
+    assert!(
+        dictionary::slots_for(&db, "desk", false)
+            .await
+            .expect("live")
+            .iter()
+            .any(|s| s.label == "description"),
+        "back when somebody actually asks for it"
+    );
+}
