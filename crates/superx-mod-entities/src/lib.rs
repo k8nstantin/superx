@@ -17,6 +17,7 @@ pub mod documents;
 pub mod edges;
 pub mod fields;
 pub mod graph;
+pub mod migrate;
 pub mod nodes;
 pub mod notes;
 pub mod registry;
