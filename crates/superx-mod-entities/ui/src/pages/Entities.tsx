@@ -42,6 +42,7 @@ import type { EntityDetail } from '../generated/EntityDetail'
 import type { AnnotationView } from '../generated/AnnotationView'
 import { useBreadcrumb } from '../Breadcrumbs'
 import { Fields } from '../Fields'
+import { Content } from '../Content'
 
 // The Entities page (issue #231, approved design): list with a type
 // DROPDOWN + search + New entity; click a row → the entity's detail
@@ -649,6 +650,7 @@ function DetailView({
                 reads must never fail — but it is no longer the only door. */}
             <Fields entityId={d.id} />
           </Card>
+          <Content kind="entity" uid={d.id} title="Files" />
           <Card withBorder>
             <Title order={6} tt="uppercase" c="dimmed" mb="xs">
               Attributes (raw)

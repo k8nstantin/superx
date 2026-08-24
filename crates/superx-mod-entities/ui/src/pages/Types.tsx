@@ -15,6 +15,7 @@ import {
 } from '@mantine/core'
 import { addType, fetchTypes, typeColor } from '../api'
 import { useBreadcrumb } from '../Breadcrumbs'
+import { Content } from '../Content'
 
 // The Types page (approved design): entity types only — no category
 // concept. Relations are not types; they live in the link dialog.

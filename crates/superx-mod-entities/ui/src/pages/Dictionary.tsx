@@ -25,6 +25,7 @@ import {
   fetchVocabulary,
 } from '../api'
 import { useBreadcrumb } from '../Breadcrumbs'
+import { Content } from '../Content'
 // The generated types ARE the contract — a hand-written duplicate here
 // drifts from the module the moment either side changes.
 import type { LabelView } from '../generated/LabelView'
@@ -76,6 +77,8 @@ export default function DictionaryPage() {
   const labels = useQuery({ queryKey: ['labels'], queryFn: () => fetchLabels(false) })
   const types = useQuery({ queryKey: ['types'], queryFn: fetchTypes })
   const [forType, setForType] = useState<string | null>(null)
+  // A label is argued about too — §3 gives it a thread of its own.
+  const [forLabel, setForLabel] = useState<string | null>(null)
 
   const slots = useQuery({
     queryKey: ['slots', forType],
@@ -131,8 +134,26 @@ export default function DictionaryPage() {
         </Card>
       </Grid.Col>
 
+      <Grid.Col span={{ base: 12, md: 7 }}>
+        {forType && (
+          <Card withBorder padding="md">
+            <Content
+              kind="type"
+              uid={forType}
+              title={`What belongs to the type '${forType}'`}
+            />
+          </Card>
+        )}
+      </Grid.Col>
+
+      <Grid.Col span={{ base: 12, md: 5 }}>
+        {forLabel && (
+          <Content kind="label" uid={forLabel} title={`What belongs to '${forLabel}'`} />
+        )}
+      </Grid.Col>
+
       <Grid.Col span={12}>
-        <LabelTable labels={labels.data ?? []} />
+        <LabelTable labels={labels.data ?? []} onPick={setForLabel} picked={forLabel} />
       </Grid.Col>
     </Grid>
   )
@@ -450,7 +471,15 @@ function SlotEditor({
   )
 }
 
-function LabelTable({ labels }: { labels: LabelView[] }) {
+function LabelTable({
+  labels,
+  onPick,
+  picked,
+}: {
+  labels: LabelView[]
+  onPick: (key: string) => void
+  picked: string | null
+}) {
   return (
     <Card withBorder padding="md">
       <Title order={4} mb="xs">
@@ -469,7 +498,12 @@ function LabelTable({ labels }: { labels: LabelView[] }) {
           </Table.Thead>
           <Table.Tbody>
             {labels.map((l) => (
-              <Table.Tr key={`${l.label_kind}:${l.key}`}>
+              <Table.Tr
+                key={`${l.label_kind}:${l.key}`}
+                onClick={() => onPick(l.key)}
+                style={{ cursor: 'pointer' }}
+                bg={picked === l.key ? 'rgba(122, 74, 143, 0.18)' : undefined}
+              >
                 <Table.Td>
                   <Text ff="monospace" size="sm">
                     {l.key}

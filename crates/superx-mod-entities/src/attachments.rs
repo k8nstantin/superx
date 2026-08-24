@@ -63,6 +63,40 @@ pub async fn attach(
     source: &Path,
     author: &crate::notes::Author,
 ) -> Result<String> {
+    let filename = source
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| KernelError::Module(format!("{source:?} has no file name")))?;
+    let bytes = std::fs::read(source)
+        .map_err(|e| KernelError::Module(format!("read {source:?}: {e}")))?;
+    attach_bytes(
+        db,
+        module_dir,
+        Upload { target, label, filename: &filename, bytes: &bytes, author },
+    )
+    .await
+}
+
+/// One upload, as a value — the browser has bytes in hand rather than a
+/// path, and the two paths must not drift apart.
+pub struct Upload<'a> {
+    pub target: &'a Target,
+    /// What the file MEANS. A PDF labelled `mandate` IS the mandate.
+    pub label: &'a str,
+    pub filename: &'a str,
+    pub bytes: &'a [u8],
+    pub author: &'a crate::notes::Author,
+}
+
+/// Store bytes already in hand and record what they are.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] for an undefined label or an unwritable
+/// directory; [`KernelError::Db`] for engine errors.
+pub async fn attach_bytes(db: &Db, module_dir: &Path, up: Upload<'_>) -> Result<String> {
+    let Upload { target, label, filename, bytes, author } = up;
+
     if crate::dictionary::current(db, label, crate::dictionary::SLOT).await?.is_none() {
         return Err(KernelError::Module(format!(
             "the dictionary defines no slot label '{label}' — a file that means \
@@ -70,15 +104,17 @@ pub async fn attach(
         )));
     }
 
-    let filename = source
+    // The name is untrusted wherever it came from: keep only the final
+    // component, so it can never climb out of the module's directory.
+    let filename = Path::new(filename)
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .ok_or_else(|| KernelError::Module(format!("{source:?} has no file name")))?;
-    let bytes = std::fs::read(source)
-        .map_err(|e| KernelError::Module(format!("read {source:?}: {e}")))?;
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .unwrap_or("attachment")
+        .to_string();
 
     // One directory per attachment uid: two files of the same name on the
-    // same entity must not overwrite each other, and a version chain
+    // same target must not overwrite each other, and a version chain
     // keeps its own bytes.
     let uid = uuid::Uuid::now_v7().to_string();
     let relative = PathBuf::from(SUBDIR).join(&uid).join(&filename);
@@ -87,7 +123,7 @@ pub async fn attach(
         std::fs::create_dir_all(parent)
             .map_err(|e| KernelError::Module(format!("create {parent:?}: {e}")))?;
     }
-    std::fs::write(&absolute, &bytes)
+    std::fs::write(&absolute, bytes)
         .map_err(|e| KernelError::Module(format!("write {absolute:?}: {e}")))?;
 
     append(

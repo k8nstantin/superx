@@ -48,6 +48,16 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         // the order everything else depends on, so it needs a surface.
         .route("/api/labels", get(api_labels).post(api_define_label))
         .route("/api/vocabulary", get(api_vocabulary))
+        // Content belongs to an entity, a TYPE or a LABEL (#296) — the
+        // same shape for all three, because a type is exactly the thing
+        // people argue about.
+        .route("/api/content/{kind}/{uid}", get(api_content))
+        .route("/api/content/{kind}/{uid}/note", post(api_content_note))
+        .route(
+            "/api/content/{kind}/{uid}/file",
+            post(api_content_file).layer(DefaultBodyLimit::max(upload_limit)),
+        )
+        .route("/api/files/{uid}/download", get(api_file_download))
         .route("/api/types/{name}/slots", get(api_slots).post(api_bind_slot))
         .route("/api/entities", get(api_list).post(api_create))
         .route("/api/entities/{frag}", get(api_detail))
@@ -169,6 +179,106 @@ async fn api_set_field(
             Resp::ok(serde_json::json!({ "key": req.key }))
         }
         Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_content(
+    State(state): State<AppState>,
+    AxumPath((kind, uid)): AxumPath<(String, String)>,
+) -> Resp<api::ContentView> {
+    let db = module_db!(state);
+    match api::content(&db, &kind, &uid).await {
+        Ok(v) => Resp::ok(v),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_content_note(
+    State(state): State<AppState>,
+    AxumPath((kind, uid)): AxumPath<(String, String)>,
+    Json(req): Json<api::ContentNoteReq>,
+) -> Resp<serde_json::Value> {
+    let db = module_db!(state);
+    match api::write_content_note(&db, &kind, &uid, &req).await {
+        Ok(note_uid) => {
+            emit(&state.kernel, "content_written", format!("{kind}:{uid}")).await;
+            Resp::ok(serde_json::json!({ "note_uid": note_uid }))
+        }
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_content_file(
+    State(state): State<AppState>,
+    AxumPath((kind, uid)): AxumPath<(String, String)>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> Resp<serde_json::Value> {
+    let db = module_db!(state);
+    if body.is_empty() {
+        return Resp::err("empty upload".to_string());
+    }
+    let Some(label) = q.get("label") else {
+        return Resp::err("a file needs a label — it is what the file MEANS".to_string());
+    };
+    let target = match crate::target::Target::resolve(&db, &kind, &uid).await {
+        Ok(t) => t,
+        Err(e) => return Resp::err(e.to_string()),
+    };
+    let dir = match state.kernel.module_dir(crate::MODULE_NAME) {
+        Ok(d) => d,
+        Err(e) => return Resp::err(e.to_string()),
+    };
+    let name = q.get("name").cloned().unwrap_or_else(|| "attachment".to_string());
+    match crate::attachments::attach_bytes(
+        &db,
+        &dir,
+        crate::attachments::Upload {
+            target: &target,
+            label,
+            filename: &name,
+            bytes: &body,
+            author: &crate::notes::Author::operator(),
+        },
+    )
+    .await
+    {
+        Ok(attachment_uid) => {
+            emit(&state.kernel, "file_attached", format!("{kind}:{uid}")).await;
+            Resp::ok(serde_json::json!({ "uid": attachment_uid }))
+        }
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_file_download(
+    State(state): State<AppState>,
+    AxumPath(uid): AxumPath<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let db = match state.kernel.module_db(crate::MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let Ok(Some(a)) = crate::attachments::current(&db, &uid).await else {
+        return (StatusCode::NOT_FOUND, "no such attachment").into_response();
+    };
+    let Ok(dir) = state.kernel.module_dir(crate::MODULE_NAME) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no module dir").into_response();
+    };
+    match std::fs::read(crate::attachments::absolute_path(&dir, &a)) {
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, a.mime.clone()),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("inline; filename=\"{}\"", a.filename),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }
 }
 

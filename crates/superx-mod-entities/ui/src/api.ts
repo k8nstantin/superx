@@ -17,6 +17,8 @@ import type { LabelReq } from './generated/LabelReq'
 import type { SlotReq } from './generated/SlotReq'
 import type { FieldView } from './generated/FieldView'
 import type { FieldReq } from './generated/FieldReq'
+import type { ContentView } from './generated/ContentView'
+import type { ContentNoteReq } from './generated/ContentNoteReq'
 
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(path)
@@ -128,3 +130,23 @@ export const fetchFields = (frag: string) =>
 
 export const setField = (frag: string, req: FieldReq) =>
   post<{ key: string }>(`/api/entities/${encodeURIComponent(frag)}/fields`, req)
+
+// ── Content on anything (#296) ───────────────────────────────────────
+// An entity, a TYPE or a LABEL — the same shape for all three.
+
+export const fetchContent = (kind: string, uid: string) =>
+  get<ContentView>(`/api/content/${kind}/${encodeURIComponent(uid)}`)
+
+export const writeContentNote = (kind: string, uid: string, req: ContentNoteReq) =>
+  post<{ note_uid: string }>(`/api/content/${kind}/${encodeURIComponent(uid)}/note`, req)
+
+/// The bytes ARE the body: one file, no multipart boundary to parse, and
+/// the label rides in the query because it is what the file MEANS.
+export async function uploadFile(kind: string, uid: string, label: string, file: File) {
+  const url =
+    `/api/content/${kind}/${encodeURIComponent(uid)}/file` +
+    `?label=${encodeURIComponent(label)}&name=${encodeURIComponent(file.name)}`
+  const r = await fetch(url, { method: 'POST', body: file })
+  if (!r.ok) throw new Error(await errText(r))
+  return (await r.json()) as { uid: string }
+}
