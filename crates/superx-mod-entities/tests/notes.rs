@@ -215,22 +215,33 @@ async fn every_note_records_who_wrote_it_and_as_what() {
     assert_eq!(versions[0].author_kind.as_deref(), Some("agent"));
 }
 
-/// The seam (#268): describing an entity writes a note AND the legacy
-/// text carrier, so the note store becomes real while every existing
-/// reader — the runner above all — keeps working unchanged.
+/// THE SEAM IS CLOSED (#268 opened it, #302 closes it): describing an
+/// entity writes a note and NOTHING ELSE. The dual-write existed so
+/// readers could move across one at a time — `api::detail`, the
+/// runner, the graph. They all have, so the carrier stops being made.
+///
+/// What it does not do is delete: the carriers that exist stay on the
+/// record, and `migrate-prose` still reads their role edges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_legacy_carrier_and_the_note_store_are_both_written() {
+async fn prose_no_longer_makes_an_entity() {
     let db = fresh_db().await;
     let task = create_entity(&db, "task", "Build it", None, None).await.expect("create");
 
     texts::set_role_text(&db, &task, "describes", "what to do").await.expect("describe");
     texts::add_comment(&db, &task, "a remark", &Author::operator()).await.expect("comment");
 
-    // Legacy: the reader that exists today still sees everything.
-    let annotations = texts::annotations(&db, &task).await.expect("annotations");
-    assert_eq!(annotations.len(), 2);
+    // No carrier, and so no role edge either — the two things that used
+    // to put prose in the product graph.
+    assert!(
+        superx_mod_entities::nodes::list_entities(&db, Some("text")).await.expect("list").is_empty(),
+        "prose is not an entity"
+    );
+    assert!(
+        texts::annotations(&db, &task).await.expect("annotations").is_empty(),
+        "the legacy reader finds nothing, because nothing legacy was written"
+    );
 
-    // New: the note store carries the same prose, under dictionary labels.
+    // The note store carries the same prose, under dictionary labels.
     let stored = notes::for_entity(&db, &task, false).await.expect("notes");
     assert_eq!(stored.len(), 2);
     assert!(stored.iter().any(|n| n.label == "description" && n.body == "what to do"));

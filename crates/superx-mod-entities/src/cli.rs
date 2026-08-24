@@ -609,9 +609,13 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let uuid = record_uuid(&anchor);
     emit(kernel, "entity_created", &uuid, &entity_type, &name).await;
     if let Some(text) = describe {
-        let (text_node, _) = texts::set_role_text(&db, &anchor, "describes", &text).await?;
-        emit(kernel, "entity_created", &record_uuid(&text_node), "text", "describes-text").await;
-        emit_link(kernel, &uuid, &record_uuid(&text_node), "describes", "entities_linked").await;
+        // One event, and it names what happened: prose was written on
+        // this entity. The pair that used to go out here — an
+        // `entity_created` for a `text` node and an `entities_linked`
+        // for its role edge — described a carrier and an edge that
+        // #302 stopped creating.
+        let (note_uid, _) = texts::set_role_text(&db, &anchor, "describes", &text).await?;
+        emit(kernel, "note_written", &note_uid, "description", &uuid).await;
     }
     Ok(format!("{uuid}\n"))
 }
@@ -770,15 +774,18 @@ async fn role_text_cmd(kernel: &Kernel, args: &[String], role: &str) -> Result<S
         return Err(usage());
     }
     let target = nodes::resolve_entity(&db, fragment).await?;
-    let (node, created) = texts::set_role_text(&db, &target, role, &text).await?;
-    let node_uuid = record_uuid(&node);
+    let label = texts::label_for_role(role)?;
+    let (note_uid, created) = texts::set_role_text(&db, &target, role, &text).await?;
+    let target_uuid = record_uuid(&target);
     if created {
-        emit(kernel, "entity_created", &node_uuid, "text", "").await;
-        emit_link(kernel, &record_uuid(&target), &node_uuid, role, "entities_linked").await;
-        Ok(format!("{role} text created: {node_uuid}\n"))
+        emit(kernel, "note_written", &note_uid, label, &target_uuid).await;
+        Ok(format!("{label} written: {note_uid}\n"))
     } else {
-        emit(kernel, "entity_updated", &node_uuid, "text", "").await;
-        Ok(format!("{role} text evolved (new version): {node_uuid}\n"))
+        // A `one` label amends the note already there, so this is a new
+        // VERSION of the same chain — the uid does not change, which is
+        // the whole point of the chain.
+        emit(kernel, "note_amended", &note_uid, label, &target_uuid).await;
+        Ok(format!("{label} amended (new version): {note_uid}\n"))
     }
 }
 
@@ -796,11 +803,9 @@ async fn comment_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         return Err(usage());
     }
     let target = nodes::resolve_entity(&db, fragment).await?;
-    let node = texts::add_comment(&db, &target, &text, &author).await?;
-    let node_uuid = record_uuid(&node);
-    emit(kernel, "entity_created", &node_uuid, "text", "comment").await;
-    emit_link(kernel, &record_uuid(&target), &node_uuid, "comments", "entities_linked").await;
-    Ok(format!("comment added: {node_uuid}\n"))
+    let note_uid = texts::add_comment(&db, &target, &text, &author).await?;
+    emit(kernel, "note_written", &note_uid, "comments", &record_uuid(&target)).await;
+    Ok(format!("comment added: {note_uid}\n"))
 }
 
 async fn attach_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {

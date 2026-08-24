@@ -369,11 +369,12 @@ mod firing {
         /// the task, authored by the agent in this run — not a node in
         /// the product graph an agent then has to walk past.
         ///
-        /// It goes through `texts::add_comment` and returns the CARRIER
-        /// id, exactly as the entities CLI does, because a fixture that
-        /// is kinder than the real path proves a property of itself
-        /// rather than of the runner. Returning the note uid here hid
-        /// both a wrong id and an empty one.
+        /// It goes through `texts::add_comment` and returns exactly what
+        /// the entities CLI returns, because a fixture that is kinder
+        /// than the real path proves a property of itself rather than
+        /// of the runner. That used to be a carrier id; since #302
+        /// retired the carrier it is the note uid, and this follows the
+        /// real path rather than preserving the old shape.
         async fn write_back(
             &self,
             task_uid: &str,
@@ -382,8 +383,7 @@ mod firing {
         ) -> superx_kernel::Result<String> {
             let task = nodes::resolve_entity(&self.edb, task_uid).await?;
             let author = superx_mod_entities::notes::Author::claimed("agent", Some(run_uid), None)?;
-            let carrier = texts::add_comment(&self.edb, &task, output, &author).await?;
-            Ok(superx_ops::record_uuid(&carrier))
+            texts::add_comment(&self.edb, &task, output, &author).await
         }
     }
 
@@ -496,11 +496,20 @@ mod firing {
             !output_ref.is_empty(),
             "the run points at something — an empty output_ref is a run that recorded nothing"
         );
-        // While both stores are written this is the comment carrier's id,
-        // which is what the entities CLI reports. It resolves.
-        superx_mod_entities::nodes::resolve_entity(&edb, &output_ref)
+        // The property is that the reference points at something REAL —
+        // a run pointing at nothing records nothing. Since #302 retired
+        // the carrier it is a note uid rather than an entity id, so it
+        // is resolved where notes live.
+        let note = superx_mod_entities::notes::current(&edb, &output_ref)
             .await
+            .expect("read")
             .expect("whatever the run points at can be found");
+        assert_eq!(note.label, "comments", "the output is a comment on the task");
+        assert_eq!(
+            note.author_kind.as_deref(),
+            Some("agent"),
+            "authored by the agent that ran it, not by the operator"
+        );
 
         // And it did NOT become a node in the graph.
         assert!(
@@ -682,7 +691,19 @@ mod firing {
         edges::link(&edb, &product, &t2, "contains").await.expect("c2");
         edges::link(&edb, &t2, &t1, "depends_on").await.expect("d");
         let (i2, _) = texts::set_role_text(&edb, &t2, "instructs", "old orders").await.expect("i2");
-        let old_version = nodes::current_state(&edb, &i2).await.expect("q").expect("s").valid_from;
+        // The version the RUNNER pins is the note's `valid_from` as
+        // rfc3339 (`graph.rs` builds the node contract that way), so
+        // read it from the same place. Comparing against a carrier's
+        // state version — which is what this did before #302 retired
+        // the carrier — would compare two different clocks and pass
+        // whatever happened.
+        let old_version = superx_mod_entities::notes::current(&edb, &i2)
+            .await
+            .expect("q")
+            .expect("note")
+            .valid_from
+            .map(|t| t.to_rfc3339())
+            .expect("a written note has a version");
 
         let mut exchange = FixtureExchange::new(edb.clone(), product.clone());
         exchange.instruct_edit = Some((t2.clone(), "NEW orders".to_string()));

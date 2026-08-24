@@ -4,11 +4,11 @@
 //! comment always mints a new node — many comments coexist, and a
 //! comment on a comment is a thread.
 
-use superx_kernel::types::{Object, RecordId, Value};
+use superx_kernel::types::RecordId;
 use superx_kernel::{Db, Result};
 
-use crate::edges::{expand, link};
-use crate::nodes::{create_entity, current_state, update_entity};
+use crate::edges::expand;
+use crate::nodes::current_state;
 use crate::notes::{self, Author};
 
 /// The role edges whose targets are inline text nodes.
@@ -57,31 +57,20 @@ pub async fn set_role_text(
     target: &RecordId,
     role: &str,
     text: &str,
-) -> Result<(RecordId, bool)> {
-    // The note store first (#268). It consults the dictionary, so an
-    // undefined label is refused BEFORE a legacy node is created —
-    // failing closed rather than leaving a half-written pair.
-    let (note_uid, _) =
+) -> Result<(String, bool)> {
+    // THE LAST STEP OF THE SEAM (#302). This wrote the note AND a
+    // legacy `text` entity on a role edge, so readers could be moved
+    // across one at a time. They all have been — `api::detail` reads
+    // `notes::for_entity`, the runner reads `node.note(...)`, and
+    // `texts::annotations` has no caller left outside its own tests.
+    //
+    // So the carrier stops being written. Not deleted: the ~41 that
+    // exist stay on the record, append-only, and `migrate-prose` still
+    // reads their role edges to move history that predates the note
+    // store.
+    let (note_uid, created) =
         notes::write(db, target, label_for_role(role)?, text, &Author::operator()).await?;
-
-    let existing = expand(db, std::slice::from_ref(target), false)
-        .await?
-        .into_iter()
-        .find(|e| e.active && e.rel_type == role);
-    if let Some(edge) = existing {
-        update_entity(db, &edge.to, Some(label_for(text)), Some(text.to_string()), None).await?;
-        return Ok((edge.to, false));
-    }
-    let node = create_entity(
-        db,
-        "text",
-        &label_for(text),
-        Some(text.to_string()),
-        Some(carries(&note_uid)),
-    )
-    .await?;
-    link(db, target, &node, role).await?;
-    Ok((node, true))
+    Ok((note_uid, created))
 }
 
 /// Add a comment: always a fresh text node + `comments` edge.
@@ -94,18 +83,9 @@ pub async fn add_comment(
     target: &RecordId,
     text: &str,
     author: &Author,
-) -> Result<RecordId> {
+) -> Result<String> {
     let (note_uid, _) = notes::write(db, target, label_for_role("comments")?, text, author).await?;
-    let node = create_entity(
-        db,
-        "text",
-        &label_for(text),
-        Some(text.to_string()),
-        Some(carries(&note_uid)),
-    )
-    .await?;
-    link(db, target, &node, "comments").await?;
-    Ok(node)
+    Ok(note_uid)
 }
 
 /// The current text annotations of an entity (active role edges →
@@ -127,29 +107,4 @@ pub async fn annotations(db: &Db, target: &RecordId) -> Result<Vec<Annotation>> 
         out.push(Annotation { rel_type: edge.rel_type, text_id: edge.to, content });
     }
     Ok(out)
-}
-
-/// A one-line label derived from the text (name column contract).
-fn label_for(text: &str) -> String {
-    let line = text.lines().next().unwrap_or("");
-    if line.chars().count() > 40 {
-        let cut: String = line.chars().take(40).collect();
-        format!("{cut}…")
-    } else {
-        line.to_string()
-    }
-}
-
-/// Mark a carrier with the note it duplicates.
-///
-/// While both stores are written, a carrier created today ALREADY has
-/// its prose in the note store. Without this the migration would move it
-/// a second time and the entity would show the same comment twice — and
-/// for a plural label there is no cardinality rule to collapse them
-/// back. Recording the pairing makes the migration exact instead of
-/// guessing from the text.
-fn carries(note_uid: &str) -> Value {
-    let mut attrs = Object::new();
-    attrs.insert("note_uid".to_string(), Value::String(note_uid.to_string()));
-    Value::Object(attrs)
 }
