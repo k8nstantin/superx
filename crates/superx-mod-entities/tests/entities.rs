@@ -878,7 +878,24 @@ async fn ancestor_path_is_root_first_priority_ordered_and_cycle_safe() {
 
     // A cycle terminates instead of climbing forever (asserted last:
     // it gives the root an incoming edge).
-    edges::link(&db, &task, &product, "contains").await.expect("cycle");
+    //
+    // `link` refuses to CREATE one now (#298) — `contains` is acyclic —
+    // but data written before that rule may hold one, and the walk must
+    // still come back rather than climb forever. So the fixture is
+    // written the way such a row got there: straight into the substrate,
+    // past the guard.
+    let edge_uid = uuid::Uuid::now_v7().to_string();
+    db.query(
+        "RELATE $from->edge->$to SET edge_uid = $uid, rel_type = 'contains', \
+         active = true, valid_from = time::now()",
+    )
+    .bind(("from", task.clone()))
+    .bind(("to", product.clone()))
+    .bind(("uid", edge_uid))
+    .await
+    .expect("cycle")
+    .check()
+    .expect("a cycle that predates the rule");
     let trail = graph::ancestors(&db, &task, 12).await.expect("walk");
     assert!(trail.len() <= 3, "visited set stops the cycle: {}", trail.len());
 }

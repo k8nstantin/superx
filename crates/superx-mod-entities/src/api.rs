@@ -272,6 +272,12 @@ pub struct LabelView {
     pub value_kind: Option<String>,
     pub cardinality: Option<String>,
     pub archived: bool,
+    /// Link labels: what this edge will accept at each end, how it reads
+    /// the other way, and whether it may close a loop.
+    pub source_types: Vec<String>,
+    pub target_types: Vec<String>,
+    pub inverse: Option<String>,
+    pub acyclic: bool,
 }
 
 /// A slot a type carries, resolved against the label it names.
@@ -313,6 +319,12 @@ pub struct LabelReq {
     pub description: Option<String>,
     pub cardinality: Option<String>,
     pub value_kind: Option<String>,
+    /// Link labels only: which types may sit at each end. Absent leaves
+    /// what is there; an empty list clears it back to permissive.
+    pub source_types: Option<Vec<String>>,
+    pub target_types: Option<Vec<String>>,
+    pub inverse: Option<String>,
+    pub acyclic: Option<bool>,
 }
 
 /// Give a type a slot, or change the one it has.
@@ -524,6 +536,10 @@ pub async fn labels(db: &Db, include_archived: bool) -> Result<Vec<LabelView>> {
             value_kind: l.value_kind,
             cardinality: l.cardinality,
             archived: l.archived,
+            source_types: l.source_types,
+            target_types: l.target_types,
+            inverse: l.inverse,
+            acyclic: l.acyclic,
         })
         .collect())
 }
@@ -564,6 +580,10 @@ pub async fn define_label(db: &Db, req: &LabelReq) -> Result<()> {
             description: req.description.as_deref(),
             cardinality: req.cardinality.as_deref(),
             value_kind: req.value_kind.as_deref(),
+            source_types: req.source_types.as_deref(),
+            target_types: req.target_types.as_deref(),
+            inverse: req.inverse.as_deref(),
+            acyclic: req.acyclic,
         },
     )
     .await

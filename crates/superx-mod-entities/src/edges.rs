@@ -6,7 +6,7 @@
 //! row on the same edge_uid with active = false; current edge state =
 //! latest row per edge_uid.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use superx_kernel::types::{RecordId, Value};
 use superx_kernel::{Db, KernelError, Result};
@@ -46,9 +46,97 @@ pub async fn link(db: &Db, from: &RecordId, to: &RecordId, rel_type: &str) -> Re
             record_uuid(to)
         )));
     }
+    // What the LABEL will accept (#298, spec §5.5). A mislabelled field
+    // is a confusing entity; a mislabelled edge is a wrong graph, and the
+    // graph is what agents execute.
+    enforce_link_label(db, from, to, rel_type).await?;
+
     let edge_uid = uuid::Uuid::now_v7().to_string();
     relate(db, from, to, &edge_uid, rel_type, true).await?;
     Ok(edge_uid)
+}
+
+/// Refuse a link the dictionary says cannot exist.
+///
+/// A label with NO declared endpoints stays permissive: one somebody has
+/// not finished describing must not block work, the same rule as a type
+/// that declares no slots accepting anything (§7). Enforcement arrives
+/// with the declaration, never before it.
+async fn enforce_link_label(
+    db: &Db,
+    from: &RecordId,
+    to: &RecordId,
+    rel_type: &str,
+) -> Result<()> {
+    let Some(label) = crate::dictionary::current(db, rel_type, crate::dictionary::LINK).await?
+    else {
+        // Not in the dictionary at all: the registry already vouched for
+        // the relation type, and refusing here would break every edge
+        // written before link labels were seeded.
+        return Ok(());
+    };
+
+    if !label.source_types.is_empty() {
+        let (kind, _) = crate::nodes::anchor_info(db, from).await?;
+        if !label.source_types.contains(&kind) {
+            return Err(KernelError::Module(format!(
+                "'{rel_type}' does not start at a {kind} — it starts at: {}",
+                label.source_types.join(", ")
+            )));
+        }
+    }
+    if !label.target_types.is_empty() {
+        let (kind, _) = crate::nodes::anchor_info(db, to).await?;
+        if !label.target_types.contains(&kind) {
+            return Err(KernelError::Module(format!(
+                "'{rel_type}' does not point at a {kind} — it points at: {}",
+                label.target_types.join(", ")
+            )));
+        }
+    }
+
+    if label.acyclic && reaches(db, to, from, rel_type).await? {
+        return Err(KernelError::Module(format!(
+            "'{rel_type}' is acyclic and this would close a loop — {} already reaches {} \
+             that way. A cycle here is not a link that reads oddly: the runner's wave \
+             pass drops every task in it, so the work never runs and nothing says why",
+            record_uuid(to),
+            record_uuid(from)
+        )));
+    }
+    Ok(())
+}
+
+/// Can `start` reach `goal` by following active edges of one label?
+///
+/// Bounded by the nodes it visits, not by the table: an acyclic check
+/// that walked everything would cost the graph on every link.
+async fn reaches(db: &Db, start: &RecordId, goal: &RecordId, rel_type: &str) -> Result<bool> {
+    let goal_uuid = record_uuid(goal);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut frontier = vec![start.clone()];
+    seen.insert(record_uuid(start));
+
+    while !frontier.is_empty() {
+        if seen.contains(&goal_uuid) {
+            return Ok(true);
+        }
+        let mut next = Vec::new();
+        for edge in expand(db, &frontier, false).await? {
+            if !edge.active || edge.rel_type != rel_type {
+                continue;
+            }
+            let uuid = record_uuid(&edge.to);
+            if uuid == goal_uuid {
+                return Ok(true);
+            }
+            if seen.insert(uuid) {
+                next.push(edge.to);
+            }
+        }
+        frontier = next;
+    }
+    Ok(false)
 }
 
 /// Retract the active link on (from, to, rel_type) by appending an

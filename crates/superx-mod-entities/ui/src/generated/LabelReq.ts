@@ -3,4 +3,9 @@
 /**
  * Define or redefine a label.
  */
-export type LabelReq = { key: string, label_kind: string, display: string | null, semantics: string, description: string | null, cardinality: string | null, value_kind: string | null, };
+export type LabelReq = { key: string, label_kind: string, display: string | null, semantics: string, description: string | null, cardinality: string | null, value_kind: string | null, 
+/**
+ * Link labels only: which types may sit at each end. Absent leaves
+ * what is there; an empty list clears it back to permissive.
+ */
+source_types: Array<string> | null, target_types: Array<string> | null, inverse: string | null, acyclic: boolean | null, };
