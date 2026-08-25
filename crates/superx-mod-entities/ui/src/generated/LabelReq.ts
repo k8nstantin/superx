@@ -8,4 +8,14 @@ export type LabelReq = { key: string, label_kind: string, display: string | null
  * Link labels only: which types may sit at each end. Absent leaves
  * what is there; an empty list clears it back to permissive.
  */
-source_types: Array<string> | null, target_types: Array<string> | null, inverse: string | null, acyclic: boolean | null, };
+source_types: Array<string> | null, target_types: Array<string> | null, inverse: string | null, acyclic: boolean | null, 
+/**
+ * WHAT THE RUNNER IS TO DO WITH IT — "this is the spec to build
+ * from", "this is your mandate; you may not change it". The column
+ * has existed since #266 and nothing could write it, so a label
+ * could say what it MEANT to a human and nothing to a machine.
+ *
+ * This is the half of a label that makes it actionable: an agent
+ * reads the labels first, and this is what it reads.
+ */
+agent_note: string | null, };

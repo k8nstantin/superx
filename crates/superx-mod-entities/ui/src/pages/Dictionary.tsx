@@ -199,6 +199,10 @@ function DefineLabel({
   const [valueKind, setValueKind] = useState<string | null>(null)
   const [cardinality, setCardinality] = useState<string | null>('one')
   const [description, setDescription] = useState('')
+  // WHAT THE RUNNER IS TO DO WITH IT. A label that says what it means
+  // to a human and nothing to a machine is not actionable, and
+  // actionable is the whole reason a label exists.
+  const [action, setAction] = useState('')
   const [error, setError] = useState<string | null>(null)
   // Link labels: what may sit at each end, and whether it may close a
   // loop. A mislabelled edge is a wrong graph, and the graph is what
@@ -223,6 +227,7 @@ function DefineLabel({
         display: display.trim() ? display.trim() : null,
         semantics: semantics ?? '',
         description: description.trim() ? description.trim() : null,
+        agent_note: action.trim() ? action.trim() : null,
         cardinality: isSlot ? cardinality : null,
         value_kind: isSlot ? valueKind : null,
         source_types: isSlot ? null : sourceTypes,
@@ -234,6 +239,7 @@ function DefineLabel({
       setKey('')
       setDisplay('')
       setDescription('')
+      setAction('')
       setError(null)
       onDone()
     },
@@ -373,6 +379,16 @@ function DefineLabel({
         placeholder="what this term means, for whoever reads it next"
         value={description}
         onChange={(e) => setDescription(e.currentTarget.value)}
+        autosize
+        minRows={2}
+        mb="xs"
+      />
+      <Textarea
+        label="What the runner does with it"
+        description="read by an agent before anything else — this is what makes the label actionable"
+        placeholder="This is the spec to build from. Build exactly this; where it is silent, ask rather than assume."
+        value={action}
+        onChange={(e) => setAction(e.currentTarget.value)}
         autosize
         minRows={2}
         mb="sm"
@@ -635,6 +651,19 @@ function LabelTable({
                   <Text size="xs" c="dimmed">
                     {SEMANTICS_HELP[l.semantics] ?? ''}
                   </Text>
+                  {/* What the RUNNER does with it — the half that makes
+                      a label actionable rather than merely descriptive.
+                      A label with none is a term a human understands
+                      and a machine does not. */}
+                  {l.agent_note ? (
+                    <Text size="xs" c="pelican.4" mt={2}>
+                      → {l.agent_note}
+                    </Text>
+                  ) : (
+                    <Text size="xs" c="dimmed" fs="italic" mt={2}>
+                      → no action set — nothing tells an agent what to do with it
+                    </Text>
+                  )}
                 </Table.Td>
                 <Table.Td>
                   {l.label_kind === 'link' ? (

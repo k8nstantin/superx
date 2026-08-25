@@ -18,6 +18,12 @@ undeclared: boolean,
  */
 ad_hoc: boolean, 
 /**
+ * The dictionary term this field borrows its meaning from, if the
+ * operator attached one. Absent means the field is theirs alone —
+ * named, typed, and not something an agent acts on.
+ */
+label: string | null, 
+/**
  * How this type treats it — the override where there is one.
  */
 semantics: string, 

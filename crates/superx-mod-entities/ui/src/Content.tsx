@@ -121,7 +121,7 @@ function Files({
   const [error, setError] = useState<string | null>(null)
 
   const upload = useMutation({
-    mutationFn: (file: File) => uploadFile(kind, uid, label as string, file),
+    mutationFn: (file: File) => uploadFile(kind, uid, label ?? '', file),
     onSuccess: () => {
       setError(null)
       onDone()
@@ -135,9 +135,15 @@ function Files({
         <Stack gap={4} mb="sm">
           {files.map((f) => (
             <Group key={f.uid} gap="xs" wrap="nowrap">
-              <Badge size="xs" color="pelican" variant="light">
-                {f.label}
-              </Badge>
+              {f.label ? (
+                <Badge size="xs" color="pelican" variant="light">
+                  {f.label}
+                </Badge>
+              ) : (
+                <Badge size="xs" color="gray" variant="outline">
+                  unlabelled
+                </Badge>
+              )}
               <Anchor size="sm" href={`/api/files/${f.uid}/download`} target="_blank">
                 {f.filename}
               </Anchor>
@@ -152,14 +158,15 @@ function Files({
       <Group gap="xs" mb="sm" align="flex-end">
         <Select
           size="xs"
-          label="Attach a file as"
-          description="the label is what the file MEANS"
-          placeholder="pick a label"
+          label="Label — optional"
+          description="a label makes it actionable; without one it is attached for reference"
+          placeholder="none"
           data={labels}
           value={label}
           onChange={setLabel}
+          clearable
           searchable
-          w={220}
+          w={260}
         />
         <input
           ref={picker}
@@ -171,10 +178,14 @@ function Files({
             e.currentTarget.value = ''
           }}
         />
+        {/* NOT gated on the label. A file has a name and bytes; the
+            label is the optional third thing, and requiring it meant
+            you could not attach anything without first deciding what it
+            MEANS — §5.4's "a PDF labelled mandate IS the mandate" is
+            what a label BUYS you, not the price of attaching. */}
         <Button
           size="xs"
           variant="light"
-          disabled={!label}
           loading={upload.isPending}
           onClick={() => picker.current?.click()}
         >

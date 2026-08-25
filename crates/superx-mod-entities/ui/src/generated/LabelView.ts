@@ -3,7 +3,12 @@
 /**
  * One term in the dictionary, as the design surface shows it.
  */
-export type LabelView = { key: string, 
+export type LabelView = { 
+/**
+ * What the runner is to DO with it. A label with none says what it
+ * means to a human and nothing to a machine.
+ */
+agent_note: string | null, key: string, 
 /**
  * `slot` (what an entity carries) or `link` (how entities connect).
  */
