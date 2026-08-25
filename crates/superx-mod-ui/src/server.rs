@@ -344,9 +344,9 @@ async fn api_sessions(
                 .await
                 .unwrap_or((None, None));
         let context_pct = context_tokens.map(|c| ((c * 100) / window).clamp(0, 100));
-        let model = crate::activity::session_model(kernel, s.entity_id.clone())
+        let (model, effort) = crate::activity::session_model_effort(kernel, s.entity_id.clone())
             .await
-            .unwrap_or(None);
+            .unwrap_or((None, None));
         let uuid = superx_ops::record_uuid(&s.entity_id);
         out.push(SessionView {
             identity: format!("{agent}/{uuid}"),
@@ -359,6 +359,7 @@ async fn api_sessions(
             output_tokens,
             last_active,
             model,
+            effort,
         });
     }
     Json(out)
@@ -429,10 +430,26 @@ async fn api_session_activity(
 }
 
 /// The Status page's aggregation (issue #228).
-async fn api_stats(State(state): State<AppState>) -> Response<StatsSummary> {
+#[derive(serde::Deserialize)]
+struct RangeQuery {
+    range: Option<String>,
+}
+
+async fn api_stats(
+    State(state): State<AppState>,
+    Query(q): Query<RangeQuery>,
+) -> Response<StatsSummary> {
     let kernel = &state.kernel;
     let window = crate::resolved_stats_window(kernel).await;
-    match crate::stats::stats_summary(kernel, window).await {
+    // Scroll-back (#326): a named range replaces the fixed newest-N
+    // read. Unknown values fall back to the window rather than
+    // erroring, so a stale bookmark still renders.
+    let range = q.range.unwrap_or_else(|| "window".to_string());
+    let range = match range.as_str() {
+        "1h" | "6h" | "24h" | "7d" | "30d" | "all" | "window" => range,
+        _ => "window".to_string(),
+    };
+    match crate::stats::stats_for_range(kernel, window, &range).await {
         Ok(s) => Response::ok(s),
         Err(e) => Response::err(e.to_string()),
     }

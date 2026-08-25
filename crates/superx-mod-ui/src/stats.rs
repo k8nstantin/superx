@@ -8,12 +8,15 @@
 //! Pure SELECT throughout — readers must not mutate the stream they
 //! observe. All code lives in the ui module; kernel untouched.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
-use crate::api::{NameCount, SessionStat, StatsSummary, TimeCount, ToolOutcome};
+use crate::api::{
+    ChurnPoint, LiveSession, ModelStat, NameCount, RepoStat, SessionStat, StatsSummary,
+    TimeCount, ToolOutcome,
+};
 
 /// Telemetry window backing the events/min timeline (same bound the
 /// charts endpoint has always used).
@@ -220,6 +223,32 @@ struct CodeAgg {
     subagent: i64,
     thinking: i64,
     files: HashMap<String, i64>,
+    /// Per-hour code movement, keyed `YYYY-MM-DDTHH` (issue #324).
+    churn: HashMap<String, (i64, i64)>,
+    /// Text an edit removed from a file, per file — so a later edit
+    /// that puts it back can be recognized as an undo.
+    /// Hashes of text earlier-in-time edits removed, per file. Only
+    /// equality is needed, and whole function bodies for 20k messages
+    /// is a lot of resident memory (review of #330).
+    removed_text: HashMap<String, HashSet<u64>>,
+    reverts: i64,
+    out_tokens: i64,
+    /// session uuid seen in each 5-minute bucket, for concurrency.
+    concurrency: HashMap<String, HashSet<String>>,
+    /// Message instants, for the quiet-stretch measure.
+    instants: Vec<chrono::DateTime<chrono::Utc>>,
+    // ── quality, from what the commands printed (#327) ───────────
+    tests_passed: i64,
+    tests_failed: i64,
+    compile_errors: i64,
+    denials: i64,
+    compactions: i64,
+    interventions: i64,
+    // ── the repo and model dimensions (#325, #328) ───────────────
+    repos: HashMap<String, RepoAgg>,
+    models: HashMap<String, ModelAgg>,
+    /// Per-session live state, keyed by session uuid.
+    live: HashMap<String, LiveAgg>,
     languages: HashMap<String, i64>,
     commands: HashMap<String, i64>,
     projects: HashMap<String, i64>,
@@ -251,6 +280,61 @@ fn replaced_lines(name: &str, input: &Object) -> i64 {
     0
 }
 
+/// A snippet reduced to its shape, so trivial whitespace differences
+/// do not hide an undo (issue #324). Empty for snippets too small to
+/// be meaningful evidence.
+fn snippet_key(s: &str) -> Option<u64> {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.len() < 12 {
+        return None;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&flat, &mut h);
+    Some(std::hash::Hasher::finish(&h))
+}
+
+/// Work in one repo. Agents run across many repos at once, so the
+/// aggregate alone hides a repo that is thrashing (issue #325).
+#[derive(Default)]
+struct RepoAgg {
+    branch: Option<String>,
+    messages: i64,
+    lines_added: i64,
+    lines_removed: i64,
+    files: HashSet<String>,
+    tests_run: i64,
+    tool_failures: i64,
+    out_tokens: i64,
+    agents: HashSet<String>,
+    last_active: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Outcomes attributable to one model (issue #328).
+#[derive(Default)]
+struct ModelAgg {
+    messages: i64,
+    lines_added: i64,
+    lines_removed: i64,
+    out_tokens: i64,
+    tool_failures: i64,
+    reverts: i64,
+}
+
+/// What one session is doing, for the live panel (#325).
+#[derive(Default)]
+struct LiveAgg {
+    agent: String,
+    repo: Option<String>,
+    branch: Option<String>,
+    model: Option<String>,
+    last_tool: Option<String>,
+    messages: i64,
+    lines_added: i64,
+    out_tokens: i64,
+    tool_failures: i64,
+    newest: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Default)]
 struct SessAgg {
     messages: i64,
@@ -280,6 +364,110 @@ fn score_status(o: &mut Outcome, status: &str) {
     }
 }
 
+/// The ranges the cockpit offers (issue #326). `all` is unbounded;
+/// everything else is a rolling window, and every range is capped by
+/// rows so a month of history cannot stall a page load.
+pub fn range_cutoff(range: &str) -> Option<chrono::Duration> {
+    match range {
+        "1h" => Some(chrono::Duration::hours(1)),
+        "6h" => Some(chrono::Duration::hours(6)),
+        "24h" => Some(chrono::Duration::hours(24)),
+        "7d" => Some(chrono::Duration::days(7)),
+        "30d" => Some(chrono::Duration::days(30)),
+        _ => None,
+    }
+}
+
+/// Rows the range walk will read at most. A month of heavy agent work
+/// is far more than a page needs; the payload says when it truncated
+/// rather than pretending the sample is the whole range.
+pub const RANGE_ROW_CAP: u32 = 20_000; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// Tools whose output is a command's own report. Everything else —
+/// above all `Read`, whose payload is a FILE — must never be scored:
+/// a source comment mentioning "42 failed" is not a test result
+/// (review of #330).
+const SHELL_TOOLS: [&str; 4] = ["Bash", "run_shell_command", "Shell", "run_terminal_cmd"];
+
+/// Lines scanned from each end of a command's output. Runners print
+/// their tally at the END, so scanning only the head loses it — while
+/// diagnostics appear throughout. Both ends, bounded.
+const SCAN_EDGE: usize = 300; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// A count token: strip any trailing punctuation, so cargo's
+/// `passed;` counts exactly like jest's `passed,`. Getting this wrong
+/// dropped passes while keeping failures — a one-directional bias
+/// that made every pass rate read worse than reality.
+fn count_word(w: &str) -> &str {
+    w.trim_end_matches([',', ';', '.', ')'])
+}
+
+/// What a shell command printed, mined for outcomes (issue #327).
+/// Test tallies come from the shapes real runners emit; diagnostics
+/// from compiler prefixes.
+fn score_output(text: &str, code: &mut CodeAgg) {
+    let lines: Vec<&str> = text.lines().collect();
+    let scan: Vec<&&str> = if lines.len() <= SCAN_EDGE * 2 {
+        lines.iter().collect()
+    } else {
+        lines
+            .iter()
+            .take(SCAN_EDGE)
+            .chain(lines.iter().skip(lines.len() - SCAN_EDGE))
+            .collect()
+    };
+    for line in scan {
+        let l = line.trim();
+        // cargo / go: "test result: ok. 42 passed; 0 failed; …"
+        if let Some(rest) = l.strip_prefix("test result:") {
+            for part in rest.split(';') {
+                let p = part
+                    .trim()
+                    .trim_start_matches("ok.")
+                    .trim_start_matches("FAILED.")
+                    .trim();
+                let mut it = p.split_whitespace();
+                if let (Some(n), Some(word)) = (it.next(), it.next()) {
+                    if let Ok(v) = n.parse::<i64>() {
+                        match count_word(word) {
+                            "passed" => code.tests_passed += v,
+                            "failed" => code.tests_failed += v,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // pytest / jest / vitest: "5 passed, 2 failed".
+        if l.contains("passed") || l.contains("failed") {
+            let mut prev: Option<i64> = None;
+            for w in l.split_whitespace() {
+                match count_word(w) {
+                    "passed" => {
+                        if let Some(v) = prev.take() {
+                            code.tests_passed += v;
+                        }
+                    }
+                    "failed" => {
+                        if let Some(v) = prev.take() {
+                            code.tests_failed += v;
+                        }
+                    }
+                    other => prev = other.parse::<i64>().ok(),
+                }
+            }
+        }
+        // Diagnostics: rustc, tsc, generic.
+        if l.starts_with("error[")
+            || l.starts_with("error: could not compile")
+            || l.contains(" error TS")
+        {
+            code.compile_errors += 1;
+        }
+    }
+}
+
 /// One in-engine `count() GROUP ALL` over a table.
 async fn count_rows(kernel: &Kernel, query: &'static str) -> Result<i64> {
     let rows: Vec<Value> = kernel.db().query(query).await?.take(0)?;
@@ -294,6 +482,18 @@ async fn count_rows(kernel: &Kernel, query: &'static str) -> Result<i64> {
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
 pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary> {
+    stats_for_range(kernel, window, "window").await
+}
+
+/// The aggregation over a chosen range (issue #326). `window` is the
+/// row cap for the legacy fixed-size read; a named range replaces it
+/// with a time bound and the wider cap, so every instrument gains
+/// history instead of being pinned to the newest N messages.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Result<StatsSummary> {
     // ── cheap in-engine totals ──────────────────────────────────────
     let events_total =
         count_rows(kernel, "SELECT count() AS c FROM telemetry_stream GROUP ALL").await?;
@@ -358,27 +558,135 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
     }
 
     // ── the raw-message window walk: what the agents actually did ──
-    let msgs: Vec<MessageRecord> = kernel
-        .db()
-        .query("SELECT * FROM message ORDER BY valid_from DESC LIMIT $limit")
-        .bind(("limit", window))
-        .await?
-        .take(0)?;
+    let cutoff = range_cutoff(range);
+    let cap = if range == "window" { window } else { RANGE_ROW_CAP };
+    let msgs: Vec<MessageRecord> = match cutoff {
+        Some(d) => {
+            let since = chrono::Utc::now() - d;
+            kernel
+                .db()
+                .query(
+                    "SELECT * FROM message WHERE valid_from > $since \
+                     ORDER BY valid_from DESC LIMIT $limit",
+                )
+                .bind(("since", since))
+                .bind(("limit", cap))
+                .await?
+                .take(0)?
+        }
+        None => kernel
+            .db()
+            .query("SELECT * FROM message ORDER BY valid_from DESC LIMIT $limit")
+            .bind(("limit", cap))
+            .await?
+            .take(0)?,
+    };
+    // Truncation is only meaningful for a time-bounded range: the
+    // fixed window is BY DEFINITION the newest N, so reporting it as
+    // "sampled" on the default view was just wrong (review of #330).
+    let truncated = cutoff.is_some() && msgs.len() as u32 >= cap;
     let mut tools: HashMap<String, i64> = HashMap::new();
     let mut code = CodeAgg::default();
     let mut lines_written = 0i64;
     let mut per_session: HashMap<String, SessAgg> = HashMap::new();
     let mut outcomes: HashMap<String, Outcome> = HashMap::new();
-    // tool_use_id → tool name, so a later tool_result can be scored.
-    let mut call_names: HashMap<String, String> = HashMap::new();
+    // tool_use_id → (tool name, model, repo). A `tool_result` message
+    // carries NO model of its own, so a failure attributed from the
+    // result would land on `unknown`; it belongs to whoever made the
+    // call (#328).
+    let mut call_names: HashMap<String, (String, Option<String>, Option<String>)> = HashMap::new();
     // Results seen before their call (the walk is newest-first).
     let mut pending_results: HashMap<String, bool> = HashMap::new();
+    // Output text held until the call names the tool that produced it.
+    let mut pending_output: HashMap<String, String> = HashMap::new();
+    // Shell calls seen before their output — the reverse order, which
+    // happens with interleaved sidechains. Without this the text is
+    // stashed forever and silently dropped.
+    let mut shell_calls: HashSet<String> = HashSet::new();
     for m in &msgs {
         let sid = superx_ops::record_uuid(&m.session);
         let agg = per_session.entry(sid).or_default();
         agg.messages += 1;
+        // Shape of the working day (#324): when messages landed, and
+        // how many sessions were live at once.
+        code.instants.push(m.valid_from);
+        let minute: u32 = m
+            .valid_from
+            .format("%M")
+            .to_string()
+            .parse()
+            .unwrap_or(0);
+        let bucket5 = format!("{}-{}", m.valid_from.format("%Y-%m-%dT%H"), minute / 5);
+        code.concurrency
+            .entry(bucket5)
+            .or_default()
+            .insert(superx_ops::record_uuid(&m.session));
+
         let Some(raw) = &m.raw else { continue };
-        // Which checkout the agent was standing in (#308).
+        // Live state (#325): newest-first, so the first sighting of a
+        // session carries its freshest facts.
+        {
+            let sid = superx_ops::record_uuid(&m.session);
+            let l = code.live.entry(sid).or_default();
+            l.messages += 1;
+            if l.newest.is_none() {
+                l.newest = Some(m.valid_from);
+                l.agent = superx_ops::record_uuid(&m.agent);
+            }
+        }
+
+        // Quality signals carried on the message itself (#327).
+        if get_str(raw, "toolDenialKind").is_some() {
+            code.denials += 1;
+        }
+        if matches!(raw.get("isCompactSummary"), Some(Value::Bool(true)))
+            || raw.get("compactMetadata").is_some()
+        {
+            code.compactions += 1;
+        }
+        if raw.get("interruptedMessageId").is_some() || raw.get("userFeedback").is_some() {
+            code.interventions += 1;
+        }
+        // The model that did this message (#328).
+        // A tool_result message carries no model. Attributing it to
+        // `unknown` put a meaningless row at the top of the model
+        // comparison (review of #330) — so an absent model is simply
+        // not attributed.
+        let model_opt = raw
+            .get("message")
+            .and_then(obj)
+            .and_then(|m| get_str(m, "model"))
+            .map(str::to_string);
+        let model = model_opt.clone().unwrap_or_else(|| "unknown".to_string());
+        if let Some(known) = &model_opt {
+            code.models.entry(known.clone()).or_default().messages += 1;
+        }
+        {
+            let sid = superx_ops::record_uuid(&m.session);
+            let l = code.live.entry(sid).or_default();
+            if l.model.is_none() && model != "unknown" {
+                l.model = Some(model.clone());
+            }
+        }
+        // Which repo the agent was standing in (#308, #325).
+        let repo_key = get_str(raw, "cwd").map(|c| c.rsplit('/').next().unwrap_or(c).to_string());
+        if let Some(rk) = &repo_key {
+            let sid = superx_ops::record_uuid(&m.session);
+            let l = code.live.entry(sid).or_default();
+            if l.repo.is_none() {
+                l.repo = Some(rk.clone());
+                l.branch = get_str(raw, "gitBranch").filter(|b| !b.is_empty()).map(str::to_string);
+            }
+            let r = code.repos.entry(rk.clone()).or_default();
+            r.messages += 1;
+            r.agents.insert(superx_ops::record_uuid(&m.agent));
+            if r.last_active.is_none_or(|prev| m.valid_from > prev) {
+                r.last_active = Some(m.valid_from);
+            }
+            if let Some(b) = get_str(raw, "gitBranch").filter(|b| !b.is_empty()) {
+                r.branch.get_or_insert_with(|| b.to_string());
+            }
+        }
         if let Some(cwd) = get_str(raw, "cwd") {
             let project = cwd.rsplit('/').next().unwrap_or(cwd).to_string();
             if let Some(branch) = get_str(raw, "gitBranch").filter(|b| !b.is_empty()) {
@@ -391,7 +699,17 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
         // Claude-style usage + blocks: raw.message.{usage, content[]}.
         if let Some(Value::Object(msg)) = raw.get("message") {
             if let Some(Value::Object(usage)) = msg.get("usage") {
-                agg.out_tokens += get_int(usage, "output_tokens");
+                let out = get_int(usage, "output_tokens");
+                code.live
+                    .entry(superx_ops::record_uuid(&m.session))
+                    .or_default()
+                    .out_tokens += out;
+                agg.out_tokens += out;
+                code.out_tokens += out;
+                code.models.entry(model.clone()).or_default().out_tokens += out;
+                if let Some(rk) = &repo_key {
+                    code.repos.entry(rk.clone()).or_default().out_tokens += out;
+                }
                 if let Some(Value::Object(details)) = usage.get("output_tokens_details") {
                     code.thinking += get_int(details, "thinking_tokens");
                 }
@@ -403,16 +721,56 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
                         Some("tool_use") => {
                             let name = get_str(block, "name").unwrap_or("tool").to_string();
                             *tools.entry(name.clone()).or_insert(0) += 1;
+                            {
+                                let l = code
+                                    .live
+                                    .entry(superx_ops::record_uuid(&m.session))
+                                    .or_default();
+                                if l.last_tool.is_none() {
+                                    l.last_tool = Some(name.clone());
+                                }
+                            }
                             let entry = outcomes.entry(name.clone()).or_default();
                             entry.calls += 1;
                             // The result may already have gone by.
                             if let Some(id) = get_str(block, "id") {
                                 match pending_results.remove(id) {
-                                    Some(true) => entry.failed += 1,
+                                    Some(true) => {
+                                        entry.failed += 1;
+                                        code.models.entry(model.clone()).or_default().tool_failures += 1;
+                                        if let Some(rk) = &repo_key {
+                                            code.repos.entry(rk.clone()).or_default().tool_failures += 1;
+                                        }
+                                        code.live
+                                            .entry(superx_ops::record_uuid(&m.session))
+                                            .or_default()
+                                            .tool_failures += 1;
+                                    }
                                     Some(false) => entry.ok += 1,
                                     None => {
-                                        call_names.insert(id.to_string(), name.clone());
+                                        call_names.insert(
+                                            id.to_string(),
+                                            (name.clone(), Some(model.clone()), repo_key.clone()),
+                                        );
                                     }
+                                }
+                            }
+                            // Now the tool is known: score its output
+                            // if — and only if — it was a shell call.
+                            if let Some(id) = get_str(block, "id") {
+                                match pending_output.remove(id) {
+                                    Some(text) if SHELL_TOOLS.contains(&name.as_str()) => {
+                                        score_output(&text, &mut code);
+                                    }
+                                    // Output already seen but the tool
+                                    // was not a shell: drop it.
+                                    Some(_) => {}
+                                    // Output not seen yet — remember
+                                    // that this id is worth scoring.
+                                    None if SHELL_TOOLS.contains(&name.as_str()) => {
+                                        shell_calls.insert(id.to_string());
+                                    }
+                                    None => {}
                                 }
                             }
                             // Instrument the call itself (#308).
@@ -433,6 +791,54 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
                             }
                             if let Some(Value::Object(input)) = block.get("input") {
                                 let n = block_lines(&name, input);
+                                let replaced = replaced_lines(&name, input);
+                                if n > 0 || replaced > 0 {
+                                    let hour = m.valid_from.format("%Y-%m-%dT%H").to_string();
+                                    let slot = code.churn.entry(hour).or_insert((0, 0));
+                                    slot.0 += n;
+                                    slot.1 += replaced;
+                                }
+                                // Undo detection (#324). The walk is
+                                // newest-first, so `removed_text`
+                                // holds what LATER edits took out.
+                                // An edit whose new_string is in that
+                                // set had its work thrown away by a
+                                // later edit — one undo relationship.
+                                // A flip-flop therefore scores twice,
+                                // which is the honest reading.
+                                if let Some(rk) = &repo_key {
+                                    let r = code.repos.entry(rk.clone()).or_default();
+                                    r.lines_added += n;
+                                    r.lines_removed += replaced;
+                                    if let Some(pth) = get_str(input, "file_path") {
+                                        r.files.insert(pth.to_string());
+                                    }
+                                }
+                                code.live
+                                    .entry(superx_ops::record_uuid(&m.session))
+                                    .or_default()
+                                    .lines_added += n;
+                                {
+                                    let mm = code.models.entry(model.clone()).or_default();
+                                    mm.lines_added += n;
+                                    mm.lines_removed += replaced;
+                                }
+                                if let Some(path) = get_str(input, "file_path") {
+                                    let seen = code.removed_text.entry(path.to_string()).or_default();
+                                    if let Some(key) =
+                                        get_str(input, "new_string").and_then(snippet_key)
+                                    {
+                                        if seen.contains(&key) {
+                                            code.reverts += 1;
+                                            code.models.entry(model.clone()).or_default().reverts += 1;
+                                        }
+                                    }
+                                    if let Some(key) =
+                                        get_str(input, "old_string").and_then(snippet_key)
+                                    {
+                                        seen.insert(key);
+                                    }
+                                }
                                 lines_written += n;
                                 agg.lines += n;
                                 code.lines_added += n;
@@ -459,6 +865,9 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
                                         let (is_test, is_build, is_git) = classify_command(&label);
                                         if is_test {
                                             code.tests += 1;
+                                            if let Some(rk) = &repo_key {
+                                                code.repos.entry(rk.clone()).or_default().tests_run += 1;
+                                            }
                                         }
                                         if is_build {
                                             code.builds += 1;
@@ -474,11 +883,36 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
                         Some("tool_result") => {
                             let Some(id) = get_str(block, "tool_use_id") else { continue };
                             let failed = matches!(block.get("is_error"), Some(Value::Bool(true)));
+                            // What the command PRINTED is where quality
+                            // lives (#327) — but only a SHELL call's
+                            // output is a report. The walk is
+                            // newest-first, so the tool that produced
+                            // this text is not known yet: stash it and
+                            // score when the call resolves (review of
+                            // #330).
+                            if let Some(text) = get_str(block, "content") {
+                                if shell_calls.remove(id) {
+                                    // The call already went by and it
+                                    // was a shell: score immediately.
+                                    score_output(text, &mut code);
+                                } else {
+                                    pending_output.insert(id.to_string(), text.to_string());
+                                }
+                            }
+
                             match call_names.remove(id) {
-                                Some(name) => {
+                                Some((name, call_model, call_repo)) => {
                                     let entry = outcomes.entry(name).or_default();
                                     if failed {
                                         entry.failed += 1;
+                                        // The call's model and repo, not
+                                        // this result message's.
+                                        if let Some(cm) = call_model {
+                                            code.models.entry(cm).or_default().tool_failures += 1;
+                                        }
+                                        if let Some(cr) = call_repo {
+                                            code.repos.entry(cr).or_default().tool_failures += 1;
+                                        }
                                     } else {
                                         entry.ok += 1;
                                     }
@@ -651,9 +1085,9 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
         files_touched: code.files.len() as i64,
         writes_window: code.writes,
         reads_window: code.reads,
-        files: top_n(code.files, 12),
+        files: top_n(code.files.clone(), 12),
         languages: top_n(code.languages, 10),
-        commands: top_n(code.commands, 12),
+        commands: top_n(code.commands.clone(), 12),
         projects: top_n(code.projects, 8)
             .into_iter()
             .map(|p| match code.project_branch.get(&p.name) {
@@ -672,6 +1106,115 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
         subagent_calls: code.subagent,
         thinking_tokens: code.thinking,
         dirs: top_n(code.dirs, 8),
+        churn: {
+            let mut pts: Vec<ChurnPoint> = code
+                .churn
+                .into_iter()
+                .map(|(t, (added, removed))| ChurnPoint { t, added, removed })
+                .collect();
+            pts.sort_by(|a, b| a.t.cmp(&b.t));
+            pts
+        },
+        reverts: code.reverts,
+        thrash_files: code.files.values().filter(|&&n| n >= 3).count() as i64,
+        out_tokens_window: code.out_tokens,
+        top_repeat: top_n(code.commands.clone(), 1)
+            .into_iter()
+            .find(|c| c.value >= 3),
+        max_concurrent_sessions: code
+            .concurrency
+            .values()
+            .map(|s| s.len() as i64)
+            .max()
+            .unwrap_or(0),
+        range: range.to_string(),
+        truncated,
+        tests_passed: code.tests_passed,
+        tests_failed: code.tests_failed,
+        compile_errors: code.compile_errors,
+        denials: code.denials,
+        compactions: code.compactions,
+        interventions: code.interventions,
+        repos: {
+            let mut v: Vec<RepoStat> = code
+                .repos
+                .iter()
+                .map(|(name, r)| RepoStat {
+                    name: name.clone(),
+                    branch: r.branch.clone(),
+                    messages: r.messages,
+                    lines_added: r.lines_added,
+                    lines_removed: r.lines_removed,
+                    files_touched: r.files.len() as i64,
+                    tests_run: r.tests_run,
+                    tool_failures: r.tool_failures,
+                    out_tokens: r.out_tokens,
+                    agents: r.agents.len() as i64,
+                    last_active: r.last_active.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                })
+                .collect();
+            v.sort_by(|a, b| b.messages.cmp(&a.messages).then(a.name.cmp(&b.name)));
+            v.truncate(12);
+            v
+        },
+        models: {
+            let mut v: Vec<ModelStat> = code
+                .models
+                .iter()
+                .map(|(name, m)| ModelStat {
+                    name: name.clone(),
+                    messages: m.messages,
+                    lines_added: m.lines_added,
+                    lines_removed: m.lines_removed,
+                    out_tokens: m.out_tokens,
+                    tool_failures: m.tool_failures,
+                    reverts: m.reverts,
+                })
+                .collect();
+            v.sort_by(|a, b| b.messages.cmp(&a.messages).then(a.name.cmp(&b.name)));
+            v.truncate(8);
+            v
+        },
+        live: {
+            let now = chrono::Utc::now();
+            let mut v: Vec<LiveSession> = code
+                .live
+                .iter()
+                .filter_map(|(sid, l)| {
+                    let newest = l.newest?;
+                    let idle = (now - newest).num_seconds();
+                    // Live means a message in the last five minutes —
+                    // the same threshold the Sessions page uses.
+                    if idle > 300 {
+                        return None;
+                    }
+                    Some(LiveSession {
+                        identity: sid.clone(),
+                        agent: l.agent.clone(),
+                        repo: l.repo.clone(),
+                        branch: l.branch.clone(),
+                        model: l.model.clone(),
+                        last_tool: l.last_tool.clone(),
+                        messages: l.messages,
+                        lines_added: l.lines_added,
+                        out_tokens: l.out_tokens,
+                        tool_failures: l.tool_failures,
+                        idle_secs: idle,
+                    })
+                })
+                .collect();
+            v.sort_by(|a, b| b.messages.cmp(&a.messages).then(a.identity.cmp(&b.identity)));
+            v.truncate(8);
+            v
+        },
+        longest_quiet_mins: {
+            let mut ts = code.instants.clone();
+            ts.sort_unstable();
+            ts.windows(2)
+                .map(|w| (w[1] - w[0]).num_minutes())
+                .max()
+                .unwrap_or(0)
+        },
     })
 }
 
