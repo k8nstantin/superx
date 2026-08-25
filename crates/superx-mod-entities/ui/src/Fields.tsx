@@ -20,7 +20,6 @@ import {
   fetchFields,
   fetchLabels,
   fetchVocabulary,
-  promoteField,
   setField,
 } from './api'
 import type { FieldView } from './generated/FieldView'
@@ -68,8 +67,8 @@ export function Fields({ entityId }: { entityId: string }) {
     <Stack gap="sm">
       {rows.length === 0 && (
         <Text size="sm" c="dimmed">
-          Nothing here yet. Add a field below — it lands on THIS entity, and you
-          can promote it to the type when every one of them should carry it.
+          Nothing here yet. Add a field below — name it, say what it holds, and
+          label it if an agent should act on it.
         </Text>
       )}
       {rows.map((f) => (
@@ -199,11 +198,10 @@ function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void
           Add
         </Button>
       </Group>
-      {known && !known.on_the_type && (
+      {known && (
         <Text size="xs" c="dimmed">
-          {key} is already a known field, and this type does not carry it — it
-          lands on this entity alone, and Promote gives every entity of the type
-          the slot.
+          {key} is already in the dictionary — it keeps the datatype and labels it
+          was given there.
         </Text>
       )}
       {error && (
@@ -224,13 +222,6 @@ function FieldRow({
   entityId: string
   onSaved: () => void
 }) {
-  // Promoting BINDS the slot to the type; it does not make it required,
-  // and §7 is explicit that making a field required does not
-  // retroactively invalidate what already exists.
-  const promote = useMutation({
-    mutationFn: () => promoteField(entityId, field.key),
-    onSuccess: onSaved,
-  })
   const [draft, setDraft] = useState<string>(field.value ?? '')
   const [error, setError] = useState<string | null>(null)
   const dirty = draft !== (field.value ?? '')
@@ -314,23 +305,6 @@ function FieldRow({
                 </Badge>
               </Tooltip>
             ))}
-            {field.ad_hoc && (
-              <>
-                <Tooltip label="On this entity only — its type does not carry this slot">
-                  <Badge size="xs" color="cyan" variant="light">
-                    ad hoc
-                  </Badge>
-                </Tooltip>
-                <Button
-                  size="compact-xs"
-                  variant="subtle"
-                  loading={promote.isPending}
-                  onClick={() => promote.mutate()}
-                >
-                  Promote to type
-                </Button>
-              </>
-            )}
           </>
         )}
       </Group>

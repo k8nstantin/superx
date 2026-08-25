@@ -12,10 +12,12 @@ value_kind: string, required: boolean, value: string | null,
  */
 undeclared: boolean, 
 /**
- * The dictionary defines this label, but this entity's TYPE does
- * not carry it — a field added ad hoc to this one thing (§6).
- * Distinct from `undeclared`, which means nothing defines it at
- * all: one is a deliberate exception, the other is a leftover.
+ * The dictionary defines this label but the entity's TYPE does not
+ * carry it — a field the operator added to this one thing.
+ *
+ * Kept as a FACT the page can use, not as a state to act on:
+ * promotion is gone, so this is no longer "a field waiting to
+ * become part of the type", it is just where the field came from.
  */
 ad_hoc: boolean, 
 /**
