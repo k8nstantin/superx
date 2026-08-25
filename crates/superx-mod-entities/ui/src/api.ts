@@ -16,6 +16,7 @@ import type { VocabularyView } from './generated/VocabularyView'
 import type { LabelReq } from './generated/LabelReq'
 import type { SlotReq } from './generated/SlotReq'
 import type { FieldView } from './generated/FieldView'
+import type { FieldOffer } from './generated/FieldOffer'
 import type { FieldReq } from './generated/FieldReq'
 import type { ContentView } from './generated/ContentView'
 import type { ContentNoteReq } from './generated/ContentNoteReq'
@@ -137,6 +138,12 @@ export const bindSlot = (type: string, req: SlotReq) =>
   post<{ type: string; label: string }>(`/api/types/${encodeURIComponent(type)}/slots`, req)
 
 /// Declared fields of one entity, typed (#294).
+// §6: "you never invent a label inline — you pick one from the
+// dictionary, or you add it to the dictionary."
+export const fetchAddableFields = (frag: string) =>
+  get<FieldOffer[]>(`/api/entities/${encodeURIComponent(frag)}/addable-fields`)
+export const promoteField = (frag: string, key: string) =>
+  post<boolean>(`/api/entities/${encodeURIComponent(frag)}/promote-field`, { key })
 export const fetchFields = (frag: string) =>
   get<FieldView[]>(`/api/entities/${encodeURIComponent(frag)}/fields`)
 

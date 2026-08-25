@@ -64,6 +64,11 @@ pub struct Field {
     /// True when the entity holds a key the type no longer declares.
     /// Reads never fail, so this surfaces rather than disappears.
     pub undeclared: bool,
+    /// The dictionary defines this label but the entity's TYPE does not
+    /// carry it — a field added ad hoc to this one thing (§6). It keeps
+    /// its kind and semantics and stays editable; only the type binding
+    /// is missing, and that is what promotion adds.
+    pub ad_hoc: bool,
 }
 
 /// Is this kind stored as a value rather than as prose?
@@ -94,7 +99,6 @@ pub fn all_kinds() -> Vec<&'static str> {
 /// is a secret written as anything but a reference;
 /// [`KernelError::Db`] for engine errors.
 pub async fn set(db: &Db, entity: &RecordId, key: &str, value: &str) -> Result<()> {
-    let (entity_type, _) = crate::nodes::anchor_info(db, entity).await?;
     let declared = dictionary::current(db, key, SLOT).await?.ok_or_else(|| {
         KernelError::Module(format!(
             "the dictionary declares no slot '{key}' — define it first \
@@ -118,17 +122,17 @@ pub async fn set(db: &Db, entity: &RecordId, key: &str, value: &str) -> Result<(
         )));
     }
 
-    // A type that declares nothing accepts anything: a role must be able
-    // to invent a type and refine it later. But once a type HAS
-    // declarations, a key outside them is a mistake, not an extension.
-    let slots = dictionary::slots_for(db, &entity_type, false).await?;
-    if !slots.is_empty() && !slots.iter().any(|s| s.label == key) {
-        return Err(KernelError::Module(format!(
-            "type '{entity_type}' does not carry '{key}' — it carries: {}",
-            slots.iter().map(|s| s.label.clone()).collect::<Vec<_>>().join(", ")
-        )));
-    }
-
+    // THE DICTIONARY DECIDES WHAT IS ALLOWED; THE TYPE DECIDES WHAT IS
+    // EXPECTED (§6). A defined label may be set on any entity ad hoc,
+    // and PROMOTED to the type when every entity of that type should
+    // carry it — "the label means the same thing either way, which is
+    // the point".
+    //
+    // The check that stood here refused any key the TYPE did not
+    // declare, so the only way to say something about ONE product was
+    // to change what EVERY product carries. It was redundant as a typo
+    // guard too: a typo is not a defined label, and the dictionary
+    // check above already refuses it by name.
     let checked = check(&declared, key, &kind, value)?;
     refuse_if_it_names_an_entity(db, key, value).await?;
 
@@ -183,21 +187,37 @@ pub async fn of(db: &Db, entity: &RecordId) -> Result<Vec<Field>> {
             value_kind: kind,
             required: slot.required,
             undeclared: false,
+            ad_hoc: false,
         });
     }
 
-    // What the entity holds that nothing declares. Silently dropping
-    // these would make a removed declaration look like deleted data.
+    // Everything else the entity holds. TWO DIFFERENT THINGS live here
+    // and treating them alike is what made ad-hoc fields unusable:
+    //
+    //   * the DICTIONARY defines it, the type does not carry it — a
+    //     field added ad hoc to this one entity (§6). It keeps its kind
+    //     and semantics and stays editable; only the type binding is
+    //     missing, and promotion is what adds that.
+    //
+    //   * nothing defines it at all — a leftover from a declaration
+    //     since removed. Reads never fail (§7), so it surfaces rather
+    //     than disappearing, but there is no kind to edit it against.
     for (key, value) in bag.iter() {
         if seen.iter().any(|k| k == key) {
             continue;
         }
+        let defined = dictionary::current(db, key, SLOT).await?;
+        let kind = defined.as_ref().and_then(|d| d.value_kind.clone()).unwrap_or_default();
+        let known = defined.is_some() && is_value_kind(&kind);
         out.push(Field {
             key: key.clone(),
-            value_kind: String::new(),
+            value_kind: if known { kind } else { String::new() },
+            // Ad hoc is never required: nothing has said every entity of
+            // this type must carry it — that is what promotion says.
             required: false,
             value: Some(render(value)),
-            undeclared: true,
+            undeclared: !known,
+            ad_hoc: known,
         });
     }
     Ok(out)
