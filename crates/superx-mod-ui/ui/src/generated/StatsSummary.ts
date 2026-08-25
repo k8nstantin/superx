@@ -34,4 +34,83 @@ tool_outcomes: Array<ToolOutcome>,
 /**
  * Busiest sessions in the window, by message count.
  */
-top_sessions: Array<SessionStat>, };
+top_sessions: Array<SessionStat>, 
+/**
+ * Lines the window's Write/Edit calls ADDED.
+ */
+lines_added: bigint, 
+/**
+ * Lines they REPLACED — an Edit's `old_string`, which the
+ * previous `lines_written` figure could not see.
+ */
+lines_removed: bigint, 
+/**
+ * Distinct files the window touched.
+ */
+files_touched: bigint, 
+/**
+ * Write/Edit calls vs Read calls — the make/inspect ratio.
+ */
+writes_window: bigint, reads_window: bigint, 
+/**
+ * Most-touched files, descending (full path; the UI shortens).
+ */
+files: Array<NameCount>, 
+/**
+ * Language mix by file extension, descending.
+ */
+languages: Array<NameCount>, 
+/**
+ * Shell command mix, normalized to the tool and its subcommand
+ * (`git commit`, `cargo test`), descending.
+ */
+commands: Array<NameCount>, 
+/**
+ * Projects the window worked in — the checkout directory's name,
+ * with its branch when the transcript carries one.
+ */
+projects: Array<NameCount>, 
+/**
+ * Messages captured in the last hour.
+ */
+messages_last_hour: bigint, 
+/**
+ * Output tokens in the last hour — the burn rate.
+ */
+tokens_last_hour: bigint, 
+/**
+ * How many of the last 24 hours saw any activity at all.
+ */
+active_hours_24h: bigint, 
+/**
+ * Shell calls that ran a test suite.
+ */
+tests_run: bigint, 
+/**
+ * Shell calls that ran a build or compile.
+ */
+builds_run: bigint, 
+/**
+ * Shell calls that drove git.
+ */
+git_ops: bigint, 
+/**
+ * Calls into MCP servers (`mcp__*`).
+ */
+mcp_calls: bigint, 
+/**
+ * Web fetches and searches.
+ */
+web_calls: bigint, 
+/**
+ * Subagent and skill invocations — work the agent delegated.
+ */
+subagent_calls: bigint, 
+/**
+ * Reasoning tokens in the window, where the agent reports them.
+ */
+thinking_tokens: bigint, 
+/**
+ * Directories the window worked in, descending.
+ */
+dirs: Array<NameCount>, };

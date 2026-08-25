@@ -131,6 +131,54 @@ pub struct StatsSummary {
     pub tool_outcomes: Vec<ToolOutcome>,
     /// Busiest sessions in the window, by message count.
     pub top_sessions: Vec<SessionStat>,
+
+    // ── the coder's instruments (issue #273) ──────────────────────
+    /// Lines the window's Write/Edit calls ADDED.
+    pub lines_added: i64,
+    /// Lines they REPLACED — an Edit's `old_string`, which the
+    /// previous `lines_written` figure could not see.
+    pub lines_removed: i64,
+    /// Distinct files the window touched.
+    pub files_touched: i64,
+    /// Write/Edit calls vs Read calls — the make/inspect ratio.
+    pub writes_window: i64,
+    pub reads_window: i64,
+    /// Most-touched files, descending (full path; the UI shortens).
+    pub files: Vec<NameCount>,
+    /// Language mix by file extension, descending.
+    pub languages: Vec<NameCount>,
+    /// Shell command mix, normalized to the tool and its subcommand
+    /// (`git commit`, `cargo test`), descending.
+    pub commands: Vec<NameCount>,
+    /// Projects the window worked in — the checkout directory's name,
+    /// with its branch when the transcript carries one.
+    pub projects: Vec<NameCount>,
+
+    // ── 24×7 instruments: is the machine keeping up? ──────────────
+    /// Messages captured in the last hour.
+    pub messages_last_hour: i64,
+    /// Output tokens in the last hour — the burn rate.
+    pub tokens_last_hour: i64,
+    /// How many of the last 24 hours saw any activity at all.
+    pub active_hours_24h: i64,
+
+    // ── what kind of work the window actually was ─────────────────
+    /// Shell calls that ran a test suite.
+    pub tests_run: i64,
+    /// Shell calls that ran a build or compile.
+    pub builds_run: i64,
+    /// Shell calls that drove git.
+    pub git_ops: i64,
+    /// Calls into MCP servers (`mcp__*`).
+    pub mcp_calls: i64,
+    /// Web fetches and searches.
+    pub web_calls: i64,
+    /// Subagent and skill invocations — work the agent delegated.
+    pub subagent_calls: i64,
+    /// Reasoning tokens in the window, where the agent reports them.
+    pub thinking_tokens: i64,
+    /// Directories the window worked in, descending.
+    pub dirs: Vec<NameCount>,
 }
 
 /// A tool's outcomes in the window. Claude Code reports per call via

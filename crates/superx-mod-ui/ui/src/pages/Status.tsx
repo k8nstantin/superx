@@ -52,6 +52,106 @@ function fmtAge(secs: number | bigint | null | undefined): string {
   return `${Math.floor(v / 86400)}d`
 }
 
+/// A 24-segment clock: which hours of the last day saw work. The
+/// cockpit instrument for a 24×7 operator — coverage, not volume.
+function CoverageStrip({ hours }: { hours: number | bigint | null | undefined }) {
+  const lit = hours == null ? 0 : Number(hours)
+  return (
+    <Group gap={2} mt={6} wrap="nowrap">
+      {Array.from({ length: 24 }, (_, i) => (
+        <div
+          key={i}
+          style={{
+            flex: 1,
+            height: 8,
+            borderRadius: 2,
+            background: i < lit ? 'var(--mantine-color-pelican-4)' : '#2A1235',
+          }}
+        />
+      ))}
+    </Group>
+  )
+}
+
+/// A ranked list rendered as proportional bars — the shape that reads
+/// fastest for "what dominated": languages, commands, files, projects.
+function BarList({
+  rows,
+  color = 'var(--mantine-color-pelican-5)',
+  mono,
+  shorten,
+  empty = 'nothing in this window',
+}: {
+  rows: { name: string; value: number | bigint }[]
+  color?: string
+  mono?: boolean
+  shorten?: (s: string) => string
+  empty?: string
+}) {
+  if (rows.length === 0)
+    return (
+      <Text size="xs" c="dimmed">
+        {empty}
+      </Text>
+    )
+  const max = Math.max(...rows.map((r) => Number(r.value)), 1)
+  return (
+    <div>
+      {rows.map((r) => {
+        const label = shorten ? shorten(r.name) : r.name
+        return (
+          <Tooltip key={r.name} label={`${r.name} · ${r.value}`} withArrow>
+            <Group gap="xs" wrap="nowrap" mb={4}>
+              <Text
+                size="xs"
+                ff={mono ? 'monospace' : undefined}
+                style={{
+                  width: 148,
+                  flexShrink: 0,
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}
+              >
+                {label}
+              </Text>
+              <div style={{ flex: 1, background: '#2A1235', borderRadius: 3, height: 10 }}>
+                <div
+                  style={{
+                    width: `${(Number(r.value) * 100) / max}%`,
+                    background: color,
+                    borderRadius: 3,
+                    height: 10,
+                  }}
+                />
+              </div>
+              <Text size="xs" c="dimmed" ff="monospace" style={{ width: 42, textAlign: 'right' }}>
+                {fmtCompact(r.value)}
+              </Text>
+            </Group>
+          </Tooltip>
+        )
+      })}
+    </div>
+  )
+}
+
+/// One small labelled counter inside a card — the work-mix row.
+function Counter({ label, value, tone }: { label: string; value: number | bigint | undefined; tone?: string }) {
+  return (
+    <div>
+      <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
+        {label}
+      </Text>
+      <Text fz={22} fw={700} ff="monospace" c={tone}>
+        {fmtCompact(value)}
+      </Text>
+    </div>
+  )
+}
+
+const baseName = (p: string) => p.split('/').slice(-2).join('/')
+
 export default function StatusPage() {
   useBreadcrumb([{ label: 'Status' }])
   const status = useQuery({ queryKey: ['status'], queryFn: fetchStatus, refetchInterval: 10000 })
@@ -76,8 +176,176 @@ export default function StatusPage() {
   const failed = outcomes.reduce((n, t) => n + Number(t.failed), 0)
   const failRate = scored > 0 ? Math.round((failed * 1000) / scored) / 10 : null
 
+  const burn = s ? Number(s.tokens_last_hour) : 0
+  const wr = s ? Number(s.writes_window) : 0
+  const rd = s ? Number(s.reads_window) : 0
+  const makeRatio = wr + rd > 0 ? Math.round((wr * 100) / (wr + rd)) : null
+
   return (
     <>
+      {/* ── flight strip: is the machine flying, right now? ────── */}
+      <SimpleGrid cols={{ base: 2, md: 3, lg: 5 }} mb="md">
+        <Stat
+          label="In the air"
+          value={s ? `${s.sessions_active} live` : '…'}
+          sub={s ? `${s.sessions_total} sessions total` : ''}
+          tip="sessions with a message in the last five minutes"
+        />
+        <Stat
+          label="Burn rate"
+          value={`${fmtCompact(s?.tokens_last_hour)}/h`}
+          sub="output tokens, last hour"
+          tip="how fast the agents are producing right now"
+        />
+        <Stat
+          label="Throughput"
+          value={`${fmtCompact(s?.messages_last_hour)}/h`}
+          sub="messages, last hour"
+        />
+        <Stat
+          label="Capture lag"
+          value={fmtAge(i?.last_event_secs)}
+          sub={i ? `${fmtCompact(i.events_last_hour)} events this hour` : ''}
+          tip="age of the newest captured event — the capture-alive signal"
+        />
+        <Card withBorder p="sm">
+          <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
+            Clock coverage
+          </Text>
+          <Group gap={6} align="baseline">
+            <Text fz={22} fw={700} ff="monospace">
+              {s ? `${s.active_hours_24h}/24` : '—'}
+            </Text>
+            <Text size="xs" c="dimmed">
+              hours worked
+            </Text>
+          </Group>
+          <CoverageStrip hours={s?.active_hours_24h} />
+        </Card>
+      </SimpleGrid>
+
+      {/* ── the code panel: what happened to the codebase ──────── */}
+      <Grid mb="md" gap="md">
+        <Grid.Col span={{ base: 12, lg: 4 }}>
+          <Card withBorder h="100%">
+            <Group justify="space-between" mb="sm">
+              <Title order={5}>Code written</Title>
+              <Text size="xs" c="dimmed">
+                {windowNote}
+              </Text>
+            </Group>
+            <Group gap="xl" mb="sm">
+              <div>
+                <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
+                  Lines added
+                </Text>
+                <Text fz={30} fw={700} ff="monospace" c={OK}>
+                  +{fmtCompact(s?.lines_added)}
+                </Text>
+              </div>
+              <div>
+                <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
+                  Replaced
+                </Text>
+                <Text fz={30} fw={700} ff="monospace" c={FAIL}>
+                  −{fmtCompact(s?.lines_removed)}
+                </Text>
+              </div>
+            </Group>
+            <SimpleGrid cols={2} spacing="xs" mb="sm">
+              <Counter label="Files touched" value={s?.files_touched} />
+              <Counter label="Edits" value={s?.writes_window} />
+            </SimpleGrid>
+            {makeRatio != null && (
+              <Tooltip label={`${wr} write calls vs ${rd} read calls`} withArrow>
+                <div>
+                  <Text size="xs" c="dimmed" mb={4}>
+                    make ↔ inspect · {makeRatio}% writing
+                  </Text>
+                  <div style={{ background: '#2A1235', borderRadius: 3, height: 10 }}>
+                    <div
+                      style={{
+                        width: `${makeRatio}%`,
+                        background: OK,
+                        borderRadius: 3,
+                        height: 10,
+                      }}
+                    />
+                  </div>
+                </div>
+              </Tooltip>
+            )}
+          </Card>
+        </Grid.Col>
+
+        <Grid.Col span={{ base: 12, lg: 4 }}>
+          <Card withBorder h="100%">
+            <Title order={5} mb="sm">
+              Languages
+            </Title>
+            <BarList rows={s?.languages ?? []} mono empty="no files edited in this window" />
+            <Title order={5} mt="md" mb="sm">
+              Projects
+            </Title>
+            <BarList rows={s?.projects ?? []} color="var(--mantine-color-pelican-3)" mono />
+          </Card>
+        </Grid.Col>
+
+        <Grid.Col span={{ base: 12, lg: 4 }}>
+          <Card withBorder h="100%">
+            <Title order={5} mb="sm">
+              The work mix
+            </Title>
+            <SimpleGrid cols={3} spacing="xs" mb="md">
+              <Counter label="Tests" value={s?.tests_run} tone={OK} />
+              <Counter label="Builds" value={s?.builds_run} />
+              <Counter label="Git ops" value={s?.git_ops} />
+              <Counter label="Subagents" value={s?.subagent_calls} />
+              <Counter label="MCP" value={s?.mcp_calls} />
+              <Counter label="Web" value={s?.web_calls} />
+            </SimpleGrid>
+            <Title order={5} mb="sm">
+              Commands
+            </Title>
+            <BarList
+              rows={s?.commands ?? []}
+              color="var(--mantine-color-pelican-6)"
+              mono
+              empty="no shell calls in this window"
+            />
+          </Card>
+        </Grid.Col>
+      </Grid>
+
+      <Grid mb="md" gap="md">
+        <Grid.Col span={{ base: 12, lg: 7 }}>
+          <Card withBorder h="100%">
+            <Group justify="space-between" mb="sm">
+              <Title order={5}>Hottest files</Title>
+              <Text size="xs" c="dimmed">
+                most-touched paths · {windowNote}
+              </Text>
+            </Group>
+            <BarList rows={s?.files ?? []} mono shorten={baseName} />
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 5 }}>
+          <Card withBorder h="100%">
+            <Group justify="space-between" mb="sm">
+              <Title order={5}>Where the work happened</Title>
+              <Text size="xs" c="dimmed">
+                directories
+              </Text>
+            </Group>
+            <BarList rows={s?.dirs ?? []} color="var(--mantine-color-pelican-3)" mono />
+            <Group gap="xl" mt="md">
+              <Counter label="Thinking tokens" value={s?.thinking_tokens} />
+              <Counter label="Tool calls" value={s?.tools_window} />
+            </Group>
+          </Card>
+        </Grid.Col>
+      </Grid>
+
       <SimpleGrid cols={{ base: 2, md: 4, lg: 7 }} mb="md">
         <Stat label="Agents" value={s ? String(s.agents) : '…'} />
         <Stat
