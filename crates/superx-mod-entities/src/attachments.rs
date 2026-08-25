@@ -97,10 +97,22 @@ pub struct Upload<'a> {
 pub async fn attach_bytes(db: &Db, module_dir: &Path, up: Upload<'_>) -> Result<String> {
     let Upload { target, label, filename, bytes, author } = up;
 
-    if crate::dictionary::current(db, label, crate::dictionary::SLOT).await?.is_none() {
+    // THE LABEL IS OPTIONAL, exactly as it is on a field (operator,
+    // 2026-08-25): a file has a NAME, the bytes, and optionally a
+    // label. Without one it is attached for the operator's own
+    // reference; WITH one it borrows that term's meaning and becomes
+    // actionable — §5.4's "a PDF labelled `mandate` IS the mandate".
+    //
+    // An empty label is that absence. A label that is GIVEN must be
+    // defined, because a term nobody declared cannot make anything
+    // actionable — and a typo would silently produce a file nothing
+    // acts on while the operator believed it would.
+    if !label.is_empty()
+        && crate::dictionary::current(db, label, crate::dictionary::SLOT).await?.is_none()
+    {
         return Err(KernelError::Module(format!(
-            "the dictionary defines no slot label '{label}' — a file that means \
-             nothing is a file nobody reads"
+            "the dictionary defines no label '{label}' — define it first, or leave \
+             the label empty and the file is attached for your own reference"
         )));
     }
 

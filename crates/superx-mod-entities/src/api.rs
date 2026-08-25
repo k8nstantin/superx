@@ -267,6 +267,9 @@ pub async fn types_list(db: &Db) -> Result<Vec<TypeView>> {
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct LabelView {
+    /// What the runner is to DO with it. A label with none says what it
+    /// means to a human and nothing to a machine.
+    pub agent_note: Option<String>,
     pub key: String,
     /// `slot` (what an entity carries) or `link` (how entities connect).
     pub label_kind: String,
@@ -332,6 +335,14 @@ pub struct LabelReq {
     pub target_types: Option<Vec<String>>,
     pub inverse: Option<String>,
     pub acyclic: Option<bool>,
+    /// WHAT THE RUNNER IS TO DO WITH IT — "this is the spec to build
+    /// from", "this is your mandate; you may not change it". The column
+    /// has existed since #266 and nothing could write it, so a label
+    /// could say what it MEANT to a human and nothing to a machine.
+    ///
+    /// This is the half of a label that makes it actionable: an agent
+    /// reads the labels first, and this is what it reads.
+    pub agent_note: Option<String>,
 }
 
 /// Give a type a slot, or change the one it has.
@@ -381,6 +392,10 @@ pub struct FieldView {
     /// Distinct from `undeclared`, which means nothing defines it at
     /// all: one is a deliberate exception, the other is a leftover.
     pub ad_hoc: bool,
+    /// The dictionary term this field borrows its meaning from, if the
+    /// operator attached one. Absent means the field is theirs alone —
+    /// named, typed, and not something an agent acts on.
+    pub label: Option<String>,
     /// How this type treats it — the override where there is one.
     pub semantics: String,
     /// What `enum` allows, empty for every other kind.
@@ -422,6 +437,14 @@ pub async fn entity_fields(db: &Db, fragment: &str) -> Result<Vec<FieldView>> {
                 })
                 .unwrap_or_default(),
             ad_hoc: f.ad_hoc,
+            label: defined
+                .as_ref()
+                .and_then(|d| d.attributes.as_ref())
+                .and_then(|a| a.get("label"))
+                .and_then(|v| match v {
+                    superx_kernel::types::Value::String(s) => Some(s.clone()),
+                    _ => None,
+                }),
             key: f.key,
             value_kind: f.value_kind,
             required: f.required,
@@ -512,16 +535,48 @@ pub async fn add_field(db: &Db, fragment: &str, req: &FieldReq) -> Result<()> {
                     fields::VALUE_KINDS.join(", ")
                 )));
             }
+
+            // THE THIRD THING, and it is optional. Without a label the
+            // field is `data` — yours, for your own reference, and an
+            // agent does nothing with it. WITH one it takes that
+            // label's semantics, which is what an agent acts on: a
+            // mandate binds, a directive may be refused, a secret is
+            // never printed (§5.2).
+            let borrowed = match req.label.as_deref() {
+                None => None,
+                Some(term) => Some(
+                    dictionary::current(db, term, dictionary::SLOT).await?.ok_or_else(|| {
+                        KernelError::Module(format!(
+                            "the dictionary defines no label '{term}' — a label nobody \
+                             declared cannot make anything actionable. Define it first, \
+                             or leave the label empty and the field is yours alone"
+                        ))
+                    })?,
+                ),
+            };
+            let semantics =
+                borrowed.as_ref().map_or_else(|| "data".to_string(), |l| l.semantics.clone());
+
+            // What it borrows FROM is recorded, so the page can show it
+            // and a later reader can follow it back to the definition
+            // the meaning came from.
+            let mut attrs = superx_kernel::types::Object::new();
+            if let Some(term) = req.label.as_deref() {
+                attrs.insert(
+                    "label".to_string(),
+                    superx_kernel::types::Value::String(term.to_string()),
+                );
+            }
+
             dictionary::define(db, dictionary::Definition {
                 key: &req.key,
                 kind: dictionary::SLOT,
                 display: &req.key,
-                // A field you added for your own reference is data. What
-                // makes it ACTIONABLE is giving it different semantics,
-                // which is a decision, not a side effect of naming it.
-                semantics: "data",
+                semantics: &semantics,
                 value_kind: Some(kind),
                 cardinality: Some("one"),
+                attributes: (!attrs.is_empty()).then_some(attrs),
+                agent_note: borrowed.as_ref().and_then(|l| l.agent_note.as_deref()),
                 ..Default::default()
             })
             .await?;
@@ -545,6 +600,17 @@ pub struct FieldReq {
     /// before. So a typo is still a typo; a deliberate new field is a
     /// new field, and the difference is whether a kind came with it.
     pub value_kind: Option<String>,
+    /// OPTIONAL, and this is the third thing a field has (operator,
+    /// 2026-08-25): "a custom field may or may not have the label —
+    /// adding a label makes it ACTIONABLE".
+    ///
+    /// A field with a name and a datatype and nothing else is yours,
+    /// for your own reference; an agent reads it as `data` and does
+    /// nothing with it. Attaching a label from the dictionary gives it
+    /// that label's SEMANTICS, and semantics are what an agent acts on
+    /// (§5.2) — a `mandate` binds, a `directive` may be refused, a
+    /// `secret` is never printed.
+    pub label: Option<String>,
 }
 
 /// A file attached to something, as the page shows it.
@@ -684,6 +750,7 @@ pub async fn labels(db: &Db, include_archived: bool) -> Result<Vec<LabelView>> {
             description: l.description,
             value_kind: l.value_kind,
             cardinality: l.cardinality,
+            agent_note: l.agent_note,
             archived: l.archived,
             source_types: l.source_types,
             target_types: l.target_types,
@@ -733,6 +800,8 @@ pub async fn define_label(db: &Db, req: &LabelReq) -> Result<()> {
             target_types: req.target_types.as_deref(),
             inverse: req.inverse.as_deref(),
             acyclic: req.acyclic,
+            agent_note: req.agent_note.as_deref(),
+            ..Default::default()
         },
     )
     .await

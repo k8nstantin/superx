@@ -243,3 +243,53 @@ async fn a_type_and_a_label_hold_a_thread_that_can_be_answered() {
         );
     }
 }
+
+/// THE SAME SHAPE FOR A FILE (operator, 2026-08-25): "name and the
+/// attachment itself and label (optional)".
+///
+/// Requiring a label meant you could not attach anything without first
+/// deciding what it MEANT. §5.4's "a PDF labelled `mandate` IS the
+/// mandate" is what a label BUYS you, not the price of attaching one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_can_be_attached_without_a_label() {
+    use superx_mod_entities::attachments::{attach_bytes, for_target, Upload};
+    use superx_mod_entities::notes::Author;
+    use superx_mod_entities::target::Target;
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let dir = std::env::temp_dir().join(format!("sx-nolabel-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).expect("dir");
+
+    let owner = superx_mod_entities::nodes::create_entity(&db, "product", "Desk", None, None)
+        .await
+        .expect("p");
+    let target = Target::Entity(owner.clone());
+
+    let uid = attach_bytes(&db, &dir, Upload {
+        target: &target,
+        label: "",
+        filename: "notes.txt",
+        bytes: b"for my own reference",
+        author: &Author::operator(),
+    })
+    .await
+    .expect("a file needs a name and bytes, not a meaning");
+
+    let files = for_target(&db, &target, false).await.expect("read");
+    let f = files.iter().find(|f| f.uid == uid).expect("there");
+    assert_eq!(f.label, "", "unlabelled, and it says so rather than inventing one");
+    assert_eq!(f.filename, "notes.txt");
+
+    // And a label that IS given must be defined, because a term nobody
+    // declared cannot make anything actionable.
+    attach_bytes(&db, &dir, Upload {
+        target: &target,
+        label: "mandat",
+        filename: "typo.txt",
+        bytes: b"x",
+        author: &Author::operator(),
+    })
+    .await
+    .expect_err("a typo would silently mean nothing");
+}

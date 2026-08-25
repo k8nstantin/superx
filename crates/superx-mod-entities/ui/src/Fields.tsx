@@ -17,6 +17,7 @@ import {
 import {
   fetchAddableFields,
   fetchFields,
+  fetchLabels,
   fetchVocabulary,
   promoteField,
   setField,
@@ -91,12 +92,24 @@ function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void
   // copy in the frontend would rot the moment the dictionary changes.
   const vocab = useQuery({ queryKey: ['vocabulary'], queryFn: fetchVocabulary })
   const kinds = vocab.data?.value_kinds ?? []
+  // Every slot label in the dictionary, prose included: labelling a
+  // NUMBER as `mandate` is odd but it is the operator's odd, and the
+  // meaning it borrows is the semantics, not the storage.
+  const dictionary = useQuery({ queryKey: ['labels', false], queryFn: () => fetchLabels(false) })
+  const labels = (dictionary.data ?? [])
+    .filter((l) => l.label_kind === 'slot')
+    .map((l) => l.key)
   const offers = useQuery({
     queryKey: ['addable', entityId],
     queryFn: () => fetchAddableFields(entityId),
   })
   const [key, setKey] = useState('')
   const [kind, setKind] = useState('string')
+  // ALWAYS OPTIONAL, and what makes the field actionable. Without it
+  // the field is yours: named, typed, and an agent does nothing with
+  // it. With it, the field takes that term's semantics — a mandate
+  // binds, a directive may be refused, a secret is never printed.
+  const [label, setLabel] = useState<string | null>(null)
   const [value, setValue] = useState('')
   const [error, setError] = useState<string | null>(null)
   // A name the dictionary already knows brings its own kind — you do
@@ -111,12 +124,15 @@ function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void
         key: key.trim(),
         value,
         // Only when it is NEW: naming an existing field must not carry
-        // a kind that could disagree with what it already declares.
+        // a kind or a label that could disagree with what it already
+        // declares.
         value_kind: known ? null : kind,
+        label: known ? null : label,
       }),
     onSuccess: () => {
       setKey('')
       setValue('')
+      setLabel(null)
       setError(null)
       onAdded()
     },
@@ -129,9 +145,10 @@ function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void
         Add a field
       </Text>
       <Text size="xs" c="dimmed">
-        Name it and say what kind of value it holds. A name the dictionary
-        already knows keeps its kind; a new one is added to the dictionary as
-        you type it.
+        Name it and say what kind of value it holds. A label is optional — without
+        one the field is yours for reference; with one it takes that term's
+        meaning and an agent acts on it. A name the dictionary already knows keeps
+        its own kind and label.
       </Text>
       <Group align="flex-end" gap="xs">
         <Autocomplete
@@ -153,10 +170,22 @@ function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void
           disabled={!!known}
           onChange={(k) => setKind(k ?? 'string')}
         />
+        <Select
+          label="Label — optional"
+          description="what makes it actionable"
+          placeholder="none"
+          w={190}
+          clearable
+          searchable
+          disabled={!!known}
+          data={labels}
+          value={label}
+          onChange={setLabel}
+        />
         <TextInput
           label="Value"
           description={known?.description || undefined}
-          w={240}
+          w={220}
           value={value}
           onChange={(e) => setValue(e.currentTarget.value)}
         />
@@ -208,7 +237,14 @@ function FieldRow({
     mutationFn: () =>
       // Editing an existing field never carries a kind: the label
       // already declares one, and a form must not redeclare it.
-      setField(entityId, { key: field.key, value: draft, value_kind: null }),
+      setField(entityId, {
+        key: field.key,
+        value: draft,
+        // Editing carries neither: the label already declares a kind
+        // and a meaning, and a form must not redeclare either.
+        value_kind: null,
+        label: null,
+      }),
     onSuccess: () => {
       setError(null)
       onSaved()
@@ -259,6 +295,13 @@ function FieldRow({
                 type when every one of them should carry it. Marked, so
                 it is visibly an exception rather than looking like part
                 of the type. */}
+            {field.label && (
+              <Tooltip label={`takes its meaning from the '${field.label}' label — that is what makes it actionable`}>
+                <Badge size="xs" variant="light" color="grape">
+                  {field.label}
+                </Badge>
+              </Tooltip>
+            )}
             {field.ad_hoc && (
               <>
                 <Tooltip label="On this entity only — its type does not carry this slot">

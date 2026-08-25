@@ -937,6 +937,13 @@ pub struct Definition<'a> {
     pub inverse: Option<&'a str>,
     /// Refuse a link that would close a loop.
     pub acyclic: Option<bool>,
+    /// Prose for the model, injected when the field is presented — a
+    /// field that borrows a label's meaning borrows this with it.
+    pub agent_note: Option<&'a str>,
+    /// The label's own extensible bag. A field records the dictionary
+    /// term it borrowed its meaning FROM here, so a reader can follow
+    /// it back to where the meaning came from.
+    pub attributes: Option<Object>,
 }
 
 /// Define or redefine a label. A redefinition appends to the chain —
@@ -960,6 +967,8 @@ pub async fn define(db: &Db, d: Definition<'_>) -> Result<()> {
         target_types,
         inverse,
         acyclic,
+        agent_note,
+        attributes,
     } = d;
     if key.is_empty()
         || !key
@@ -1038,6 +1047,22 @@ pub async fn define(db: &Db, d: Definition<'_>) -> Result<()> {
     }
     if let Some(no_cycles) = acyclic {
         row.insert("acyclic".to_string(), Value::Bool(no_cycles));
+    }
+    if let Some(note) = agent_note {
+        row.insert("agent_note".to_string(), Value::String(note.to_string()));
+    }
+    // MERGED, not replaced: the bag carries `enum` options and whatever
+    // else a label has accumulated, and a redefinition that mentions
+    // one key must not silently drop the rest.
+    if let Some(extra) = attributes {
+        let mut bag = match row.get("attributes") {
+            Some(Value::Object(existing)) => existing.clone(),
+            _ => Object::new(),
+        };
+        for (k, v) in extra {
+            bag.insert(k, v);
+        }
+        row.insert("attributes".to_string(), Value::Object(bag));
     }
     // Archiving is its own act; redefining an archived label does not
     // quietly bring it back.

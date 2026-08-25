@@ -40,9 +40,10 @@ const USAGE: &str = "usage: superx entities <command>\n\
   types add <name> --category entity|relation [--description <text>]\n\
   labels [--all] [--for <type>]        the dictionary: what the terminology means\n\
   fields <uuid-fragment>               the declared values of an entity\n\
-  set <uuid-fragment> <key> <value> [--type <datatype>]\n\
+  set <uuid-fragment> <key> <value> [--type <datatype>] [--label <term>]\n\
                        set a value, checked against its kind. --type NAMES a new\n\
-                       field: it is added to the dictionary with that datatype\n\
+                       field: name + datatype is yours alone; --label borrows a\n\
+                       dictionary term's meaning and makes it actionable\n\
                        any label the dictionary defines — ad hoc on this entity alone\n\
   promote <uuid-fragment> <key>       put an ad-hoc field on the TYPE, so every\n\
                        entity of it carries the slot from now on\n\
@@ -135,6 +136,7 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
                 target_types: target_types.as_deref(),
                 inverse: inverse.as_deref(),
                 acyclic,
+                ..Default::default()
             },
         )
         .await?;
@@ -401,9 +403,17 @@ async fn set_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         .position(|a| a == "--type")
         .and_then(|i| args.get(i + 1))
         .map(String::as_str);
+    // OPTIONAL, and only meaningful for a NEW field: it borrows that
+    // label's semantics, which is what makes the field actionable.
+    let label = args
+        .iter()
+        .position(|a| a == "--label")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str);
     let value = match kind {
         Some(_) => {
-            let stop = args.iter().position(|a| a == "--type").unwrap_or(args.len());
+            // The value is everything before the first flag.
+            let stop = args.iter().position(|a| a.starts_with("--")).unwrap_or(args.len());
             args.get(2..stop).map(|v| v.join(" ")).filter(|v| !v.is_empty()).ok_or_else(usage)?
         }
         None => rest(args, 2)?,
@@ -416,6 +426,7 @@ async fn set_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
             key: key.clone(),
             value: value.clone(),
             value_kind: kind.map(ToString::to_string),
+            label: label.map(ToString::to_string),
         },
     )
     .await?;

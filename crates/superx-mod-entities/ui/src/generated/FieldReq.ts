@@ -14,4 +14,17 @@ export type FieldReq = { key: string, value: string,
  * before. So a typo is still a typo; a deliberate new field is a
  * new field, and the difference is whether a kind came with it.
  */
-value_kind: string | null, };
+value_kind: string | null, 
+/**
+ * OPTIONAL, and this is the third thing a field has (operator,
+ * 2026-08-25): "a custom field may or may not have the label —
+ * adding a label makes it ACTIONABLE".
+ *
+ * A field with a name and a datatype and nothing else is yours,
+ * for your own reference; an agent reads it as `data` and does
+ * nothing with it. Attaching a label from the dictionary gives it
+ * that label's SEMANTICS, and semantics are what an agent acts on
+ * (§5.2) — a `mandate` binds, a `directive` may be refused, a
+ * `secret` is never printed.
+ */
+label: string | null, };

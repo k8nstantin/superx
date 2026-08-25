@@ -669,6 +669,7 @@ async fn naming_a_field_with_a_datatype_adds_it_to_the_dictionary() {
         key: "owner".into(),
         value: "calexander".into(),
         value_kind: Some("string".into()),
+        label: None,
     })
     .await
     .expect("name it, type it, fill it");
@@ -703,6 +704,7 @@ async fn naming_an_existing_field_cannot_redeclare_its_kind() {
         key: "port".into(),
         value: "8080".into(),
         value_kind: Some("integer".into()),
+        label: None,
     })
     .await
     .expect("new");
@@ -714,6 +716,7 @@ async fn naming_an_existing_field_cannot_redeclare_its_kind() {
         key: "port".into(),
         value: "not a port".into(),
         value_kind: Some("string".into()),
+        label: None,
     })
     .await
     .expect_err("the label still says integer");
@@ -743,6 +746,7 @@ async fn naming_a_field_with_no_datatype_is_still_refused() {
         key: "onwer".into(),
         value: "x".into(),
         value_kind: None,
+        label: None,
     })
     .await
     .expect_err("a typo with no datatype is a typo");
@@ -764,8 +768,86 @@ async fn a_datatype_outside_the_closed_set_is_refused() {
         key: "weight".into(),
         value: "3".into(),
         value_kind: Some("float".into()),
+        label: None,
     })
     .await
     .expect_err("float is not one of them");
     assert!(err.to_string().contains("not a datatype"), "{err}");
+}
+
+/// A FIELD IS THREE THINGS, and the third is optional (operator,
+/// 2026-08-25): "1. name 2. datatype 3. optional label … a custom field
+/// may or may not have the label — adding a label makes it ACTIONABLE."
+///
+/// Without one the field is theirs: named, typed, and an agent does
+/// nothing with it — semantics `data`. With one it borrows that term's
+/// semantics, and semantics are what an agent acts on (§5.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_field_without_a_label_is_yours_and_with_one_is_actionable() {
+    use superx_mod_entities::{api, dictionary, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    // No label: for your own reference.
+    api::add_field(&db, &frag, &api::FieldReq {
+        key: "ticket".into(),
+        value: "OPS-4417".into(),
+        value_kind: Some("string".into()),
+        label: None,
+    })
+    .await
+    .expect("named and typed is enough");
+
+    let d = dictionary::current(&db, "ticket", dictionary::SLOT).await.expect("r").expect("t");
+    assert_eq!(d.semantics, "data", "an agent does nothing with it");
+
+    // WITH a label: it takes that term's meaning.
+    api::add_field(&db, &frag, &api::FieldReq {
+        key: "house_rules".into(),
+        value: "never trade after 4pm".into(),
+        value_kind: Some("string".into()),
+        label: Some("mandate".into()),
+    })
+    .await
+    .expect("labelled");
+
+    let d = dictionary::current(&db, "house_rules", dictionary::SLOT).await.expect("r").expect("t");
+    assert_eq!(d.semantics, "binding", "a mandate BINDS — that is what makes it actionable");
+    assert!(
+        d.agent_note.is_some(),
+        "and the prose the model is given comes with it"
+    );
+
+    let held = api::entity_fields(&db, &frag).await.expect("fields");
+    let plain = held.iter().find(|f| f.key == "ticket").expect("there");
+    assert_eq!(plain.label, None, "no label, and the page says so");
+    let bound = held.iter().find(|f| f.key == "house_rules").expect("there");
+    assert_eq!(bound.label.as_deref(), Some("mandate"), "and this one names what it borrowed");
+    assert_eq!(bound.semantics, "binding");
+}
+
+/// A label nobody declared cannot make anything actionable, so it is
+/// refused BY NAME — a typo would otherwise produce a field the
+/// operator believed an agent would act on and it never would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_label_the_dictionary_does_not_define_is_refused() {
+    use superx_mod_entities::{api, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    let err = api::add_field(&db, &frag, &api::FieldReq {
+        key: "rules".into(),
+        value: "x".into(),
+        value_kind: Some("string".into()),
+        label: Some("mandat".into()),
+    })
+    .await
+    .expect_err("a typo cannot silently mean nothing");
+    assert!(err.to_string().contains("defines no label"), "{err}");
 }
