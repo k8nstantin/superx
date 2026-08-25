@@ -366,6 +366,19 @@ pub struct SlotReq {
 /// A declared field of an entity, with what it holds.
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
+pub struct LabelAction {
+    pub label: String,
+    /// What an agent is to do with a value carrying this label. Absent
+    /// means the label says what it MEANS to a human and nothing to a
+    /// machine — visible as a gap rather than silently doing nothing.
+    pub action: Option<String>,
+    /// How it must be TREATED (§5.2) — `binding` obeys, `directive` may
+    /// be refused, `secret` never prints.
+    pub semantics: String,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
 pub struct FieldOffer {
     pub key: String,
     pub value_kind: String,
@@ -392,10 +405,15 @@ pub struct FieldView {
     /// Distinct from `undeclared`, which means nothing defines it at
     /// all: one is a deliberate exception, the other is a leftover.
     pub ad_hoc: bool,
-    /// The dictionary term this field borrows its meaning from, if the
-    /// operator attached one. Absent means the field is theirs alone —
-    /// named, typed, and not something an agent acts on.
-    pub label: Option<String>,
+    /// The dictionary terms attached to this field. Empty means the
+    /// field is theirs alone — named, typed, and nothing an agent acts
+    /// on. Each one an agent resolves to an ACTION at read time.
+    pub labels: Vec<String>,
+    /// Those labels resolved: the name and what an agent is to DO with
+    /// it. Resolved at READ time, never frozen onto the field — a label
+    /// rewritten today changes what every field carrying it means, which
+    /// is the whole reason the action lives on the label.
+    pub actions: Vec<LabelAction>,
     /// How this type treats it — the override where there is one.
     pub semantics: String,
     /// What `enum` allows, empty for every other kind.
@@ -437,20 +455,56 @@ pub async fn entity_fields(db: &Db, fragment: &str) -> Result<Vec<FieldView>> {
                 })
                 .unwrap_or_default(),
             ad_hoc: f.ad_hoc,
-            label: defined
+            labels: defined
                 .as_ref()
                 .and_then(|d| d.attributes.as_ref())
-                .and_then(|a| a.get("label"))
-                .and_then(|v| match v {
-                    superx_kernel::types::Value::String(s) => Some(s.clone()),
-                    _ => None,
-                }),
+                .and_then(|a| a.get("labels"))
+                .map(|v| match v {
+                    superx_kernel::types::Value::Array(items) => items
+                        .iter()
+                        .filter_map(|i| match i {
+                            superx_kernel::types::Value::String(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default(),
+            actions: Vec::new(), // filled below, once the labels are known
             key: f.key,
             value_kind: f.value_kind,
             required: f.required,
             value: f.value,
             undeclared: f.undeclared,
         });
+    }
+
+    // RESOLVE THE LABELS TO THEIR ACTIONS, once, at read time.
+    //
+    // Not frozen onto the field when it was created: a label
+    // rewritten today must change what every field carrying it means,
+    // which is the whole reason the action lives on the label and not
+    // on the value. An agent reads the labels first and does what they
+    // say — so this is what it reads.
+    for view in &mut out {
+        for term in &view.labels {
+            let Some(l) = dictionary::current(db, term, dictionary::SLOT).await? else {
+                // Declared once, gone now. Reads never fail (§7), so it
+                // surfaces as a label with no action rather than
+                // vanishing and taking its meaning with it.
+                view.actions.push(LabelAction {
+                    label: term.clone(),
+                    action: None,
+                    semantics: String::new(),
+                });
+                continue;
+            };
+            view.actions.push(LabelAction {
+                label: term.clone(),
+                action: l.agent_note,
+                semantics: l.semantics,
+            });
+        }
     }
     Ok(out)
 }
@@ -536,35 +590,42 @@ pub async fn add_field(db: &Db, fragment: &str, req: &FieldReq) -> Result<()> {
                 )));
             }
 
-            // THE THIRD THING, and it is optional. Without a label the
-            // field is `data` — yours, for your own reference, and an
-            // agent does nothing with it. WITH one it takes that
-            // label's semantics, which is what an agent acts on: a
-            // mandate binds, a directive may be refused, a secret is
-            // never printed (§5.2).
-            let borrowed = match req.label.as_deref() {
-                None => None,
-                Some(term) => Some(
-                    dictionary::current(db, term, dictionary::SLOT).await?.ok_or_else(|| {
-                        KernelError::Module(format!(
-                            "the dictionary defines no label '{term}' — a label nobody \
-                             declared cannot make anything actionable. Define it first, \
-                             or leave the label empty and the field is yours alone"
-                        ))
-                    })?,
-                ),
-            };
-            let semantics =
-                borrowed.as_ref().map_or_else(|| "data".to_string(), |l| l.semantics.clone());
+            // THE THIRD THING, optional and MANY. Every label named
+            // must already be defined — a term nobody declared cannot
+            // make anything actionable, and a typo would silently
+            // produce a field the operator believed an agent would act
+            // on while it never would.
+            let mut carried = Vec::new();
+            for term in req.labels.iter().flatten() {
+                dictionary::current(db, term, dictionary::SLOT).await?.ok_or_else(|| {
+                    KernelError::Module(format!(
+                        "the dictionary defines no label '{term}' — labels are created \
+                         before they are attached. Define it first, or leave the labels \
+                         empty and the field is yours alone"
+                    ))
+                })?;
+                if !carried.contains(term) {
+                    carried.push(term.clone());
+                }
+            }
 
-            // What it borrows FROM is recorded, so the page can show it
-            // and a later reader can follow it back to the definition
-            // the meaning came from.
+            // The labels are recorded ON the field, and the ACTIONS
+            // stay on the labels themselves. That is the whole point:
+            // you cannot predict every action a field needs, so an
+            // agent resolves them at read time rather than the field
+            // freezing a copy that goes stale the moment a label is
+            // rewritten.
             let mut attrs = superx_kernel::types::Object::new();
-            if let Some(term) = req.label.as_deref() {
+            if !carried.is_empty() {
                 attrs.insert(
-                    "label".to_string(),
-                    superx_kernel::types::Value::String(term.to_string()),
+                    "labels".to_string(),
+                    superx_kernel::types::Value::Array(
+                        carried
+                            .iter()
+                            .map(|t| superx_kernel::types::Value::String(t.clone()))
+                            .collect::<Vec<_>>()
+                            .into(),
+                    ),
                 );
             }
 
@@ -572,11 +633,14 @@ pub async fn add_field(db: &Db, fragment: &str, req: &FieldReq) -> Result<()> {
                 key: &req.key,
                 kind: dictionary::SLOT,
                 display: &req.key,
-                semantics: &semantics,
+                // The FIELD's own semantics stay `data`. With many
+                // labels there is no single meaning to borrow, and
+                // picking one would be arbitrary — an agent reads the
+                // labels, and each label carries its own action.
+                semantics: "data",
                 value_kind: Some(kind),
                 cardinality: Some("one"),
                 attributes: (!attrs.is_empty()).then_some(attrs),
-                agent_note: borrowed.as_ref().and_then(|l| l.agent_note.as_deref()),
                 ..Default::default()
             })
             .await?;
@@ -600,17 +664,19 @@ pub struct FieldReq {
     /// before. So a typo is still a typo; a deliberate new field is a
     /// new field, and the difference is whether a kind came with it.
     pub value_kind: Option<String>,
-    /// OPTIONAL, and this is the third thing a field has (operator,
-    /// 2026-08-25): "a custom field may or may not have the label —
-    /// adding a label makes it ACTIONABLE".
+    /// OPTIONAL, MANY, and this is the third thing a field has
+    /// (operator, 2026-08-25): "a custom field may or may not have the
+    /// label … an item can have many labels".
     ///
-    /// A field with a name and a datatype and nothing else is yours,
-    /// for your own reference; an agent reads it as `data` and does
-    /// nothing with it. Attaching a label from the dictionary gives it
-    /// that label's SEMANTICS, and semantics are what an agent acts on
-    /// (§5.2) — a `mandate` binds, a `directive` may be refused, a
-    /// `secret` is never printed.
-    pub label: Option<String>,
+    /// A field with a name and a datatype and no labels is yours, for
+    /// your own reference, and no agent does anything with it. Each
+    /// label it carries is an ACTION an agent takes on it — "this is
+    /// the spec to build from" — so a field named `description`
+    /// labelled `spec` is the spec the runner builds from.
+    ///
+    /// You cannot predict every attribute a thing needs or every action
+    /// to take on it; this is what lets both be added without code.
+    pub labels: Option<Vec<String>>,
 }
 
 /// A file attached to something, as the page shows it.

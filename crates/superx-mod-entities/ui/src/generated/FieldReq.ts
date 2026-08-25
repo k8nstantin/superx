@@ -16,15 +16,17 @@ export type FieldReq = { key: string, value: string,
  */
 value_kind: string | null, 
 /**
- * OPTIONAL, and this is the third thing a field has (operator,
- * 2026-08-25): "a custom field may or may not have the label —
- * adding a label makes it ACTIONABLE".
+ * OPTIONAL, MANY, and this is the third thing a field has
+ * (operator, 2026-08-25): "a custom field may or may not have the
+ * label … an item can have many labels".
  *
- * A field with a name and a datatype and nothing else is yours,
- * for your own reference; an agent reads it as `data` and does
- * nothing with it. Attaching a label from the dictionary gives it
- * that label's SEMANTICS, and semantics are what an agent acts on
- * (§5.2) — a `mandate` binds, a `directive` may be refused, a
- * `secret` is never printed.
+ * A field with a name and a datatype and no labels is yours, for
+ * your own reference, and no agent does anything with it. Each
+ * label it carries is an ACTION an agent takes on it — "this is
+ * the spec to build from" — so a field named `description`
+ * labelled `spec` is the spec the runner builds from.
+ *
+ * You cannot predict every attribute a thing needs or every action
+ * to take on it; this is what lets both be added without code.
  */
-label: string | null, };
+labels: Array<string> | null, };

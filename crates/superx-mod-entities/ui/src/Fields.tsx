@@ -5,6 +5,7 @@ import {
   Autocomplete,
   Badge,
   Button,
+  MultiSelect,
   Checkbox,
   Group,
   NumberInput,
@@ -95,8 +96,10 @@ function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void
   // Every slot label in the dictionary, prose included: labelling a
   // NUMBER as `mandate` is odd but it is the operator's odd, and the
   // meaning it borrows is the semantics, not the storage.
+  // Labels are created BEFORE they are attached, so this is the offer,
+  // and a name not in it is refused rather than invented.
   const dictionary = useQuery({ queryKey: ['labels', false], queryFn: () => fetchLabels(false) })
-  const labels = (dictionary.data ?? [])
+  const vocabulary = (dictionary.data ?? [])
     .filter((l) => l.label_kind === 'slot')
     .map((l) => l.key)
   const offers = useQuery({
@@ -105,11 +108,11 @@ function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void
   })
   const [key, setKey] = useState('')
   const [kind, setKind] = useState('string')
-  // ALWAYS OPTIONAL, and what makes the field actionable. Without it
-  // the field is yours: named, typed, and an agent does nothing with
-  // it. With it, the field takes that term's semantics — a mandate
-  // binds, a directive may be refused, a secret is never printed.
-  const [label, setLabel] = useState<string | null>(null)
+  // ALWAYS OPTIONAL and MANY. Without any, the field is yours: named,
+  // typed, and nothing acts on it. Each one is an ACTION an agent takes
+  // — you cannot predict every action a thing needs, so they are added
+  // rather than coded.
+  const [labels, setLabels] = useState<string[]>([])
   const [value, setValue] = useState('')
   const [error, setError] = useState<string | null>(null)
   // A name the dictionary already knows brings its own kind — you do
@@ -127,12 +130,12 @@ function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void
         // a kind or a label that could disagree with what it already
         // declares.
         value_kind: known ? null : kind,
-        label: known ? null : label,
+        labels: known ? null : labels,
       }),
     onSuccess: () => {
       setKey('')
       setValue('')
-      setLabel(null)
+      setLabels([])
       setError(null)
       onAdded()
     },
@@ -170,17 +173,16 @@ function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void
           disabled={!!known}
           onChange={(k) => setKind(k ?? 'string')}
         />
-        <Select
-          label="Label — optional"
-          description="what makes it actionable"
-          placeholder="none"
-          w={190}
-          clearable
+        <MultiSelect
+          label="Labels — optional"
+          description="each one is an action an agent takes on it"
+          placeholder={labels.length ? undefined : 'none'}
+          w={230}
           searchable
           disabled={!!known}
-          data={labels}
-          value={label}
-          onChange={setLabel}
+          data={vocabulary}
+          value={labels}
+          onChange={setLabels}
         />
         <TextInput
           label="Value"
@@ -243,7 +245,7 @@ function FieldRow({
         // Editing carries neither: the label already declares a kind
         // and a meaning, and a form must not redeclare either.
         value_kind: null,
-        label: null,
+        labels: null,
       }),
     onSuccess: () => {
       setError(null)
@@ -295,13 +297,23 @@ function FieldRow({
                 type when every one of them should carry it. Marked, so
                 it is visibly an exception rather than looking like part
                 of the type. */}
-            {field.label && (
-              <Tooltip label={`takes its meaning from the '${field.label}' label — that is what makes it actionable`}>
-                <Badge size="xs" variant="light" color="grape">
-                  {field.label}
+            {field.actions.map((a) => (
+              <Tooltip
+                key={a.label}
+                label={
+                  a.action ??
+                  `'${a.label}' has no action set — nothing tells an agent what to do with it`
+                }
+              >
+                <Badge
+                  size="xs"
+                  variant="light"
+                  color={a.action ? 'grape' : 'gray'}
+                >
+                  {a.label}
                 </Badge>
               </Tooltip>
-            )}
+            ))}
             {field.ad_hoc && (
               <>
                 <Tooltip label="On this entity only — its type does not carry this slot">

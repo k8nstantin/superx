@@ -669,7 +669,7 @@ async fn naming_a_field_with_a_datatype_adds_it_to_the_dictionary() {
         key: "owner".into(),
         value: "calexander".into(),
         value_kind: Some("string".into()),
-        label: None,
+        labels: None,
     })
     .await
     .expect("name it, type it, fill it");
@@ -704,7 +704,7 @@ async fn naming_an_existing_field_cannot_redeclare_its_kind() {
         key: "port".into(),
         value: "8080".into(),
         value_kind: Some("integer".into()),
-        label: None,
+        labels: None,
     })
     .await
     .expect("new");
@@ -716,7 +716,7 @@ async fn naming_an_existing_field_cannot_redeclare_its_kind() {
         key: "port".into(),
         value: "not a port".into(),
         value_kind: Some("string".into()),
-        label: None,
+        labels: None,
     })
     .await
     .expect_err("the label still says integer");
@@ -746,7 +746,7 @@ async fn naming_a_field_with_no_datatype_is_still_refused() {
         key: "onwer".into(),
         value: "x".into(),
         value_kind: None,
-        label: None,
+        labels: None,
     })
     .await
     .expect_err("a typo with no datatype is a typo");
@@ -768,7 +768,7 @@ async fn a_datatype_outside_the_closed_set_is_refused() {
         key: "weight".into(),
         value: "3".into(),
         value_kind: Some("float".into()),
-        label: None,
+        labels: None,
     })
     .await
     .expect_err("float is not one of them");
@@ -796,7 +796,7 @@ async fn a_field_without_a_label_is_yours_and_with_one_is_actionable() {
         key: "ticket".into(),
         value: "OPS-4417".into(),
         value_kind: Some("string".into()),
-        label: None,
+        labels: None,
     })
     .await
     .expect("named and typed is enough");
@@ -809,24 +809,25 @@ async fn a_field_without_a_label_is_yours_and_with_one_is_actionable() {
         key: "house_rules".into(),
         value: "never trade after 4pm".into(),
         value_kind: Some("string".into()),
-        label: Some("mandate".into()),
+        labels: Some(vec!["mandate".into()]),
     })
     .await
     .expect("labelled");
 
-    let d = dictionary::current(&db, "house_rules", dictionary::SLOT).await.expect("r").expect("t");
-    assert_eq!(d.semantics, "binding", "a mandate BINDS — that is what makes it actionable");
-    assert!(
-        d.agent_note.is_some(),
-        "and the prose the model is given comes with it"
-    );
-
     let held = api::entity_fields(&db, &frag).await.expect("fields");
     let plain = held.iter().find(|f| f.key == "ticket").expect("there");
-    assert_eq!(plain.label, None, "no label, and the page says so");
+    assert!(plain.labels.is_empty(), "no labels, and nothing acts on it");
+    assert!(plain.actions.is_empty());
+
     let bound = held.iter().find(|f| f.key == "house_rules").expect("there");
-    assert_eq!(bound.label.as_deref(), Some("mandate"), "and this one names what it borrowed");
-    assert_eq!(bound.semantics, "binding");
+    assert_eq!(bound.labels, vec!["mandate".to_string()], "it names what it carries");
+
+    // THE ACTION IS RESOLVED AT READ TIME, from the label — that is
+    // what an agent reads and does.
+    let act = bound.actions.first().expect("an action came with it");
+    assert_eq!(act.label, "mandate");
+    assert_eq!(act.semantics, "binding", "a mandate BINDS");
+    assert!(act.action.is_some(), "and it says what to do about that");
 }
 
 /// A label nobody declared cannot make anything actionable, so it is
@@ -845,9 +846,135 @@ async fn a_label_the_dictionary_does_not_define_is_refused() {
         key: "rules".into(),
         value: "x".into(),
         value_kind: Some("string".into()),
-        label: Some("mandat".into()),
+        labels: Some(vec!["mandat".into()]),
     })
     .await
     .expect_err("a typo cannot silently mean nothing");
     assert!(err.to_string().contains("defines no label"), "{err}");
+}
+
+/// THE OPERATOR'S OWN EXAMPLE (2026-08-25): "say I create a field and
+/// name it `description` but attach the `spec` label to it — that means
+/// the runner will use it as the spec to build from."
+///
+/// The NAME is theirs and means nothing to a machine. The LABEL is what
+/// the runner reads, and what it reads is that label's action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_name_is_yours_and_the_label_is_what_the_runner_reads() {
+    use superx_mod_entities::{api, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    api::add_field(&db, &frag, &api::FieldReq {
+        key: "my_description".into(),
+        value: "build the matching engine first".into(),
+        value_kind: Some("string".into()),
+        labels: Some(vec!["spec".into()]),
+    })
+    .await
+    .expect("named by me, labelled for the runner");
+
+    let held = api::entity_fields(&db, &frag).await.expect("fields");
+    let f = held.iter().find(|f| f.key == "my_description").expect("there");
+    assert_eq!(f.labels, vec!["spec".to_string()]);
+
+    let act = f.actions.first().expect("resolved");
+    assert_eq!(act.label, "spec");
+    assert_eq!(act.semantics, "context", "which is how `spec` is declared");
+    assert!(
+        act.action.as_deref().is_some_and(|a| a.contains("Build exactly this")),
+        "the runner is told what to DO, not just what it is called: {:?}",
+        act.action
+    );
+}
+
+/// "AN ITEM CAN HAVE MANY LABELS" — you cannot predict every action a
+/// thing needs, so a field carries as many as it needs and an agent
+/// does each of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_field_carries_many_labels_and_each_one_is_an_action() {
+    use superx_mod_entities::{api, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let role = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&role);
+
+    api::add_field(&db, &frag, &api::FieldReq {
+        key: "operating_rules".into(),
+        value: "no trades after 16:00".into(),
+        value_kind: Some("string".into()),
+        labels: Some(vec!["mandate".into(), "playbook".into()]),
+    })
+    .await
+    .expect("two labels, two actions");
+
+    let held = api::entity_fields(&db, &frag).await.expect("fields");
+    let f = held.iter().find(|f| f.key == "operating_rules").expect("there");
+    assert_eq!(f.labels.len(), 2, "both are carried, in the order given");
+    assert_eq!(f.actions.len(), 2, "and both resolve to an action");
+
+    let kinds: Vec<&str> = f.actions.iter().map(|a| a.semantics.as_str()).collect();
+    assert!(kinds.contains(&"binding"), "the mandate half BINDS: {kinds:?}");
+    assert!(kinds.contains(&"guidance"), "the playbook half is theirs to refine: {kinds:?}");
+}
+
+/// A label rewritten later changes what every field carrying it means.
+/// That is why the action lives on the LABEL and is resolved at read
+/// time, never copied onto the field when it was created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewriting_a_label_changes_what_the_fields_carrying_it_do() {
+    use superx_mod_entities::dictionary::Definition;
+    use superx_mod_entities::{api, dictionary, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    dictionary::define(&db, Definition {
+        key: "runbook",
+        kind: "slot",
+        display: "Runbook",
+        semantics: "guidance",
+        value_kind: Some("string"),
+        cardinality: Some("one"),
+        agent_note: Some("Follow these steps."),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+
+    api::add_field(&db, &frag, &api::FieldReq {
+        key: "steps".into(),
+        value: "1. check the feed".into(),
+        value_kind: Some("string".into()),
+        labels: Some(vec!["runbook".into()]),
+    })
+    .await
+    .expect("labelled");
+
+    // The operator rewrites what the LABEL tells an agent to do.
+    dictionary::define(&db, Definition {
+        key: "runbook",
+        kind: "slot",
+        display: "Runbook",
+        semantics: "guidance",
+        agent_note: Some("Follow these steps EXACTLY, and stop if one fails."),
+        ..Default::default()
+    })
+    .await
+    .expect("rewrite");
+
+    let held = api::entity_fields(&db, &frag).await.expect("fields");
+    let f = held.iter().find(|f| f.key == "steps").expect("there");
+    assert!(
+        f.actions[0].action.as_deref().is_some_and(|a| a.contains("stop if one fails")),
+        "the field does what the label says NOW, not what it said when the field \
+         was created: {:?}",
+        f.actions[0].action
+    );
 }

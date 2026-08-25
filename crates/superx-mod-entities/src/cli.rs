@@ -42,8 +42,8 @@ const USAGE: &str = "usage: superx entities <command>\n\
   fields <uuid-fragment>               the declared values of an entity\n\
   set <uuid-fragment> <key> <value> [--type <datatype>] [--label <term>]\n\
                        set a value, checked against its kind. --type NAMES a new\n\
-                       field: name + datatype is yours alone; --label borrows a\n\
-                       dictionary term's meaning and makes it actionable\n\
+                       field: name + datatype is yours alone; --label a,b attaches\n\
+                       labels, and each label is an action an agent takes on it\n\
                        any label the dictionary defines — ad hoc on this entity alone\n\
   promote <uuid-fragment> <key>       put an ad-hoc field on the TYPE, so every\n\
                        entity of it carries the slot from now on\n\
@@ -403,13 +403,14 @@ async fn set_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         .position(|a| a == "--type")
         .and_then(|i| args.get(i + 1))
         .map(String::as_str);
-    // OPTIONAL, and only meaningful for a NEW field: it borrows that
-    // label's semantics, which is what makes the field actionable.
-    let label = args
+    // OPTIONAL and MANY, comma-separated. Each is an action an agent
+    // takes on this field; without any, the field is the operator's
+    // own and nothing acts on it.
+    let labels: Option<Vec<String>> = args
         .iter()
         .position(|a| a == "--label")
         .and_then(|i| args.get(i + 1))
-        .map(String::as_str);
+        .map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
     let value = match kind {
         Some(_) => {
             // The value is everything before the first flag.
@@ -426,7 +427,7 @@ async fn set_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
             key: key.clone(),
             value: value.clone(),
             value_kind: kind.map(ToString::to_string),
-            label: label.map(ToString::to_string),
+            labels: labels.clone(),
         },
     )
     .await?;
