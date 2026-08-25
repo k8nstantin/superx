@@ -66,7 +66,6 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         // §6: "you pick one from the dictionary, OR YOU ADD IT to the
         // dictionary". This is the first half — what already exists.
         .route("/api/entities/{frag}/addable-fields", get(api_addable_fields))
-        .route("/api/entities/{frag}/promote-field", post(api_promote_field))
         .route("/api/entities/{frag}/update", post(api_update))
         .route("/api/entities/{frag}/archive", post(api_archive))
         .route("/api/labels/{key}/archive", post(api_label_archive))
@@ -169,23 +168,6 @@ async fn api_addable_fields(
     let db = module_db!(state);
     match api::addable_fields(&db, &frag).await {
         Ok(v) => Resp::ok(v),
-        Err(e) => Resp::err(e.to_string()),
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct PromoteReq {
-    key: String,
-}
-
-async fn api_promote_field(
-    State(state): State<AppState>,
-    AxumPath(frag): AxumPath<String>,
-    Json(req): Json<PromoteReq>,
-) -> Resp<bool> {
-    let db = module_db!(state);
-    match api::promote_field(&db, &frag, &req.key).await {
-        Ok(()) => Resp::ok(true),
         Err(e) => Resp::err(e.to_string()),
     }
 }

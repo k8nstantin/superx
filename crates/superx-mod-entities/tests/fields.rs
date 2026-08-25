@@ -501,19 +501,15 @@ async fn a_key_already_there_may_stay_even_if_the_type_stopped_carrying_it() {
         .expect("what is already there may stay");
 }
 
-/// §6, the whole flow: "Seed, then design. Create the entity and it
-/// exists — a uuid7 and a name. Then design it: add fields and label
-/// them, from labels designed ahead … Fields may be added AD HOC to a
-/// single entity and PROMOTED to the type when every entity of that
-/// type should carry the slot — the label means the same thing either
-/// way, which is the point."
+/// §6: "Seed, then design. Create the entity and it exists — a uuid7
+/// and a name. Then design it: add fields and label them."
 ///
-/// Before this, `set` refused any key the TYPE did not declare, so the
-/// only way to say something about ONE product was to change what EVERY
-/// product carries. There was no ad hoc, so there was nothing to
-/// promote.
+/// `set` used to refuse any key the TYPE did not declare, so the only
+/// way to say something about ONE product was to change what EVERY
+/// product carries. A field is added where it is wanted, full stop —
+/// there is no second decision about whether it belongs to the type.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_field_is_added_to_one_entity_and_then_promoted_to_its_type() {
+async fn a_field_is_added_to_one_entity_without_touching_the_others() {
     use superx_mod_entities::{api, dictionary, fields, nodes};
     use superx_mod_entities::dictionary::Definition;
 
@@ -562,26 +558,21 @@ async fn a_field_is_added_to_one_entity_and_then_promoted_to_its_type() {
     let other = api::entity_fields(&db, &superx_ops::record_uuid(&b)).await.expect("b");
     assert!(!other.iter().any(|f| f.key == "max_notional"), "Desk B did not change");
 
-    // PROMOTE: now every product carries the slot.
-    api::promote_field(&db, &a_frag, "max_notional").await.expect("promote");
-    assert!(
-        dictionary::slots_for(&db, "product", false)
-            .await
-            .expect("slots")
-            .iter()
-            .any(|s| s.label == "max_notional"),
-        "it is on the type now"
+    // And Desk B can carry it too, independently — a field is added
+    // wherever it is wanted, and there is no second step deciding
+    // whether it "belongs to the type".
+    fields::set(&db, &b, "max_notional", "10000").await.expect("Desk B, on its own terms");
+    let other = api::entity_fields(&db, &superx_ops::record_uuid(&b)).await.expect("b");
+    assert_eq!(
+        other.iter().find(|f| f.key == "max_notional").and_then(|f| f.value.clone()),
+        Some("10000".to_string())
     );
-
-    // Desk A's value is unchanged and no longer an exception.
     let held = api::entity_fields(&db, &a_frag).await.expect("fields");
-    let f = held.iter().find(|f| f.key == "max_notional").expect("still there");
-    assert_eq!(f.value.as_deref(), Some("50000"), "promoting did not touch the value");
-    assert!(!f.ad_hoc, "it is part of the type now");
-
-    // §7: "making a field required does not retroactively invalidate
-    // existing entities". Desk B has no value and is still writable.
-    fields::set(&db, &b, "max_notional", "10000").await.expect("Desk B still writes fine");
+    assert_eq!(
+        held.iter().find(|f| f.key == "max_notional").and_then(|f| f.value.clone()),
+        Some("50000".to_string()),
+        "and Desk A keeps its own"
+    );
 }
 
 /// "You never invent a label inline. You pick one from the dictionary,

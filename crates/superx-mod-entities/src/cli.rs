@@ -45,8 +45,7 @@ const USAGE: &str = "usage: superx entities <command>\n\
                        field: name + datatype is yours alone; --label a,b attaches\n\
                        labels, and each label is an action an agent takes on it\n\
                        any label the dictionary defines — ad hoc on this entity alone\n\
-  promote <uuid-fragment> <key>       put an ad-hoc field on the TYPE, so every\n\
-                       entity of it carries the slot from now on\n\
+
   labels define <key> --kind slot|link --semantics <s> [--cardinality one|many]\n\
           [--source-types a,b] [--target-types a,b] [--acyclic] [--inverse <text>]\n\
                        [--value-kind <k>] [--display <d>] [--description <text>]\n\
@@ -86,7 +85,6 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("show") => show_cmd(kernel, &args[1..]).await,
         Some("list") => list_cmd(kernel, &args[1..]).await,
         Some("archive") => archive_cmd(kernel, &args[1..]).await,
-        Some("promote") => promote_cmd(kernel, &args[1..]).await,
         Some("validate") => validate_cmd(kernel, &args[1..]).await,
         Some("link") => link_cmd(kernel, &args[1..], true).await,
         Some("unlink") => link_cmd(kernel, &args[1..], false).await,
@@ -790,27 +788,6 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         }
     }
     Ok(out)
-}
-
-/// §6: "Fields may be added ad hoc to a single entity and PROMOTED to
-/// the type when every entity of that type should carry the slot — the
-/// label means the same thing either way, which is the point."
-///
-/// Bound NOT required: promoting says "this belongs on the type", not
-/// "every existing one is now wrong". §7 — making a field required does
-/// not retroactively invalidate what exists.
-async fn promote_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
-    let db = kernel.module_db(MODULE_NAME).await?;
-    let fragment = args.first().ok_or_else(usage)?;
-    let key = args.get(1).ok_or_else(usage)?;
-    let target = nodes::resolve_entity(&db, fragment).await?;
-    let (entity_type, _) = nodes::anchor_info(&db, &target).await?;
-    crate::api::promote_field(&db, fragment, key).await?;
-    emit(kernel, "slot_promoted", &record_uuid(&target), &entity_type, key).await;
-    Ok(format!(
-        "'{key}' is now a slot on type '{entity_type}' — every {entity_type} carries it \
-         from now on, and nothing already written became invalid\n"
-    ))
 }
 
 /// Does this graph make sense? (§5.5)

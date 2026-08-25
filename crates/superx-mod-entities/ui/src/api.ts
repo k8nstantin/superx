@@ -142,8 +142,6 @@ export const bindSlot = (type: string, req: SlotReq) =>
 // dictionary, or you add it to the dictionary."
 export const fetchAddableFields = (frag: string) =>
   get<FieldOffer[]>(`/api/entities/${encodeURIComponent(frag)}/addable-fields`)
-export const promoteField = (frag: string, key: string) =>
-  post<boolean>(`/api/entities/${encodeURIComponent(frag)}/promote-field`, { key })
 export const fetchFields = (frag: string) =>
   get<FieldView[]>(`/api/entities/${encodeURIComponent(frag)}/fields`)
 
