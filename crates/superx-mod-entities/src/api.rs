@@ -491,12 +491,60 @@ pub async fn set_field(db: &Db, fragment: &str, key: &str, value: &str) -> Resul
     fields::set(db, &id, key, value).await
 }
 
+/// Name a field, give it a datatype, put a value in it.
+///
+/// If the dictionary does not define `key` yet, this defines it — §6:
+/// "you pick one from the dictionary, OR YOU ADD IT TO THE
+/// DICTIONARY". Semantics start at `data`, which is what a field for
+/// your own reference is; changing them to `binding`, `directive` or
+/// `secret` is what makes an agent treat it specially, and that is a
+/// separate, deliberate act on the Dictionary page.
+///
+/// # Errors
+///
+/// Verb errors pass through; an unknown kind is refused by name.
+pub async fn add_field(db: &Db, fragment: &str, req: &FieldReq) -> Result<()> {
+    if let Some(kind) = req.value_kind.as_deref() {
+        if dictionary::current(db, &req.key, dictionary::SLOT).await?.is_none() {
+            if !fields::is_value_kind(kind) {
+                return Err(KernelError::Module(format!(
+                    "'{kind}' is not a datatype this understands — pick one of: {}",
+                    fields::VALUE_KINDS.join(", ")
+                )));
+            }
+            dictionary::define(db, dictionary::Definition {
+                key: &req.key,
+                kind: dictionary::SLOT,
+                display: &req.key,
+                // A field you added for your own reference is data. What
+                // makes it ACTIONABLE is giving it different semantics,
+                // which is a decision, not a side effect of naming it.
+                semantics: "data",
+                value_kind: Some(kind),
+                cardinality: Some("one"),
+                ..Default::default()
+            })
+            .await?;
+        }
+    }
+    set_field(db, fragment, &req.key, &req.value).await
+}
+
 /// One typed value, from the entity page.
 #[derive(Debug, Deserialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct FieldReq {
     pub key: String,
     pub value: String,
+    /// Naming a field the dictionary does not know yet ADDS IT to the
+    /// dictionary with this kind — §6's sentence has two halves and
+    /// only the first was built: "you pick one from the dictionary, OR
+    /// YOU ADD IT TO THE DICTIONARY".
+    ///
+    /// Absent means pick-an-existing, and an unknown key is refused as
+    /// before. So a typo is still a typo; a deliberate new field is a
+    /// new field, and the difference is whether a kind came with it.
+    pub value_kind: Option<String>,
 }
 
 /// A file attached to something, as the page shows it.

@@ -642,3 +642,130 @@ async fn the_offer_is_the_dictionary_minus_what_is_held_and_minus_prose() {
         "what it already holds is not offered twice"
     );
 }
+
+/// §6's sentence has TWO halves and only the first was built: "You pick
+/// one from the dictionary, OR YOU ADD IT TO THE DICTIONARY."
+///
+/// So naming a field and giving it a datatype IS adding it — the
+/// operator names the field, says what kind of value it holds, and puts
+/// something in it. Semantics start at `data`, which is what a field
+/// for your own reference is; making it actionable is a separate,
+/// deliberate change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn naming_a_field_with_a_datatype_adds_it_to_the_dictionary() {
+    use superx_mod_entities::{api, dictionary, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    assert!(
+        dictionary::current(&db, "owner", dictionary::SLOT).await.expect("read").is_none(),
+        "nothing defines it yet"
+    );
+
+    api::add_field(&db, &frag, &api::FieldReq {
+        key: "owner".into(),
+        value: "calexander".into(),
+        value_kind: Some("string".into()),
+    })
+    .await
+    .expect("name it, type it, fill it");
+
+    let defined = dictionary::current(&db, "owner", dictionary::SLOT)
+        .await
+        .expect("read")
+        .expect("it is in the dictionary now");
+    assert_eq!(defined.value_kind.as_deref(), Some("string"));
+    assert_eq!(defined.semantics, "data", "for your reference until you say otherwise");
+
+    let held = api::entity_fields(&db, &frag).await.expect("fields");
+    let f = held.iter().find(|f| f.key == "owner").expect("on the entity");
+    assert_eq!(f.value.as_deref(), Some("calexander"));
+    assert!(f.ad_hoc, "on this entity alone until promoted");
+}
+
+/// A datatype is only honoured when the field is NEW. Naming one that
+/// already exists must not redeclare what the term means — §5.6 puts
+/// the tightest gate in the system on that, because it retroactively
+/// changes every entity that used it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn naming_an_existing_field_cannot_redeclare_its_kind() {
+    use superx_mod_entities::{api, dictionary, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    api::add_field(&db, &frag, &api::FieldReq {
+        key: "port".into(),
+        value: "8080".into(),
+        value_kind: Some("integer".into()),
+    })
+    .await
+    .expect("new");
+
+    // Same name, a different datatype, and a value that only fits the
+    // NEW one. It must be checked against `integer`, which is what the
+    // label still declares.
+    api::add_field(&db, &frag, &api::FieldReq {
+        key: "port".into(),
+        value: "not a port".into(),
+        value_kind: Some("string".into()),
+    })
+    .await
+    .expect_err("the label still says integer");
+
+    assert_eq!(
+        dictionary::current(&db, "port", dictionary::SLOT)
+            .await
+            .expect("read")
+            .and_then(|d| d.value_kind)
+            .as_deref(),
+        Some("integer"),
+        "and the declaration is untouched"
+    );
+}
+
+/// Without a datatype it is still pick-an-existing, so a typo is a typo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn naming_a_field_with_no_datatype_is_still_refused() {
+    use superx_mod_entities::{api, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    let err = api::add_field(&db, &frag, &api::FieldReq {
+        key: "onwer".into(),
+        value: "x".into(),
+        value_kind: None,
+    })
+    .await
+    .expect_err("a typo with no datatype is a typo");
+    assert!(err.to_string().contains("declares no slot"), "{err}");
+}
+
+/// A datatype outside the closed set is refused by name rather than
+/// quietly defining something nothing can read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_datatype_outside_the_closed_set_is_refused() {
+    use superx_mod_entities::{api, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    let err = api::add_field(&db, &frag, &api::FieldReq {
+        key: "weight".into(),
+        value: "3".into(),
+        value_kind: Some("float".into()),
+    })
+    .await
+    .expect_err("float is not one of them");
+    assert!(err.to_string().contains("not a datatype"), "{err}");
+}

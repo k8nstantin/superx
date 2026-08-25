@@ -567,6 +567,17 @@ function DetailView({
           {/* The discussion starts here, and it has to LOOK like it
               does: a 35k-char description above an unmarked comment
               reads as one continuous document (#261). */}
+          <Divider my="md" labelPosition="left" label="fields" color="dark.5" />
+          {/* Beside the description and the comments, not in a column
+              on the far side of the page. These are the three things an
+              entity says about itself, and §6 designs them together:
+              "seed, then design — add fields and label them". */}
+          <Card withBorder ref={fieldsRef}>
+            <Title order={6} tt="uppercase" c="dimmed" mb="xs">
+              Fields
+            </Title>
+            <Fields entityId={d.id} />
+          </Card>
           <Divider
             my="md"
             labelPosition="left"
@@ -618,18 +629,6 @@ function DetailView({
           </Card>
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 6 }}>
-          {/* FIELDS FIRST. §6 is "seed, then design — add fields and
-              label them"; burying them under comments, edges and
-              attachments meant the operator could not find the one
-              surface the whole design is about, and on a narrow window
-              this column stacks below everything so they were simply
-              off-screen. */}
-          <Card withBorder mb="md" ref={fieldsRef}>
-            <Title order={6} tt="uppercase" c="dimmed" mb="xs">
-              Fields
-            </Title>
-            <Fields entityId={d.id} />
-          </Card>
           <Card withBorder mb="md" ref={edgesRef}>
             <Title order={6} tt="uppercase" c="dimmed" mb="xs">
               Edges · {d.edges.length}

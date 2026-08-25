@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
+  Autocomplete,
   Badge,
   Button,
   Checkbox,
@@ -13,7 +14,13 @@ import {
   TextInput,
   Tooltip,
 } from '@mantine/core'
-import { fetchAddableFields, fetchFields, promoteField, setField } from './api'
+import {
+  fetchAddableFields,
+  fetchFields,
+  fetchVocabulary,
+  promoteField,
+  setField,
+} from './api'
 import type { FieldView } from './generated/FieldView'
 
 // Declared fields, rendered as what they are (#294).
@@ -80,19 +87,35 @@ export function Fields({ entityId }: { entityId: string }) {
 /// is an AD HOC field on this entity alone, which the row then offers
 /// to promote.
 function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void }) {
+  // The closed set of datatypes comes from the substrate — a second
+  // copy in the frontend would rot the moment the dictionary changes.
+  const vocab = useQuery({ queryKey: ['vocabulary'], queryFn: fetchVocabulary })
+  const kinds = vocab.data?.value_kinds ?? []
   const offers = useQuery({
     queryKey: ['addable', entityId],
     queryFn: () => fetchAddableFields(entityId),
   })
-  const [key, setKey] = useState<string | null>(null)
+  const [key, setKey] = useState('')
+  const [kind, setKind] = useState('string')
   const [value, setValue] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const chosen = (offers.data ?? []).find((o) => o.key === key)
+  // A name the dictionary already knows brings its own kind — you do
+  // not get to redeclare what a term means by filling in a form (§5.6:
+  // changing what a label means carries the tightest gate in the
+  // system).
+  const known = (offers.data ?? []).find((o) => o.key === key.trim())
 
   const save = useMutation({
-    mutationFn: () => setField(entityId, { key: key as string, value }),
+    mutationFn: () =>
+      setField(entityId, {
+        key: key.trim(),
+        value,
+        // Only when it is NEW: naming an existing field must not carry
+        // a kind that could disagree with what it already declares.
+        value_kind: known ? null : kind,
+      }),
     onSuccess: () => {
-      setKey(null)
+      setKey('')
       setValue('')
       setError(null)
       onAdded()
@@ -100,59 +123,64 @@ function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void
     onError: (e) => setError(String(e)),
   })
 
-  if ((offers.data ?? []).length === 0) {
-    return (
-      <Text size="xs" c="dimmed">
-        Every value label in the dictionary is already on this entity. Define
-        another on the Dictionary page and it becomes available here.
-      </Text>
-    )
-  }
-
   return (
-    <Group align="flex-end" gap="xs" mt="xs">
-      <Select
-        label="Add a field"
-        description="picked from the dictionary — a label means the same thing everywhere"
-        placeholder="choose a label…"
-        w={230}
-        searchable
-        value={key}
-        onChange={(k) => {
-          setKey(k)
-          setError(null)
-        }}
-        data={(offers.data ?? []).map((o) => ({
-          value: o.key,
-          label: o.on_the_type ? o.key : `${o.key} — ad hoc`,
-        }))}
-      />
-      <TextInput
-        label={chosen ? `Value (${chosen.value_kind})` : 'Value'}
-        description={chosen?.description || undefined}
-        w={260}
-        value={value}
-        onChange={(e) => setValue(e.currentTarget.value)}
-      />
-      <Button
-        disabled={!key || !value.trim()}
-        loading={save.isPending}
-        onClick={() => save.mutate()}
-      >
-        Add
-      </Button>
-      {chosen && !chosen.on_the_type && (
-        <Text size="xs" c="dimmed" maw={280}>
-          Not on the {"type"} — this adds it to this entity alone. Promote it
-          afterwards to give every entity of the type the slot.
+    <Stack gap={4} mt="md">
+      <Text size="sm" fw={600}>
+        Add a field
+      </Text>
+      <Text size="xs" c="dimmed">
+        Name it and say what kind of value it holds. A name the dictionary
+        already knows keeps its kind; a new one is added to the dictionary as
+        you type it.
+      </Text>
+      <Group align="flex-end" gap="xs">
+        <Autocomplete
+          label="Name"
+          placeholder="branch, host, owner…"
+          w={200}
+          value={key}
+          data={(offers.data ?? []).map((o) => o.key)}
+          onChange={(k) => {
+            setKey(k)
+            setError(null)
+          }}
+        />
+        <Select
+          label="Datatype"
+          w={140}
+          data={kinds}
+          value={known ? known.value_kind : kind}
+          disabled={!!known}
+          onChange={(k) => setKind(k ?? 'string')}
+        />
+        <TextInput
+          label="Value"
+          description={known?.description || undefined}
+          w={240}
+          value={value}
+          onChange={(e) => setValue(e.currentTarget.value)}
+        />
+        <Button
+          disabled={!key.trim() || !value.trim()}
+          loading={save.isPending}
+          onClick={() => save.mutate()}
+        >
+          Add
+        </Button>
+      </Group>
+      {known && !known.on_the_type && (
+        <Text size="xs" c="dimmed">
+          {key} is already a known field, and this type does not carry it — it
+          lands on this entity alone, and Promote gives every entity of the type
+          the slot.
         </Text>
       )}
       {error && (
-        <Text size="xs" c="red.4" maw={320}>
+        <Text size="xs" c="red.4">
           {error}
         </Text>
       )}
-    </Group>
+    </Stack>
   )
 }
 
@@ -177,7 +205,10 @@ function FieldRow({
   const dirty = draft !== (field.value ?? '')
 
   const save = useMutation({
-    mutationFn: () => setField(entityId, { key: field.key, value: draft }),
+    mutationFn: () =>
+      // Editing an existing field never carries a kind: the label
+      // already declares one, and a form must not redeclare it.
+      setField(entityId, { key: field.key, value: draft, value_kind: null }),
     onSuccess: () => {
       setError(null)
       onSaved()
