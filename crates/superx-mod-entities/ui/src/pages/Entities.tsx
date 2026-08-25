@@ -384,6 +384,7 @@ function DetailView({
   const instrRef = useRef<HTMLDivElement>(null)
   const commentsRef = useRef<HTMLDivElement>(null)
   const edgesRef = useRef<HTMLDivElement>(null)
+  const fieldsRef = useRef<HTMLDivElement>(null)
   const attachRef = useRef<HTMLDivElement>(null)
   const jump = (r: React.RefObject<HTMLDivElement | null>) =>
     r.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -492,6 +493,9 @@ function DetailView({
             instructions
           </Button>
         )}
+        <Button size="compact-xs" variant="light" onClick={() => jump(fieldsRef)}>
+          fields
+        </Button>
         <Button size="compact-xs" variant="light" onClick={() => jump(commentsRef)}>
           comments {comments.length > 0 ? `(${comments.length})` : ''}
         </Button>
@@ -614,6 +618,18 @@ function DetailView({
           </Card>
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 6 }}>
+          {/* FIELDS FIRST. §6 is "seed, then design — add fields and
+              label them"; burying them under comments, edges and
+              attachments meant the operator could not find the one
+              surface the whole design is about, and on a narrow window
+              this column stacks below everything so they were simply
+              off-screen. */}
+          <Card withBorder mb="md" ref={fieldsRef}>
+            <Title order={6} tt="uppercase" c="dimmed" mb="xs">
+              Fields
+            </Title>
+            <Fields entityId={d.id} />
+          </Card>
           <Card withBorder mb="md" ref={edgesRef}>
             <Title order={6} tt="uppercase" c="dimmed" mb="xs">
               Edges · {d.edges.length}
@@ -687,15 +703,6 @@ function DetailView({
                 </Group>
               ))
             )}
-          </Card>
-          <Card withBorder>
-            <Title order={6} tt="uppercase" c="dimmed" mb="xs">
-              Fields
-            </Title>
-            {/* Declared fields, rendered as what they are (#294). The raw
-                bag below stays reachable for whatever nothing declares —
-                reads must never fail — but it is no longer the only door. */}
-            <Fields entityId={d.id} />
           </Card>
           <Content kind="entity" uid={d.id} title="Files" />
           <Card withBorder>
