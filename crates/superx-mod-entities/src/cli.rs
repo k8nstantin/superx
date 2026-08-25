@@ -40,7 +40,9 @@ const USAGE: &str = "usage: superx entities <command>\n\
   types add <name> --category entity|relation [--description <text>]\n\
   labels [--all] [--for <type>]        the dictionary: what the terminology means\n\
   fields <uuid-fragment>               the declared values of an entity\n\
-  set <uuid-fragment> <key> <value>    set one declared value, checked against its kind\n\
+  set <uuid-fragment> <key> <value> [--type <datatype>]\n\
+                       set a value, checked against its kind. --type NAMES a new\n\
+                       field: it is added to the dictionary with that datatype\n\
                        any label the dictionary defines — ad hoc on this entity alone\n\
   promote <uuid-fragment> <key>       put an ad-hoc field on the TYPE, so every\n\
                        entity of it carries the slot from now on\n\
@@ -390,9 +392,33 @@ async fn set_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
     let fragment = args.first().ok_or_else(usage)?;
     let key = args.get(1).ok_or_else(usage)?;
-    let value = rest(args, 2)?;
+    // Naming a field the dictionary does not know DEFINES it, when a
+    // datatype comes with it — §6: "you pick one from the dictionary,
+    // OR YOU ADD IT TO THE DICTIONARY". Without --type this is
+    // set-an-existing, so a typo is still refused by name.
+    let kind = args
+        .iter()
+        .position(|a| a == "--type")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str);
+    let value = match kind {
+        Some(_) => {
+            let stop = args.iter().position(|a| a == "--type").unwrap_or(args.len());
+            args.get(2..stop).map(|v| v.join(" ")).filter(|v| !v.is_empty()).ok_or_else(usage)?
+        }
+        None => rest(args, 2)?,
+    };
     let anchor = nodes::resolve_entity(&db, fragment).await?;
-    fields::set(&db, &anchor, key, &value).await?;
+    crate::api::add_field(
+        &db,
+        fragment,
+        &crate::api::FieldReq {
+            key: key.clone(),
+            value: value.clone(),
+            value_kind: kind.map(ToString::to_string),
+        },
+    )
+    .await?;
     emit(kernel, "entity_updated", &record_uuid(&anchor), "", key).await;
     Ok(format!("{key} set\n"))
 }

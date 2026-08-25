@@ -3,4 +3,15 @@
 /**
  * One typed value, from the entity page.
  */
-export type FieldReq = { key: string, value: string, };
+export type FieldReq = { key: string, value: string, 
+/**
+ * Naming a field the dictionary does not know yet ADDS IT to the
+ * dictionary with this kind — §6's sentence has two halves and
+ * only the first was built: "you pick one from the dictionary, OR
+ * YOU ADD IT TO THE DICTIONARY".
+ *
+ * Absent means pick-an-existing, and an unknown key is refused as
+ * before. So a typo is still a typo; a deliberate new field is a
+ * new field, and the difference is whether a kind came with it.
+ */
+value_kind: string | null, };

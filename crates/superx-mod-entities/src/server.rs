@@ -63,8 +63,8 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/entities/{frag}", get(api_detail))
         .route("/api/entities/{frag}/history", get(api_history))
         .route("/api/entities/{frag}/fields", get(api_fields).post(api_set_field))
-        // §6: "you never invent a label inline — you pick one from the
-        // dictionary". This is the offer the page picks from.
+        // §6: "you pick one from the dictionary, OR YOU ADD IT to the
+        // dictionary". This is the first half — what already exists.
         .route("/api/entities/{frag}/addable-fields", get(api_addable_fields))
         .route("/api/entities/{frag}/promote-field", post(api_promote_field))
         .route("/api/entities/{frag}/update", post(api_update))
@@ -207,7 +207,10 @@ async fn api_set_field(
     Json(req): Json<api::FieldReq>,
 ) -> Resp<serde_json::Value> {
     let db = module_db!(state);
-    match api::set_field(&db, &frag, &req.key, &req.value).await {
+    // Naming a field the dictionary does not know DEFINES it, when a
+    // datatype came with it (§6). Without one this is the old
+    // set-an-existing path, so a typo is still refused by name.
+    match api::add_field(&db, &frag, &req).await {
         Ok(()) => {
             emit(&state.kernel, "entity_updated", frag.clone()).await;
             Resp::ok(serde_json::json!({ "key": req.key }))
