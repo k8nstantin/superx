@@ -86,8 +86,11 @@ impl Target {
             }
             "label" => {
                 // Either kind of label can be argued about, so both count.
-                for label_kind in [crate::dictionary::SLOT, crate::dictionary::LINK] {
-                    if crate::dictionary::current(db, uid, label_kind).await?.is_some() {
+                {
+                    // One list: a label is found by name, whatever kind
+                    // it was written as. Looping the two old kinds made
+                    // anything defined after the merge unaddressable.
+                    if crate::dictionary::find(db, uid).await?.is_some() {
                         return Ok(Self::Label(uid.to_string()));
                     }
                 }

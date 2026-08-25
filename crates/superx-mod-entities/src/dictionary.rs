@@ -793,6 +793,11 @@ async fn append(db: &Db, mut row: Object) -> Result<()> {
 ///
 /// [`KernelError::Db`] for engine errors.
 pub async fn find(db: &Db, key: &str) -> Result<Option<LabelRow>> {
+    Ok(newest_object(db, key).await?.as_ref().and_then(parse_obj))
+}
+
+/// The newest row for a name, whatever kind it carries.
+async fn newest_object(db: &Db, key: &str) -> Result<Option<Object>> {
     let mut resp = db
         .query(
             "SELECT * FROM label WHERE key = $key ORDER BY valid_from DESC, id DESC LIMIT 1",
@@ -800,7 +805,10 @@ pub async fn find(db: &Db, key: &str) -> Result<Option<LabelRow>> {
         .bind(("key", key.to_string()))
         .await?;
     let rows: Vec<Value> = resp.take(0)?;
-    Ok(rows.first().and_then(parse))
+    Ok(rows.first().and_then(|r| match r {
+        Value::Object(o) => Some(o.clone()),
+        _ => None,
+    }))
 }
 
 pub async fn current(db: &Db, key: &str, kind: &str) -> Result<Option<LabelRow>> {
@@ -871,8 +879,13 @@ pub async fn archive(db: &Db, key: &str, kind: &str, archived: bool) -> Result<(
 
 /// The current definition, stripped of what belongs to the ROW rather
 /// than to the definition, ready to be amended and appended.
-async fn carry_forward(db: &Db, key: &str, kind: &str) -> Result<Option<Object>> {
-    let Some(mut prior) = current_object(db, key, kind).await? else {
+async fn carry_forward(db: &Db, key: &str, _kind: &str) -> Result<Option<Object>> {
+    // BY NAME, not by (name, kind). Keyed on the pair, redefining a
+    // label written before the merge under the merged kind found
+    // nothing and started from an empty row — silently dropping its
+    // datatype, cardinality, endpoints and action. One list means one
+    // chain per name.
+    let Some(mut prior) = newest_object(db, key).await? else {
         return Ok(None);
     };
     // The new version is a new row: it gets its own id and its own

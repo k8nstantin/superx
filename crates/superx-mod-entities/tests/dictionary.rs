@@ -937,3 +937,104 @@ async fn labels_survive_a_rename_and_an_archive() {
     assert!(state.archived);
     assert_eq!(state.labels, vec!["spec".to_string()], "the labels came through both writes");
 }
+
+// REVIEW OF #332. Merging two vocabularies is not done when the LOOKUPS
+// merge — it is done when nothing asks the old question any more. Three
+// places still did, and each failed silently.
+
+/// A label written before the merge, redefined under the merged kind,
+/// must keep everything the redefinition does not mention. Keyed on
+/// (name, kind), the carry-forward found nothing and started from an
+/// empty row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redefining_a_pre_merge_label_keeps_what_it_declared() {
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+
+    // `spec` ships as a slot: markdown, one.
+    let before = dictionary::find(&db, "spec").await.expect("r").expect("t");
+    assert_eq!(before.value_kind.as_deref(), Some("markdown"));
+    assert_eq!(before.cardinality.as_deref(), Some("one"));
+
+    // Reworded under the MERGED kind, saying nothing about either.
+    dictionary::define(&db, Definition {
+        key: "spec",
+        kind: dictionary::LABEL,
+        display: "Spec",
+        semantics: "context",
+        description: Some("the contract the work is judged by"),
+        ..Default::default()
+    })
+    .await
+    .expect("redefine");
+
+    let after = dictionary::find(&db, "spec").await.expect("r").expect("t");
+    assert_eq!(after.description.as_deref(), Some("the contract the work is judged by"));
+    assert_eq!(after.value_kind.as_deref(), Some("markdown"), "the datatype survived");
+    assert_eq!(after.cardinality.as_deref(), Some("one"), "and so did the cardinality");
+}
+
+/// A label created under the merged kind and used on an edge must have
+/// its endpoints enforced. Asking for a LINK label meant anything new
+/// was invisible to the check, so #299's protection was silently off
+/// for every label defined from now on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merged_kind_label_still_has_its_endpoints_enforced() {
+    use superx_mod_entities::{edges, nodes, registry};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed(&db).await.expect("labels");
+
+    dictionary::define(&db, Definition {
+        key: "audits",
+        kind: dictionary::LABEL,
+        display: "audits",
+        semantics: "governance",
+        source_types: Some(&["task".to_string()]),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+    registry::add_type(&db, "audits", "relation", None).await.expect("relation kind");
+
+    let task = nodes::create_entity(&db, "task", "Check", None, None).await.expect("t");
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+
+    edges::link(&db, &task, &product, "audits").await.expect("a task audits");
+
+    let err = edges::link(&db, &product, &task, "audits")
+        .await
+        .expect_err("a product does not — the rule is enforced whatever kind it was written as");
+    assert!(err.to_string().contains("task"), "{err}");
+}
+
+/// A label created under the merged kind must still be addressable as
+/// the subject of a note. Looping the two old kinds made anything
+/// defined after the merge unreachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merged_kind_label_can_still_be_argued_about() {
+    use superx_mod_entities::notes::Author;
+    use superx_mod_entities::{notes, target::Target};
+
+    let db = fresh_db().await;
+    dictionary::seed(&db).await.expect("labels");
+    dictionary::define(&db, Definition {
+        key: "runbook",
+        kind: dictionary::LABEL,
+        display: "Runbook",
+        semantics: "guidance",
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+
+    let target = Target::resolve(&db, "label", "runbook").await.expect("a label is a subject");
+    notes::write_to_target(&db, &target, "comments", "should this be binding?", &Author::operator())
+        .await
+        .expect("argue about it");
+
+    let held = notes::for_target(&db, &target, false).await.expect("read");
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].body, "should this be binding?");
+}
