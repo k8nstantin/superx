@@ -355,6 +355,18 @@ pub struct SlotReq {
 /// A declared field of an entity, with what it holds.
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
+pub struct FieldOffer {
+    pub key: String,
+    pub value_kind: String,
+    pub semantics: String,
+    pub description: String,
+    /// Already on the type — adding it here just fills it in. False
+    /// means adding it is an AD HOC field on this entity alone.
+    pub on_the_type: bool,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
 pub struct FieldView {
     pub key: String,
     /// Empty when the entity holds a key its type no longer declares.
@@ -364,6 +376,11 @@ pub struct FieldView {
     /// True when nothing declares this key any more. Reads never fail,
     /// so it surfaces rather than disappearing.
     pub undeclared: bool,
+    /// The dictionary defines this label, but this entity's TYPE does
+    /// not carry it — a field added ad hoc to this one thing (§6).
+    /// Distinct from `undeclared`, which means nothing defines it at
+    /// all: one is a deliberate exception, the other is a leftover.
+    pub ad_hoc: bool,
     /// How this type treats it — the override where there is one.
     pub semantics: String,
     /// What `enum` allows, empty for every other kind.
@@ -404,6 +421,7 @@ pub async fn entity_fields(db: &Db, fragment: &str) -> Result<Vec<FieldView>> {
                     _ => Vec::new(),
                 })
                 .unwrap_or_default(),
+            ad_hoc: f.ad_hoc,
             key: f.key,
             value_kind: f.value_kind,
             required: f.required,
@@ -412,6 +430,55 @@ pub async fn entity_fields(db: &Db, fragment: &str) -> Result<Vec<FieldView>> {
         });
     }
     Ok(out)
+}
+
+/// The slot labels this entity could take that it does not already
+/// hold — the dictionary's offer, so a field is PICKED, never invented
+/// inline (§6).
+///
+/// Prose kinds are excluded: they are notes, not values in the bag, and
+/// offering them here would put a description into the attributes.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn addable_fields(db: &Db, fragment: &str) -> Result<Vec<FieldOffer>> {
+    let id = nodes::resolve_entity(db, fragment).await?;
+    let held: std::collections::HashSet<String> =
+        fields::of(db, &id).await?.into_iter().map(|f| f.key).collect();
+    let (entity_type, _) = nodes::anchor_info(db, &id).await?;
+    let slots = dictionary::slots_for(db, &entity_type, false).await?;
+
+    Ok(dictionary::list(db, false)
+        .await?
+        .into_iter()
+        .filter(|l| l.label_kind == dictionary::SLOT)
+        .filter(|l| l.value_kind.as_deref().is_some_and(fields::is_value_kind))
+        .filter(|l| !held.contains(&l.key))
+        .map(|l| FieldOffer {
+            on_the_type: slots.iter().any(|s| s.label == l.key),
+            value_kind: l.value_kind.unwrap_or_default(),
+            description: l.description.unwrap_or_default(),
+            semantics: l.semantics,
+            key: l.key,
+        })
+        .collect())
+}
+
+/// Promote an ad-hoc field to the type: every entity of that type
+/// carries the slot from now on (§6).
+///
+/// Not required by default — promoting says "this belongs on the type",
+/// not "every existing one is now wrong". §7: making a field required
+/// does not retroactively invalidate what exists.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn promote_field(db: &Db, fragment: &str, key: &str) -> Result<()> {
+    let id = nodes::resolve_entity(db, fragment).await?;
+    let (entity_type, _) = nodes::anchor_info(db, &id).await?;
+    dictionary::bind_slot(db, &entity_type, key, false, None, &notes::Author::operator()).await
 }
 
 /// Set one declared field, checked against what its label declares.

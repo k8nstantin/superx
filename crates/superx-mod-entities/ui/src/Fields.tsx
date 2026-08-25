@@ -13,7 +13,7 @@ import {
   TextInput,
   Tooltip,
 } from '@mantine/core'
-import { fetchFields, setField } from './api'
+import { fetchAddableFields, fetchFields, promoteField, setField } from './api'
 import type { FieldView } from './generated/FieldView'
 
 // Declared fields, rendered as what they are (#294).
@@ -46,30 +46,113 @@ export function Fields({ entityId }: { entityId: string }) {
     queryFn: () => fetchFields(entityId),
   })
 
+  const refresh = () => {
+    void qc.invalidateQueries({ queryKey: ['fields', entityId] })
+    void qc.invalidateQueries({ queryKey: ['addable', entityId] })
+    void qc.invalidateQueries({ queryKey: ['entity', entityId] })
+    void qc.invalidateQueries({ queryKey: ['slots'] })
+  }
+
   const rows = fields.data ?? []
-  if (rows.length === 0) {
+
+  return (
+    <Stack gap="sm">
+      {rows.length === 0 && (
+        <Text size="sm" c="dimmed">
+          Nothing here yet. Add a field below — it lands on THIS entity, and you
+          can promote it to the type when every one of them should carry it.
+        </Text>
+      )}
+      {rows.map((f) => (
+        <FieldRow key={f.key} field={f} entityId={entityId} onSaved={refresh} />
+      ))}
+      <AddField entityId={entityId} onAdded={refresh} />
+    </Stack>
+  )
+}
+
+/// §6: "Seed, then design … add fields and label them, FROM LABELS
+/// DESIGNED AHEAD. You never invent a label inline — you pick one from
+/// the dictionary, or you add it to the dictionary."
+///
+/// So this is a picker over the dictionary, never a free-text key. A
+/// label the type already carries just gets filled in; one it does not
+/// is an AD HOC field on this entity alone, which the row then offers
+/// to promote.
+function AddField({ entityId, onAdded }: { entityId: string; onAdded: () => void }) {
+  const offers = useQuery({
+    queryKey: ['addable', entityId],
+    queryFn: () => fetchAddableFields(entityId),
+  })
+  const [key, setKey] = useState<string | null>(null)
+  const [value, setValue] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const chosen = (offers.data ?? []).find((o) => o.key === key)
+
+  const save = useMutation({
+    mutationFn: () => setField(entityId, { key: key as string, value }),
+    onSuccess: () => {
+      setKey(null)
+      setValue('')
+      setError(null)
+      onAdded()
+    },
+    onError: (e) => setError(String(e)),
+  })
+
+  if ((offers.data ?? []).length === 0) {
     return (
-      <Text size="sm" c="dimmed">
-        This type declares no values — only prose. Give it slots on the Dictionary
-        page and they appear here.
+      <Text size="xs" c="dimmed">
+        Every value label in the dictionary is already on this entity. Define
+        another on the Dictionary page and it becomes available here.
       </Text>
     )
   }
 
   return (
-    <Stack gap="sm">
-      {rows.map((f) => (
-        <FieldRow
-          key={f.key}
-          field={f}
-          entityId={entityId}
-          onSaved={() => {
-            void qc.invalidateQueries({ queryKey: ['fields', entityId] })
-            void qc.invalidateQueries({ queryKey: ['entity', entityId] })
-          }}
-        />
-      ))}
-    </Stack>
+    <Group align="flex-end" gap="xs" mt="xs">
+      <Select
+        label="Add a field"
+        description="picked from the dictionary — a label means the same thing everywhere"
+        placeholder="choose a label…"
+        w={230}
+        searchable
+        value={key}
+        onChange={(k) => {
+          setKey(k)
+          setError(null)
+        }}
+        data={(offers.data ?? []).map((o) => ({
+          value: o.key,
+          label: o.on_the_type ? o.key : `${o.key} — ad hoc`,
+        }))}
+      />
+      <TextInput
+        label={chosen ? `Value (${chosen.value_kind})` : 'Value'}
+        description={chosen?.description || undefined}
+        w={260}
+        value={value}
+        onChange={(e) => setValue(e.currentTarget.value)}
+      />
+      <Button
+        disabled={!key || !value.trim()}
+        loading={save.isPending}
+        onClick={() => save.mutate()}
+      >
+        Add
+      </Button>
+      {chosen && !chosen.on_the_type && (
+        <Text size="xs" c="dimmed" maw={280}>
+          Not on the {"type"} — this adds it to this entity alone. Promote it
+          afterwards to give every entity of the type the slot.
+        </Text>
+      )}
+      {error && (
+        <Text size="xs" c="red.4" maw={320}>
+          {error}
+        </Text>
+      )}
+    </Group>
   )
 }
 
@@ -82,6 +165,13 @@ function FieldRow({
   entityId: string
   onSaved: () => void
 }) {
+  // Promoting BINDS the slot to the type; it does not make it required,
+  // and §7 is explicit that making a field required does not
+  // retroactively invalidate what already exists.
+  const promote = useMutation({
+    mutationFn: () => promoteField(entityId, field.key),
+    onSuccess: onSaved,
+  })
   const [draft, setDraft] = useState<string>(field.value ?? '')
   const [error, setError] = useState<string | null>(null)
   const dirty = draft !== (field.value ?? '')
@@ -128,6 +218,27 @@ function FieldRow({
                   {field.semantics}
                 </Badge>
               </Tooltip>
+            )}
+            {/* §6: added ad hoc to THIS entity, and promotable to the
+                type when every one of them should carry it. Marked, so
+                it is visibly an exception rather than looking like part
+                of the type. */}
+            {field.ad_hoc && (
+              <>
+                <Tooltip label="On this entity only — its type does not carry this slot">
+                  <Badge size="xs" color="cyan" variant="light">
+                    ad hoc
+                  </Badge>
+                </Tooltip>
+                <Button
+                  size="compact-xs"
+                  variant="subtle"
+                  loading={promote.isPending}
+                  onClick={() => promote.mutate()}
+                >
+                  Promote to type
+                </Button>
+              </>
             )}
           </>
         )}

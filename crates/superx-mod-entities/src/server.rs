@@ -63,6 +63,10 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/entities/{frag}", get(api_detail))
         .route("/api/entities/{frag}/history", get(api_history))
         .route("/api/entities/{frag}/fields", get(api_fields).post(api_set_field))
+        // §6: "you never invent a label inline — you pick one from the
+        // dictionary". This is the offer the page picks from.
+        .route("/api/entities/{frag}/addable-fields", get(api_addable_fields))
+        .route("/api/entities/{frag}/promote-field", post(api_promote_field))
         .route("/api/entities/{frag}/update", post(api_update))
         .route("/api/entities/{frag}/archive", post(api_archive))
         .route("/api/labels/{key}/archive", post(api_label_archive))
@@ -154,6 +158,34 @@ async fn api_types(State(state): State<AppState>) -> Resp<Vec<api::TypeView>> {
     let db = module_db!(state);
     match api::types_list(&db).await {
         Ok(v) => Resp::ok(v),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+async fn api_addable_fields(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+) -> Resp<Vec<api::FieldOffer>> {
+    let db = module_db!(state);
+    match api::addable_fields(&db, &frag).await {
+        Ok(v) => Resp::ok(v),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PromoteReq {
+    key: String,
+}
+
+async fn api_promote_field(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+    Json(req): Json<PromoteReq>,
+) -> Resp<bool> {
+    let db = module_db!(state);
+    match api::promote_field(&db, &frag, &req.key).await {
+        Ok(()) => Resp::ok(true),
         Err(e) => Resp::err(e.to_string()),
     }
 }

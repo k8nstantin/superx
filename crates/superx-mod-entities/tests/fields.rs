@@ -69,10 +69,20 @@ async fn a_value_is_checked_against_the_kind_its_label_declares() {
         .await
         .expect("define");
     let task = create_entity(&db, "task", "t", None, None).await.expect("create");
-    // `task` declares slots, so an undeclared key is refused there too.
-    fields::set(&db, &task, "retries", "3")
-        .await
-        .expect_err("declared in the dictionary is not the same as carried by the type");
+    // §6: a label the DICTIONARY defines may be set on any entity ad
+    // hoc, and promoted to the type later — "the label means the same
+    // thing either way, which is the point". The type says what is
+    // EXPECTED, not what is permitted.
+    fields::set(&db, &task, "retries", "3").await.expect("ad hoc on this task");
+    let held = fields::of(&db, &task).await.expect("read");
+    assert_eq!(
+        held.iter().find(|f| f.key == "retries").and_then(|f| f.value.clone()),
+        Some("3".to_string())
+    );
+
+    // And the VALUE is still checked against what the label declares —
+    // dropping the type check did not drop the kind check.
+    fields::set(&db, &task, "retries", "three").await.expect_err("integer means integer");
 }
 
 /// A type that declares nothing accepts anything: a role must be able to
@@ -439,14 +449,17 @@ async fn the_bag_door_refuses_what_the_field_door_refuses() {
     .await
     .expect("define");
 
-    // `repo` declares slots, and max_notional is not among them.
-    fields::set(&db, &repo, "max_notional", "500")
+    // A defined label may be set ad hoc (§6), and the value is still
+    // checked: `max_notional` is a number, so prose in it is refused by
+    // BOTH doors — which is what this test is really about.
+    fields::set(&db, &repo, "max_notional", "500").await.expect("ad hoc, and 500 is a number");
+    fields::set(&db, &repo, "max_notional", "loads")
         .await
-        .expect_err("the field door refuses it");
+        .expect_err("the field door refuses a non-number");
 
     let mut bag = Object::new();
     bag.insert("url".to_string(), Value::String("https://example.com/r".into()));
-    bag.insert("max_notional".to_string(), Value::String("500".into()));
+    bag.insert("max_notional".to_string(), Value::String("loads".into()));
     fields::validate_bag(&db, &repo, &bag)
         .await
         .expect_err("and so does the bag door");
@@ -486,4 +499,146 @@ async fn a_key_already_there_may_stay_even_if_the_type_stopped_carrying_it() {
     fields::validate_bag(&db, &repo, &bag)
         .await
         .expect("what is already there may stay");
+}
+
+/// §6, the whole flow: "Seed, then design. Create the entity and it
+/// exists — a uuid7 and a name. Then design it: add fields and label
+/// them, from labels designed ahead … Fields may be added AD HOC to a
+/// single entity and PROMOTED to the type when every entity of that
+/// type should carry the slot — the label means the same thing either
+/// way, which is the point."
+///
+/// Before this, `set` refused any key the TYPE did not declare, so the
+/// only way to say something about ONE product was to change what EVERY
+/// product carries. There was no ad hoc, so there was nothing to
+/// promote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_field_is_added_to_one_entity_and_then_promoted_to_its_type() {
+    use superx_mod_entities::{api, dictionary, fields, nodes};
+    use superx_mod_entities::dictionary::Definition;
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed_type_labels(&db).await.expect("slots");
+
+    // Not in the shipped dictionary, so define it — "you pick one from
+    // the dictionary, OR YOU ADD IT to the dictionary" (§6).
+    dictionary::define(&db, Definition {
+        key: "max_notional",
+        kind: "slot",
+        display: "Max notional",
+        semantics: "data",
+        cardinality: Some("one"),
+        value_kind: Some("number"),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+
+    let a = nodes::create_entity(&db, "product", "Desk A", None, None).await.expect("a");
+    let b = nodes::create_entity(&db, "product", "Desk B", None, None).await.expect("b");
+    let a_frag = superx_ops::record_uuid(&a);
+
+    // `max_notional` is in the shipped dictionary but is NOT a product
+    // slot — exactly the case that used to be impossible.
+    assert!(
+        !dictionary::slots_for(&db, "product", false)
+            .await
+            .expect("slots")
+            .iter()
+            .any(|s| s.label == "max_notional"),
+        "the type does not carry it, which is the point of the test"
+    );
+
+    fields::set(&db, &a, "max_notional", "50000").await.expect("ad hoc on THIS desk");
+
+    let held = api::entity_fields(&db, &a_frag).await.expect("fields");
+    let f = held.iter().find(|f| f.key == "max_notional").expect("it is there");
+    assert_eq!(f.value.as_deref(), Some("50000"));
+    assert!(f.ad_hoc, "marked as an exception rather than looking like part of the type");
+    assert!(!f.undeclared, "the dictionary defines it — that is not the same as the type carrying it");
+
+    // The OTHER desk is untouched: an ad-hoc field is about one thing.
+    let other = api::entity_fields(&db, &superx_ops::record_uuid(&b)).await.expect("b");
+    assert!(!other.iter().any(|f| f.key == "max_notional"), "Desk B did not change");
+
+    // PROMOTE: now every product carries the slot.
+    api::promote_field(&db, &a_frag, "max_notional").await.expect("promote");
+    assert!(
+        dictionary::slots_for(&db, "product", false)
+            .await
+            .expect("slots")
+            .iter()
+            .any(|s| s.label == "max_notional"),
+        "it is on the type now"
+    );
+
+    // Desk A's value is unchanged and no longer an exception.
+    let held = api::entity_fields(&db, &a_frag).await.expect("fields");
+    let f = held.iter().find(|f| f.key == "max_notional").expect("still there");
+    assert_eq!(f.value.as_deref(), Some("50000"), "promoting did not touch the value");
+    assert!(!f.ad_hoc, "it is part of the type now");
+
+    // §7: "making a field required does not retroactively invalidate
+    // existing entities". Desk B has no value and is still writable.
+    fields::set(&db, &b, "max_notional", "10000").await.expect("Desk B still writes fine");
+}
+
+/// "You never invent a label inline. You pick one from the dictionary,
+/// or you add it to the dictionary." A key the dictionary does not
+/// define is still refused — that check does the typo-catching the
+/// type check was doing, and does it by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_label_the_dictionary_does_not_define_is_still_refused() {
+    use superx_mod_entities::{fields, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let err = fields::set(&db, &product, "max_notionl", "50000")
+        .await
+        .expect_err("a typo is not a label");
+    assert!(err.to_string().contains("declares no slot"), "{err}");
+}
+
+/// The offer is the dictionary's, minus what is already held, minus
+/// prose — a description belongs in the note store, and offering it
+/// here would put it in the attributes bag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_offer_is_the_dictionary_minus_what_is_held_and_minus_prose() {
+    use superx_mod_entities::dictionary::Definition;
+    use superx_mod_entities::{api, dictionary, fields, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    dictionary::define(&db, Definition {
+        key: "max_notional",
+        kind: "slot",
+        display: "Max notional",
+        semantics: "data",
+        cardinality: Some("one"),
+        value_kind: Some("number"),
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    let offered = api::addable_fields(&db, &frag).await.expect("offers");
+    assert!(offered.iter().any(|o| o.key == "max_notional"), "a value label is offered");
+    assert!(
+        !offered.iter().any(|o| o.key == "description"),
+        "prose is not: it is a note, not a value in the bag"
+    );
+
+    fields::set(&db, &product, "max_notional", "1").await.expect("set");
+    let offered = api::addable_fields(&db, &frag).await.expect("offers again");
+    assert!(
+        !offered.iter().any(|o| o.key == "max_notional"),
+        "what it already holds is not offered twice"
+    );
 }
