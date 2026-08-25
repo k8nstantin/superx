@@ -89,7 +89,21 @@ pub async fn prose(db: &Db, dry_run: bool) -> Result<Report> {
             if inbound.iter().any(|e| e.active) {
                 report.other_roles.push(record_uuid(&carrier.id));
             } else {
+                // Nothing claims it, so nothing is GUESSED about where
+                // its prose belongs — it is not moved. But it is still
+                // an old anchor of a retired type, and leaving it live
+                // means it shows in the entity list forever with no way
+                // to hide it. Archived (not moved, not deleted) and
+                // reported by uuid so the operator can look.
                 report.orphans.push(record_uuid(&carrier.id));
+                let already =
+                    nodes::current_state(db, &carrier.id).await?.is_some_and(|s| s.archived);
+                if !already {
+                    report.anchors_archived += 1;
+                    if !dry_run {
+                        nodes::set_archived(db, &carrier.id, true).await?;
+                    }
+                }
             }
             continue;
         };
@@ -105,6 +119,13 @@ pub async fn prose(db: &Db, dry_run: bool) -> Result<Report> {
         // cardinality rule to collapse the copies back together.
         if names_a_live_note(db, history.last()).await? {
             report.dual_written += history.len();
+            // Its prose does not move — it is already a note — but the
+            // CARRIER still must go. Skipping it entirely left three of
+            // these on the operator's instance with live role edges,
+            // still hanging off the graph, which is the exact thing B4
+            // exists to end. Nothing moves; the edge is retracted and
+            // the anchor archived like every other.
+            migrated.push((carrier.id.clone(), owner.clone(), edge.rel_type.clone()));
             continue;
         }
 
@@ -283,7 +304,19 @@ async fn write_attachment(
     row.insert("filename".to_string(), Value::String(filename));
     row.insert("mime".to_string(), Value::String(mime));
     row.insert("size".to_string(), Value::Number(size.into()));
-    row.insert("path".to_string(), Value::String(text("file")));
+    // RELATIVE to the module directory, like every attachment row
+    // written since #296. The legacy node recorded an ABSOLUTE path,
+    // which is only correct while the instance home never moves — and
+    // this operator's did: their document rows point at
+    // `<repo>/modules/entities/files/...` from before the home became
+    // `~/.superx`. Storing the relative form makes the row correct for
+    // wherever the module lives now.
+    let stored = text("file");
+    let relative = std::path::Path::new(&stored)
+        .file_name()
+        .map(|n| format!("files/{}", n.to_string_lossy()))
+        .unwrap_or(stored);
+    row.insert("path".to_string(), Value::String(relative));
     row.insert("active".to_string(), Value::Bool(true));
     row.insert("attributes".to_string(), Value::Object(provenance));
     row.insert("author_kind".to_string(), Value::String("system".to_string()));

@@ -1073,7 +1073,9 @@ async fn a_document_becomes_an_attachment_row_and_leaves_the_graph() {
         &db,
         &product,
         "mandate.pdf",
-        "attachments/abc/mandate.pdf",
+        // How a legacy document node actually recorded it: an ABSOLUTE
+        // path under the instance home of the day.
+        "/old/home/modules/entities/files/01a0-mandate.pdf",
         "application/pdf",
         1234,
     )
@@ -1099,7 +1101,13 @@ async fn a_document_becomes_an_attachment_row_and_leaves_the_graph() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].label, "attachments");
     assert_eq!(files[0].filename, "mandate.pdf");
-    assert_eq!(files[0].path, "attachments/abc/mandate.pdf", "the same bytes, not a copy");
+    // RELATIVE to the module directory, not the absolute path the node
+    // recorded: an instance whose home has moved — this operator's has —
+    // would otherwise hold rows pointing outside the module forever.
+    assert_eq!(
+        files[0].path, "files/01a0-mandate.pdf",
+        "the same file, addressed so it survives the home moving"
+    );
 
     // The anchor is archived, not deleted.
     let state = nodes::current_state(&db, &doc).await.expect("read").expect("still there");
