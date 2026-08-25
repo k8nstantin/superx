@@ -71,6 +71,15 @@ pub struct Report {
 ///
 /// [`KernelError::Db`](superx_kernel::KernelError::Db) for engine errors.
 pub async fn prose(db: &Db, dry_run: bool) -> Result<Report> {
+    // REFUSE BEFORE WRITING ANYTHING. Archiving an anchor writes
+    // `entity_state.archived`, a column added in #304 that an instance
+    // which has not re-provisioned does not have. Discovering that
+    // halfway through leaves the prose moved and the carriers still
+    // live — worse than not having started, and the engine's own
+    // message ("no such field exists") says nothing about how to fix
+    // it. Checked once, up front, in the operator's terms.
+    can_archive(db).await?;
+
     let mut report = Report::default();
     // Anchors whose content is safely in the new tables, collected as
     // we go and retired only at the END. Retracting an edge before the
@@ -315,7 +324,16 @@ async fn write_attachment(
     let relative = std::path::Path::new(&stored)
         .file_name()
         .map(|n| format!("files/{}", n.to_string_lossy()))
-        .unwrap_or(stored);
+        .ok_or_else(|| {
+            // A document node with no stored file is not something to
+            // guess about: writing a row that points nowhere would turn
+            // a broken node into a broken attachment and call it
+            // migrated.
+            superx_kernel::KernelError::Module(format!(
+                "document {source} records no file — nothing to attach. Its node is \
+                 untouched; look at it with `superx entities show {source}`"
+            ))
+        })?;
     row.insert("path".to_string(), Value::String(relative));
     row.insert("active".to_string(), Value::Bool(true));
     row.insert("attributes".to_string(), Value::Object(provenance));
@@ -331,6 +349,31 @@ async fn write_attachment(
         .await?
         .check()?;
     Ok(())
+}
+
+/// Does this database have the column archiving needs?
+///
+/// `INFO FOR TABLE` rather than a probe write: asking is free and a
+/// probe write on an append-only substrate would leave a row behind
+/// just to find out.
+async fn can_archive(db: &Db) -> Result<()> {
+    let mut resp = db.query("INFO FOR TABLE entity_state").await?;
+    let info: Vec<Value> = resp.take(0)?;
+    let has = info.iter().any(|row| {
+        let Value::Object(o) = row else { return false };
+        let Some(Value::Object(fields)) = o.get("fields") else { return false };
+        fields.contains_key("archived")
+    });
+    if has {
+        return Ok(());
+    }
+    Err(superx_kernel::KernelError::Module(
+        "this database predates the `archived` column, so the carriers could be \
+         moved but never retired — and stopping halfway would leave the prose in \
+         two places. Run `superx modules provision entities` (it applies the \
+         module's schema), then run this again."
+            .to_string(),
+    ))
 }
 
 /// The uid of the note already carrying this label on this entity, if

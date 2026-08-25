@@ -695,20 +695,20 @@ async fn api_download(
     // LOOK, never what may be served.
     // `join` with an ABSOLUTE path replaces the base rather than
     // nesting under it, so this must only be tried for a relative one.
-    let relative = std::path::Path::new(&path)
-        .is_relative()
-        .then(|| module_dir.join(&path))
-        .filter(|p| p.exists());
-    let by_name = std::path::Path::new(&path)
-        .file_name()
-        .map(|n| module_dir.join("files").join(n));
-    let absolute = if let Some(p) = relative {
-        p
-    } else if by_name.as_ref().is_some_and(|p| p.exists()) {
-        by_name.unwrap_or_default()
-    } else {
-        std::path::PathBuf::from(&path)
-    };
+    let stored = std::path::Path::new(&path);
+    let absolute = [
+        // `join` with an ABSOLUTE path replaces the base rather than
+        // nesting under it, so that form is only tried as itself.
+        stored.is_relative().then(|| module_dir.join(stored)),
+        stored.file_name().map(|n| module_dir.join("files").join(n)),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.exists())
+    // Nothing under this module matched. The recorded path goes to the
+    // root check below, which is what refuses it — reaching here is not
+    // permission to serve it.
+    .unwrap_or_else(|| stored.to_path_buf());
     let (Ok(real), Ok(root)) = (
         std::fs::canonicalize(&absolute),
         std::fs::canonicalize(&module_dir),

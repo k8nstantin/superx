@@ -336,3 +336,49 @@ async fn comments_stay_separate_and_do_not_collapse_into_one_chain() {
         );
     }
 }
+
+/// An instance that has not re-provisioned has no `archived` column, so
+/// carriers could be MOVED but never retired. Discovering that halfway
+/// through leaves the prose in two places — worse than not starting.
+///
+/// Found in review of #310 by running it: it failed with the engine's
+/// own "no such field exists", AFTER having already written the notes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn it_refuses_before_writing_when_the_substrate_predates_archiving() {
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("entities").await.expect("nsdb");
+    let old = superx_mod_entities::SCHEMA_DDL
+        .replace("$SUPERX_MODULE_PASSWORD", "test-password")
+        .lines()
+        .filter(|l| !(l.contains("ON TABLE entity_state") && l.contains("archived")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    db.query(old).await.expect("ddl").check().expect("the shape before #304");
+    superx_mod_entities::dictionary::seed(&db).await.expect("dictionary");
+    superx_mod_entities::registry::seed_types(&db).await.expect("types");
+
+    let product = create_entity(&db, "product", "Ledger", None, None).await.expect("create");
+    legacy_carrier(&db, &product, "describes", &["a wording"]).await;
+
+    let err = migrate::prose(&db, false).await.expect_err("it must not start");
+    let text = err.to_string();
+    assert!(
+        text.contains("provision entities"),
+        "the refusal names the fix rather than quoting the engine: {text}"
+    );
+
+    // AND NOTHING WAS WRITTEN. A migration that moves the words and then
+    // dies is the failure this guards against, so the check has to come
+    // before the FIRST write, not before the first archive.
+    assert!(
+        superx_mod_entities::notes::for_entity(&db, &product, false)
+            .await
+            .expect("read")
+            .is_empty(),
+        "it refused before writing, not partway through"
+    );
+
+    // A dry run is refused too: reporting work it could not carry out
+    // would be a plan that is not a plan.
+    migrate::prose(&db, true).await.expect_err("dry run refuses as well");
+}
