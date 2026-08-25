@@ -10,11 +10,4 @@ export type GraphView = { root: string, nodes: Array<GraphNodeView>, edges: Arra
 /**
  * The walk stopped at the depth limit — there is more out there.
  */
-truncated: boolean, depth: bigint, 
-/**
- * Labels on active edges the walk did not follow, because they are
- * not declared link labels. Sent to the page rather than dropped:
- * an edge that silently vanishes is how this view and the CLI's
- * came to disagree (#300).
- */
-unwalked_labels: Array<string>, };
+truncated: boolean, depth: bigint, };

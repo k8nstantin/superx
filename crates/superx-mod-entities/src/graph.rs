@@ -17,7 +17,6 @@ pub struct GraphNode {
     pub id: RecordId,
     pub entity_type: String,
     pub name: String,
-    pub content: Option<String>,
     /// FLEXIBLE attributes of the current state (prompt context).
     pub attributes: Option<superx_kernel::types::Value>,
     /// Current state's valid_from — the version the reader saw.
@@ -44,14 +43,6 @@ pub struct Subgraph {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     pub truncated_at_depth: bool,
-    /// Labels found on active edges out of the walked nodes that are
-    /// NOT declared link labels, so the walk did not follow them.
-    ///
-    /// Reported rather than swallowed: an edge that silently vanishes
-    /// is how the two views came to disagree in the first place (#300),
-    /// and a reader that says "3 edges not shown, their labels are
-    /// prose" teaches the difference instead of lying about it.
-    pub unwalked_labels: Vec<String>,
 }
 
 /// BFS from a root. Cycles are legal in the graph; the visited set
@@ -72,34 +63,15 @@ pub async fn subgraph(
     let mut edges: Vec<GraphEdge> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut truncated = false;
-    let mut unwalked: HashSet<String> = HashSet::new();
-
-    // WHICH EDGES ARE STRUCTURAL IS DATA, NOT A TYPE CHECK.
+    // NO FILTER HERE, DELIBERATELY (§6). Prose left the graph by having
+    // its role edges RETRACTED in B4, not by a reader learning to skip
+    // it: "every entity is a node and no reader needs a filter — the
+    // special case does not get documented, it stops existing."
     //
-    // The dictionary already separates link labels (contains,
-    // depends_on, attached) from slot labels (description, comments) —
-    // so the rule is read from the place the operator designs it,
-    // and both readers of this walk get it without either of them
-    // remembering to filter. `api.rs` used to drop nodes whose type was
-    // `text` and the CLI did not, which is precisely how the operator's
-    // graph came to hold 1 node where the runner's held 4 (#300).
-    //
-    // Archived labels COUNT AS STRUCTURAL. Archiving stops a label
-    // being offered for new edges; it does not make the edges it
-    // already made stop being part of the shape. Excluding them would
-    // erase every hierarchy from both views the moment somebody
-    // archived `contains`.
-    let declared = crate::dictionary::list(db, true).await?;
-    let structural: HashSet<String> = declared
-        .iter()
-        .filter(|l| l.label_kind == crate::dictionary::LINK)
-        .map(|l| l.key.clone())
-        .collect();
-    // An unprovisioned database declares nothing, and a graph that
-    // walked nothing would read as an empty instance rather than an
-    // unseeded one. Enforcement arrives with the declaration — the same
-    // rule as a type that declares no slots accepting anything (§7).
-    let filtering = !structural.is_empty();
+    // A walk that filtered by label was the shape this file carried
+    // between #301 and B4. It made both views agree by teaching each of
+    // them the same new rule, which is a rule to maintain forever
+    // instead of data to clean up once.
 
     let mut frontier: Vec<RecordId> = vec![root.clone()];
     visited.insert(record_uuid(root));
@@ -118,13 +90,6 @@ pub async fn subgraph(
             .await?
             .into_iter()
             .filter(|e| e.active)
-            .filter(|e| {
-                if !filtering || structural.contains(&e.rel_type) {
-                    return true;
-                }
-                unwalked.insert(e.rel_type.clone());
-                false
-            })
             .collect();
         let mut next: Vec<RecordId> = Vec::new();
         for edge in level {
@@ -144,9 +109,7 @@ pub async fn subgraph(
         depth += 1;
     }
 
-    let mut unwalked_labels: Vec<String> = unwalked.into_iter().collect();
-    unwalked_labels.sort();
-    Ok(Subgraph { nodes, edges, truncated_at_depth: truncated, unwalked_labels })
+    Ok(Subgraph { nodes, edges, truncated_at_depth: truncated })
 }
 
 /// Resolve one BFS level's metadata in a single batched read and
@@ -165,29 +128,20 @@ async fn push_level(
     let mut by_entity = crate::notes::for_entities(db, level, false).await?;
     for id in level {
         let uuid = record_uuid(id);
-        let (entity_type, name, content, attributes, version) = match meta.get(&uuid) {
+        let (entity_type, name, attributes, version) = match meta.get(&uuid) {
             Some(m) => (
                 m.entity_type.clone(),
                 m.name.clone(),
-                m.content.clone(),
                 m.attributes.clone(),
                 m.version.clone(),
             ),
-            None => (String::new(), String::new(), None, None, String::new()),
-        };
-        // Content rides along only for content-bearing nodes; other
-        // kinds keep exports lean.
-        let content = if entity_type == "text" || entity_type == "document" {
-            content
-        } else {
-            None
+            None => (String::new(), String::new(), None, String::new()),
         };
         let notes = by_entity.remove(&uuid).unwrap_or_default();
         nodes.push(GraphNode {
             id: id.clone(),
             entity_type,
             name,
-            content,
             attributes,
             version,
             depth,
@@ -218,14 +172,6 @@ pub fn render_tree(graph: &Subgraph, root: &RecordId) -> String {
     render_children(&root_uuid, "", &by_uuid, &children, &mut drawn, &mut out);
     if graph.truncated_at_depth {
         out.push_str("(deeper levels exist — raise --depth)\n");
-    }
-    if !graph.unwalked_labels.is_empty() {
-        // Said out loud rather than swallowed: these are the labels that
-        // used to make the CLI graph disagree with the operator's.
-        out.push_str(&format!(
-            "(not part of the shape, so not walked: {} — prose lives on the entity, not in the graph)\n",
-            graph.unwalked_labels.join(", ")
-        ));
     }
     out
 }
@@ -269,7 +215,6 @@ pub fn to_json(graph: &Subgraph, root: &RecordId) -> serde_json::Value {
             "uid": record_uuid(&n.id),
             "type": n.entity_type,
             "name": n.name,
-            "content": n.content,
             "attributes": n.attributes.as_ref().map(crate::nodes::value_to_json),
             "version": n.version,
             "depth": n.depth,

@@ -21,8 +21,12 @@ const USAGE: &str = "usage: superx entities <command>\n\
   create --type <type> [--describe <text>] [--content <text>] [--attrs <json>] <name…>\n\
   update <uuid-fragment> [--name <name>] [--content <text>] [--attrs <json>]\n\
          (--attrs REPLACES the whole attributes object; omit to keep it)\n\
-  show <uuid-fragment> [--history]\n\
-  list [--type <type>]\n\
+  show <uuid-fragment> [--history] [--as-of <rfc3339>]\n\
+       --as-of reads the WHOLE entity as it stood then: its state, notes,\n\
+       attachments and edges at one instant, not a picker per field\n\
+  list [--type <type>] [--archived]\n\
+  archive <uuid-fragment> [--restore]  hide it from the lists; nothing is erased\n\
+  validate [<uuid-fragment>] [--depth <n>]   does this graph make sense? (§5.5)\n\
   link <from-fragment> <to-fragment> --rel <relation-type>\n\
   unlink <from-fragment> <to-fragment> --rel <relation-type>\n\
   describe <uuid-fragment> <text…>     set/evolve the describing text node\n\
@@ -75,6 +79,8 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("update") => update_cmd(kernel, &args[1..]).await,
         Some("show") => show_cmd(kernel, &args[1..]).await,
         Some("list") => list_cmd(kernel, &args[1..]).await,
+        Some("archive") => archive_cmd(kernel, &args[1..]).await,
+        Some("validate") => validate_cmd(kernel, &args[1..]).await,
         Some("link") => link_cmd(kernel, &args[1..], true).await,
         Some("unlink") => link_cmd(kernel, &args[1..], false).await,
         Some("describe") => role_text_cmd(kernel, &args[1..], "describes").await,
@@ -676,6 +682,13 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
     let fragment = args.first().ok_or_else(usage)?;
     let history = args.iter().any(|a| a == "--history");
+    // §14: ONE instant reaching every chain, not a picker per field. A
+    // field-by-field picker answers "how did this text change"; this
+    // answers "what did the agent see when it did that", and the two
+    // are different questions because each chain moves independently.
+    let as_of = crate::asof::parse(
+        args.iter().position(|a| a == "--as-of").and_then(|i| args.get(i + 1)).map(String::as_str),
+    )?;
 
     let anchor = nodes::resolve_entity(&db, fragment).await?;
     let (entity_type, created_at) = nodes::anchor_info(&db, &anchor).await?;
@@ -700,12 +713,17 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
             out.push_str(&format!("  v{} · {}\n", n + 1, v.valid_from));
             out.push_str(&render_state(v, "    "));
         }
-    } else if let Some(current) = nodes::current_state(&db, &anchor).await? {
+    } else if let Some(current) = nodes::state_at(&db, &anchor, as_of).await? {
+        if as_of.is_some() {
+            out.push_str(&format!("  (as it stood at {})\n", current.valid_from));
+        }
         out.push_str(&render_state(&current, "  "));
+    } else if as_of.is_some() {
+        out.push_str("  (nothing here at that instant — it was created later)\n");
     }
     // Prose from the note store (#278), by label rather than by the edge
     // it used to hang off.
-    let attached = notes::for_entity(&db, &anchor, false).await?;
+    let attached = notes::for_entity_at(&db, &anchor, false, as_of).await?;
     if !attached.is_empty() {
         out.push_str("prose:\n");
         for note in attached {
@@ -719,25 +737,118 @@ async fn show_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     Ok(out)
 }
 
+/// Does this graph make sense? (§5.5)
+///
+/// The check to run BEFORE dispatching agents at a graph one of them
+/// designed. Every rule comes from the dictionary, so a label narrowed
+/// today is enforced today with no code change.
+///
+/// Exit is non-zero when anything is wrong, so it can gate a dispatch
+/// in a script rather than being read by eye.
+async fn validate_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let depth = args
+        .iter()
+        .position(|a| a == "--depth")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|d| d.parse::<usize>().ok())
+        .unwrap_or(resolved_max_depth(kernel).await);
+    let fragment = args.first().filter(|a| !a.starts_with("--"));
+
+    let findings = match fragment {
+        Some(f) => {
+            let root = nodes::resolve_entity(&db, f).await?;
+            crate::validate::subgraph(&db, &root, depth).await?
+        }
+        None => crate::validate::everything(&db, depth).await?,
+    };
+
+    if findings.is_empty() {
+        return Ok("the graph fits the dictionary — nothing to fix\n".to_string());
+    }
+    let mut out = format!("{} problem(s):\n", findings.len());
+    for f in &findings {
+        out.push_str(&format!("  {}\n    {}\n", f.subject, f.detail));
+    }
+    // A refusal, not a report: an operator who scripted this wants a
+    // non-zero exit before the dispatch, not a message they might miss.
+    Err(KernelError::Module(out))
+}
+
+/// Hide an entity from the lists, or bring it back (§14).
+///
+/// `archived` answers "should this still be shown by default?" — it is
+/// real, it is true, it is finished with. That is a different question
+/// from `active`, which answers "does this assertion still hold?", and
+/// one flag for both produces filters that mean different things in
+/// different places.
+///
+/// Not a delete: the entity, its history, its notes and its edges are
+/// all still there and still reachable by uuid.
+async fn archive_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let fragment = args.first().ok_or_else(usage)?;
+    let restore = match args.get(1).map(String::as_str) {
+        None => false,
+        Some("--restore") => true,
+        Some(_) => return Err(usage()),
+    };
+    let target = nodes::resolve_entity(&db, fragment).await?;
+    let uuid = record_uuid(&target);
+    let changed = nodes::set_archived(&db, &target, !restore).await?;
+    if !changed {
+        return Ok(format!(
+            "{uuid} is already {}\n",
+            if restore { "in the lists" } else { "archived" }
+        ));
+    }
+    emit(kernel, if restore { "entity_restored" } else { "entity_archived" }, &uuid, "", "").await;
+    Ok(if restore {
+        format!("{uuid} restored to the lists\n")
+    } else {
+        format!("{uuid} archived — hidden from the lists; nothing was erased\n")
+    })
+}
+
 async fn list_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
-    let type_filter = match args.first().map(String::as_str) {
-        Some("--type") => Some(args.get(1).ok_or_else(usage)?.clone()),
-        Some(_) => return Err(usage()),
-        None => None,
-    };
-    let rows = nodes::list_entities(&db, type_filter.as_deref()).await?;
-    if rows.is_empty() {
+    let mut type_filter = None;
+    let mut include_archived = false;
+    let mut rest = args;
+    while let Some(flag) = rest.first().map(String::as_str) {
+        match flag {
+            "--type" => {
+                type_filter = Some(rest.get(1).ok_or_else(usage)?.clone());
+                rest = &rest[2..];
+            }
+            "--archived" => {
+                include_archived = true;
+                rest = &rest[1..];
+            }
+            _ => return Err(usage()),
+        }
+    }
+    let all = nodes::list_entities(&db, type_filter.as_deref()).await?;
+    let hidden = all.iter().filter(|r| r.archived).count();
+    let rows: Vec<_> = all.into_iter().filter(|r| include_archived || !r.archived).collect();
+    if rows.is_empty() && hidden == 0 {
         return Ok("no entities yet — create one with `superx entities create`\n".to_string());
     }
     let mut out = format!("entities ({}):\n", rows.len());
     for row in rows {
         out.push_str(&format!(
-            "  {}  {:<10} {}\n",
+            "  {}  {:<10} {}{}\n",
             record_uuid(&row.id),
             row.entity_type,
-            row.name
+            row.name,
+            if row.archived { "  [archived]" } else { "" }
         ));
+    }
+    // Said out loud. A list that silently drops rows is the same shape
+    // of lie as a graph that silently drops edges: the operator must be
+    // able to tell "nothing there" from "something hidden".
+    if hidden > 0 && !include_archived {
+        out.push_str(&format!("  ({hidden} archived — see them with --archived)\n"));
     }
     Ok(out)
 }
@@ -814,6 +925,14 @@ async fn attach_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         (Some(f), Some(p)) => (f, std::path::PathBuf::from(p)),
         _ => return Err(usage()),
     };
+    // §5.4: the label is what the file MEANS, and a spec sheet uploaded
+    // as a PDF and labelled `spec` IS the spec. Defaults to the §5.3
+    // `attachments` label when the operator does not say.
+    let label = match (args.get(2).map(String::as_str), args.get(3)) {
+        (Some("--label"), Some(l)) => l.clone(),
+        (None, _) => "attachments".to_string(),
+        _ => return Err(usage()),
+    };
     let owner = nodes::resolve_entity(&db, fragment).await?;
     let size = std::fs::metadata(&path)
         .map_err(|e| KernelError::Module(format!("cannot read {}: {e}", path.display())))?
@@ -824,34 +943,22 @@ async fn attach_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         .unwrap_or("attachment")
         .to_string();
 
-    // The file lands in the module's own dir, keyed by a fresh uuid7
-    // (the historical-log convention extends to stored blobs).
-    let files_dir = kernel.module_dir(MODULE_NAME)?.join("files");
-    std::fs::create_dir_all(&files_dir)
-        .map_err(|e| KernelError::Module(format!("cannot create files dir: {e}")))?;
-    let stored_name = format!("{}-{file_name}", uuid::Uuid::now_v7());
-    let stored = files_dir.join(&stored_name);
-    // Streamed copy — attachments never transit memory whole (#179).
-    std::fs::copy(&path, &stored)
-        .map_err(|e| KernelError::Module(format!("cannot store file: {e}")))?;
-
+    // §6: "a file is attached content: it belongs to the entity and is
+    // never a node." One writer for the CLI and the browser both, so
+    // the two paths cannot drift — the row records the label, and the
+    // label is what says a PDF IS the mandate (§5.4).
     let mime = documents::mime_for(&file_name);
-    let node = documents::attach_document(
+    let uid = crate::attachments::attach(
         &db,
-        &owner,
-        &file_name,
-        &stored.to_string_lossy(),
-        mime,
-        size,
+        &kernel.module_dir(MODULE_NAME)?,
+        &crate::target::Target::Entity(owner.clone()),
+        &label,
+        &path,
+        &crate::notes::Author::operator(),
     )
     .await?;
-    let node_uuid = record_uuid(&node);
-    emit(kernel, "document_attached", &node_uuid, "document", &file_name).await;
-    emit_link(kernel, &record_uuid(&owner), &node_uuid, "attached", "entities_linked").await;
-    Ok(format!(
-        "document {node_uuid} attached ({mime}, {size} bytes) — stored at {}\n",
-        stored.display()
-    ))
+    emit(kernel, "file_attached", &uid, "attachments", &record_uuid(&owner)).await;
+    Ok(format!("attached {uid} ({mime}, {size} bytes) — {file_name}\n"))
 }
 
 async fn tree_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {

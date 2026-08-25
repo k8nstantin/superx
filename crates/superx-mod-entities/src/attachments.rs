@@ -154,6 +154,20 @@ pub async fn for_target(
     target: &Target,
     include_retracted: bool,
 ) -> Result<Vec<Attachment>> {
+    for_target_at(db, target, include_retracted, None).await
+}
+
+/// The same files, as they stood at an instant (§14).
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn for_target_at(
+    db: &Db,
+    target: &Target,
+    include_retracted: bool,
+    as_of: crate::asof::AsOf,
+) -> Result<Vec<Attachment>> {
     let mut resp = db
         .query(
             "SELECT * FROM attachment WHERE target_uid = $uid AND target_kind = $kind \
@@ -169,6 +183,11 @@ pub async fn for_target(
         std::collections::BTreeMap::new();
     for row in &rows {
         if let Some(a) = parse(row) {
+            // Before the reduction, so the head is the head as of the
+            // instant rather than the current one hidden.
+            if !crate::asof::visible_at(a.valid_from, as_of) {
+                continue;
+            }
             heads.insert(a.uid.clone(), a);
         }
     }

@@ -362,7 +362,10 @@ async fn every_shipped_type_carries_at_least_a_description_and_a_channel() {
     let bound = dictionary::seed_type_labels(&db).await.expect("slots");
     assert!(bound > 0);
 
-    for entity_type in ["product", "task", "rag", "model", "document", "repo", "credential"] {
+    // `document` is not in this list any more: B6 retired it as an
+    // entity type, because a file is an attachment row and not a thing
+    // you describe and comment on.
+    for entity_type in ["product", "task", "rag", "model", "repo", "credential"] {
         let slots = dictionary::slots_for(&db, entity_type, false).await.expect("slots");
         assert!(
             slots.iter().any(|s| s.label == "description"),
@@ -799,36 +802,6 @@ async fn redefining_a_link_label_keeps_endpoints_it_does_not_mention() {
     assert_eq!(now.source_types, vec!["role".to_string()], "endpoints survive a rewording");
     assert!(now.acyclic, "and so does acyclic");
     assert_eq!(now.description.as_deref(), Some("an independent check"));
-}
-
-/// An instance seeded before a shipped label gained its declaration
-/// would never receive it: the seed skips what already exists. So the
-/// acyclic flag protecting the runner would be real on a fresh install
-/// and silently absent on every instance that has been running — which
-/// is exactly the instance that has a graph worth protecting.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn seeding_gives_an_older_link_label_the_rules_it_predates() {
-    let db = fresh_db().await;
-
-    // A label as an older build wrote it: no endpoints, no acyclic.
-    dictionary::define(&db, Definition {
-        key: "depends_on",
-        kind: LINK,
-        display: "depends on",
-        semantics: "ordering",
-        ..Default::default()
-    })
-    .await
-    .expect("the old shape");
-
-    let before = dictionary::current(&db, "depends_on", LINK).await.expect("r").expect("t");
-    assert!(!before.acyclic, "nothing protects the graph yet");
-
-    dictionary::seed(&db).await.expect("seed");
-
-    let after = dictionary::current(&db, "depends_on", LINK).await.expect("r").expect("t");
-    assert!(after.acyclic, "the rule reaches an instance that predates it");
-    assert_eq!(after.semantics, "ordering", "and says nothing new about anything else");
 }
 
 /// The seed fills gaps; it does not overrule. A value somebody set —

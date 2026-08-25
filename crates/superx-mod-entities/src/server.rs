@@ -64,6 +64,8 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/entities/{frag}/history", get(api_history))
         .route("/api/entities/{frag}/fields", get(api_fields).post(api_set_field))
         .route("/api/entities/{frag}/update", post(api_update))
+        .route("/api/entities/{frag}/archive", post(api_archive))
+        .route("/api/labels/{key}/archive", post(api_label_archive))
         .route("/api/entities/{frag}/describe", post(api_describe))
         .route("/api/entities/{frag}/comment", post(api_comment))
         .route("/api/entities/{frag}/link", post(api_link))
@@ -369,6 +371,9 @@ async fn api_rel_types(State(state): State<AppState>) -> Resp<Vec<String>> {
 #[derive(serde::Deserialize)]
 struct ListQuery {
     r#type: Option<String>,
+    /// Include archived rows. Absent means no, which is what archiving
+    /// is for (§14).
+    archived: Option<bool>,
 }
 
 async fn api_list(
@@ -376,7 +381,7 @@ async fn api_list(
     Query(q): Query<ListQuery>,
 ) -> Resp<Vec<api::EntityListItem>> {
     let db = module_db!(state);
-    match api::list(&db, q.r#type.as_deref()).await {
+    match api::list(&db, q.r#type.as_deref(), q.archived.unwrap_or(false)).await {
         Ok(v) => Resp::ok(v),
         Err(e) => Resp::err(e.to_string()),
     }
@@ -396,12 +401,64 @@ async fn api_create(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct DetailQuery {
+    /// Read the WHOLE entity as it stood at this instant (§14): state,
+    /// notes, attachments and edges all resolved at the same moment,
+    /// which is what answers "what did the agent see when it did that".
+    /// Absent is now.
+    as_of: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ArchiveReq {
+    /// `true` archives, `false` restores. Explicit rather than a
+    /// toggle: a toggle sent twice by a retried request undoes itself,
+    /// and the caller always knows which it meant.
+    archived: bool,
+}
+
+async fn api_archive(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+    Json(req): Json<ArchiveReq>,
+) -> Resp<bool> {
+    let db = module_db!(state);
+    match api::set_archived(&db, &frag, req.archived).await {
+        Ok(changed) => Resp::ok(changed),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LabelArchiveReq {
+    kind: String,
+    archived: bool,
+}
+
+async fn api_label_archive(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+    Json(req): Json<LabelArchiveReq>,
+) -> Resp<bool> {
+    let db = module_db!(state);
+    match api::set_label_archived(&db, &key, &req.kind, req.archived).await {
+        Ok(()) => Resp::ok(true),
+        Err(e) => Resp::err(e.to_string()),
+    }
+}
+
 async fn api_detail(
     State(state): State<AppState>,
     AxumPath(frag): AxumPath<String>,
+    Query(q): Query<DetailQuery>,
 ) -> Resp<api::EntityDetail> {
     let db = module_db!(state);
-    match api::detail(&db, &frag).await {
+    let as_of = match crate::asof::parse(q.as_of.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return Resp::err(e.to_string()),
+    };
+    match api::detail_at(&db, &frag, as_of).await {
         Ok(v) => Resp::ok(v),
         Err(e) => Resp::err(e.to_string()),
     }
@@ -532,12 +589,15 @@ async fn api_graph(
 
 #[derive(serde::Deserialize)]
 struct AttachQuery {
-    /// The uploaded file's own name, for the document node's metadata.
+    /// The uploaded file's own name.
     name: Option<String>,
+    /// What the file MEANS (§5.4). A PDF labelled `mandate` IS the
+    /// mandate; absent falls back to §5.3's `attachments`.
+    label: Option<String>,
 }
 
-/// EU4 — store an uploaded file under the module's dir and record the
-/// document node + `attached` edge. The bytes never leave the module.
+/// EU4 — store an uploaded file under the module's dir and record an
+/// `attachment` row. The bytes never leave the module.
 async fn api_attach(
     State(state): State<AppState>,
     AxumPath(frag): AxumPath<String>,
@@ -562,35 +622,32 @@ async fn api_attach(
         Ok(o) => o,
         Err(e) => return Resp::err(e.to_string()),
     };
-    let files_dir = match state.kernel.module_dir(crate::MODULE_NAME) {
-        Ok(d) => d.join("files"),
+    let module_dir = match state.kernel.module_dir(crate::MODULE_NAME) {
+        Ok(d) => d,
         Err(e) => return Resp::err(e.to_string()),
     };
-    if let Err(e) = std::fs::create_dir_all(&files_dir) {
-        return Resp::err(format!("cannot create files dir: {e}"));
-    }
-    // Same storage convention as `superx entities attach`: a uuid7
-    // prefix keeps names unique and time-ordered.
-    let stored = files_dir.join(format!("{}-{file_name}", uuid::Uuid::now_v7()));
     let size = body.len() as u64;
-    if let Err(e) = std::fs::write(&stored, &body) {
-        return Resp::err(format!("cannot store file: {e}"));
-    }
-    let mime = crate::documents::mime_for(&file_name);
-    match crate::documents::attach_document(
+    // One writer for the browser and the CLI both, so the two paths
+    // cannot drift — it stores the bytes under the module's own
+    // directory and records the row. §6: a file "belongs to the entity
+    // and is never a node".
+    let label = q.label.clone().unwrap_or_else(|| "attachments".to_string());
+    match crate::attachments::attach_bytes(
         &db,
-        &owner,
-        &file_name,
-        &stored.to_string_lossy(),
-        mime,
-        size,
+        &module_dir,
+        crate::attachments::Upload {
+            target: &crate::target::Target::Entity(owner),
+            label: &label,
+            filename: &file_name,
+            bytes: &body,
+            author: &crate::notes::Author::operator(),
+        },
     )
     .await
     {
-        Ok(node) => {
-            let uuid = superx_ops::record_uuid(&node);
-            emit(&state.kernel, "document_attached", format!("{file_name} → {frag}")).await;
-            Resp::ok(serde_json::json!({ "id": uuid, "name": file_name, "size": size }))
+        Ok(uid) => {
+            emit(&state.kernel, "file_attached", format!("{file_name} → {frag}")).await;
+            Resp::ok(serde_json::json!({ "id": uid, "name": file_name, "size": size }))
         }
         Err(e) => Resp::err(e.to_string()),
     }

@@ -53,7 +53,19 @@ export const fetchRelTypes = () => get<string[]>('/api/rel-types')
 export const fetchEntities = (type?: string) =>
   get<EntityListItem[]>(`/api/entities${type ? `?type=${encodeURIComponent(type)}` : ''}`)
 export const createEntity = (req: CreateReq) => post<{ id: string }>('/api/entities', req)
-export const fetchDetail = (frag: string) => get<EntityDetail>(`/api/entities/${frag}`)
+// §14: one instant reaching every chain — state, notes, attachments
+// and edges resolved at the same moment. Absent is now.
+export const fetchDetail = (frag: string, asOf?: string) =>
+  get<EntityDetail>(
+    `/api/entities/${frag}${asOf ? `?as_of=${encodeURIComponent(asOf)}` : ''}`,
+  )
+// `archived` is explicit, never a toggle: a toggle sent twice by a
+// retried request undoes itself, and the caller always knows which it
+// meant.
+export const setArchived = (frag: string, archived: boolean) =>
+  post<boolean>(`/api/entities/${frag}/archive`, { archived })
+export const setLabelArchived = (key: string, kind: string, archived: boolean) =>
+  post<boolean>(`/api/labels/${encodeURIComponent(key)}/archive`, { kind, archived })
 export const fetchHistory = (frag: string) => get<VersionView[]>(`/api/entities/${frag}/history`)
 export const updateEntity = (frag: string, req: UpdateReq) =>
   post<{ id: string }>(`/api/entities/${frag}/update`, req)

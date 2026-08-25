@@ -43,6 +43,8 @@ pub struct EntityListItem {
     pub id: String,
     pub entity_type: String,
     pub name: String,
+    /// Hidden from the default list, still on the record.
+    pub archived: bool,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -97,8 +99,11 @@ pub struct EntityDetail {
     pub content: Option<String>,
     /// Pretty-printed attributes JSON, absent when empty.
     pub attributes_json: Option<String>,
-    /// valid_from of the current state row — the version stamp.
+    /// valid_from of the current state row — the version stamp. Send
+    /// it back as `based_on` to make a write compare-and-append (§6).
     pub version: String,
+    /// Hidden from the lists, still on the record (§14).
+    pub archived: bool,
     pub annotations: Vec<AnnotationView>,
     /// Active NON-TEXT edges, both directions (text-role edges show
     /// as annotations instead).
@@ -152,11 +157,6 @@ pub struct GraphView {
     /// The walk stopped at the depth limit — there is more out there.
     pub truncated: bool,
     pub depth: i64,
-    /// Labels on active edges the walk did not follow, because they are
-    /// not declared link labels. Sent to the page rather than dropped:
-    /// an edge that silently vanishes is how this view and the CLI's
-    /// came to disagree (#300).
-    pub unwalked_labels: Vec<String>,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -187,6 +187,12 @@ pub struct UpdateReq {
     /// REPLACES the whole attributes object when present (the
     /// module's update semantics); omit to keep it.
     pub attributes_json: Option<String>,
+    /// The version this edit was based on (§6). Send it and a write
+    /// that would silently clobber somebody else's is refused, with
+    /// their version named so you can re-read and merge. Omit it and
+    /// the old latest-wins behaviour applies — the guarantee is
+    /// offered, never imposed.
+    pub based_on: Option<String>,
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -237,13 +243,6 @@ fn attrs_to_json(v: &Option<superx_kernel::types::Value>) -> Option<String> {
     serde_json::to_string_pretty(&json).ok()
 }
 
-/// The module's own annotation carrier: descriptions, comments and
-/// instructions are `text` entities hung off their target by a role
-/// edge (`texts::set_role_text` / `add_comment`). It is a real
-/// registered type, but nothing hand-creates one — writing a
-/// description IS creating it.
-const TEXT_TYPE: &str = "text"; // skill-allow: §9-const — the module's own data model (texts.rs, graph.rs), not a tunable
-
 /// ENTITY types only — relation kinds are not "types" (operator
 /// model); they surface solely through [`rel_types`]. The carrier type
 /// is flagged, not hidden: the registry stays honest and the create
@@ -254,7 +253,10 @@ pub async fn types_list(db: &Db) -> Result<Vec<TypeView>> {
         .into_iter()
         .filter(|t| t.category == "entity")
         .map(|t| TypeView {
-            system: t.name == TEXT_TYPE,
+            // Nothing is a "system" type any more: prose and files
+            // stopped being entities, so no kind has to be hidden from
+            // the create form to keep the operator out of trouble.
+            system: false,
             name: t.name,
             description: t.description,
         })
@@ -528,6 +530,33 @@ pub async fn write_content_note(
 /// # Errors
 ///
 /// Verb errors pass through.
+/// Archive or restore an entity (§14). Returns whether anything
+/// changed — archiving what is already archived is a no-op, not an
+/// error.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn set_archived(db: &Db, fragment: &str, archived: bool) -> Result<bool> {
+    let id = nodes::resolve_entity(db, fragment).await?;
+    nodes::set_archived(db, &id, archived).await
+}
+
+/// Archive or restore a label (§14): a term superseded by a better one
+/// stops being offered without the dictionary losing what it meant.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn set_label_archived(
+    db: &Db,
+    key: &str,
+    kind: &str,
+    archived: bool,
+) -> Result<()> {
+    dictionary::archive(db, key, kind, archived).await
+}
+
 pub async fn labels(db: &Db, include_archived: bool) -> Result<Vec<LabelView>> {
     Ok(dictionary::list(db, include_archived)
         .await?
@@ -702,29 +731,69 @@ pub async fn rel_types(db: &Db) -> Result<Vec<String>> {
 /// off — every comment and description would otherwise land here as a
 /// row of its own — so the unfiltered list omits them; asking for the
 /// carrier type by name still returns them.
-pub async fn list(db: &Db, type_filter: Option<&str>) -> Result<Vec<EntityListItem>> {
+pub async fn list(
+    db: &Db,
+    type_filter: Option<&str>,
+    include_archived: bool,
+) -> Result<Vec<EntityListItem>> {
     Ok(nodes::list_entities(db, type_filter)
         .await?
         .into_iter()
-        .filter(|e| type_filter.is_some() || e.entity_type != TEXT_TYPE)
+        // No type filter. The carriers that used to need hiding are
+        // ARCHIVED by B4, and archived is the one question the list
+        // asks — "should this still be shown by default?" (§14).
+        .filter(|e| include_archived || !e.archived)
         .map(|e| EntityListItem {
             id: record_uuid(&e.id),
             entity_type: e.entity_type,
             name: e.name,
+            archived: e.archived,
         })
         .collect())
 }
 
 pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
+    detail_at(db, fragment, None).await
+}
+
+/// THE WHOLE ENTITY AS IT STOOD AT AN INSTANT (§14).
+///
+/// A field-by-field picker answers "how did this text change". This
+/// answers **"what did the agent see when it did that"** — the question
+/// after a bad run — and it cannot be assembled from separate pickers,
+/// because each one moves independently.
+///
+/// One instant reaches every chain: state, notes, attachments and
+/// edges, all resolved at the same moment. `valid_from <= as_of`,
+/// latest wins per chain, edges as they were ACTIVE then.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] when the instant is unreadable or the entity
+/// did not exist yet; verb errors pass through.
+pub async fn detail_at(
+    db: &Db,
+    fragment: &str,
+    as_of: crate::asof::AsOf,
+) -> Result<EntityDetail> {
     let id = nodes::resolve_entity(db, fragment).await?;
     let (entity_type, _created) = nodes::anchor_info(db, &id).await?;
-    let state = nodes::current_state(db, &id).await?.ok_or_else(|| {
-        KernelError::Module(format!("entity {} has no state chain", record_uuid(&id)))
+    let state = nodes::state_at(db, &id, as_of).await?.ok_or_else(|| {
+        // Distinguishing the two is the difference between a broken
+        // substrate and a question about a time before this existed.
+        if as_of.is_some() {
+            KernelError::Module(format!(
+                "entity {} had no version at that instant — it was created later",
+                record_uuid(&id)
+            ))
+        } else {
+            KernelError::Module(format!("entity {} has no state chain", record_uuid(&id)))
+        }
     })?;
     // Prose comes from the note store (#278). The text carriers still
     // exist and are still written, but nothing reads them for display any
     // more — which is what had to become true before they can go.
-    let annotations = notes::for_entity(db, &id, false)
+    let annotations = notes::for_entity_at(db, &id, false, as_of)
         .await?
         .into_iter()
         .map(|n| AnnotationView {
@@ -740,8 +809,8 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
     // Active NON-TEXT edges, both directions, with the far side named.
     let mut views: Vec<(RecordId, EdgeView)> = Vec::new();
     for (rows, outbound) in [
-        (edges::expand(db, std::slice::from_ref(&id), false).await?, true),
-        (edges::expand(db, std::slice::from_ref(&id), true).await?, false),
+        (edges::expand_at(db, std::slice::from_ref(&id), false, as_of).await?, true),
+        (edges::expand_at(db, std::slice::from_ref(&id), true, as_of).await?, false),
     ] {
         for e in rows {
             if !e.active || texts::TEXT_ROLES.contains(&e.rel_type.as_str()) {
@@ -774,7 +843,7 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
         })
         .collect();
 
-    let attachments = attachments_of(db, &edges).await?;
+    let attachments = attachments_of(db, &id, as_of).await?;
     let ancestors = graph::ancestors(db, &id, ANCESTOR_MAX_DEPTH)
         .await?
         .into_iter()
@@ -792,6 +861,7 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
         name: state.name,
         content: state.content,
         attributes_json: attrs_to_json(&state.attributes),
+        archived: state.archived,
         version: state.valid_from,
         annotations,
         edges,
@@ -800,46 +870,33 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
     })
 }
 
-/// Resolve the `attached` edges to their documents' file metadata
-/// (EU4). Attachments are ordinary entities, so they already appear
-/// among the edges — this reads the metadata the download route needs.
-async fn attachments_of(db: &Db, edges: &[EdgeView]) -> Result<Vec<AttachmentView>> {
-    let mut out = Vec::new();
-    for e in edges.iter().filter(|e| e.outbound && e.rel_type == "attached") {
-        let Ok(doc) = nodes::resolve_entity(db, &e.other_id).await else {
-            continue;
-        };
-        let Some(state) = nodes::current_state(db, &doc).await? else {
-            continue;
-        };
-        let attrs = state.attributes.as_ref();
-        out.push(AttachmentView {
-            id: e.other_id.clone(),
-            name: attr_str(attrs, "original_name").unwrap_or_else(|| state.name.clone()),
-            mime: attr_str(attrs, "mime").unwrap_or_else(|| "application/octet-stream".into()),
-            size: attr_int(attrs, "size"),
-        });
-    }
-    Ok(out)
+/// The files on an entity, read from the `attachment` rows.
+///
+/// It used to walk the `attached` edge to a `document` node and read
+/// its attributes. B4 retracted those edges and B6 stopped creating the
+/// nodes, so that walk now finds nothing — the rows are the one place
+/// files live (§3, §6).
+async fn attachments_of(
+    db: &Db,
+    id: &RecordId,
+    as_of: crate::asof::AsOf,
+) -> Result<Vec<AttachmentView>> {
+    Ok(attachments::for_target_at(db, &target::Target::Entity(id.clone()), false, as_of)
+        .await?
+        .into_iter()
+        .map(|a| AttachmentView { id: a.uid, name: a.filename, mime: a.mime, size: a.size })
+        .collect())
 }
 
+/// A string out of an attributes bag, for the legacy document rows the
+/// download route still resolves.
 fn attr_str(attrs: Option<&Value>, key: &str) -> Option<String> {
     match attrs {
         Some(Value::Object(o)) => match o.get(key) {
-            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::String(v)) => Some(v.clone()),
             _ => None,
         },
         _ => None,
-    }
-}
-
-fn attr_int(attrs: Option<&Value>, key: &str) -> i64 {
-    match attrs {
-        Some(Value::Object(o)) => match o.get(key) {
-            Some(Value::Number(n)) => n.to_int().unwrap_or(0),
-            _ => 0,
-        },
-        _ => 0,
     }
 }
 
@@ -865,15 +922,9 @@ pub async fn graph_view(
     let mut truncated = false;
     let mut seen_nodes: HashSet<String> = HashSet::new();
     let mut seen_edges: HashSet<String> = HashSet::new();
-    let mut unwalked: Vec<String> = Vec::new();
     for &reverse in walks {
         let sub = graph::subgraph(db, &id, depth, reverse).await?;
         truncated |= sub.truncated_at_depth;
-        for label in &sub.unwalked_labels {
-            if !unwalked.contains(label) {
-                unwalked.push(label.clone());
-            }
-        }
         for n in sub.nodes {
             // The type check that used to live here is gone. Prose is
             // not a member of the product graph (operator, issue #246)
@@ -916,15 +967,29 @@ pub async fn graph_view(
         edges: edges_out,
         truncated,
         depth: depth as i64,
-        unwalked_labels: unwalked,
     })
 }
 
 /// Where an attachment's bytes live, and what to call them on the way
 /// out. Path resolution stays in the module: the stored path is a
 /// substrate fact written by the attach path, never client input.
-pub async fn attachment_file(db: &Db, fragment: &str) -> Result<(String, String, String)> {
-    let id = nodes::resolve_entity(db, fragment).await?;
+pub async fn attachment_file(db: &Db, uid: &str) -> Result<(String, String, String)> {
+    // An attachment ROW, by uid. It used to resolve a `document` entity
+    // and read its attributes; B4 migrated those into rows and B6
+    // stopped creating them, so the row is where the path is.
+    if let Some(a) = attachments::current(db, uid).await? {
+        if !a.active {
+            return Err(KernelError::Module(
+                "that attachment was retracted — it is on the record, not on the way out".into(),
+            ));
+        }
+        return Ok((a.path, a.filename, a.mime));
+    }
+
+    // A LEGACY document node, for an instance that has not migrated yet.
+    // Reading it keeps every existing download link working across the
+    // upgrade instead of breaking until the operator runs the migration.
+    let id = nodes::resolve_entity(db, uid).await?;
     let state = nodes::current_state(db, &id)
         .await?
         .ok_or_else(|| KernelError::Module("attachment has no state".into()))?;
@@ -990,6 +1055,9 @@ pub async fn create(db: &Db, req: &CreateReq) -> Result<String> {
 
 pub async fn update(db: &Db, fragment: &str, req: &UpdateReq) -> Result<String> {
     let id = nodes::resolve_entity(db, fragment).await?;
+    // Before anything is validated or written: did the thing move under
+    // the writer's feet? Refusing here means no half-applied edit.
+    nodes::check_fresh(db, &id, req.based_on.as_deref()).await?;
     let attrs = attrs_from_json(&req.attributes_json)?;
 
     // Every declared key goes through the same check whichever door it

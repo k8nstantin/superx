@@ -11,6 +11,7 @@
 //! own log (`target: "entities"`), own CLI (`superx entities …`).
 
 pub mod api;
+pub mod asof;
 pub mod attachments;
 pub mod cli;
 pub mod dictionary;
@@ -25,6 +26,7 @@ pub mod registry;
 pub mod target;
 mod server;
 pub mod texts;
+pub mod validate;
 
 use async_trait::async_trait;
 use superx_kernel::types::Value;

@@ -19,6 +19,50 @@ async fn fresh_db() -> superx_kernel::Db {
     db
 }
 
+
+/// Build a document node the way the world before B4 did: a `document`
+/// entity joined by an `attached` edge. `documents::attach_document` is
+/// gone — a file is an attachment row now (§6) — so tests that need the
+/// legacy shape build it directly, past the writer, which is how such a
+/// row got there.
+async fn legacy_document(
+    db: &superx_kernel::Db,
+    owner: &superx_kernel::types::RecordId,
+    name: &str,
+    path: &str,
+    mime: &str,
+    size: u64,
+) -> superx_kernel::types::RecordId {
+    let attributes = superx_kernel::message::value_from_json(&serde_json::json!({
+        "file": path,
+        "original_name": name,
+        "mime": mime,
+        "size": size,
+    }));
+    let _ = superx_mod_entities::registry::add_type(db, "document", "entity", None).await;
+    let node = superx_mod_entities::nodes::create_entity(db, "document", name, None, Some(attributes))
+        .await
+        .expect("legacy document node");
+    superx_mod_entities::edges::link(db, owner, &node, "attached").await.expect("attached edge");
+    node
+}
+
+
+/// Build a text carrier the way the world before #268 did. `text` is no
+/// longer a shipped entity type — B6 retired it — so the legacy shape
+/// registers the legacy type first, which is the honest statement of
+/// what it is: a row a fresh instance would never make.
+async fn legacy_text(
+    db: &superx_kernel::Db,
+    name: &str,
+    body: &str,
+) -> superx_kernel::types::RecordId {
+    let _ = superx_mod_entities::registry::add_type(db, "text", "entity", None).await;
+    superx_mod_entities::nodes::create_entity(db, "text", name, Some(body.to_string()), None)
+        .await
+        .expect("legacy carrier")
+}
+
 #[test]
 fn facilities_declared() {
     let d = EntitiesModule.descriptor();
@@ -43,10 +87,10 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
     );
     let rels = api::rel_types(&db).await.expect("rels");
     assert!(rels.contains(&"depends_on".to_string()));
-    // The text carrier is registered but never hand-created: flagged
-    // so the create form drops it.
-    assert!(types.iter().any(|t| t.name == "text" && t.system));
-    assert!(types.iter().all(|t| t.name == "text" || !t.system));
+    // No kind is a "system" type any more. `text` needed the flag
+    // because writing a description created one behind your back; B6
+    // ended that, so there is nothing the create form has to hide.
+    assert!(types.iter().all(|t| !t.system), "no kind is hidden from the create form");
 
     // Create with a markdown description + JSON attributes.
     let product = api::create(
@@ -92,6 +136,7 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
             name: Some("Widget X2".into()),
             content: None,
             attributes_json: None,
+            based_on: None,
         },
     )
     .await
@@ -107,7 +152,7 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
 
     // The list is entities, not their annotations: the description and
     // comment text nodes stay out of it unless asked for by name.
-    let listed = api::list(&db, None).await.expect("list");
+    let listed = api::list(&db, None, false).await.expect("list");
     assert!(listed.iter().any(|e| e.id == product));
     assert!(
         listed.iter().all(|e| e.entity_type != "text"),
@@ -116,7 +161,7 @@ async fn ui_api_round_trip_create_detail_update_comment_link_types() {
     // Writing prose no longer creates a carrier at all (#302), so
     // there is nothing of that type to return. The prose itself is on
     // the detail page above, under its dictionary label.
-    let texts_only = api::list(&db, Some("text")).await.expect("list text");
+    let texts_only = api::list(&db, Some("text"), true).await.expect("list text");
     assert!(
         texts_only.is_empty(),
         "a description and a comment made no entities: {:?}",
@@ -282,15 +327,7 @@ async fn ui_graph_leaves_descriptions_and_comments_out_of_it() {
     // Writing prose no longer makes one (#302), so this builds the
     // pre-#268 shape directly: ~41 exist on the live instance and
     // clicking one must still open something.
-    let carrier = superx_mod_entities::nodes::create_entity(
-        &db,
-        "text",
-        "an older description",
-        Some("an older description".to_string()),
-        None,
-    )
-    .await
-    .expect("legacy carrier");
+    let carrier = legacy_text(&db, "an older description", "an older description").await;
     let text_id = &superx_ops::record_uuid(&carrier);
     let tg = api::graph_view(&db, text_id, 2, "both").await.expect("text graph");
     assert_eq!(&tg.root, text_id);
@@ -317,32 +354,58 @@ async fn ui_attachments_surface_on_the_owner_and_resolve_to_their_file() {
     .expect("owner");
     let owner_id = superx_mod_entities::nodes::resolve_entity(&db, &owner).await.expect("resolve");
 
-    let doc = documents::attach_document(
+    // Through the real writer: a file is an attachment ROW, never a
+    // node (§6), so there is no `attached` edge to assert any more.
+    let dir = std::env::temp_dir().join(format!("sx-att-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let uid = superx_mod_entities::attachments::attach_bytes(
         &db,
-        &owner_id,
-        "notes.md",
-        "/tmp/entities/files/01a0-notes.md",
-        documents::mime_for("notes.md"),
-        4096,
+        &dir,
+        superx_mod_entities::attachments::Upload {
+            target: &superx_mod_entities::target::Target::Entity(owner_id.clone()),
+            label: "attachments",
+            filename: "notes.md",
+            bytes: &vec![0u8; 4096],
+            author: &Author::operator(),
+        },
     )
     .await
     .expect("attach");
 
-    // The owner's detail shows it as an attachment, not just an edge.
+    // The owner's detail shows it as an attachment.
     let d = api::detail(&db, &owner).await.expect("detail");
     assert_eq!(d.attachments.len(), 1, "{:?}", d.attachments);
     let a = &d.attachments[0];
     assert_eq!(a.name, "notes.md");
     assert_eq!(a.mime, "text/markdown");
     assert_eq!(a.size, 4096);
-    assert!(d.edges.iter().any(|e| e.rel_type == "attached" && e.outbound));
+    assert_eq!(a.id, uid);
+    assert!(
+        !d.edges.iter().any(|e| e.rel_type == "attached"),
+        "a file makes no edge: it is content on the entity, not a member of the graph"
+    );
 
-    // The download route resolves the stored path from the substrate.
-    let (path, name, mime) = api::attachment_file(&db, &superx_ops::record_uuid(&doc))
-        .await
-        .expect("file");
-    assert_eq!(path, "/tmp/entities/files/01a0-notes.md");
+    // The download route resolves the stored path from the row.
+    let (path, name, mime) = api::attachment_file(&db, &uid).await.expect("file");
+    assert!(path.ends_with("notes.md"), "{path}");
     assert_eq!((name.as_str(), mime.as_str()), ("notes.md", "text/markdown"));
+
+    // And a LEGACY document node still resolves, so an instance that
+    // has not run the migration keeps its download links working.
+    let legacy = legacy_document(
+        &db,
+        &owner_id,
+        "old.md",
+        "/tmp/entities/files/01a0-old.md",
+        documents::mime_for("old.md"),
+        11,
+    )
+    .await;
+    let (p2, n2, _) = api::attachment_file(&db, &superx_ops::record_uuid(&legacy))
+        .await
+        .expect("legacy file");
+    assert_eq!(p2, "/tmp/entities/files/01a0-old.md");
+    assert_eq!(n2, "old.md");
 
     // An entity that is not an attachment has no file to serve.
     assert!(
@@ -418,7 +481,10 @@ async fn seeding_is_idempotent() {
     assert_eq!(second, 0, "re-seed creates nothing");
     let rows = registry::list_types(&db).await.expect("list");
     assert_eq!(rows.len(), registry::SEEDED_TYPES.len());
-    assert!(rows.iter().any(|r| r.name == "text" && r.category == "entity"));
+    // `text` and `document` are NOT here: B6 retired them, because
+    // prose is a note and a file is an attachment row. An instance that
+    // already has the rows keeps them — the registry is append-only.
+    assert!(rows.iter().all(|r| r.name != "text" && r.name != "document"));
     assert!(rows.iter().any(|r| r.name == "instructs" && r.category == "relation"));
 }
 
@@ -790,7 +856,7 @@ async fn documents_are_graph_nodes() {
     registry::seed_types(&db).await.expect("seed");
 
     let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
-    let doc = documents::attach_document(
+    let doc = legacy_document(
         &db,
         &product,
         "spec.pdf",
@@ -798,8 +864,7 @@ async fn documents_are_graph_nodes() {
         "application/pdf",
         4096,
     )
-    .await
-    .expect("attach");
+    .await;
 
     // The document rides the graph like any node.
     let sub = graph::subgraph(&db, &product, 3, false).await.expect("bfs");
@@ -847,30 +912,33 @@ async fn subgraph_carries_text_content_via_batched_meta() {
     let db = fresh_db().await;
     registry::seed_types(&db).await.expect("seed");
 
-    // A DOCUMENT, not a text carrier. The property under test is that
-    // the batched per-level meta read carries content for
-    // content-bearing kinds — which is unchanged. What changed is that
-    // prose is no longer a member of the graph (#300), so proving this
-    // on a `describes` text node would be proving it about a node the
-    // walk correctly never reaches.
+    // The property is the BATCHED per-level read: one request resolves
+    // the whole frontier's name, attributes, version and notes, so a
+    // walk costs the nodes it reaches rather than the table.
+    //
+    // It no longer carries `content`. The only kinds that had any were
+    // `text` and `document`, and B4 took both out of the graph — so a
+    // field that can never be populated is gone rather than left as a
+    // column that is always null.
     let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
-    let doc = nodes::create_entity(
-        &db,
-        "document",
-        "spec.md",
-        Some("The whole point.".to_string()),
-        None,
-    )
-    .await
-    .expect("d");
-    edges::link(&db, &product, &doc, "attached").await.expect("attach");
+    let attrs = superx_kernel::message::value_from_json(&serde_json::json!({"owner": "cal"}));
+    let part = nodes::create_entity(&db, "product", "Frame", None, Some(attrs)).await.expect("c");
+    edges::link(&db, &product, &part, "contains").await.expect("link");
+    superx_mod_entities::texts::set_role_text(&db, &part, "describes", "the frame")
+        .await
+        .expect("prose");
 
     let sub = graph::subgraph(&db, &product, 3, false).await.expect("bfs");
-    let file = sub.nodes.iter().find(|n| n.entity_type == "document").expect("document node");
-    assert_eq!(file.content.as_deref(), Some("The whole point."));
-    let root = sub.nodes.iter().find(|n| n.entity_type == "product").expect("root");
-    assert_eq!(root.name, "Widget");
-    assert!(root.content.is_none(), "non-content kinds stay lean");
+    let child = sub.nodes.iter().find(|n| n.name == "Frame").expect("reached in one batch");
+    assert!(child.attributes.is_some(), "attributes came with it");
+    assert!(!child.version.is_empty(), "and the version it was read at");
+    assert!(
+        child.notes.iter().any(|n| n.body == "the frame"),
+        "and its prose, from the same read — fetching notes separately would let one \
+         written after the walk slip into a prompt"
+    );
+    let root = sub.nodes.iter().find(|n| n.entity_type == "product" && n.name == "Widget");
+    assert_eq!(root.expect("root").depth, 0);
 }
 
 // -------------------------------------------------------------- #253 --
@@ -908,15 +976,7 @@ async fn ancestor_path_is_root_first_priority_ordered_and_cycle_safe() {
     // made through `set_role_text` — but ~41 of them exist on the live
     // instance and clicking one must still say where it hangs. Built
     // the way the world before #268 built it, straight past the writer.
-    let text = nodes::create_entity(
-        &db,
-        "text",
-        "what to build",
-        Some("what to build".to_string()),
-        None,
-    )
-    .await
-    .expect("legacy carrier");
+    let text = legacy_text(&db, "what to build", "what to build").await;
     edges::link(&db, &task, &text, "describes").await.expect("legacy role edge");
     let trail = graph::ancestors(&db, &text, 12).await.expect("walk");
     assert_eq!(
@@ -955,150 +1015,127 @@ async fn ancestor_path_is_root_first_priority_ordered_and_cycle_safe() {
     assert!(trail.len() <= 3, "visited set stops the cycle: {}", trail.len());
 }
 
-/// THE INVARIANT THIS FILE EXISTS FOR (#300): the operator's view and
-/// the runner's view are the same graph.
+/// B4's END, which is what takes prose out of the graph (§13):
+/// "Role edges are then retracted and old anchors archived rather than
+/// deleted, so it reads correctly in both directions."
 ///
-/// They were not. Measured on the live instance, one product at depth
-/// 3: the CLI walk returned 4 nodes and 3 edges, the API returned 1 and
-/// 0. The type check lived in `api.rs` and nowhere in the CLI path, so
-/// a design approved from the API view was a design nobody had seen the
-/// whole of — and the runner builds its prompt by walking the graph.
+/// Not a reader-side filter. §6 is explicit: "every entity is a node
+/// and no reader needs a filter — the special case does not get
+/// documented, it stops existing."
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn both_views_walk_the_same_graph() {
-    use superx_mod_entities::{api, dictionary, edges, graph, nodes, registry, texts};
+async fn migration_retracts_the_role_edges_and_archives_the_anchors() {
+    use superx_mod_entities::{edges, graph, migrate, nodes};
 
     let db = fresh_db().await;
     registry::seed_types(&db).await.expect("types");
-    dictionary::seed(&db).await.expect("labels");
 
     let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
     let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("t");
     edges::link(&db, &product, &task, "contains").await.expect("structural");
 
-    // Prose as the world before #268 stored it: a `text` entity on a
-    // `describes` edge. Writing prose stopped making one in #302, so
-    // this is built directly — and it has to be, because the shape
-    // still exists on the live instance and is exactly what the two
-    // views used to disagree about.
-    let carrier = nodes::create_entity(
+    // Prose as the world before #268 stored it.
+    let carrier = legacy_text(&db, "what this desk is", "what this desk is").await;
+    edges::link(&db, &product, &carrier, "describes").await.expect("role edge");
+
+    let before = graph::subgraph(&db, &product, 3, false).await.expect("before");
+    assert_eq!(before.nodes.len(), 3, "prose is in the graph until B4 runs");
+
+    let report = migrate::prose(&db, false).await.expect("migrate");
+    assert_eq!(report.edges_retracted, 1);
+    assert_eq!(report.anchors_archived, 1);
+
+    let after = graph::subgraph(&db, &product, 3, false).await.expect("after");
+    assert_eq!(after.nodes.len(), 2, "the product and its task, nothing else");
+    assert!(after.nodes.iter().all(|n| n.entity_type != "text"));
+
+    // The prose is READABLE, just not a member of the graph.
+    let notes = superx_mod_entities::notes::for_entity(&db, &product, false).await.expect("notes");
+    assert!(notes.iter().any(|n| n.body == "what this desk is"), "the words survived");
+
+    // Nothing was deleted, and it is reversible by un-retracting: the
+    // anchor is still there, archived, with its own history.
+    let state = nodes::current_state(&db, &carrier).await.expect("read").expect("still there");
+    assert!(state.archived, "hidden, not erased");
+}
+
+/// §6: "A file is attached content: it belongs to the entity and is
+/// never a node." B3's exit says the same: "no new node appears in the
+/// graph or the entity list."
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_document_becomes_an_attachment_row_and_leaves_the_graph() {
+    use superx_mod_entities::{attachments, graph, migrate, nodes, target::Target};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let doc = legacy_document(
         &db,
-        "text",
-        "what this desk is",
-        Some("what this desk is".to_string()),
-        None,
+        &product,
+        "mandate.pdf",
+        "attachments/abc/mandate.pdf",
+        "application/pdf",
+        1234,
     )
-    .await
-    .expect("legacy carrier");
-    edges::link(&db, &product, &carrier, "describes").await.expect("legacy role edge");
-
-    // And prose as it is stored now, which creates no node to filter.
-    texts::set_role_text(&db, &product, "describes", "what this desk is").await.expect("prose");
-    texts::add_comment(&db, &product, "a remark", &superx_mod_entities::notes::Author::operator())
-        .await
-        .expect("comment");
-
-    let walk = graph::subgraph(&db, &product, 3, false).await.expect("walk");
-    let view = api::graph_view(&db, &superx_ops::record_uuid(&product), 3, "out").await.expect("view");
+    .await;
 
     assert_eq!(
-        walk.nodes.len(),
-        view.nodes.len(),
-        "the two views disagree on how many nodes are in the graph: CLI {:?} vs API {:?}",
-        walk.nodes.iter().map(|n| (&n.entity_type, &n.name)).collect::<Vec<_>>(),
-        view.nodes.iter().map(|n| (&n.entity_type, &n.name)).collect::<Vec<_>>(),
-    );
-    assert_eq!(walk.edges.len(), view.edges.len(), "and on how many edges");
-
-    // Two nodes, one edge: the product and its task. The description
-    // and the comment are attached to the product, not members of it.
-    assert_eq!(walk.nodes.len(), 2, "prose is not in the shape");
-    assert_eq!(walk.edges.len(), 1);
-    assert!(
-        walk.nodes.iter().all(|n| n.entity_type != "text"),
-        "no prose carrier reached the walk"
+        graph::subgraph(&db, &product, 2, false).await.expect("before").nodes.len(),
+        2,
+        "the document is a node until B4 runs"
     );
 
-    // And the walk SAYS what it did not follow, rather than swallowing
-    // it — a silently vanishing edge is the original bug.
-    assert!(
-        walk.unwalked_labels.iter().any(|l| l == "describes"),
-        "the walk reports the prose labels it skipped: {:?}",
-        walk.unwalked_labels
-    );
-    assert_eq!(view.unwalked_labels, walk.unwalked_labels, "and both views report the same");
+    let report = migrate::prose(&db, false).await.expect("migrate");
+    assert_eq!(report.documents, 1);
+
+    // Gone from the graph…
+    let after = graph::subgraph(&db, &product, 2, false).await.expect("after");
+    assert_eq!(after.nodes.len(), 1, "only the product");
+
+    // …and readable as an attachment on the entity, under §5.3's label.
+    let files = attachments::for_target(&db, &Target::Entity(product.clone()), false)
+        .await
+        .expect("attachments");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].label, "attachments");
+    assert_eq!(files[0].filename, "mandate.pdf");
+    assert_eq!(files[0].path, "attachments/abc/mandate.pdf", "the same bytes, not a copy");
+
+    // The anchor is archived, not deleted.
+    let state = nodes::current_state(&db, &doc).await.expect("read").expect("still there");
+    assert!(state.archived);
 }
 
-/// `attached` was a registered relation type that the dictionary never
-/// declared, while holding two of the operator's documents. A walk that
-/// followed only declared labels would have deleted those documents
-/// from BOTH views — the fix quietly causing the very loss it exists to
-/// prevent.
+/// "Idempotent and re-runnable" — the spec's words. A second run must
+/// not move anything again, retract an edge twice, or pad the anchor's
+/// history with versions that say nothing new.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_attached_document_stays_in_the_shape() {
-    use superx_mod_entities::{dictionary, edges, graph, nodes, registry};
+async fn running_the_migration_twice_changes_nothing_the_second_time() {
+    use superx_mod_entities::{edges, migrate, nodes};
 
     let db = fresh_db().await;
     registry::seed_types(&db).await.expect("types");
-    dictionary::seed(&db).await.expect("labels");
 
     let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
-    let doc = nodes::create_entity(&db, "document", "mandate.pdf", None, None).await.expect("d");
-    edges::link(&db, &product, &doc, "attached").await.expect("attach");
+    let carrier =
+        legacy_text(&db, "words", "words").await;
+    edges::link(&db, &product, &carrier, "describes").await.expect("edge");
+    legacy_document(&db, &product, "f.pdf", "attachments/x/f.pdf", "application/pdf", 9).await;
 
-    let walk = graph::subgraph(&db, &product, 2, false).await.expect("walk");
-    assert!(
-        walk.nodes.iter().any(|n| n.entity_type == "document"),
-        "the document is part of the shape — a file labelled a mandate IS the mandate (§5.4)"
+    let first = migrate::prose(&db, false).await.expect("first");
+    assert!(first.versions > 0 && first.documents == 1 && first.edges_retracted == 2);
+    let history = nodes::state_history(&db, &carrier).await.expect("history").len();
+
+    let second = migrate::prose(&db, false).await.expect("second");
+    assert_eq!(second.versions, 0, "no prose moves twice");
+    assert_eq!(second.documents, 0, "no file moves twice");
+    assert_eq!(second.edges_retracted, 0, "an edge already retracted is not retracted again");
+    assert_eq!(second.anchors_archived, 0, "an anchor already archived is left alone");
+    assert_eq!(
+        nodes::state_history(&db, &carrier).await.expect("history").len(),
+        history,
+        "the anchor's history did not grow"
     );
-    assert!(walk.unwalked_labels.is_empty(), "and nothing was skipped: {:?}", walk.unwalked_labels);
-}
-
-/// An unprovisioned database declares nothing. A walk that filtered on
-/// an empty dictionary would return a bare root and read as an empty
-/// instance rather than an unseeded one — enforcement arrives with the
-/// declaration, never before it (§7).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_undeclared_dictionary_does_not_blank_the_graph() {
-    use superx_mod_entities::{edges, graph, nodes, registry};
-
-    // NOT `fresh_db` — that seeds the dictionary, which is the whole
-    // thing this test needs absent. A test that claims to prove the
-    // unseeded path while running the seeded one proves nothing.
-    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
-    db.use_ns("superx").use_db("entities").await.expect("nsdb");
-    let ddl = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "test-password");
-    db.query(ddl).await.expect("ddl").check().expect("schema");
-    registry::seed_types(&db).await.expect("types");
-
-    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
-    let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("t");
-    edges::link(&db, &product, &task, "contains").await.expect("link");
-
-    let walk = graph::subgraph(&db, &product, 2, false).await.expect("walk");
-    assert_eq!(walk.nodes.len(), 2, "the walk still walks");
-    assert_eq!(walk.edges.len(), 1);
-}
-
-/// Archiving a label stops it being OFFERED. It does not make the edges
-/// it already made stop being part of the shape — otherwise archiving
-/// `contains` would erase every hierarchy from both views at once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn archiving_a_link_label_does_not_erase_its_edges_from_the_graph() {
-    use superx_mod_entities::{dictionary, edges, graph, nodes, registry};
-
-    let db = fresh_db().await;
-    registry::seed_types(&db).await.expect("types");
-    dictionary::seed(&db).await.expect("labels");
-
-    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
-    let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("t");
-    edges::link(&db, &product, &task, "contains").await.expect("link");
-
-    dictionary::archive(&db, "contains", dictionary::LINK, true).await.expect("archive");
-
-    let walk = graph::subgraph(&db, &product, 2, false).await.expect("walk");
-    assert_eq!(walk.nodes.len(), 2, "the hierarchy survives archiving the label");
-    assert_eq!(walk.edges.len(), 1);
 }
 
 /// THE UPGRADE PATH, not the fresh-install path (#304).
@@ -1170,4 +1207,384 @@ async fn the_new_columns_do_not_invalidate_rows_written_before_them() {
     edges::link(&db, &product, &another, "contains").await.expect("write after upgrade");
     let out = edges::expand(&db, std::slice::from_ref(&product), false).await.expect("expand2");
     assert_eq!(out.len(), 2);
+}
+
+/// §6 compare-and-append: "Every write carries the `valid_from` it was
+/// based on. If the chain head has moved, the write is refused and the
+/// current version comes back with the refusal."
+///
+/// The scenario is the spec's: the operator saves an edit based on v3
+/// while a role, also holding v3, saves a moment later. Without this the
+/// role's row wins, the operator's is invisible, and nobody is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_against_a_version_that_has_moved_is_refused() {
+    use superx_mod_entities::{api, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let id = api::create(
+        &db,
+        &api::CreateReq {
+            entity_type: "product".into(),
+            name: "Widget".into(),
+            description: None,
+            content: None,
+            attributes_json: None,
+        },
+    )
+    .await
+    .expect("create");
+    let anchor = nodes::resolve_entity(&db, &id).await.expect("resolve");
+    let v1 = nodes::current_state(&db, &anchor).await.expect("read").expect("state").valid_from;
+
+    // A role writes first, holding v1.
+    api::update(
+        &db,
+        &id,
+        &api::UpdateReq {
+            name: Some("Widget, by the role".into()),
+            content: None,
+            attributes_json: None,
+            based_on: Some(v1.clone()),
+        },
+    )
+    .await
+    .expect("the first writer wins");
+
+    // The operator, also holding v1, saves a moment later.
+    let err = api::update(
+        &db,
+        &id,
+        &api::UpdateReq {
+            name: Some("Widget, by the operator".into()),
+            content: None,
+            attributes_json: None,
+            based_on: Some(v1.clone()),
+        },
+    )
+    .await
+    .expect_err("the second writer is refused rather than silently winning");
+
+    // The refusal CARRIES the version that beat it — a role told only
+    // "no" has nothing to do; one handed the current version can
+    // re-read, merge and retry.
+    let text = err.to_string();
+    assert!(text.contains(&v1), "it names what the write was based on: {text}");
+    let head = nodes::current_state(&db, &anchor).await.expect("read").expect("state").valid_from;
+    assert!(text.contains(&head), "and the version that is actually there: {text}");
+
+    // Nothing was half-applied: the role's write stands untouched.
+    assert_eq!(
+        api::detail(&db, &id).await.expect("detail").name,
+        "Widget, by the role",
+        "the refused edit changed nothing"
+    );
+
+    // And re-reading, then writing against the CURRENT version, works.
+    api::update(
+        &db,
+        &id,
+        &api::UpdateReq {
+            name: Some("Widget, merged".into()),
+            content: None,
+            attributes_json: None,
+            based_on: Some(head),
+        },
+    )
+    .await
+    .expect("a writer that re-read is not blocked");
+    assert_eq!(api::detail(&db, &id).await.expect("detail").name, "Widget, merged");
+}
+
+/// The guarantee is OFFERED, never imposed. A caller with no version to
+/// quote — which is most callers today, and every older client — keeps
+/// the latest-wins behaviour rather than being refused for not making a
+/// claim it never made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_that_claims_nothing_is_not_refused() {
+    use superx_mod_entities::api;
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let id = api::create(
+        &db,
+        &api::CreateReq {
+            entity_type: "product".into(),
+            name: "Widget".into(),
+            description: None,
+            content: None,
+            attributes_json: None,
+        },
+    )
+    .await
+    .expect("create");
+
+    for name in ["one", "two"] {
+        api::update(
+            &db,
+            &id,
+            &api::UpdateReq {
+                name: Some(name.to_string()),
+                content: None,
+                attributes_json: None,
+                based_on: None,
+            },
+        )
+        .await
+        .expect("no claim, no refusal");
+    }
+    assert_eq!(api::detail(&db, &id).await.expect("detail").name, "two");
+}
+
+/// §14, the read that matters: "the entity as it stood at an instant —
+/// its state, every note, every attachment and every edge resolved at
+/// the SAME moment."
+///
+/// A field-by-field picker answers "how did this text change". This
+/// answers "what did the agent see when it did that", which cannot be
+/// assembled from separate pickers because each one moves
+/// independently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_instant_reaches_every_chain() {
+    use superx_mod_entities::{api, asof, edges, nodes, texts};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+    texts::set_role_text(&db, &product, "describes", "the first wording").await.expect("d1");
+    let task = nodes::create_entity(&db, "task", "Build it", None, None).await.expect("t");
+    edges::link(&db, &product, &task, "contains").await.expect("link");
+
+    // THE INSTANT, taken from the LAST setup write rather than from
+    // the clock: `set_role_text` appends a note and no state version,
+    // so the anchor's own timestamp predates the prose and would make
+    // this test assert something it never set up.
+    let then = edges::expand(&db, std::slice::from_ref(&product), false)
+        .await
+        .expect("edges")
+        .into_iter()
+        .map(|e| e.valid_from)
+        .max()
+        .expect("the link is the last thing written above");
+
+    // The world moves on: renamed, re-described, a comment added, the
+    // task unlinked.
+    nodes::update_entity(&db, &product, Some("Widget X2".into()), None, None).await.expect("rename");
+    texts::set_role_text(&db, &product, "describes", "a later wording").await.expect("d2");
+    texts::add_comment(&db, &product, "a remark", &Author::operator()).await.expect("c");
+    edges::unlink(&db, &product, &task, "contains").await.expect("unlink");
+
+    // Now is now.
+    let now = api::detail(&db, &frag).await.expect("now");
+    assert_eq!(now.name, "Widget X2");
+    assert!(now.annotations.iter().any(|a| a.content == "a later wording"));
+    assert!(now.annotations.iter().any(|a| a.label == "comments"));
+    assert!(!now.edges.iter().any(|e| e.rel_type == "contains"), "the link is gone now");
+
+    // Then is then — one instant, every chain.
+    let past = api::detail_at(&db, &frag, asof::parse(Some(&then)).expect("parse"))
+        .await
+        .expect("as-of");
+    assert_eq!(past.name, "Widget", "the name it had");
+    assert!(
+        past.annotations.iter().any(|a| a.content == "the first wording"),
+        "the wording it had: {:?}",
+        past.annotations.iter().map(|a| &a.content).collect::<Vec<_>>()
+    );
+    assert!(
+        !past.annotations.iter().any(|a| a.content == "a later wording"),
+        "and not the one written afterwards"
+    );
+    assert!(
+        !past.annotations.iter().any(|a| a.label == "comments"),
+        "a comment written afterwards was not there"
+    );
+    assert!(
+        past.edges.iter().any(|e| e.rel_type == "contains"),
+        "the edge was ACTIVE then, even though it is unlinked now"
+    );
+}
+
+/// An instant before the entity existed is a question about a time when
+/// it did not, and the refusal says so rather than reading as a broken
+/// substrate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_instant_before_it_existed_says_so() {
+    use superx_mod_entities::{api, asof, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    let err = api::detail_at(&db, &frag, asof::parse(Some("2000-01-01T00:00:00Z")).expect("p"))
+        .await
+        .expect_err("there was no Widget in 2000");
+    assert!(err.to_string().contains("created later"), "{err}");
+
+    // And an unreadable instant is refused before anything is read.
+    asof::parse(Some("last tuesday")).expect_err("not an instant");
+}
+
+/// §14: archiving hides, it does not erase — and it is a versioned
+/// change, so an as-of read from before it still shows the thing as
+/// live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archiving_hides_by_default_and_is_itself_a_version() {
+    use superx_mod_entities::{api, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let product = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&product);
+
+    assert!(api::list(&db, None, false).await.expect("list").iter().any(|e| e.id == frag));
+
+    assert!(nodes::set_archived(&db, &product, true).await.expect("archive"));
+    assert!(
+        !api::list(&db, None, false).await.expect("list").iter().any(|e| e.id == frag),
+        "hidden from the default list"
+    );
+    let shown = api::list(&db, None, true).await.expect("list");
+    let row = shown.iter().find(|e| e.id == frag).expect("still there when asked for");
+    assert!(row.archived, "and it says so, rather than looking ordinary");
+
+    // Restoring changes it back, and restoring AGAIN appends nothing —
+    // a repeated call must not pad the history with rows saying nothing.
+    assert!(nodes::set_archived(&db, &product, false).await.expect("restore"));
+    assert!(!nodes::set_archived(&db, &product, false).await.expect("again"), "no second version");
+
+    // Restored.
+    assert!(api::list(&db, None, false).await.expect("list").iter().any(|e| e.id == frag));
+}
+
+/// §5.5: "once cardinality, endpoints and acyclicity are DATA, 'does
+/// this graph make sense?' derives from the dictionary alone … exactly
+/// the check to run before dispatching agents at a graph one of them
+/// designed."
+///
+/// The point is that a graph can be wrong without any single write
+/// being wrong: a label narrowed after its edges exist, a type given a
+/// required slot after its entities were made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_graph_is_checked_against_the_dictionary_it_was_built_under() {
+    use superx_mod_entities::dictionary::{Definition, LINK};
+    use superx_mod_entities::{dictionary, edges, nodes, validate};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    let task = nodes::create_entity(&db, "task", "Trade", None, None).await.expect("t");
+    edges::link(&db, &product, &task, "contains").await.expect("legal when written");
+
+    // Clean under the dictionary as it stands.
+    assert!(
+        validate::subgraph(&db, &product, 3).await.expect("check").is_empty(),
+        "nothing wrong yet"
+    );
+
+    // NOW the operator narrows the label — every write so far was
+    // legal, and the graph is wrong the moment the rule changes.
+    dictionary::define(&db, Definition {
+        key: "contains",
+        kind: LINK,
+        display: "contains",
+        semantics: "composition",
+        source_types: Some(&["role".to_string()]),
+        ..Default::default()
+    })
+    .await
+    .expect("narrow it");
+
+    let findings = validate::subgraph(&db, &product, 3).await.expect("check");
+    assert_eq!(findings.len(), 1, "{:?}", findings.iter().map(|f| &f.detail).collect::<Vec<_>>());
+    assert!(findings[0].detail.contains("starts at role"), "{}", findings[0].detail);
+}
+
+/// A required slot added to a type after its entities were made: every
+/// entity written before it is now missing something it was promised,
+/// and no single write was wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entity_missing_what_its_type_requires_is_reported() {
+    use superx_mod_entities::{dictionary, nodes, validate};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed_type_labels(&db).await.expect("slots");
+
+    let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
+    // The shipped bindings already require something of a product, so
+    // the baseline is what they require — not zero. Naming it here
+    // rather than asserting emptiness keeps the test about the ONE slot
+    // it adds below.
+    let baseline = validate::subgraph(&db, &product, 1).await.expect("check").len();
+
+    dictionary::bind_slot(&db, "product", "spec", true, None, &Author::operator())
+        .await
+        .expect("now every product needs one");
+
+    let findings = validate::subgraph(&db, &product, 1).await.expect("check");
+    assert!(
+        findings.iter().any(|f| f.detail.contains("carries no 'spec'")),
+        "{:?}",
+        findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
+    );
+
+    // Writing one clears it.
+    superx_mod_entities::notes::write(
+        &db,
+        &product,
+        "spec",
+        "what to build",
+        &Author::operator(),
+    )
+    .await
+    .expect("write the spec");
+    assert_eq!(
+        validate::subgraph(&db, &product, 1).await.expect("check").len(),
+        baseline,
+        "writing the spec cleared the finding it caused, and nothing else"
+    );
+}
+
+/// A cycle written before the label was marked acyclic. `link` refuses
+/// to create one now, so the only way in is data that predates the
+/// rule — which is exactly the case this check exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cycle_that_predates_the_rule_is_found() {
+    use superx_mod_entities::{edges, nodes, validate};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    let a = nodes::create_entity(&db, "task", "A", None, None).await.expect("a");
+    let b = nodes::create_entity(&db, "task", "B", None, None).await.expect("b");
+    edges::link(&db, &a, &b, "depends_on").await.expect("a waits on b");
+
+    // Straight into the substrate, past the guard — how such a row got
+    // there before the rule existed.
+    let uid = uuid::Uuid::now_v7().to_string();
+    db.query(
+        "RELATE $from->edge->$to SET edge_uid = $uid, rel_type = 'depends_on', \
+         active = true, valid_from = time::now()",
+    )
+    .bind(("from", b.clone()))
+    .bind(("to", a.clone()))
+    .bind(("uid", uid))
+    .await
+    .expect("write")
+    .check()
+    .expect("the pre-rule shape");
+
+    let findings = validate::subgraph(&db, &a, 5).await.expect("check");
+    assert!(
+        findings.iter().any(|f| f.detail.contains("acyclic")),
+        "{:?}",
+        findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
+    );
 }
