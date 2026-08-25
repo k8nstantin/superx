@@ -128,7 +128,6 @@ fn strip_heredocs(cmd: &str) -> String {
         if let Some(pos) = line.find("<<") {
             let raw = line[pos + 2..]
                 .trim_start_matches('-')
-                .trim()
                 .split_whitespace()
                 .next()
                 .unwrap_or("");
