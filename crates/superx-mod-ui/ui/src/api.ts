@@ -32,7 +32,8 @@ export const fetchActivity = (limit = 500, before?: string, q?: string) =>
   get<SseEvent[]>(`/api/activity?limit=${limit}${feedArgs(before, q)}`)
 export const fetchActions = (limit = 50) => get<ActionView[]>(`/api/actions?limit=${limit}`)
 export const fetchCharts = () => get<ChartsSummary>('/api/charts/summary')
-export const fetchStats = () => get<StatsSummary>('/api/stats')
+export const fetchStats = (range = 'window') =>
+  get<StatsSummary>(`/api/stats?range=${range}`)
 export const fetchInsights = () => get<InsightsSummary>('/api/insights')
 
 export async function runCommand(argv: string[]): Promise<{ output: string; is_error: boolean }> {

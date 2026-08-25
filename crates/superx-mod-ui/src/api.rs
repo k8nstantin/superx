@@ -179,6 +179,123 @@ pub struct StatsSummary {
     pub thinking_tokens: i64,
     /// Directories the window worked in, descending.
     pub dirs: Vec<NameCount>,
+
+    // ── churn and rework (issue #322) ─────────────────────────────
+    /// Lines added and replaced per hour, oldest first — the churn
+    /// chart. `added` and `removed` are separate series so the UI can
+    /// diverge them around zero.
+    pub churn: Vec<ChurnPoint>,
+    /// Edits whose added text a LATER edit removed from the same
+    /// file — work that was thrown away. Counts each undo
+    /// relationship, so a flip-flop (A→B, B→A, A→B) scores 2: the
+    /// sharpest rework signal the transcript carries.
+    pub reverts: i64,
+    /// Files the window touched three or more times.
+    pub thrash_files: i64,
+    /// Output tokens produced in the window — pairs with
+    /// `lines_added` to give tokens per line.
+    pub out_tokens_window: i64,
+    /// The single most-repeated command, with its count. Running one
+    /// command eleven times is the shape of fighting something.
+    pub top_repeat: Option<NameCount>,
+    /// The most sessions seen active in the same five-minute bucket.
+    pub max_concurrent_sessions: i64,
+    /// The longest gap between captured messages in the window, in
+    /// minutes — the quiet stretch.
+    pub longest_quiet_mins: i64,
+
+    // ── scroll-back (issue #326) ──────────────────────────────────
+    /// The range this payload covers, echoed back: `1h`, `24h`, `all`.
+    pub range: String,
+    /// True when the row cap cut the range short — the figures are a
+    /// sample of the range, and the UI must say so.
+    pub truncated: bool,
+
+    // ── quality out of what the commands printed (issue #327) ─────
+    pub tests_passed: i64,
+    pub tests_failed: i64,
+    /// Compiler and type-checker diagnostics seen in tool output.
+    pub compile_errors: i64,
+    /// Tool calls the agent was not permitted to make.
+    pub denials: i64,
+    /// Context-exhaustion events — the agent had to compact.
+    pub compactions: i64,
+    /// Times the operator interrupted or corrected the agent.
+    pub interventions: i64,
+
+    // ── the repo and model dimensions (#325, #328) ────────────────
+    pub repos: Vec<RepoStat>,
+    pub models: Vec<ModelStat>,
+    /// Sessions with a message in the last five minutes, busiest
+    /// first — what is happening right now.
+    pub live: Vec<LiveSession>,
+}
+
+/// Per-repo work (issue #325): agents run across many repos at once,
+/// so every figure needs a repo slice — one busy repo otherwise hides
+/// a thrashing one.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct RepoStat {
+    /// Checkout directory name.
+    pub name: String,
+    /// Newest branch seen for it, when the transcript carries one.
+    pub branch: Option<String>,
+    pub messages: i64,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub files_touched: i64,
+    pub tests_run: i64,
+    pub tool_failures: i64,
+    pub out_tokens: i64,
+    /// Distinct agents that worked in it.
+    pub agents: i64,
+    /// Newest activity, RFC3339.
+    pub last_active: String,
+}
+
+/// A session that is live right now — what it is working on, not
+/// just that it exists (issue #325). The panel a 24×7 operator reads
+/// first: which agent, which repo, which model, how hard it is going.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct LiveSession {
+    pub identity: String,
+    pub agent: String,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub model: Option<String>,
+    /// The newest tool it called.
+    pub last_tool: Option<String>,
+    pub messages: i64,
+    pub lines_added: i64,
+    pub out_tokens: i64,
+    pub tool_failures: i64,
+    /// Seconds since its newest message.
+    pub idle_secs: i64,
+}
+
+/// Per-model outcomes (issue #328): which model actually produces
+/// keepable code on this codebase.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ModelStat {
+    pub name: String,
+    pub messages: i64,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub out_tokens: i64,
+    pub tool_failures: i64,
+    pub reverts: i64,
+}
+
+/// One hour of code movement.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ChurnPoint {
+    pub t: String,
+    pub added: i64,
+    pub removed: i64,
 }
 
 /// A tool's outcomes in the window. Claude Code reports per call via

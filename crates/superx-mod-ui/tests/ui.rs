@@ -1074,3 +1074,166 @@ async fn dotfiles_are_not_languages() {
     assert_eq!(langs, vec!["rs"], "only the real extension counts: {langs:?}");
     assert_eq!(s.files_touched, 2, "both files still counted as touched");
 }
+
+/// Churn, undo detection, and the struggle instruments (issue #324).
+/// The ratio is the insight: replaced ÷ (added + replaced). A window
+/// that rewrites the same lines scores high; greenfield scores zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn churn_and_rework_signals() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let edit = |path: &str, old: &str, new: &str| {
+        serde_json::json!({"message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
+            "input": {"file_path": path, "old_string": old, "new_string": new}}]}})
+    };
+
+    // Greenfield: a Write replaces nothing.
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "message": {"usage": {"output_tokens": 400},
+            "content": [{"type": "tool_use", "id": "w", "name": "Write",
+                "input": {"file_path": "/r/src/new.rs", "content": "a\nb\nc\nd"}}]}
+    })).await;
+
+    // A real edit, then an edit that PUTS THE FIRST TEXT BACK — the
+    // undo. Snippets are long enough to be evidence.
+    let original = "fn handler() { the original body here }";
+    let replacement = "fn handler() { a different body entirely }";
+    log_tool_message(&kernel, &session, &agent, edit("/r/src/lib.rs", original, replacement)).await;
+    log_tool_message(&kernel, &session, &agent, edit("/r/src/lib.rs", replacement, original)).await;
+    // A third touch makes lib.rs a thrash file (3+ touches).
+    log_tool_message(&kernel, &session, &agent, edit("/r/src/lib.rs", original, replacement)).await;
+
+    // The same command four times — fighting something.
+    for _ in 0..4 {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "message": {"content": [{"type": "tool_use", "id": "b", "name": "Bash",
+                "input": {"command": "cargo test --workspace"}}]}
+        })).await;
+    }
+
+    let s = superx_mod_ui::stats::stats_summary(&kernel, 500).await.expect("stats");
+
+    // Churn: 4 written lines + 3 edits of one line each = 7 added,
+    // 3 replaced. The ratio is what the operator reads.
+    assert_eq!(s.lines_added, 7, "4 written + 3 edited");
+    assert_eq!(s.lines_removed, 3, "three single-line replacements");
+    assert!(!s.churn.is_empty(), "the chart has a point");
+    let charted_added: i64 = s.churn.iter().map(|p| p.added).sum();
+    let charted_removed: i64 = s.churn.iter().map(|p| p.removed).sum();
+    assert_eq!(charted_added, s.lines_added, "series totals match the tile");
+    assert_eq!(charted_removed, s.lines_removed);
+
+    // A→B, B→A, A→B is a flip-flop: TWO undo relationships. Edit 2's
+    // work was thrown away by edit 3, and edit 3's by edit 4. Counting
+    // both is the honest reading of "how much work was discarded".
+    assert_eq!(s.reverts, 2, "two edits had their work undone later");
+
+    // lib.rs was touched three times; new.rs once.
+    assert_eq!(s.thrash_files, 1, "only lib.rs crossed the threshold");
+
+    // Struggle: the repeated command surfaces with its count.
+    let repeat = s.top_repeat.expect("a command ran 3+ times");
+    assert_eq!(repeat.name, "cargo test");
+    assert_eq!(repeat.value, 4);
+
+    // Economics and shape.
+    assert_eq!(s.out_tokens_window, 400, "window tokens, for tokens-per-line");
+    assert_eq!(s.max_concurrent_sessions, 1, "one session was live");
+    assert!(s.longest_quiet_mins < 5, "these all landed together");
+}
+
+/// Many agents across many repos (issue #325), quality mined from what
+/// commands printed (#327), and the model dimension (#328).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repos_models_and_quality_are_separable() {
+    let kernel = fresh_kernel().await;
+    let a1 = kernel.create_entity("node_agent").await.expect("a1");
+    let a2 = kernel.create_entity("node_agent").await.expect("a2");
+    let s1 = kernel.create_entity("node_session").await.expect("s1");
+    let s2 = kernel.create_entity("node_session").await.expect("s2");
+
+    // Agent 1 writes in repo A with the fast model.
+    kernel.log_message(superx_kernel::NewMessage {
+        session: s1.clone(), agent: a1.clone(), role: "assistant".into(), content: String::new(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "cwd": "/w/alpha", "gitBranch": "main",
+            "message": {"model": "claude-fable-5", "usage": {"output_tokens": 300},
+                "content": [{"type": "tool_use", "id": "e1", "name": "Write",
+                    "input": {"file_path": "/w/alpha/src/a.rs", "content": "1\n2\n3"}}]}}))),
+        seq: None, emitted_at: None,
+    }).await.expect("m1");
+
+    // Agent 2 works repo B, runs a test suite, and the output says
+    // what happened — the seam we had never read.
+    kernel.log_message(superx_kernel::NewMessage {
+        session: s2.clone(), agent: a2.clone(), role: "assistant".into(), content: String::new(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "cwd": "/w/beta",
+            "message": {"model": "claude-opus-5",
+                "content": [{"type": "tool_use", "id": "b1", "name": "Bash",
+                    "input": {"command": "cargo test --workspace"}}]}}))),
+        seq: None, emitted_at: None,
+    }).await.expect("m2");
+    kernel.log_message(superx_kernel::NewMessage {
+        session: s2.clone(), agent: a2.clone(), role: "tool".into(), content: String::new(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "cwd": "/w/beta",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "b1", "is_error": true,
+                "content": "running 9 tests\ntest result: FAILED. 7 passed; 2 failed; 0 ignored\nerror[E0382]: borrow of moved value\nerror: could not compile `beta`"}]}}))),
+        seq: None, emitted_at: None,
+    }).await.expect("m3");
+
+    // The operator had to step in, and the agent ran out of context.
+    kernel.log_message(superx_kernel::NewMessage {
+        session: s2.clone(), agent: a2.clone(), role: "user".into(), content: "stop".into(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "cwd": "/w/beta", "interruptedMessageId": "abc",
+            "message": {"content": []}}))),
+        seq: None, emitted_at: None,
+    }).await.expect("m4");
+    kernel.log_message(superx_kernel::NewMessage {
+        session: s2.clone(), agent: a2.clone(), role: "system".into(), content: String::new(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "cwd": "/w/beta", "isCompactSummary": true, "message": {"content": []}}))),
+        seq: None, emitted_at: None,
+    }).await.expect("m5");
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // Range is echoed, and this sample did not hit the cap.
+    assert_eq!(s.range, "24h");
+    assert!(!s.truncated);
+
+    // Two repos, separable — one busy repo cannot hide the other.
+    assert_eq!(s.repos.len(), 2, "{:?}", s.repos.iter().map(|r| &r.name).collect::<Vec<_>>());
+    let alpha = s.repos.iter().find(|r| r.name == "alpha").expect("alpha");
+    assert_eq!(alpha.branch.as_deref(), Some("main"));
+    assert_eq!(alpha.lines_added, 3);
+    assert_eq!(alpha.agents, 1);
+    let beta = s.repos.iter().find(|r| r.name == "beta").expect("beta");
+    assert_eq!(beta.tests_run, 1, "the test call is attributed to beta");
+    assert_eq!(beta.tool_failures, 1);
+    assert_eq!(beta.lines_added, 0, "beta wrote no code in this window");
+
+    // Quality, read out of the tool output.
+    assert_eq!(s.tests_passed, 7);
+    assert_eq!(s.tests_failed, 2);
+    assert_eq!(s.compile_errors, 2, "error[E0382] and could-not-compile");
+    assert_eq!(s.interventions, 1, "the operator interrupted once");
+    assert_eq!(s.compactions, 1, "context was exhausted once");
+
+    // The model dimension: who produced what.
+    let fable = s.models.iter().find(|m| m.name == "claude-fable-5").expect("fable");
+    assert_eq!(fable.lines_added, 3);
+    assert_eq!(fable.out_tokens, 300);
+    let opus = s.models.iter().find(|m| m.name == "claude-opus-5").expect("opus");
+    assert_eq!(opus.tool_failures, 1, "the failure lands on the model that caused it");
+
+    // Both sessions are live, and each says what it is doing.
+    assert_eq!(s.live.len(), 2, "{:?}", s.live.len());
+    let busiest = &s.live[0];
+    assert!(busiest.messages >= 1);
+    assert!(busiest.repo.is_some(), "a live row names its repo");
+    assert!(busiest.idle_secs < 300);
+}

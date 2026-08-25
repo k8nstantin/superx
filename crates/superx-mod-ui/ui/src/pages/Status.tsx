@@ -155,7 +155,13 @@ const baseName = (p: string) => p.split('/').slice(-2).join('/')
 export default function StatusPage() {
   useBreadcrumb([{ label: 'Status' }])
   const status = useQuery({ queryKey: ['status'], queryFn: fetchStatus, refetchInterval: 10000 })
-  const stats = useQuery({ queryKey: ['stats'], queryFn: fetchStats, refetchInterval: 15000 })
+  // Scroll-back (#326): every window-scoped panel follows this.
+  const [range, setRange] = useState<string>('window')
+  const stats = useQuery({
+    queryKey: ['stats', range],
+    queryFn: () => fetchStats(range),
+    refetchInterval: 15000,
+  })
   // All-history aggregates: heavier, and they move slowly.
   const insights = useQuery({
     queryKey: ['insights'],
@@ -166,7 +172,22 @@ export default function StatusPage() {
 
   const s = stats.data
   const i = insights.data
-  const windowNote = s ? `newest ${s.window_messages} captured messages` : ''
+  const RANGES: [string, string][] = [
+    ['window', 'live'],
+    ['1h', '1h'],
+    ['6h', '6h'],
+    ['24h', '24h'],
+    ['7d', '7d'],
+    ['30d', '30d'],
+    ['all', 'all'],
+  ]
+  const windowNote = !s
+    ? ''
+    : s.range === 'window'
+      ? `newest ${s.window_messages} captured messages`
+      : s.truncated
+        ? `${s.range} · sampled, row cap reached`
+        : `over the last ${s.range}`
 
   const tok = i?.tokens
   const promptTotal = tok ? Number(tok.input) + Number(tok.cache_read) + Number(tok.cache_write) : 0
@@ -176,13 +197,177 @@ export default function StatusPage() {
   const failed = outcomes.reduce((n, t) => n + Number(t.failed), 0)
   const failRate = scored > 0 ? Math.round((failed * 1000) / scored) / 10 : null
 
+  // Churn: replaced ÷ (added + replaced). 0% is greenfield; a high
+  // number means the window spent itself rewriting (#324).
+  const added = s ? Number(s.lines_added) : 0
+  const replaced = s ? Number(s.lines_removed) : 0
+  const churnPct = added + replaced > 0 ? Math.round((replaced * 100) / (added + replaced)) : null
+  const churnTone = churnPct == null ? undefined : churnPct >= 50 ? FAIL : churnPct >= 25 ? CANCEL : OK
+  const churnRead =
+    churnPct == null
+      ? ''
+      : churnPct >= 50
+        ? 'mostly rewriting'
+        : churnPct >= 25
+          ? 'revising as it goes'
+          : 'mostly new code'
+  const tokensPerLine = s && added > 0 ? Math.round(Number(s.out_tokens_window) / added) : null
+  const testsPer100 = s && added > 0 ? Math.round((Number(s.tests_run) * 100 * 10) / added) / 10 : null
+
   const burn = s ? Number(s.tokens_last_hour) : 0
   const wr = s ? Number(s.writes_window) : 0
   const rd = s ? Number(s.reads_window) : 0
   const makeRatio = wr + rd > 0 ? Math.round((wr * 100) / (wr + rd)) : null
 
+  const q = s
+    ? Number(s.tests_passed) + Number(s.tests_failed) > 0
+      ? Math.round(
+          (Number(s.tests_passed) * 1000) / (Number(s.tests_passed) + Number(s.tests_failed)),
+        ) / 10
+      : null
+    : null
+
   return (
     <>
+      {/* ── scroll-back: one control, every window-scoped panel ── */}
+      <Group justify="space-between" mb="md" wrap="nowrap">
+        <Group gap={6} wrap="nowrap">
+          {RANGES.map(([key, label]) => (
+            <Button
+              key={key}
+              size="compact-xs"
+              variant={range === key ? 'filled' : 'default'}
+              onClick={() => setRange(key)}
+            >
+              {label}
+            </Button>
+          ))}
+        </Group>
+        <Text size="xs" c="dimmed">
+          {windowNote}
+          {s?.truncated && ' — figures are a sample of this range'}
+        </Text>
+      </Group>
+
+      {/* ── what is happening right now, per session ───────────── */}
+      {(s?.live?.length ?? 0) > 0 && (
+        <Card withBorder mb="md">
+          <Group justify="space-between" mb="xs">
+            <Title order={5}>Running now</Title>
+            <Text size="xs" c="dimmed">
+              sessions with a message in the last five minutes
+            </Text>
+          </Group>
+          <Table striped highlightOnHover>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>Session</Table.Th>
+                <Table.Th>Repo</Table.Th>
+                <Table.Th>Model</Table.Th>
+                <Table.Th>Doing</Table.Th>
+                <Table.Th ta="right">Msgs</Table.Th>
+                <Table.Th ta="right">Lines</Table.Th>
+                <Table.Th ta="right">Tokens</Table.Th>
+                <Table.Th ta="right">Fails</Table.Th>
+                <Table.Th ta="right">Idle</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {(s?.live ?? []).map((l) => (
+                <Table.Tr key={l.identity}>
+                  <Table.Td>
+                    <Group gap={6} wrap="nowrap">
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: '50%',
+                          background: sessionColor(l.identity),
+                          flexShrink: 0,
+                        }}
+                      />
+                      <Text size="xs" ff="monospace">
+                        {l.identity.slice(0, 13)}
+                      </Text>
+                    </Group>
+                  </Table.Td>
+                  <Table.Td>
+                    <Text size="xs" ff="monospace">
+                      {l.repo ?? '—'}
+                      {l.branch && (
+                        <Text span size="xs" c="dimmed">
+                          {' · '}
+                          {l.branch}
+                        </Text>
+                      )}
+                    </Text>
+                  </Table.Td>
+                  <Table.Td>
+                    <Text size="xs" c="dimmed">
+                      {l.model ?? '—'}
+                    </Text>
+                  </Table.Td>
+                  <Table.Td>
+                    {l.last_tool ? (
+                      <Badge size="sm" variant="light">
+                        {l.last_tool}
+                      </Badge>
+                    ) : (
+                      '—'
+                    )}
+                  </Table.Td>
+                  <Table.Td ta="right">{String(l.messages)}</Table.Td>
+                  <Table.Td ta="right">{fmtCompact(l.lines_added)}</Table.Td>
+                  <Table.Td ta="right">{fmtCompact(l.out_tokens)}</Table.Td>
+                  <Table.Td ta="right" c={Number(l.tool_failures) > 0 ? 'red.4' : undefined}>
+                    {String(l.tool_failures)}
+                  </Table.Td>
+                  <Table.Td ta="right">{fmtAge(l.idle_secs)}</Table.Td>
+                </Table.Tr>
+              ))}
+            </Table.Tbody>
+          </Table>
+        </Card>
+      )}
+
+      {/* ── quality: what the commands actually reported ───────── */}
+      <SimpleGrid cols={{ base: 2, md: 3, lg: 6 }} mb="md">
+        <Stat
+          label="Tests passed"
+          value={fmtCompact(s?.tests_passed)}
+          sub={q == null ? '' : `${q}% pass rate`}
+          tip="read out of what the test runners printed"
+        />
+        <Stat
+          label="Tests failed"
+          value={fmtCompact(s?.tests_failed)}
+          tip="failing tests reported in tool output"
+        />
+        <Stat
+          label="Compile errors"
+          value={fmtCompact(s?.compile_errors)}
+          tip="rustc / tsc diagnostics seen in tool output"
+        />
+        <Stat
+          label="Interventions"
+          value={fmtCompact(s?.interventions)}
+          sub="you stepped in"
+          tip="messages carrying an interruption or correction"
+        />
+        <Stat
+          label="Compactions"
+          value={fmtCompact(s?.compactions)}
+          sub="context ran out"
+          tip="the agent had to compact its context"
+        />
+        <Stat
+          label="Denials"
+          value={fmtCompact(s?.denials)}
+          sub="not permitted"
+          tip="tool calls the agent was not allowed to make"
+        />
+      </SimpleGrid>
+
       {/* ── flight strip: is the machine flying, right now? ────── */}
       <SimpleGrid cols={{ base: 2, md: 3, lg: 5 }} mb="md">
         <Stat
@@ -313,6 +498,255 @@ export default function StatusPage() {
               mono
               empty="no shell calls in this window"
             />
+          </Card>
+        </Grid.Col>
+      </Grid>
+
+      {/* ── churn: is the work accumulating, or being redone? ─── */}
+      <Grid mb="md" gap="md">
+        <Grid.Col span={{ base: 12, lg: 8 }}>
+          <Card withBorder h="100%">
+            <Group justify="space-between" mb="xs">
+              <Title order={5}>Code churn — added against replaced</Title>
+              <Text size="xs" c="dimmed">
+                per hour · {windowNote}
+              </Text>
+            </Group>
+            <EChart
+              height={210}
+              option={{
+                grid: { left: 52, right: 12, top: 18, bottom: 26 },
+                tooltip: { ...TOOLTIP, trigger: 'axis' },
+                legend: {
+                  data: ['added', 'replaced'],
+                  textStyle: { color: INK_MUTED },
+                  right: 0,
+                  top: -2,
+                },
+                xAxis: {
+                  type: 'category',
+                  data: (s?.churn ?? []).map((p) => p.t.slice(11) + ':00'),
+                  axisLabel: { color: AXIS },
+                  axisLine: { lineStyle: { color: GRID_LINE } },
+                },
+                yAxis: {
+                  type: 'value',
+                  axisLabel: { color: AXIS },
+                  splitLine: { lineStyle: { color: GRID_LINE } },
+                },
+                series: [
+                  {
+                    name: 'added',
+                    type: 'bar',
+                    stack: 'churn',
+                    data: (s?.churn ?? []).map((p) => Number(p.added)),
+                    itemStyle: { color: OK },
+                  },
+                  {
+                    // Drawn below the axis so the two read as opposing
+                    // forces rather than a sum.
+                    name: 'replaced',
+                    type: 'bar',
+                    stack: 'churn',
+                    data: (s?.churn ?? []).map((p) => -Number(p.removed)),
+                    itemStyle: { color: FAIL },
+                  },
+                ],
+              }}
+            />
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 4 }}>
+          <Card withBorder h="100%">
+            <Title order={5} mb="xs">
+              Churn ratio
+            </Title>
+            <Group gap="sm" align="baseline">
+              <Text fz={44} fw={700} ff="monospace" c={churnTone}>
+                {churnPct == null ? '—' : `${churnPct}%`}
+              </Text>
+              <Text size="sm" c="dimmed">
+                {churnRead}
+              </Text>
+            </Group>
+            <Tooltip label="replaced ÷ (added + replaced) — 0% is all new code" withArrow>
+              <div style={{ background: '#2A1235', borderRadius: 3, height: 10, marginTop: 6 }}>
+                <div
+                  style={{
+                    width: `${churnPct ?? 0}%`,
+                    background: churnTone,
+                    borderRadius: 3,
+                    height: 10,
+                  }}
+                />
+              </div>
+            </Tooltip>
+            <SimpleGrid cols={2} spacing="xs" mt="md">
+              <Tooltip label="edits whose work a later edit threw away — a flip-flop counts twice" withArrow>
+                <div>
+                  <Counter label="Work undone" value={s?.reverts} tone={s && Number(s.reverts) > 0 ? FAIL : undefined} />
+                </div>
+              </Tooltip>
+              <Tooltip label="files touched three or more times in this window" withArrow>
+                <div>
+                  <Counter label="Thrash files" value={s?.thrash_files} />
+                </div>
+              </Tooltip>
+              <Tooltip label="output tokens spent per line of code that survived" withArrow>
+                <div>
+                  <Counter label="Tokens / line" value={tokensPerLine ?? undefined} />
+                </div>
+              </Tooltip>
+              <div>
+                <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
+                  Tests / 100 lines
+                </Text>
+                <Text fz={22} fw={700} ff="monospace">
+                  {testsPer100 == null ? '—' : testsPer100}
+                </Text>
+              </div>
+            </SimpleGrid>
+            {s?.top_repeat && (
+              <Tooltip label="the same command, over and over — the shape of fighting something" withArrow>
+                <Group gap="xs" mt="md" wrap="nowrap">
+                  <Badge color="orange" variant="light">
+                    ×{String(s.top_repeat.value)}
+                  </Badge>
+                  <Text size="sm" ff="monospace" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {s.top_repeat.name}
+                  </Text>
+                </Group>
+              </Tooltip>
+            )}
+            <Group gap="lg" mt="md">
+              <Counter label="Agents at once" value={s?.max_concurrent_sessions} />
+              <div>
+                <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
+                  Longest quiet
+                </Text>
+                <Text fz={22} fw={700} ff="monospace">
+                  {s ? `${s.longest_quiet_mins}m` : '—'}
+                </Text>
+              </div>
+            </Group>
+          </Card>
+        </Grid.Col>
+      </Grid>
+
+      {/* ── many agents, many repos: one row each ─────────────── */}
+      <Grid mb="md" gap="md">
+        <Grid.Col span={{ base: 12, lg: 7 }}>
+          <Card withBorder h="100%">
+            <Group justify="space-between" mb="xs">
+              <Title order={5}>Repos worked</Title>
+              <Text size="xs" c="dimmed">
+                one busy repo should not hide a thrashing one
+              </Text>
+            </Group>
+            <Table striped highlightOnHover>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>Repo</Table.Th>
+                  <Table.Th ta="right">Agents</Table.Th>
+                  <Table.Th ta="right">Msgs</Table.Th>
+                  <Table.Th ta="right">+/−</Table.Th>
+                  <Table.Th ta="right">Churn</Table.Th>
+                  <Table.Th ta="right">Files</Table.Th>
+                  <Table.Th ta="right">Tests</Table.Th>
+                  <Table.Th ta="right">Fails</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {(s?.repos ?? []).map((r) => {
+                  const a = Number(r.lines_added)
+                  const d = Number(r.lines_removed)
+                  const pct = a + d > 0 ? Math.round((d * 100) / (a + d)) : null
+                  return (
+                    <Table.Tr key={r.name}>
+                      <Table.Td>
+                        <Text size="xs" ff="monospace">
+                          {r.name}
+                        </Text>
+                        {r.branch && (
+                          <Text size="xs" c="dimmed">
+                            {r.branch}
+                          </Text>
+                        )}
+                      </Table.Td>
+                      <Table.Td ta="right">{String(r.agents)}</Table.Td>
+                      <Table.Td ta="right">{fmtCompact(r.messages)}</Table.Td>
+                      <Table.Td ta="right">
+                        <Text span size="xs" c={OK}>
+                          +{fmtCompact(a)}
+                        </Text>{' '}
+                        <Text span size="xs" c={FAIL}>
+                          −{fmtCompact(d)}
+                        </Text>
+                      </Table.Td>
+                      <Table.Td ta="right" c={pct != null && pct >= 50 ? 'red.4' : undefined}>
+                        {pct == null ? '—' : `${pct}%`}
+                      </Table.Td>
+                      <Table.Td ta="right">{String(r.files_touched)}</Table.Td>
+                      <Table.Td ta="right">{String(r.tests_run)}</Table.Td>
+                      <Table.Td ta="right" c={Number(r.tool_failures) > 0 ? 'red.4' : undefined}>
+                        {String(r.tool_failures)}
+                      </Table.Td>
+                    </Table.Tr>
+                  )
+                })}
+              </Table.Tbody>
+            </Table>
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 5 }}>
+          <Card withBorder h="100%">
+            <Group justify="space-between" mb="xs">
+              <Title order={5}>Model against model</Title>
+              <Text size="xs" c="dimmed">
+                which one produces keepable code
+              </Text>
+            </Group>
+            <Table striped>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>Model</Table.Th>
+                  <Table.Th ta="right">Churn</Table.Th>
+                  <Table.Th ta="right">Tok/line</Table.Th>
+                  <Table.Th ta="right">Undone</Table.Th>
+                  <Table.Th ta="right">Fails</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {(s?.models ?? []).map((m) => {
+                  const a = Number(m.lines_added)
+                  const d = Number(m.lines_removed)
+                  const pct = a + d > 0 ? Math.round((d * 100) / (a + d)) : null
+                  const tpl = a > 0 ? Math.round(Number(m.out_tokens) / a) : null
+                  return (
+                    <Table.Tr key={m.name}>
+                      <Table.Td>
+                        <Text size="xs" ff="monospace">
+                          {m.name}
+                        </Text>
+                        <Text size="xs" c="dimmed">
+                          {fmtCompact(m.messages)} msgs · +{fmtCompact(a)} lines
+                        </Text>
+                      </Table.Td>
+                      <Table.Td ta="right" c={pct != null && pct >= 50 ? 'red.4' : undefined}>
+                        {pct == null ? '—' : `${pct}%`}
+                      </Table.Td>
+                      <Table.Td ta="right">{tpl ?? '—'}</Table.Td>
+                      <Table.Td ta="right" c={Number(m.reverts) > 0 ? 'orange.4' : undefined}>
+                        {String(m.reverts)}
+                      </Table.Td>
+                      <Table.Td ta="right" c={Number(m.tool_failures) > 0 ? 'red.4' : undefined}>
+                        {String(m.tool_failures)}
+                      </Table.Td>
+                    </Table.Tr>
+                  )
+                })}
+              </Table.Tbody>
+            </Table>
           </Card>
         </Grid.Col>
       </Grid>
