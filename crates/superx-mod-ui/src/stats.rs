@@ -81,26 +81,79 @@ fn block_lines(name: &str, input: &Object) -> i64 {
 /// Classify a shell command into the tool and, where it carries one,
 /// its subcommand — `git commit`, `cargo test` — so the mix reads the
 /// way a developer thinks about their own day (issue #308).
-fn command_label(cmd: &str) -> Option<String> {
-    // Take the first pipeline stage and drop leading env assignments.
-    let head = cmd
-        .split(['|', ';', '&'])
-        .next()
-        .unwrap_or("")
-        .trim();
-    let mut parts = head
+///
+/// Real agent shells are chains: `cd repo && cargo test`. A naive
+/// "first stage" read labels that `cd`, which buries the actual work
+/// (the review of #311 found the command mix collapsing into one `cd`
+/// bar). So every stage is returned, with the pure-navigation ones
+/// dropped.
+fn command_labels(cmd: &str) -> Vec<String> {
+    cmd.split(SEQUENCERS)
+        .filter_map(stage_label)
+        .collect()
+}
+
+/// `&&`, `||`, `;`, `|` and newlines all separate stages. Splitting on
+/// the single chars covers the doubled operators too — the empty
+/// stage between them simply yields no label.
+const SEQUENCERS: [char; 5] = ['|', ';', '&', '\n', '\r'];
+
+/// Shell noise that is not the program: grouping, env prefixes, and
+/// wrappers that take the real command as their argument.
+const WRAPPERS: [&str; 8] = ["(", ")", "{", "}", "sudo", "time", "env", "nohup"];
+
+/// Flags whose NEXT token is a value, not a subcommand — `git -C dir
+/// status` must read `git status`, not `git dir`.
+const VALUE_FLAGS: [&str; 6] = ["-C", "-c", "--git-dir", "--work-tree", "-f", "--file"];
+
+/// One stage of a chain, or `None` when the stage is only navigation,
+/// shell punctuation, or empty.
+fn stage_label(stage: &str) -> Option<String> {
+    let mut words = stage
         .split_whitespace()
-        .skip_while(|w| w.contains('=') || *w == "sudo" || *w == "time");
-    let prog_path = parts.next()?;
+        .map(|w| w.trim_matches(|c| c == '(' || c == ')' || c == '{' || c == '}'))
+        .filter(|w| !w.is_empty())
+        .skip_while(|w| w.contains('=') || WRAPPERS.contains(w));
+    let prog_path = words.next()?;
     let prog = prog_path.rsplit('/').next().unwrap_or(prog_path);
-    if prog.is_empty() {
+    // Navigation is not work; `cd repo && cargo test` is one call
+    // about cargo.
+    if prog.is_empty() || matches!(prog, "cd" | "pushd" | "popd" | "export" | "source" | ".") {
         return None;
     }
-    // For multiplexers the verb is the information.
-    const SUBCOMMANDED: [&str; 8] = ["git", "cargo", "npm", "npx", "docker", "go", "gh", "pnpm"];
+    const SUBCOMMANDED: [&str; 9] = [
+        "git", "cargo", "npm", "npx", "docker", "go", "gh", "pnpm", "yarn",
+    ];
     if SUBCOMMANDED.contains(&prog) {
-        if let Some(sub) = parts.find(|w| !w.starts_with('-')) {
-            return Some(format!("{prog} {sub}"));
+        // Walk the tokens, stepping over flags AND the values that
+        // belong to them, until a bare word appears.
+        let mut skip_next = false;
+        while let Some(w) = words.next() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if VALUE_FLAGS.contains(&w) {
+                skip_next = true;
+                continue;
+            }
+            if w.starts_with('-') {
+                continue;
+            }
+            // A path is an argument, never a subcommand.
+            if w.contains('/') || w.starts_with('.') {
+                continue;
+            }
+            // `npm run build` and `npm run dev` are different work;
+            // keep the script name rather than collapsing both to
+            // `npm run` (which also hid the verb from the build
+            // classifier — review of #311).
+            if w == "run" {
+                if let Some(script) = words.find(|x| !x.starts_with('-')) {
+                    return Some(format!("{prog} run {script}"));
+                }
+            }
+            return Some(format!("{prog} {w}"));
         }
     }
     Some(prog.to_string())
@@ -121,8 +174,10 @@ fn classify_command(label: &str) -> (bool, bool, bool) {
 /// The extension of a path, lowercased — the language proxy.
 fn extension_of(path: &str) -> Option<String> {
     let file = path.rsplit('/').next()?;
-    let (_, ext) = file.rsplit_once('.')?;
-    if ext.is_empty() || ext.len() > 12 || ext.contains(' ') {
+    // A dotfile has no extension: `.gitignore` is a name, not a
+    // language (review of #311).
+    let (stem, ext) = file.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() || ext.len() > 12 || ext.contains(' ') {
         return None;
     }
     Some(ext.to_ascii_lowercase())
@@ -398,7 +453,9 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
                                 }
                                 // The shell command it ran.
                                 if let Some(cmd) = get_str(input, "command") {
-                                    if let Some(label) = command_label(cmd) {
+                                    // Every stage of the chain counts —
+                                    // `cd repo && cargo test` is a test run.
+                                    for label in command_labels(cmd) {
                                         let (is_test, is_build, is_git) = classify_command(&label);
                                         if is_test {
                                             code.tests += 1;
@@ -552,7 +609,11 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
         let rows: Vec<Value> = kernel
             .db()
             .query(
-                "SELECT time::hour(valid_from) AS h FROM message \
+                // (day, hour), not hour alone: in a rolling 24-hour
+                // window the same clock hour occurs twice, and
+                // collapsing them caps a round-the-clock operator
+                // below 24 (review of #311).
+                "SELECT time::format(valid_from, '%Y-%m-%dT%H') AS h FROM message \
                  WHERE valid_from > time::now() - 24h GROUP BY h",
             )
             .await?

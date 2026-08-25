@@ -993,5 +993,84 @@ async fn cockpit_instruments_read_the_work() {
     // 24×7 instruments: everything just written is inside the hour.
     assert!(s.messages_last_hour >= 8, "got {}", s.messages_last_hour);
     assert!(s.tokens_last_hour >= 120, "got {}", s.tokens_last_hour);
-    assert_eq!(s.active_hours_24h, 1, "one distinct hour of activity");
+    // One hour of work — but a run that straddles :59:59 → :00:00
+    // legitimately touches two buckets, so this must not be `== 1`.
+    assert!(
+        (1..=2).contains(&s.active_hours_24h),
+        "one hour of work, two if the run crossed the boundary: {}",
+        s.active_hours_24h
+    );
+}
+
+/// The shell shapes agents actually emit (review of #311). `cd repo &&
+/// cargo test` used to label `cd` and score zero tests, which made the
+/// whole command mix read wrong on real data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_mix_reads_real_agent_shells() {
+    struct Case {
+        cmd: &'static str,
+        expect: &'static [&'static str],
+        tests: i64,
+        builds: i64,
+        git: i64,
+    }
+    const CASES: &[Case] = &[
+        // The chain — the common case, and the one that was broken.
+        Case { cmd: "cd /Users/x/repo && cargo test --workspace",
+               expect: &["cargo test"], tests: 1, builds: 0, git: 0 },
+        Case { cmd: "cd frontend && npm run build",
+               expect: &["npm run build"], tests: 0, builds: 1, git: 0 },
+        // A flag's VALUE is not a subcommand.
+        Case { cmd: "git -C /repo status",
+               expect: &["git status"], tests: 0, builds: 0, git: 1 },
+        // Subshell punctuation is not a program.
+        Case { cmd: "( cd x && make )",
+               expect: &["make"], tests: 0, builds: 1, git: 0 },
+        // Every stage of a chain counts.
+        Case { cmd: "cargo build --release && cargo test && git push",
+               expect: &["cargo build", "cargo test", "git push"], tests: 1, builds: 1, git: 1 },
+        // Env prefixes and pipes.
+        Case { cmd: "RUST_LOG=debug cargo clippy -- -D warnings | tail -5",
+               expect: &["cargo clippy", "tail"], tests: 0, builds: 0, git: 0 },
+        // Plain program, no subcommand vocabulary.
+        Case { cmd: "python3 tools/skill_audit.py",
+               expect: &["python3"], tests: 0, builds: 0, git: 0 },
+    ];
+
+    for c in CASES {
+        let kernel = fresh_kernel().await;
+        let agent = kernel.create_entity("node_agent").await.expect("agent");
+        let session = kernel.create_entity("node_session").await.expect("session");
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "message": {"content": [{"type": "tool_use", "id": "b", "name": "Bash",
+                "input": {"command": c.cmd}}]}
+        })).await;
+        let s = superx_mod_ui::stats::stats_summary(&kernel, 100).await.expect("stats");
+        let got: Vec<&str> = s.commands.iter().map(|x| x.name.as_str()).collect();
+        for want in c.expect {
+            assert!(got.contains(want), "`{}` → {got:?}, expected to contain {want:?}", c.cmd);
+        }
+        assert_eq!(got.len(), c.expect.len(), "`{}` → {got:?}", c.cmd);
+        assert_eq!(s.tests_run, c.tests, "tests for `{}`", c.cmd);
+        assert_eq!(s.builds_run, c.builds, "builds for `{}`", c.cmd);
+        assert_eq!(s.git_ops, c.git, "git for `{}`", c.cmd);
+    }
+}
+
+/// A dotfile is a name, not a language (review of #311).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dotfiles_are_not_languages() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    for path in ["/repo/.gitignore", "/repo/src/main.rs"] {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
+                "input": {"file_path": path, "old_string": "a", "new_string": "b"}}]}
+        })).await;
+    }
+    let s = superx_mod_ui::stats::stats_summary(&kernel, 100).await.expect("stats");
+    let langs: Vec<&str> = s.languages.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(langs, vec!["rs"], "only the real extension counts: {langs:?}");
+    assert_eq!(s.files_touched, 2, "both files still counted as touched");
 }
