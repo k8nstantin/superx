@@ -208,7 +208,12 @@ function FieldRow({
             <Badge size="xs" variant="light" ff="monospace">
               {field.value_kind}
             </Badge>
-            {field.semantics && (
+            {/* `data` is the DEFAULT for every value field — "a value
+                you compute with" — so the badge said nothing and made
+                `budget NUMBER DATA` look like two things to understand
+                instead of one. The other semantics change how an agent
+                must TREAT the value (§5.2), so those still show. */}
+            {field.semantics && field.semantics !== 'data' && (
               <Tooltip label={SEMANTICS_HELP[field.semantics] ?? field.semantics}>
                 <Badge
                   size="xs"

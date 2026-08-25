@@ -192,6 +192,10 @@ function DefineLabel({
   const [key, setKey] = useState('')
   const [display, setDisplay] = useState('')
   const [semantics, setSemantics] = useState<string | null>(null)
+  // Once the operator picks a semantics themselves, the kind stops
+  // overwriting it — a default that fights a decision is worse than no
+  // default.
+  const [semanticsTouched, setSemanticsTouched] = useState(false)
   const [valueKind, setValueKind] = useState<string | null>(null)
   const [cardinality, setCardinality] = useState<string | null>('one')
   const [description, setDescription] = useState('')
@@ -257,7 +261,11 @@ function DefineLabel({
         value={kind}
         onChange={(v) => {
           setKind(v ?? 'slot')
+          // Slot and link have different closed vocabularies, so the
+          // choice cannot carry over — and the default is free to
+          // apply again.
           setSemantics(null)
+          setSemanticsTouched(false)
         }}
         mb="xs"
       />
@@ -276,14 +284,6 @@ function DefineLabel({
         onChange={(e) => setDisplay(e.currentTarget.value)}
         mb="xs"
       />
-      <Select
-        label="Semantics"
-        description={semantics ? SEMANTICS_HELP[semantics] : 'how an agent must TREAT it'}
-        data={semanticsChoices}
-        value={semantics}
-        onChange={setSemantics}
-        mb="xs"
-      />
       {isSlot ? (
         <>
           <Select
@@ -291,7 +291,17 @@ function DefineLabel({
             description="prose becomes a versioned note; a value lives in the attributes bag"
             data={kindChoices}
             value={valueKind}
-            onChange={setValueKind}
+            onChange={(k) => {
+              setValueKind(k)
+              // A plain value is `data` — "a value you compute with" —
+              // and prose read for background is `context`. Filled in
+              // so the common case is name + kind; still a Select, so
+              // a mandate or a directive is one click away.
+              if (k && !semanticsTouched) {
+                const prose = (vocab?.prose_kinds ?? []).includes(k)
+                setSemantics(prose ? 'context' : 'data')
+              }
+            }}
             mb="xs"
           />
           <Select
@@ -339,6 +349,25 @@ function DefineLabel({
           />
         </>
       )}
+      {/* AFTER the kind, because the kind answers it most of the time.
+          This is the question that matters when it is NOT `data`: a
+          mandate binds and cannot be edited, a playbook is the role's
+          own to refine — same kind, opposite meaning (§5.2). */}
+      <Select
+        label="How an agent must treat it"
+        description={
+          semantics
+            ? SEMANTICS_HELP[semantics]
+            : 'filled in from the kind — change it for a mandate, a directive or a secret'
+        }
+        data={semanticsChoices}
+        value={semantics}
+        onChange={(v) => {
+          setSemantics(v)
+          setSemanticsTouched(true)
+        }}
+        mb="xs"
+      />
       <Textarea
         label="Description"
         placeholder="what this term means, for whoever reads it next"
