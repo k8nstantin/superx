@@ -1596,3 +1596,174 @@ async fn a_cycle_that_predates_the_rule_is_found() {
         findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
     );
 }
+
+/// THE OPERATOR'S OWN EXAMPLE, end to end (2026-08-25):
+///
+///   "I create a root entity of `role` — DBA, database administrator.
+///    That entity will have sub-entities and tasks, another label
+///    `task`. All labels. That role is loaded with descriptions and sub
+///    types and tasks and linked models and RAGs and a repository. Then
+///    that role can take over the database management by using all
+///    entities. And what are the databases it is managing? Another
+///    entity with a label `resource`. And we can have many labels per
+///    entity."
+///
+/// This is the shape the whole design exists to hold. If it cannot be
+/// expressed, nothing downstream matters — "we don't get entities right
+/// and how they're linked, the runner is fucked and the graph is
+/// fucked".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_role_is_specialised_out_of_entities_and_labels() {
+    use superx_mod_entities::dictionary::Definition;
+    use superx_mod_entities::{api, dictionary, edges, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    // `role` and `resource` are LABELS, defined like any other. Nothing
+    // in the code knows what a DBA is.
+    for (key, note) in [
+        ("role", "This is who you are. Act within it and nothing beyond it."),
+        ("resource", "This is what you act ON. Change it only as your tasks say."),
+    ] {
+        dictionary::define(&db, Definition {
+            key,
+            kind: dictionary::LABEL,
+            display: key,
+            semantics: "context",
+            agent_note: Some(note),
+            ..Default::default()
+        })
+        .await
+        .expect("define");
+    }
+
+    // THE ROOT. A product-typed anchor labelled `role` — the type is the
+    // first label it carries, and `role` is another.
+    let dba = nodes::create_entity(&db, "product", "DBA", None, None).await.expect("root");
+    let dba_frag = superx_ops::record_uuid(&dba);
+    api::set_entity_labels(&db, &dba_frag, &["role".to_string()]).await.expect("label it");
+
+    // Loaded with prose and with fields it needs.
+    superx_mod_entities::texts::set_role_text(&db, &dba, "describes", "runs the databases")
+        .await
+        .expect("describe");
+    api::add_field(&db, &dba_frag, &api::FieldReq {
+        key: "house_rules".into(),
+        value: "never drop a table without a snapshot".into(),
+        value_kind: Some("string".into()),
+        labels: Some(vec!["mandate".into()]),
+    })
+    .await
+    .expect("what it may never do");
+
+    // SUB-ENTITIES and TASKS beneath it.
+    let subrole = nodes::create_entity(&db, "product", "Backups", None, None).await.expect("sub");
+    api::set_entity_labels(&db, &superx_ops::record_uuid(&subrole), &["role".to_string()])
+        .await
+        .expect("also a role");
+    let task = nodes::create_entity(&db, "task", "Nightly verify", None, None).await.expect("t");
+    edges::link(&db, &dba, &subrole, "contains").await.expect("subrole");
+    edges::link(&db, &subrole, &task, "contains").await.expect("its task");
+
+    // WHAT IT CONSULTS: a model, a rag, a repo.
+    for (kind, name) in [("model", "opus"), ("rag", "runbooks"), ("repo", "schemas")] {
+        let it = nodes::create_entity(&db, kind, name, None, None).await.expect("thing");
+        edges::link(&db, &dba, &it, "consults").await.expect("consults");
+    }
+
+    // WHAT IT ACTS ON: the databases, labelled `resource`.
+    let prod_db = nodes::create_entity(&db, "repo", "prod-postgres", None, None).await.expect("r");
+    api::set_entity_labels(&db, &superx_ops::record_uuid(&prod_db), &["resource".to_string()])
+        .await
+        .expect("a resource");
+    edges::link(&db, &dba, &prod_db, "linked").await.expect("it manages this");
+
+    // --- and now READ IT BACK the way an agent would ------------------
+    let d = api::detail(&db, &dba_frag).await.expect("detail");
+    assert_eq!(d.labels, vec!["role".to_string()], "what it is, beyond its anchor type");
+    assert_eq!(
+        d.label_actions[0].action.as_deref(),
+        Some("This is who you are. Act within it and nothing beyond it."),
+        "and what an agent does about being that"
+    );
+
+    // Its mandate, resolved to an action.
+    let fields = api::entity_fields(&db, &dba_frag).await.expect("fields");
+    let rules = fields.iter().find(|f| f.key == "house_rules").expect("there");
+    assert_eq!(rules.actions[0].semantics, "binding", "a mandate BINDS");
+
+    // Everything it is linked to, from one walk.
+    let sub = superx_mod_entities::graph::subgraph(&db, &dba, 3, false).await.expect("walk");
+    let names: Vec<&str> = sub.nodes.iter().map(|n| n.name.as_str()).collect();
+    for expected in ["DBA", "Backups", "Nightly verify", "opus", "runbooks", "schemas",
+                     "prod-postgres"] {
+        assert!(names.contains(&expected), "{expected} is in the role's world: {names:?}");
+    }
+
+    // MANY LABELS PER ENTITY: the same thing is a role AND a resource,
+    // and both are true at once.
+    api::set_entity_labels(&db, &dba_frag, &["role".to_string(), "resource".to_string()])
+        .await
+        .expect("both");
+    let carried = nodes::labels_of(&db, &dba).await.expect("labels");
+    assert_eq!(
+        carried,
+        vec!["product".to_string(), "role".to_string(), "resource".to_string()],
+        "its anchor type first, then everything else it is"
+    );
+}
+
+/// Endpoint rules resolve by MEMBERSHIP, so a rule written about `role`
+/// holds for anything labelled `role` — whatever its anchor type is.
+/// Written against a single answer to "what is this", the DBA above
+/// would have been a `product` and no rule about roles could reach it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rule_written_about_a_label_reaches_whatever_carries_it() {
+    use superx_mod_entities::dictionary::Definition;
+    use superx_mod_entities::{api, dictionary, edges, nodes, registry};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    dictionary::define(&db, Definition {
+        key: "role",
+        kind: dictionary::LABEL,
+        display: "role",
+        semantics: "context",
+        ..Default::default()
+    })
+    .await
+    .expect("define");
+    dictionary::define(&db, Definition {
+        key: "supervises",
+        kind: dictionary::LABEL,
+        display: "supervises",
+        semantics: "governance",
+        source_types: Some(&["role".to_string()]),
+        ..Default::default()
+    })
+    .await
+    .expect("only a role supervises");
+    registry::add_type(&db, "supervises", "relation", None).await.expect("relation");
+
+    // A product-typed anchor LABELLED `role`.
+    let dba = nodes::create_entity(&db, "product", "DBA", None, None).await.expect("p");
+    api::set_entity_labels(&db, &superx_ops::record_uuid(&dba), &["role".to_string()])
+        .await
+        .expect("label");
+    let task = nodes::create_entity(&db, "task", "Verify", None, None).await.expect("t");
+
+    edges::link(&db, &dba, &task, "supervises")
+        .await
+        .expect("it carries `role`, so the rule about roles reaches it");
+
+    // Something that does NOT carry it is refused, and the refusal says
+    // what the thing actually is.
+    let plain = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p2");
+    let err = edges::link(&db, &plain, &task, "supervises")
+        .await
+        .expect_err("a plain product does not supervise");
+    assert!(err.to_string().contains("product"), "{err}");
+    assert!(err.to_string().contains("role"), "{err}");
+}

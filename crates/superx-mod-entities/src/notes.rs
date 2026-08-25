@@ -554,13 +554,26 @@ async fn require_label(db: &Db, label: &str) -> Result<dictionary::LabelRow> {
     if let Some(defined) = dictionary::find(db, label).await? {
         return Ok(defined);
     }
-    if dictionary::revision(db).await? == 0 {
+    // SEED WHEN THE SHIPPED VOCABULARY IS MISSING, not when the
+    // dictionary is empty.
+    //
+    // The empty test was right until #333 made seeding a TYPE also
+    // define its label: a provisioned-but-never-started instance then
+    // had labels — `product`, `task` — while `description` and the rest
+    // were still absent, so the dictionary no longer looked empty and
+    // the heal never fired. A provisioned instance could not be
+    // described, which is exactly the state this exists for.
+    //
+    // Asking whether the shipped vocabulary is there answers the real
+    // question, and it stays right however the rest of the dictionary
+    // fills up.
+    if !dictionary::shipped_is_present(db).await? {
         let seeded = dictionary::seed(db).await?;
         tracing::info!(
             target: "entities",
             seeded,
             label,
-            "dictionary was never seeded — shipped vocabulary applied before the first prose write"
+            "shipped vocabulary was missing — applied before the first prose write"
         );
         if let Some(defined) = dictionary::find(db, label).await? {
             return Ok(defined);

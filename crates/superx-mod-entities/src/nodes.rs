@@ -248,6 +248,28 @@ pub async fn update_entity(
     .await
 }
 
+/// EVERYTHING THIS ENTITY IS, as a set of labels.
+///
+/// Its `entity_type` is the first — immutable, and what every existing
+/// row already carries — and `entity_state.labels` are the rest. One
+/// answer to "what is this", assembled from one vocabulary rather than
+/// a registry on one side and a label list on the other.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn labels_of(db: &Db, anchor: &RecordId) -> Result<Vec<String>> {
+    let (entity_type, _) = anchor_info(db, anchor).await?;
+    let mut out = vec![entity_type];
+    if let Some(state) = current_state(db, anchor).await? {
+        for l in state.labels {
+            if !out.contains(&l) {
+                out.push(l);
+            }
+        }
+    }
+    Ok(out)
+}
 /// Set the labels an entity carries (#324).
 ///
 /// Everything else carries forward: this is one decision, and a write

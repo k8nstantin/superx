@@ -413,6 +413,25 @@ const SEEDED: &[Seed] = &[
     },
 ];
 
+/// Is the vocabulary SuperX ships with present?
+///
+/// Not "is the dictionary empty": since #333 a provisioned instance has
+/// labels for its types before anything has seeded the shipped
+/// vocabulary, so emptiness stopped being the question. This asks the
+/// one that matters — can prose written right now be interpreted.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn shipped_is_present(db: &Db) -> Result<bool> {
+    for s in SEEDED {
+        if find(db, s.key).await?.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Seed the shipped dictionary; returns how many rows were new.
 /// Idempotent — a label that already has a chain is left alone, so
 /// re-provisioning never resurrects a definition the operator changed.

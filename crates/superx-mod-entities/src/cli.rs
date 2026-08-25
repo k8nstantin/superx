@@ -18,7 +18,8 @@ const DEFAULT_MAX_DEPTH: usize = 5; // skill-allow: §9-const — bootstrap fall
 const ANCESTOR_MAX_DEPTH: usize = 12; // skill-allow: §9-const — render-layer bound, not a policy tunable
 
 const USAGE: &str = "usage: superx entities <command>\n\
-  create --type <type> [--describe <text>] [--content <text>] [--attrs <json>] <name…>\n\
+  create --type <type> [--label a,b] [--describe <text>] [--content <text>]\n\
+         [--attrs <json>] <name…>   --label is everything else it IS\n\
   update <uuid-fragment> [--name <name>] [--content <text>] [--attrs <json>]\n\
          (--attrs REPLACES the whole attributes object; omit to keep it)\n\
   show <uuid-fragment> [--history] [--as-of <rfc3339>]\n\
@@ -634,6 +635,10 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let mut describe = None;
     let mut content = None;
     let mut attrs = None;
+    // Everything else this thing IS (#333). "I create a root entity of
+    // `role` — DBA. The database it manages is another entity with a
+    // label `resource`. And we can have many labels per entity."
+    let mut labels: Vec<String> = Vec::new();
     let mut name_words: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -654,6 +659,14 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
                 attrs = Some(next_value(args, i)?);
                 i += 2;
             }
+            "--label" => {
+                labels = next_value(args, i)?
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                i += 2;
+            }
             word => {
                 name_words.push(word.to_string());
                 i += 1;
@@ -670,6 +683,10 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let anchor = nodes::create_entity(&db, &entity_type, &name, content, attributes).await?;
     let uuid = record_uuid(&anchor);
     emit(kernel, "entity_created", &uuid, &entity_type, &name).await;
+    if !labels.is_empty() {
+        nodes::set_labels(&db, &anchor, &labels).await?;
+        emit(kernel, "entity_labelled", &uuid, &entity_type, &labels.join(",")).await;
+    }
     if let Some(text) = describe {
         // One event, and it names what happened: prose was written on
         // this entity. The pair that used to go out here — an

@@ -80,20 +80,27 @@ async fn enforce_link_label(
         return Ok(());
     };
 
+    // BY MEMBERSHIP (#333). "Starts at: role" asks whether the thing
+    // CARRIES the label `role`, not whether that is the single answer to
+    // what it is — a DBA labelled both `role` and `resource` satisfies a
+    // rule written about either. An entity is a set of labels: its
+    // immutable type first, then everything else it is labelled with.
     if !label.source_types.is_empty() {
-        let (kind, _) = crate::nodes::anchor_info(db, from).await?;
-        if !label.source_types.contains(&kind) {
+        let carried = crate::nodes::labels_of(db, from).await?;
+        if !carried.iter().any(|l| label.source_types.contains(l)) {
             return Err(KernelError::Module(format!(
-                "'{rel_type}' does not start at a {kind} — it starts at: {}",
+                "'{rel_type}' does not start at {} — it starts at: {}",
+                carried.join(" + "),
                 label.source_types.join(", ")
             )));
         }
     }
     if !label.target_types.is_empty() {
-        let (kind, _) = crate::nodes::anchor_info(db, to).await?;
-        if !label.target_types.contains(&kind) {
+        let carried = crate::nodes::labels_of(db, to).await?;
+        if !carried.iter().any(|l| label.target_types.contains(l)) {
             return Err(KernelError::Module(format!(
-                "'{rel_type}' does not point at a {kind} — it points at: {}",
+                "'{rel_type}' does not point at {} — it points at: {}",
+                carried.join(" + "),
                 label.target_types.join(", ")
             )));
         }

@@ -59,6 +59,27 @@ pub async fn seed_types(db: &Db) -> Result<usize> {
         if insert_type(db, name, category, Some(description)).await? {
             created += 1;
         }
+        // AND AS A LABEL (#333). What a thing IS belongs in the same
+        // vocabulary as everything else about it: one list, so `product`
+        // can carry an action a runner reads exactly as `spec` does, and
+        // an entity's identity is simply the first label it carries.
+        //
+        // Defined only when nothing defines it yet, so a name the
+        // operator has already given a meaning is never overruled.
+        if crate::dictionary::find(db, name).await?.is_none() {
+            crate::dictionary::define(db, crate::dictionary::Definition {
+                key: name,
+                kind: crate::dictionary::LABEL,
+                display: name,
+                // What a thing IS is background an agent reads, not an
+                // instruction it obeys — a label that BINDS is a
+                // deliberate act, never a side effect of seeding.
+                semantics: "context",
+                description: Some(description),
+                ..Default::default()
+            })
+            .await?;
+        }
     }
     Ok(created)
 }
