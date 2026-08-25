@@ -893,3 +893,105 @@ async fn session_activity_never_bleeds_across_agents_sharing_a_source_key() {
         "agent B's session must NOT see agent A's action: {b:#?}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// The coder's instruments (issue #308) — what the window did to code.
+// ─────────────────────────────────────────────────────────────────────
+
+/// One captured assistant message carrying tool_use blocks, in the
+/// shape Claude Code actually writes.
+async fn log_tool_message(kernel: &Kernel, session: &superx_kernel::types::RecordId,
+                          agent: &superx_kernel::types::RecordId, raw: serde_json::Value) {
+    kernel
+        .log_message(superx_kernel::NewMessage {
+            session: session.clone(),
+            agent: agent.clone(),
+            role: "assistant".to_string(),
+            content: String::new(),
+            raw: Some(superx_kernel::message::json_to_object(&raw)),
+            seq: None,
+            emitted_at: None,
+        })
+        .await
+        .expect("message");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cockpit_instruments_read_the_work() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+
+    // An Edit: three lines replace one — added and removed are
+    // different numbers, which the old lines_written could not say.
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/Users/dev/projects/superx", "gitBranch": "feat/cockpit",
+        "message": {"usage": {"output_tokens": 120, "output_tokens_details": {"thinking_tokens": 45}},
+            "content": [{"type": "tool_use", "id": "t1", "name": "Edit",
+                "input": {"file_path": "/Users/dev/projects/superx/crates/mod/src/stats.rs",
+                          "old_string": "one line", "new_string": "a\nb\nc"}}]}
+    })).await;
+
+    // A test run, a build, and a git push — three shell classes.
+    for cmd in ["cargo test --workspace", "cargo build --release", "git push -u origin HEAD"] {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "cwd": "/Users/dev/projects/superx",
+            "message": {"content": [{"type": "tool_use", "id": "c", "name": "Bash",
+                "input": {"command": cmd}}]}
+        })).await;
+    }
+
+    // A read, an MCP call, a web fetch, a delegated subagent.
+    for (name, input) in [
+        ("Read", serde_json::json!({"file_path": "/Users/dev/projects/superx/README.md"})),
+        ("mcp__gdx__search", serde_json::json!({})),
+        ("WebFetch", serde_json::json!({})),
+        ("Task", serde_json::json!({})),
+    ] {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "cwd": "/Users/dev/projects/superx",
+            "message": {"content": [{"type": "tool_use", "id": "x", "name": name, "input": input}]}
+        })).await;
+    }
+
+    let s = superx_mod_ui::stats::stats_summary(&kernel, 500).await.expect("stats");
+
+    // Code output, with the add/remove split the old figure lacked.
+    assert_eq!(s.lines_added, 3, "new_string lines");
+    assert_eq!(s.lines_removed, 1, "old_string lines");
+    assert_eq!(s.files_touched, 2, "the edited file and the read one");
+    assert_eq!(s.writes_window, 1);
+    assert_eq!(s.reads_window, 1);
+
+    // Language and directory mix come from the paths themselves.
+    assert_eq!(s.languages.iter().find(|l| l.name == "rs").map(|l| l.value), Some(1));
+    assert_eq!(s.languages.iter().find(|l| l.name == "md").map(|l| l.value), Some(1));
+    assert!(s.dirs.iter().any(|d| d.name.ends_with("mod/src")), "{:?}", s.dirs);
+
+    // Commands carry their subcommand, and are classified.
+    let names: Vec<&str> = s.commands.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"cargo test"), "{names:?}");
+    assert!(names.contains(&"cargo build"), "{names:?}");
+    assert!(names.contains(&"git push"), "{names:?}");
+    assert_eq!(s.tests_run, 1);
+    assert_eq!(s.builds_run, 1);
+    assert_eq!(s.git_ops, 1);
+
+    // Call classes.
+    assert_eq!(s.mcp_calls, 1);
+    assert_eq!(s.web_calls, 1);
+    assert_eq!(s.subagent_calls, 1);
+    assert_eq!(s.thinking_tokens, 45);
+
+    // The project the work happened in, with its branch.
+    // One row per project, labelled with its newest branch — not one
+    // row per (project, branch) pair, which would split the count.
+    assert_eq!(s.projects.len(), 1, "{:?}", s.projects);
+    assert_eq!(s.projects[0].name, "superx · feat/cockpit");
+    assert_eq!(s.projects[0].value, 8, "every message counted once");
+
+    // 24×7 instruments: everything just written is inside the hour.
+    assert!(s.messages_last_hour >= 8, "got {}", s.messages_last_hour);
+    assert!(s.tokens_last_hour >= 120, "got {}", s.tokens_last_hour);
+    assert_eq!(s.active_hours_24h, 1, "one distinct hour of activity");
+}

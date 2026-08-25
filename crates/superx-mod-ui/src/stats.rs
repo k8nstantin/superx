@@ -26,6 +26,8 @@ const DEFAULT_ACTIVE_SECS: i64 = 300; // skill-allow: §9-const — bootstrap fa
 
 /// Tools whose input content counts as CODE WRITTEN.
 const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+/// Tools that inspect rather than change (issue #308).
+const READ_TOOLS: &[&str] = &["Read", "Glob", "Grep", "NotebookRead"];
 
 fn obj(v: &Value) -> Option<&Object> {
     match v {
@@ -70,6 +72,124 @@ fn block_lines(name: &str, input: &Object) -> i64 {
             .iter()
             .filter_map(|e| obj(e))
             .filter_map(|e| get_str(e, "new_string"))
+            .map(line_count)
+            .sum();
+    }
+    0
+}
+
+/// Classify a shell command into the tool and, where it carries one,
+/// its subcommand — `git commit`, `cargo test` — so the mix reads the
+/// way a developer thinks about their own day (issue #308).
+fn command_label(cmd: &str) -> Option<String> {
+    // Take the first pipeline stage and drop leading env assignments.
+    let head = cmd
+        .split(['|', ';', '&'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let mut parts = head
+        .split_whitespace()
+        .skip_while(|w| w.contains('=') || *w == "sudo" || *w == "time");
+    let prog_path = parts.next()?;
+    let prog = prog_path.rsplit('/').next().unwrap_or(prog_path);
+    if prog.is_empty() {
+        return None;
+    }
+    // For multiplexers the verb is the information.
+    const SUBCOMMANDED: [&str; 8] = ["git", "cargo", "npm", "npx", "docker", "go", "gh", "pnpm"];
+    if SUBCOMMANDED.contains(&prog) {
+        if let Some(sub) = parts.find(|w| !w.starts_with('-')) {
+            return Some(format!("{prog} {sub}"));
+        }
+    }
+    Some(prog.to_string())
+}
+
+/// Does this shell call run tests / build / drive git?
+fn classify_command(label: &str) -> (bool, bool, bool) {
+    let test = label.contains("test") || label.starts_with("pytest") || label.starts_with("jest");
+    let build = label.contains("build")
+        || label.contains("compile")
+        || label == "cargo check"
+        || label == "make"
+        || label.starts_with("tsc");
+    let git = label.starts_with("git") || label.starts_with("gh ");
+    (test, build, git)
+}
+
+/// The extension of a path, lowercased — the language proxy.
+fn extension_of(path: &str) -> Option<String> {
+    let file = path.rsplit('/').next()?;
+    let (_, ext) = file.rsplit_once('.')?;
+    if ext.is_empty() || ext.len() > 12 || ext.contains(' ') {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+/// The directory a path sits in, shortened to its last two segments.
+fn dir_of(path: &str) -> Option<String> {
+    let (dir, _) = path.rsplit_once('/')?;
+    let segs: Vec<&str> = dir.rsplit('/').take(2).collect();
+    if segs.is_empty() {
+        return None;
+    }
+    Some(segs.into_iter().rev().collect::<Vec<_>>().join("/"))
+}
+
+/// Top-N of a count map, descending, ties broken by name so the
+/// panel does not reshuffle between refreshes.
+fn top_n(map: HashMap<String, i64>, n: usize) -> Vec<NameCount> {
+    let mut v: Vec<NameCount> = map
+        .into_iter()
+        .map(|(name, value)| NameCount { name, value })
+        .collect();
+    v.sort_by(|a, b| b.value.cmp(&a.value).then(a.name.cmp(&b.name)));
+    v.truncate(n);
+    v
+}
+
+/// Everything the walk learns about the code itself.
+#[derive(Default)]
+struct CodeAgg {
+    lines_added: i64,
+    lines_removed: i64,
+    writes: i64,
+    reads: i64,
+    tests: i64,
+    builds: i64,
+    git: i64,
+    mcp: i64,
+    web: i64,
+    subagent: i64,
+    thinking: i64,
+    files: HashMap<String, i64>,
+    languages: HashMap<String, i64>,
+    commands: HashMap<String, i64>,
+    projects: HashMap<String, i64>,
+    /// Newest branch seen per project — the walk is newest-first, so
+    /// the first one wins. Kept apart from the counter so a project
+    /// is not split into one row per branch.
+    project_branch: HashMap<String, String>,
+    dirs: HashMap<String, i64>,
+}
+
+/// Lines a call REPLACED — an Edit's `old_string`, which the
+/// lines-written figure alone cannot see. A Write replaces nothing;
+/// it is counted entirely as added.
+fn replaced_lines(name: &str, input: &Object) -> i64 {
+    if !WRITE_TOOLS.contains(&name) {
+        return 0;
+    }
+    if let Some(s) = get_str(input, "old_string") {
+        return line_count(s);
+    }
+    if let Some(Value::Array(edits)) = input.get("edits") {
+        return edits
+            .iter()
+            .filter_map(|e| obj(e))
+            .filter_map(|e| get_str(e, "old_string"))
             .map(line_count)
             .sum();
     }
@@ -190,6 +310,7 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
         .await?
         .take(0)?;
     let mut tools: HashMap<String, i64> = HashMap::new();
+    let mut code = CodeAgg::default();
     let mut lines_written = 0i64;
     let mut per_session: HashMap<String, SessAgg> = HashMap::new();
     let mut outcomes: HashMap<String, Outcome> = HashMap::new();
@@ -202,10 +323,23 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
         let agg = per_session.entry(sid).or_default();
         agg.messages += 1;
         let Some(raw) = &m.raw else { continue };
+        // Which checkout the agent was standing in (#308).
+        if let Some(cwd) = get_str(raw, "cwd") {
+            let project = cwd.rsplit('/').next().unwrap_or(cwd).to_string();
+            if let Some(branch) = get_str(raw, "gitBranch").filter(|b| !b.is_empty()) {
+                code.project_branch
+                    .entry(project.clone())
+                    .or_insert_with(|| branch.to_string());
+            }
+            *code.projects.entry(project).or_insert(0) += 1;
+        }
         // Claude-style usage + blocks: raw.message.{usage, content[]}.
         if let Some(Value::Object(msg)) = raw.get("message") {
             if let Some(Value::Object(usage)) = msg.get("usage") {
                 agg.out_tokens += get_int(usage, "output_tokens");
+                if let Some(Value::Object(details)) = usage.get("output_tokens_details") {
+                    code.thinking += get_int(details, "thinking_tokens");
+                }
             }
             if let Some(Value::Array(blocks)) = msg.get("content") {
                 for b in blocks.iter() {
@@ -226,10 +360,58 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
                                     }
                                 }
                             }
+                            // Instrument the call itself (#308).
+                            if name.starts_with("mcp__") {
+                                code.mcp += 1;
+                            }
+                            if matches!(name.as_str(), "WebFetch" | "WebSearch" | "web_fetch" | "google_web_search") {
+                                code.web += 1;
+                            }
+                            if matches!(name.as_str(), "Task" | "Skill" | "Agent") {
+                                code.subagent += 1;
+                            }
+                            if READ_TOOLS.contains(&name.as_str()) {
+                                code.reads += 1;
+                            }
+                            if WRITE_TOOLS.contains(&name.as_str()) {
+                                code.writes += 1;
+                            }
                             if let Some(Value::Object(input)) = block.get("input") {
                                 let n = block_lines(&name, input);
                                 lines_written += n;
                                 agg.lines += n;
+                                code.lines_added += n;
+                                code.lines_removed += replaced_lines(&name, input);
+
+                                // The file this call touched.
+                                if let Some(path) = get_str(input, "file_path")
+                                    .or_else(|| get_str(input, "path"))
+                                    .or_else(|| get_str(input, "notebook_path"))
+                                {
+                                    *code.files.entry(path.to_string()).or_insert(0) += 1;
+                                    if let Some(ext) = extension_of(path) {
+                                        *code.languages.entry(ext).or_insert(0) += 1;
+                                    }
+                                    if let Some(dir) = dir_of(path) {
+                                        *code.dirs.entry(dir).or_insert(0) += 1;
+                                    }
+                                }
+                                // The shell command it ran.
+                                if let Some(cmd) = get_str(input, "command") {
+                                    if let Some(label) = command_label(cmd) {
+                                        let (is_test, is_build, is_git) = classify_command(&label);
+                                        if is_test {
+                                            code.tests += 1;
+                                        }
+                                        if is_build {
+                                            code.builds += 1;
+                                        }
+                                        if is_git {
+                                            code.git += 1;
+                                        }
+                                        *code.commands.entry(label).or_insert(0) += 1;
+                                    }
+                                }
                             }
                         }
                         Some("tool_result") => {
@@ -347,6 +529,37 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
         }
     }
 
+    // ── 24×7 instruments: engine-side, cheap, whole-history ──────
+    let messages_last_hour = count_rows(
+        kernel,
+        "SELECT count() AS c FROM message WHERE valid_from > time::now() - 1h GROUP ALL",
+    )
+    .await
+    .unwrap_or(0);
+    let tokens_last_hour = {
+        let rows: Vec<Value> = kernel
+            .db()
+            .query(
+                "SELECT math::sum(raw.message.usage.output_tokens ?? raw.tokens.output ?? 0) \
+                 AS c FROM message WHERE valid_from > time::now() - 1h GROUP ALL",
+            )
+            .await?
+            .take(0)?;
+        rows.first().and_then(|r| obj(r).map(|o| get_int(o, "c"))).unwrap_or(0)
+    };
+    // Clock coverage: how many of the last 24 hours saw any activity.
+    let active_hours_24h = {
+        let rows: Vec<Value> = kernel
+            .db()
+            .query(
+                "SELECT time::hour(valid_from) AS h FROM message \
+                 WHERE valid_from > time::now() - 24h GROUP BY h",
+            )
+            .await?
+            .take(0)?;
+        rows.len() as i64
+    };
+
     Ok(StatsSummary {
         agents,
         sessions_total,
@@ -372,6 +585,32 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
         tools,
         tool_outcomes,
         top_sessions,
+        lines_added: code.lines_added,
+        lines_removed: code.lines_removed,
+        files_touched: code.files.len() as i64,
+        writes_window: code.writes,
+        reads_window: code.reads,
+        files: top_n(code.files, 12),
+        languages: top_n(code.languages, 10),
+        commands: top_n(code.commands, 12),
+        projects: top_n(code.projects, 8)
+            .into_iter()
+            .map(|p| match code.project_branch.get(&p.name) {
+                Some(b) => NameCount { name: format!("{} · {b}", p.name), value: p.value },
+                None => p,
+            })
+            .collect(),
+        messages_last_hour,
+        tokens_last_hour,
+        active_hours_24h,
+        tests_run: code.tests,
+        builds_run: code.builds,
+        git_ops: code.git,
+        mcp_calls: code.mcp,
+        web_calls: code.web,
+        subagent_calls: code.subagent,
+        thinking_tokens: code.thinking,
+        dirs: top_n(code.dirs, 8),
     })
 }
 
