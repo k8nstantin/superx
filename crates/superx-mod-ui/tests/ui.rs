@@ -1035,6 +1035,15 @@ async fn command_mix_reads_real_agent_shells() {
         // Plain program, no subcommand vocabulary.
         Case { cmd: "python3 tools/skill_audit.py",
                expect: &["python3"], tests: 0, builds: 0, git: 0 },
+        // `2>&1` is a redirection, not a sequencer: live QA found a
+        // stage labelled `1` topping the command mix (#334).
+        Case { cmd: "cargo test --workspace 2>&1 | tail -5",
+               expect: &["cargo test", "tail"], tests: 1, builds: 0, git: 0 },
+        // A heredoc body is DATA. Every line of this embedded script
+        // was being read as a shell call, producing `let`, `assert`,
+        // `\"\"\"` and `if` as top commands (#334).
+        Case { cmd: "python3 - <<'PYEOF'\nlet x = 1\nassert x\nif True:\n    print(\"\"\")\nPYEOF\ngit status",
+               expect: &["python3", "git status"], tests: 0, builds: 0, git: 1 },
     ];
 
     for c in CASES {
