@@ -422,6 +422,19 @@ async fn migrate_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
             "already a note (dual-write)", r.dual_written
         ));
     }
+    // B4's second half, which this report did not mention: an operator
+    // running --dry-run could not see that it was about to retract role
+    // edges and archive anchors — the part that changes what they SEE.
+    // A dry run that hides half the work is not a dry run.
+    out.push_str(&format!(
+        "  {:<28} {}\n  {:<28} {}\n  {:<28} {}\n",
+        if dry_run { "documents to move" } else { "documents moved" },
+        r.documents,
+        if dry_run { "role edges to retract" } else { "role edges retracted" },
+        r.edges_retracted,
+        if dry_run { "anchors to archive" } else { "anchors archived" },
+        r.anchors_archived,
+    ));
     if !r.other_roles.is_empty() {
         out.push_str(&format!(
             "\n  {} text node(s) reached by a NON-prose edge (the runner's \

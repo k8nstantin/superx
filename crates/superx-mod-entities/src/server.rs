@@ -668,20 +668,55 @@ async fn api_download(
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
     // The stored path is a substrate fact, but serve it only if it
-    // really sits under this module's files dir — a rogue path in the
-    // attributes must not turn this route into an arbitrary file read.
-    let files_dir = match state.kernel.module_dir(crate::MODULE_NAME) {
-        Ok(d) => d.join("files"),
+    // really sits under this module's own directory — a rogue path in
+    // the row must not turn this route into an arbitrary file read.
+    //
+    // TWO SHAPES, one root. An `attachment` row stores a path RELATIVE
+    // to the module dir (`attachments/<uid>/<file>`); a legacy document
+    // node stored an ABSOLUTE one under `files/`. Guarding against
+    // `files/` alone refused every attachment row — the primary path —
+    // and a relative path canonicalized against the process's working
+    // directory, which is not where the bytes are.
+    let module_dir = match state.kernel.module_dir(crate::MODULE_NAME) {
+        Ok(d) => d,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    // THIS MODULE'S OWN DIRECTORY FIRST, always. A row may record an
+    // ABSOLUTE path from before the instance home moved — this
+    // operator's documents point at `<repo>/modules/entities/files/…`
+    // from when the home was the repo root, and that file still exists
+    // there. Trusting the absolute path because it resolves would serve
+    // bytes from outside the module, which is exactly what the root
+    // check below exists to prevent.
+    //
+    // So: try the path relative to the module dir, then its basename
+    // under `files/`, and only then the recorded path itself. Every
+    // branch still goes through the root check — this decides where to
+    // LOOK, never what may be served.
+    // `join` with an ABSOLUTE path replaces the base rather than
+    // nesting under it, so this must only be tried for a relative one.
+    let stored = std::path::Path::new(&path);
+    let absolute = [
+        // `join` with an ABSOLUTE path replaces the base rather than
+        // nesting under it, so that form is only tried as itself.
+        stored.is_relative().then(|| module_dir.join(stored)),
+        stored.file_name().map(|n| module_dir.join("files").join(n)),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.exists())
+    // Nothing under this module matched. The recorded path goes to the
+    // root check below, which is what refuses it — reaching here is not
+    // permission to serve it.
+    .unwrap_or_else(|| stored.to_path_buf());
     let (Ok(real), Ok(root)) = (
-        std::fs::canonicalize(&path),
-        std::fs::canonicalize(&files_dir),
+        std::fs::canonicalize(&absolute),
+        std::fs::canonicalize(&module_dir),
     ) else {
         return (StatusCode::NOT_FOUND, "attachment file is missing").into_response();
     };
     if !real.starts_with(&root) {
-        return (StatusCode::FORBIDDEN, "attachment is outside the module's files dir")
+        return (StatusCode::FORBIDDEN, "attachment is outside the module's own directory")
             .into_response();
     }
     match std::fs::read(&real) {

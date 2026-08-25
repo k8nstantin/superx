@@ -71,6 +71,15 @@ pub struct Report {
 ///
 /// [`KernelError::Db`](superx_kernel::KernelError::Db) for engine errors.
 pub async fn prose(db: &Db, dry_run: bool) -> Result<Report> {
+    // REFUSE BEFORE WRITING ANYTHING. Archiving an anchor writes
+    // `entity_state.archived`, a column added in #304 that an instance
+    // which has not re-provisioned does not have. Discovering that
+    // halfway through leaves the prose moved and the carriers still
+    // live — worse than not having started, and the engine's own
+    // message ("no such field exists") says nothing about how to fix
+    // it. Checked once, up front, in the operator's terms.
+    can_archive(db).await?;
+
     let mut report = Report::default();
     // Anchors whose content is safely in the new tables, collected as
     // we go and retired only at the END. Retracting an edge before the
@@ -89,7 +98,21 @@ pub async fn prose(db: &Db, dry_run: bool) -> Result<Report> {
             if inbound.iter().any(|e| e.active) {
                 report.other_roles.push(record_uuid(&carrier.id));
             } else {
+                // Nothing claims it, so nothing is GUESSED about where
+                // its prose belongs — it is not moved. But it is still
+                // an old anchor of a retired type, and leaving it live
+                // means it shows in the entity list forever with no way
+                // to hide it. Archived (not moved, not deleted) and
+                // reported by uuid so the operator can look.
                 report.orphans.push(record_uuid(&carrier.id));
+                let already =
+                    nodes::current_state(db, &carrier.id).await?.is_some_and(|s| s.archived);
+                if !already {
+                    report.anchors_archived += 1;
+                    if !dry_run {
+                        nodes::set_archived(db, &carrier.id, true).await?;
+                    }
+                }
             }
             continue;
         };
@@ -105,6 +128,13 @@ pub async fn prose(db: &Db, dry_run: bool) -> Result<Report> {
         // cardinality rule to collapse the copies back together.
         if names_a_live_note(db, history.last()).await? {
             report.dual_written += history.len();
+            // Its prose does not move — it is already a note — but the
+            // CARRIER still must go. Skipping it entirely left three of
+            // these on the operator's instance with live role edges,
+            // still hanging off the graph, which is the exact thing B4
+            // exists to end. Nothing moves; the edge is retracted and
+            // the anchor archived like every other.
+            migrated.push((carrier.id.clone(), owner.clone(), edge.rel_type.clone()));
             continue;
         }
 
@@ -283,7 +313,28 @@ async fn write_attachment(
     row.insert("filename".to_string(), Value::String(filename));
     row.insert("mime".to_string(), Value::String(mime));
     row.insert("size".to_string(), Value::Number(size.into()));
-    row.insert("path".to_string(), Value::String(text("file")));
+    // RELATIVE to the module directory, like every attachment row
+    // written since #296. The legacy node recorded an ABSOLUTE path,
+    // which is only correct while the instance home never moves — and
+    // this operator's did: their document rows point at
+    // `<repo>/modules/entities/files/...` from before the home became
+    // `~/.superx`. Storing the relative form makes the row correct for
+    // wherever the module lives now.
+    let stored = text("file");
+    let relative = std::path::Path::new(&stored)
+        .file_name()
+        .map(|n| format!("files/{}", n.to_string_lossy()))
+        .ok_or_else(|| {
+            // A document node with no stored file is not something to
+            // guess about: writing a row that points nowhere would turn
+            // a broken node into a broken attachment and call it
+            // migrated.
+            superx_kernel::KernelError::Module(format!(
+                "document {source} records no file — nothing to attach. Its node is \
+                 untouched; look at it with `superx entities show {source}`"
+            ))
+        })?;
+    row.insert("path".to_string(), Value::String(relative));
     row.insert("active".to_string(), Value::Bool(true));
     row.insert("attributes".to_string(), Value::Object(provenance));
     row.insert("author_kind".to_string(), Value::String("system".to_string()));
@@ -298,6 +349,31 @@ async fn write_attachment(
         .await?
         .check()?;
     Ok(())
+}
+
+/// Does this database have the column archiving needs?
+///
+/// `INFO FOR TABLE` rather than a probe write: asking is free and a
+/// probe write on an append-only substrate would leave a row behind
+/// just to find out.
+async fn can_archive(db: &Db) -> Result<()> {
+    let mut resp = db.query("INFO FOR TABLE entity_state").await?;
+    let info: Vec<Value> = resp.take(0)?;
+    let has = info.iter().any(|row| {
+        let Value::Object(o) = row else { return false };
+        let Some(Value::Object(fields)) = o.get("fields") else { return false };
+        fields.contains_key("archived")
+    });
+    if has {
+        return Ok(());
+    }
+    Err(superx_kernel::KernelError::Module(
+        "this database predates the `archived` column, so the carriers could be \
+         moved but never retired — and stopping halfway would leave the prose in \
+         two places. Run `superx modules provision entities` (it applies the \
+         module's schema), then run this again."
+            .to_string(),
+    ))
 }
 
 /// The uid of the note already carrying this label on this entity, if
