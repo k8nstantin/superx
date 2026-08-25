@@ -32,4 +32,10 @@ last_active: string | null,
  * normal — so this is the newest message's model, not a stamp
  * taken when the session began. `None` when nothing names one.
  */
-model: string | null, };
+model: string | null, 
+/**
+ * The reasoning effort the session is CURRENTLY running at, when
+ * the agent reports one — same newest-message semantics as
+ * `model`, because effort is switched mid-session too.
+ */
+effort: string | null, };

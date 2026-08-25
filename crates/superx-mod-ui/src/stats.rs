@@ -227,7 +227,10 @@ struct CodeAgg {
     churn: HashMap<String, (i64, i64)>,
     /// Text an edit removed from a file, per file — so a later edit
     /// that puts it back can be recognized as an undo.
-    removed_text: HashMap<String, HashSet<String>>,
+    /// Hashes of text earlier-in-time edits removed, per file. Only
+    /// equality is needed, and whole function bodies for 20k messages
+    /// is a lot of resident memory (review of #330).
+    removed_text: HashMap<String, HashSet<u64>>,
     reverts: i64,
     out_tokens: i64,
     /// session uuid seen in each 5-minute bucket, for concurrency.
@@ -280,13 +283,14 @@ fn replaced_lines(name: &str, input: &Object) -> i64 {
 /// A snippet reduced to its shape, so trivial whitespace differences
 /// do not hide an undo (issue #324). Empty for snippets too small to
 /// be meaningful evidence.
-fn normalize_snippet(s: &str) -> String {
+fn snippet_key(s: &str) -> Option<u64> {
     let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.len() < 12 {
-        String::new()
-    } else {
-        flat
+        return None;
     }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&flat, &mut h);
+    Some(std::hash::Hasher::finish(&h))
 }
 
 /// Work in one repo. Agents run across many repos at once, so the
@@ -379,20 +383,53 @@ pub fn range_cutoff(range: &str) -> Option<chrono::Duration> {
 /// rather than pretending the sample is the whole range.
 pub const RANGE_ROW_CAP: u32 = 20_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
-/// What a command printed, mined for outcomes (issue #327). Test
-/// counts come from the shapes real runners emit; diagnostics from the
-/// compiler prefixes.
+/// Tools whose output is a command's own report. Everything else —
+/// above all `Read`, whose payload is a FILE — must never be scored:
+/// a source comment mentioning "42 failed" is not a test result
+/// (review of #330).
+const SHELL_TOOLS: [&str; 4] = ["Bash", "run_shell_command", "Shell", "run_terminal_cmd"];
+
+/// Lines scanned from each end of a command's output. Runners print
+/// their tally at the END, so scanning only the head loses it — while
+/// diagnostics appear throughout. Both ends, bounded.
+const SCAN_EDGE: usize = 300; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// A count token: strip any trailing punctuation, so cargo's
+/// `passed;` counts exactly like jest's `passed,`. Getting this wrong
+/// dropped passes while keeping failures — a one-directional bias
+/// that made every pass rate read worse than reality.
+fn count_word(w: &str) -> &str {
+    w.trim_end_matches([',', ';', '.', ')'])
+}
+
+/// What a shell command printed, mined for outcomes (issue #327).
+/// Test tallies come from the shapes real runners emit; diagnostics
+/// from compiler prefixes.
 fn score_output(text: &str, code: &mut CodeAgg) {
-    for line in text.lines().take(400) {
+    let lines: Vec<&str> = text.lines().collect();
+    let scan: Vec<&&str> = if lines.len() <= SCAN_EDGE * 2 {
+        lines.iter().collect()
+    } else {
+        lines
+            .iter()
+            .take(SCAN_EDGE)
+            .chain(lines.iter().skip(lines.len() - SCAN_EDGE))
+            .collect()
+    };
+    for line in scan {
         let l = line.trim();
-        // cargo: "test result: ok. 42 passed; 0 failed; ..."
+        // cargo / go: "test result: ok. 42 passed; 0 failed; …"
         if let Some(rest) = l.strip_prefix("test result:") {
             for part in rest.split(';') {
-                let p = part.trim().trim_start_matches("ok.").trim_start_matches("FAILED.").trim();
+                let p = part
+                    .trim()
+                    .trim_start_matches("ok.")
+                    .trim_start_matches("FAILED.")
+                    .trim();
                 let mut it = p.split_whitespace();
                 if let (Some(n), Some(word)) = (it.next(), it.next()) {
                     if let Ok(v) = n.parse::<i64>() {
-                        match word {
+                        match count_word(word) {
                             "passed" => code.tests_passed += v,
                             "failed" => code.tests_failed += v,
                             _ => {}
@@ -402,17 +439,17 @@ fn score_output(text: &str, code: &mut CodeAgg) {
             }
             continue;
         }
-        // pytest / jest / vitest: "5 passed", "2 failed"
-        if l.contains(" passed") || l.contains(" failed") {
+        // pytest / jest / vitest: "5 passed, 2 failed".
+        if l.contains("passed") || l.contains("failed") {
             let mut prev: Option<i64> = None;
             for w in l.split_whitespace() {
-                match w.trim_end_matches(',') {
-                    "passed" | "passed," => {
+                match count_word(w) {
+                    "passed" => {
                         if let Some(v) = prev.take() {
                             code.tests_passed += v;
                         }
                     }
-                    "failed" | "failed," => {
+                    "failed" => {
                         if let Some(v) = prev.take() {
                             code.tests_failed += v;
                         }
@@ -421,8 +458,11 @@ fn score_output(text: &str, code: &mut CodeAgg) {
                 }
             }
         }
-        // Diagnostics: rustc, tsc, go, generic.
-        if l.starts_with("error[") || l.starts_with("error: could not compile") || l.contains(" error TS") {
+        // Diagnostics: rustc, tsc, generic.
+        if l.starts_with("error[")
+            || l.starts_with("error: could not compile")
+            || l.contains(" error TS")
+        {
             code.compile_errors += 1;
         }
     }
@@ -541,7 +581,10 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             .await?
             .take(0)?,
     };
-    let truncated = msgs.len() as u32 >= cap;
+    // Truncation is only meaningful for a time-bounded range: the
+    // fixed window is BY DEFINITION the newest N, so reporting it as
+    // "sampled" on the default view was just wrong (review of #330).
+    let truncated = cutoff.is_some() && msgs.len() as u32 >= cap;
     let mut tools: HashMap<String, i64> = HashMap::new();
     let mut code = CodeAgg::default();
     let mut lines_written = 0i64;
@@ -554,6 +597,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
     let mut call_names: HashMap<String, (String, Option<String>, Option<String>)> = HashMap::new();
     // Results seen before their call (the walk is newest-first).
     let mut pending_results: HashMap<String, bool> = HashMap::new();
+    // Output text held until the call names the tool that produced it.
+    let mut pending_output: HashMap<String, String> = HashMap::new();
+    // Shell calls seen before their output — the reverse order, which
+    // happens with interleaved sidechains. Without this the text is
+    // stashed forever and silently dropped.
+    let mut shell_calls: HashSet<String> = HashSet::new();
     for m in &msgs {
         let sid = superx_ops::record_uuid(&m.session);
         let agg = per_session.entry(sid).or_default();
@@ -599,15 +648,18 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             code.interventions += 1;
         }
         // The model that did this message (#328).
-        let model = raw
+        // A tool_result message carries no model. Attributing it to
+        // `unknown` put a meaningless row at the top of the model
+        // comparison (review of #330) — so an absent model is simply
+        // not attributed.
+        let model_opt = raw
             .get("message")
             .and_then(obj)
             .and_then(|m| get_str(m, "model"))
-            .unwrap_or("unknown")
-            .to_string();
-        {
-            let mm = code.models.entry(model.clone()).or_default();
-            mm.messages += 1;
+            .map(str::to_string);
+        let model = model_opt.clone().unwrap_or_else(|| "unknown".to_string());
+        if let Some(known) = &model_opt {
+            code.models.entry(known.clone()).or_default().messages += 1;
         }
         {
             let sid = superx_ops::record_uuid(&m.session);
@@ -703,6 +755,24 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     }
                                 }
                             }
+                            // Now the tool is known: score its output
+                            // if — and only if — it was a shell call.
+                            if let Some(id) = get_str(block, "id") {
+                                match pending_output.remove(id) {
+                                    Some(text) if SHELL_TOOLS.contains(&name.as_str()) => {
+                                        score_output(&text, &mut code);
+                                    }
+                                    // Output already seen but the tool
+                                    // was not a shell: drop it.
+                                    Some(_) => {}
+                                    // Output not seen yet — remember
+                                    // that this id is worth scoring.
+                                    None if SHELL_TOOLS.contains(&name.as_str()) => {
+                                        shell_calls.insert(id.to_string());
+                                    }
+                                    None => {}
+                                }
+                            }
                             // Instrument the call itself (#308).
                             if name.starts_with("mcp__") {
                                 code.mcp += 1;
@@ -755,18 +825,18 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 }
                                 if let Some(path) = get_str(input, "file_path") {
                                     let seen = code.removed_text.entry(path.to_string()).or_default();
-                                    if let Some(added) = get_str(input, "new_string") {
-                                        let key = normalize_snippet(added);
-                                        if !key.is_empty() && seen.contains(&key) {
+                                    if let Some(key) =
+                                        get_str(input, "new_string").and_then(snippet_key)
+                                    {
+                                        if seen.contains(&key) {
                                             code.reverts += 1;
                                             code.models.entry(model.clone()).or_default().reverts += 1;
                                         }
                                     }
-                                    if let Some(gone) = get_str(input, "old_string") {
-                                        let key = normalize_snippet(gone);
-                                        if !key.is_empty() {
-                                            seen.insert(key);
-                                        }
+                                    if let Some(key) =
+                                        get_str(input, "old_string").and_then(snippet_key)
+                                    {
+                                        seen.insert(key);
                                     }
                                 }
                                 lines_written += n;
@@ -814,10 +884,20 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                             let Some(id) = get_str(block, "tool_use_id") else { continue };
                             let failed = matches!(block.get("is_error"), Some(Value::Bool(true)));
                             // What the command PRINTED is where quality
-                            // lives (#327) — test tallies and compiler
-                            // diagnostics, never read until now.
+                            // lives (#327) — but only a SHELL call's
+                            // output is a report. The walk is
+                            // newest-first, so the tool that produced
+                            // this text is not known yet: stash it and
+                            // score when the call resolves (review of
+                            // #330).
                             if let Some(text) = get_str(block, "content") {
-                                score_output(text, &mut code);
+                                if shell_calls.remove(id) {
+                                    // The call already went by and it
+                                    // was a shell: score immediately.
+                                    score_output(text, &mut code);
+                                } else {
+                                    pending_output.insert(id.to_string(), text.to_string());
+                                }
                             }
 
                             match call_names.remove(id) {

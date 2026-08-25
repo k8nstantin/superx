@@ -93,7 +93,7 @@ export function sessionColor(sessionKey: string): string {
 function identityOf(
   e: SseEvent,
   d: Directory,
-): { label: string; key: string; model?: string } | null {
+): { label: string; key: string; model?: string; effort?: string } | null {
   let match: SessionView | undefined
   if (e.kind === 'message') {
     match = e.session_id ? d.bySessionId.get(e.session_id) : undefined
@@ -110,10 +110,16 @@ function identityOf(
     return {
       // The model is part of the session's identity (issue #241): the
       // session outlives the model choice, so it is the CURRENT model,
-      // read live rather than stamped at the session's birth.
-      label: `${match.agent}/${match.session_id.slice(0, 8)}${match.model ? ` · ${match.model}` : ''}`,
+      // read live rather than stamped at the session's birth. Effort
+      // rides along the same way when the agent reports it — the same
+      // work at a different effort is different work.
+      label:
+        `${match.agent}/${match.session_id.slice(0, 8)}` +
+        (match.model ? ` · ${match.model}` : '') +
+        (match.effort ? ` · ${match.effort}` : ''),
       key: match.session_id,
       model: match.model ?? undefined,
+      effort: match.effort ?? undefined,
     }
   if (e.kind === 'message' && e.session_id)
     return { label: e.session_id.slice(0, 8), key: e.session_id }

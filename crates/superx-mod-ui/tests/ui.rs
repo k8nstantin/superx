@@ -1237,3 +1237,64 @@ async fn repos_models_and_quality_are_separable() {
     assert!(busiest.repo.is_some(), "a live row names its repo");
     assert!(busiest.idle_secs < 300);
 }
+
+/// The negative cases the review of #330 exposed: output must only be
+/// scored when a SHELL call produced it, the tally lives at the END of
+/// long output, and `passed;` must count exactly like `passed,`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quality_scoring_only_trusts_shell_output() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+
+    let result = |id: &str, body: String| {
+        serde_json::json!({"message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "is_error": false, "content": body}]}})
+    };
+    let call = |id: &str, tool: &str| {
+        serde_json::json!({"message": {"model": "claude-fable-5", "content": [
+            {"type": "tool_use", "id": id, "name": tool, "input": {"command": "cargo test"}}]}})
+    };
+
+    // Real order: the call happens, THEN its result. A FILE whose
+    // text mentions tests and errors must score nothing — Read output
+    // is a file body, not a report.
+    let poison = "// docs: test result: ok. 999 passed; 42 failed\nerror[E0999]: in a comment".to_string();
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "message": {"model": "claude-fable-5", "content": [
+            {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/r/README.md"}}]}})).await;
+    log_tool_message(&kernel, &session, &agent, result("r1", poison)).await;
+
+    // A long shell run whose summary sits far past the head, in
+    // cargo's semicolon-separated form.
+    let mut long: String = (0..500).map(|i| format!("running case {i}\n")).collect();
+    long.push_str("test result: ok. 12 passed; 3 failed; 0 ignored\n");
+    log_tool_message(&kernel, &session, &agent, call("b1", "Bash")).await;
+    log_tool_message(&kernel, &session, &agent, result("b1", long)).await;
+
+    // And the REVERSE order — result before call, as interleaved
+    // sidechains produce — must score too, not vanish.
+    log_tool_message(&kernel, &session, &agent, result("b2", "1 passed\n".to_string())).await;
+    log_tool_message(&kernel, &session, &agent, call("b2", "Bash")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // ONLY the shell run counted, and its tail was read.
+    assert_eq!(s.tests_passed, 13, "12 from the tail + 1 from the reversed pair");
+    assert_eq!(s.tests_failed, 3, "`passed;` and `failed;` count alike");
+    assert_eq!(s.compile_errors, 0, "a comment in a file is not a diagnostic");
+
+    // The model table has no meaningless row: tool_result messages
+    // carry no model and are not attributed.
+    assert!(
+        s.models.iter().all(|m| m.name != "unknown"),
+        "no unknown row: {:?}",
+        s.models.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+
+    // The fixed window is by definition the newest N, so it is never
+    // reported as a truncated sample.
+    let w = superx_mod_ui::stats::stats_summary(&kernel, 2).await.expect("window");
+    assert!(!w.truncated, "the default window is not a truncated range");
+    assert_eq!(w.range, "window");
+}

@@ -67,6 +67,10 @@ pub struct SessionView {
     /// normal — so this is the newest message's model, not a stamp
     /// taken when the session began. `None` when nothing names one.
     pub model: Option<String>,
+    /// The reasoning effort the session is CURRENTLY running at, when
+    /// the agent reports one — same newest-message semantics as
+    /// `model`, because effort is switched mid-session too.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Serialize, TS)]

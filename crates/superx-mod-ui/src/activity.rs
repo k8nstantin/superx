@@ -386,24 +386,52 @@ fn obj_of(row: &Value, key: &str) -> Option<superx_kernel::types::Object> {
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
 pub async fn session_model(kernel: &Kernel, session: RecordId) -> Result<Option<String>> {
-    let rows: Vec<Value> = kernel
-        .db()
-        .query(
-            "SELECT raw.message.model ?? raw.model AS model, valid_from \
-             FROM message WHERE session = $sess \
-               AND (raw.message.model != NONE OR raw.model != NONE) \
-             ORDER BY valid_from DESC LIMIT 1",
+    Ok(session_model_effort(kernel, session).await?.0)
+}
+
+/// The session's CURRENT model and reasoning effort, in one read.
+/// Effort is a separate newest-value lookup because a session can name
+/// a model on one message and its effort on another.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn session_model_effort(
+    kernel: &Kernel,
+    session: RecordId,
+) -> Result<(Option<String>, Option<String>)> {
+    let newest = |field: &str, guard: &str| {
+        format!(
+            "SELECT {field} AS v, valid_from FROM message \
+             WHERE session = $sess AND {guard} \
+             ORDER BY valid_from DESC LIMIT 1"
         )
+    };
+    let pick = |rows: Vec<Value>| {
+        rows.first().and_then(|row| match row {
+            Value::Object(o) => match o.get("v") {
+                Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+    };
+    let model: Vec<Value> = kernel
+        .db()
+        .query(newest(
+            "raw.message.model ?? raw.model",
+            "(raw.message.model != NONE OR raw.model != NONE)",
+        ))
+        .bind(("sess", session.clone()))
+        .await?
+        .take(0)?;
+    let effort: Vec<Value> = kernel
+        .db()
+        .query(newest("raw.effort", "raw.effort != NONE"))
         .bind(("sess", session))
         .await?
         .take(0)?;
-    Ok(rows.first().and_then(|row| match row {
-        Value::Object(o) => match o.get("model") {
-            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-            _ => None,
-        },
-        _ => None,
-    }))
+    Ok((pick(model), pick(effort)))
 }
 
 pub async fn session_token_stats(

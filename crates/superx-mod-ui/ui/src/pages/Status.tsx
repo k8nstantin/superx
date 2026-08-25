@@ -219,6 +219,22 @@ export default function StatusPage() {
   const rd = s ? Number(s.reads_window) : 0
   const makeRatio = wr + rd > 0 ? Math.round((wr * 100) / (wr + rd)) : null
 
+  // A 30-day range is ~720 hourly points: unreadable, and the labels
+  // repeat. Fold to days for long ranges (review of #330).
+  const churnSeries = (() => {
+    const pts = s?.churn ?? []
+    if (!(range === '7d' || range === '30d' || range === 'all')) return pts
+    const byDay = new Map<string, { t: string; added: number; removed: number }>()
+    for (const p of pts) {
+      const day = p.t.slice(0, 10)
+      const cur = byDay.get(day) ?? { t: day, added: 0, removed: 0 }
+      cur.added += Number(p.added)
+      cur.removed += Number(p.removed)
+      byDay.set(day, cur)
+    }
+    return [...byDay.values()].sort((a, b) => a.t.localeCompare(b.t))
+  })()
+
   const q = s
     ? Number(s.tests_passed) + Number(s.tests_failed) > 0
       ? Math.round(
@@ -368,7 +384,15 @@ export default function StatusPage() {
         />
       </SimpleGrid>
 
-      {/* ── flight strip: is the machine flying, right now? ────── */}
+      {/* ── flight strip: always NOW, never the selected range ── */}
+      <Group justify="space-between" mb={6}>
+        <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.5 }}>
+          Right now
+        </Text>
+        <Text size="xs" c="dimmed">
+          these five do not follow the range — they are live readings
+        </Text>
+      </Group>
       <SimpleGrid cols={{ base: 2, md: 3, lg: 5 }} mb="md">
         <Stat
           label="In the air"
@@ -525,7 +549,13 @@ export default function StatusPage() {
                 },
                 xAxis: {
                   type: 'category',
-                  data: (s?.churn ?? []).map((p) => p.t.slice(11) + ':00'),
+                  // Hour labels repeat once a range spans days, so
+                  // long ranges show the date instead (review of #330).
+                  data: churnSeries.map((p) =>
+                    range === '7d' || range === '30d' || range === 'all'
+                      ? p.t.slice(5, 10)
+                      : p.t.slice(11) + ':00',
+                  ),
                   axisLabel: { color: AXIS },
                   axisLine: { lineStyle: { color: GRID_LINE } },
                 },
@@ -539,7 +569,7 @@ export default function StatusPage() {
                     name: 'added',
                     type: 'bar',
                     stack: 'churn',
-                    data: (s?.churn ?? []).map((p) => Number(p.added)),
+                    data: churnSeries.map((p) => Number(p.added)),
                     itemStyle: { color: OK },
                   },
                   {
@@ -548,7 +578,7 @@ export default function StatusPage() {
                     name: 'replaced',
                     type: 'bar',
                     stack: 'churn',
-                    data: (s?.churn ?? []).map((p) => -Number(p.removed)),
+                    data: churnSeries.map((p) => -Number(p.removed)),
                     itemStyle: { color: FAIL },
                   },
                 ],
@@ -717,7 +747,7 @@ export default function StatusPage() {
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
-                {(s?.models ?? []).map((m) => {
+                {(s?.models ?? []).filter((m) => m.name !== 'unknown').map((m) => {
                   const a = Number(m.lines_added)
                   const d = Number(m.lines_removed)
                   const pct = a + d > 0 ? Math.round((d * 100) / (a + d)) : null

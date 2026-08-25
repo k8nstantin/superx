@@ -151,11 +151,20 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
                 </Table.Td>
                 <Table.Td>
                   {s.model ? (
-                    <Tooltip label="the model currently doing this session's work" withArrow>
-                      <Badge variant="light" color="pelican">
-                        {s.model}
-                      </Badge>
-                    </Tooltip>
+                    <Group gap={4} wrap="nowrap">
+                      <Tooltip label="the model currently doing this session's work" withArrow>
+                        <Badge variant="light" color="pelican">
+                          {s.model}
+                        </Badge>
+                      </Tooltip>
+                      {s.effort && (
+                        <Tooltip label="reasoning effort this session is running at" withArrow>
+                          <Badge variant="outline" color="pelican" size="sm">
+                            {s.effort}
+                          </Badge>
+                        </Tooltip>
+                      )}
+                    </Group>
                   ) : (
                     <Text size="xs" c="dimmed">
                       —
@@ -254,6 +263,13 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
             <Badge variant="light" color="pelican">
               {session.model}
             </Badge>
+          )}
+          {session.effort && (
+            <Tooltip label="reasoning effort this session is running at" withArrow>
+              <Badge variant="outline" color="pelican" size="sm">
+                {session.effort}
+              </Badge>
+            </Tooltip>
           )}
         </Group>
       }

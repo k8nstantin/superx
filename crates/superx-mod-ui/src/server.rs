@@ -344,9 +344,9 @@ async fn api_sessions(
                 .await
                 .unwrap_or((None, None));
         let context_pct = context_tokens.map(|c| ((c * 100) / window).clamp(0, 100));
-        let model = crate::activity::session_model(kernel, s.entity_id.clone())
+        let (model, effort) = crate::activity::session_model_effort(kernel, s.entity_id.clone())
             .await
-            .unwrap_or(None);
+            .unwrap_or((None, None));
         let uuid = superx_ops::record_uuid(&s.entity_id);
         out.push(SessionView {
             identity: format!("{agent}/{uuid}"),
@@ -359,6 +359,7 @@ async fn api_sessions(
             output_tokens,
             last_active,
             model,
+            effort,
         });
     }
     Json(out)
