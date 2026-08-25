@@ -3,6 +3,7 @@ import type { AncestorView } from "./AncestorView";
 import type { AnnotationView } from "./AnnotationView";
 import type { AttachmentView } from "./AttachmentView";
 import type { EdgeView } from "./EdgeView";
+import type { LabelAction } from "./LabelAction";
 
 export type EntityDetail = { id: string, entity_type: string, name: string, 
 /**
@@ -22,7 +23,12 @@ version: string,
 /**
  * Hidden from the lists, still on the record (§14).
  */
-archived: boolean, annotations: Array<AnnotationView>, 
+archived: boolean, 
+/**
+ * The labels this entity carries beyond what it IS, each resolved
+ * to what an agent should do about it.
+ */
+labels: Array<string>, label_actions: Array<LabelAction>, annotations: Array<AnnotationView>, 
 /**
  * Active NON-TEXT edges, both directions (text-role edges show
  * as annotations instead).

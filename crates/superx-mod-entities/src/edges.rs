@@ -68,7 +68,11 @@ async fn enforce_link_label(
     to: &RecordId,
     rel_type: &str,
 ) -> Result<()> {
-    let Some(label) = crate::dictionary::current(db, rel_type, crate::dictionary::LINK).await?
+    // BY NAME. Endpoints are a property consulted where they apply, not
+    // a second vocabulary to look in: asking for a LINK label meant a
+    // label written under the merged kind was invisible here, and every
+    // rule it declared went unenforced.
+    let Some(label) = crate::dictionary::find(db, rel_type).await?
     else {
         // Not in the dictionary at all: the registry already vouched for
         // the relation type, and refusing here would break every edge

@@ -148,7 +148,7 @@ pub async fn prose(db: &Db, dry_run: bool) -> Result<Report> {
         // A PLURAL slot is the opposite: every comment is its own note.
         // Joining them by label would collapse every comment an entity
         // has ever had into one chain, so each carrier keeps its own uid.
-        let singular = crate::dictionary::current(db, label, crate::dictionary::SLOT)
+        let singular = crate::dictionary::find(db, label)
             .await?
             .and_then(|d| d.cardinality)
             .as_deref()

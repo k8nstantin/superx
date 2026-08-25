@@ -27,6 +27,13 @@ use superx_kernel::{Db, KernelError, Result};
 use crate::registry::new_id;
 
 /// Which vocabulary a label belongs to.
+/// What a NEW label is written as. One list — a label is a label,
+/// whether it sits on an entity, a field or a relation (#324).
+pub const LABEL: &str = "label"; // skill-allow: §9-const — the module's own data model, not a tunable
+
+/// What labels written before #324 carry. Kept because nothing is
+/// rewritten: those rows stay valid and stay readable exactly as they
+/// are, and [`find`] reaches them whatever they say.
 pub const SLOT: &str = "slot"; // skill-allow: §9-const — the module's own data model, not a tunable
 /// Link labels: how entities connect.
 pub const LINK: &str = "link"; // skill-allow: §9-const — the module's own data model, not a tunable
@@ -771,6 +778,39 @@ async fn append(db: &Db, mut row: Object) -> Result<()> {
 /// # Errors
 ///
 /// [`KernelError::Db`] for engine errors.
+/// A label BY NAME, whatever kind it was written as (#324).
+///
+/// The one lookup. `slot` and `link` were two vocabularies you had to
+/// know the answer to before you could ask the question — "not check
+/// this and then check that, one and only". Rows written before the
+/// merge still say `slot` or `link`; this finds them regardless, so
+/// nothing had to be rewritten to stop the divide existing.
+///
+/// Newest wins across the whole name, so a label redefined under the
+/// merged kind supersedes its own older row.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn find(db: &Db, key: &str) -> Result<Option<LabelRow>> {
+    Ok(newest_object(db, key).await?.as_ref().and_then(parse_obj))
+}
+
+/// The newest row for a name, whatever kind it carries.
+async fn newest_object(db: &Db, key: &str) -> Result<Option<Object>> {
+    let mut resp = db
+        .query(
+            "SELECT * FROM label WHERE key = $key ORDER BY valid_from DESC, id DESC LIMIT 1",
+        )
+        .bind(("key", key.to_string()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    Ok(rows.first().and_then(|r| match r {
+        Value::Object(o) => Some(o.clone()),
+        _ => None,
+    }))
+}
+
 pub async fn current(db: &Db, key: &str, kind: &str) -> Result<Option<LabelRow>> {
     Ok(current_object(db, key, kind).await?.as_ref().and_then(parse_obj))
 }
@@ -839,8 +879,13 @@ pub async fn archive(db: &Db, key: &str, kind: &str, archived: bool) -> Result<(
 
 /// The current definition, stripped of what belongs to the ROW rather
 /// than to the definition, ready to be amended and appended.
-async fn carry_forward(db: &Db, key: &str, kind: &str) -> Result<Option<Object>> {
-    let Some(mut prior) = current_object(db, key, kind).await? else {
+async fn carry_forward(db: &Db, key: &str, _kind: &str) -> Result<Option<Object>> {
+    // BY NAME, not by (name, kind). Keyed on the pair, redefining a
+    // label written before the merge under the merged kind found
+    // nothing and started from an empty row — silently dropping its
+    // datatype, cardinality, endpoints and action. One list means one
+    // chain per name.
+    let Some(mut prior) = newest_object(db, key).await? else {
         return Ok(None);
     };
     // The new version is a new row: it gets its own id and its own
@@ -979,12 +1024,21 @@ pub async fn define(db: &Db, d: Definition<'_>) -> Result<()> {
             "label key '{key}' must be lowercase [a-z0-9_] — one spelling per term is the point"
         )));
     }
+    // ONE LIST NOW (#324). A label is a label — you attach it to an
+    // entity, a field or a relation — so its semantics may come from
+    // either vocabulary. `slot` and `link` are still accepted because
+    // every row written before the merge says one of them, and nothing
+    // is rewritten.
+    let merged: Vec<&str> =
+        SLOT_SEMANTICS.iter().chain(LINK_SEMANTICS.iter()).copied().collect();
     let allowed: &[&str] = match kind {
+        LABEL => &merged,
         SLOT => &SLOT_SEMANTICS,
         LINK => &LINK_SEMANTICS,
         other => {
             return Err(KernelError::Module(format!(
-                "label kind '{other}' must be '{SLOT}' or '{LINK}'"
+                "label kind '{other}' must be '{LABEL}' — or '{SLOT}' / '{LINK}', \
+                 which is what labels written before they became one list say"
             )))
         }
     };

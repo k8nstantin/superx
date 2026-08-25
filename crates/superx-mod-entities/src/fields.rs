@@ -28,7 +28,7 @@
 use superx_kernel::types::{Object, RecordId, Value};
 use superx_kernel::{Db, KernelError, Result};
 
-use crate::dictionary::{self, SLOT};
+use crate::dictionary;
 use crate::nodes::{current_state, update_entity};
 
 /// Kinds whose content is prose: a versioned note chain, read by
@@ -99,7 +99,7 @@ pub fn all_kinds() -> Vec<&'static str> {
 /// is a secret written as anything but a reference;
 /// [`KernelError::Db`] for engine errors.
 pub async fn set(db: &Db, entity: &RecordId, key: &str, value: &str) -> Result<()> {
-    let declared = dictionary::current(db, key, SLOT).await?.ok_or_else(|| {
+    let declared = dictionary::find(db, key).await?.ok_or_else(|| {
         KernelError::Module(format!(
             "the dictionary declares no slot '{key}' — define it first \
              (superx entities labels define), because a key nobody declared is \
@@ -173,7 +173,7 @@ pub async fn of(db: &Db, entity: &RecordId) -> Result<Vec<Field>> {
     let mut out = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for slot in dictionary::slots_for(db, &entity_type, false).await? {
-        let Some(declared) = dictionary::current(db, &slot.label, SLOT).await? else {
+        let Some(declared) = dictionary::find(db, &slot.label).await? else {
             continue;
         };
         let kind = declared.value_kind.unwrap_or_default();
@@ -206,7 +206,7 @@ pub async fn of(db: &Db, entity: &RecordId) -> Result<Vec<Field>> {
         if seen.iter().any(|k| k == key) {
             continue;
         }
-        let defined = dictionary::current(db, key, SLOT).await?;
+        let defined = dictionary::find(db, key).await?;
         let kind = defined.as_ref().and_then(|d| d.value_kind.clone()).unwrap_or_default();
         let known = defined.is_some() && is_value_kind(&kind);
         out.push(Field {
@@ -394,7 +394,7 @@ pub async fn validate_bag(
 
     let mut checked = Object::new();
     for (key, value) in incoming.iter() {
-        let declared = dictionary::current(db, key, SLOT).await?;
+        let declared = dictionary::find(db, key).await?;
         let kind = declared
             .as_ref()
             .and_then(|d| d.value_kind.clone())

@@ -21,7 +21,7 @@
 use superx_kernel::types::{Object, RecordId, Value};
 use superx_kernel::{Db, KernelError, Result};
 
-use crate::dictionary::{self, SLOT};
+use crate::dictionary;
 use crate::nodes::anchor_info;
 use crate::registry::new_id;
 
@@ -192,7 +192,7 @@ pub async fn reply(db: &Db, parent_uid: &str, body: &str, author: &Author) -> Re
         .ok_or_else(|| KernelError::Module(format!("no note '{parent_uid}' to reply to")))?;
     let target = attached_to(db, &parent).await?;
 
-    let singular = dictionary::current(db, &parent.label, SLOT)
+    let singular = dictionary::find(db, &parent.label)
         .await?
         .and_then(|d| d.cardinality)
         .as_deref()
@@ -551,7 +551,7 @@ fn str_field(o: &Object, key: &str) -> Option<String> {
 /// rather than deletes, an archived label leaves the table non-empty and
 /// can never be resurrected by this path.
 async fn require_label(db: &Db, label: &str) -> Result<dictionary::LabelRow> {
-    if let Some(defined) = dictionary::current(db, label, SLOT).await? {
+    if let Some(defined) = dictionary::find(db, label).await? {
         return Ok(defined);
     }
     if dictionary::revision(db).await? == 0 {
@@ -562,7 +562,7 @@ async fn require_label(db: &Db, label: &str) -> Result<dictionary::LabelRow> {
             label,
             "dictionary was never seeded — shipped vocabulary applied before the first prose write"
         );
-        if let Some(defined) = dictionary::current(db, label, SLOT).await? {
+        if let Some(defined) = dictionary::find(db, label).await? {
             return Ok(defined);
         }
     }

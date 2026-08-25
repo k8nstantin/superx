@@ -49,7 +49,9 @@ pub async fn subgraph(db: &Db, root: &RecordId, depth: usize) -> Result<Vec<Find
     // --- edges: endpoints, and cycles in an acyclic label ------------
     let mut seen_labels: HashSet<String> = HashSet::new();
     for edge in &sub.edges {
-        let Some(label) = dictionary::current(db, &edge.rel_type, dictionary::LINK).await? else {
+        // BY NAME, for the same reason the write check is: a label under
+        // the merged kind is still the label this edge carries.
+        let Some(label) = dictionary::find(db, &edge.rel_type).await? else {
             findings.push(Finding {
                 subject: format!("{} -[{}]-> {}", &edge.from[..8], edge.rel_type, &edge.to[..8]),
                 detail: format!(
@@ -126,7 +128,7 @@ pub async fn subgraph(db: &Db, root: &RecordId, depth: usize) -> Result<Vec<Find
         // A `one` label holding several notes is two answers to a
         // question that has one.
         for label in &held {
-            let singular = dictionary::current(db, label, dictionary::SLOT)
+            let singular = dictionary::find(db, label)
                 .await?
                 .and_then(|d| d.cardinality)
                 .as_deref()
