@@ -11,6 +11,10 @@ use crate::registry::new_id;
 /// One version row of an entity's state chain.
 pub struct StateRow {
     pub name: String,
+    /// The labels this entity carries beyond what it IS. Its identity
+    /// stays in `entity.entity_type`; these are everything else it is
+    /// also labelled with, and each one an agent resolves to an action.
+    pub labels: Vec<String>,
     pub content: Option<String>,
     pub attributes: Option<Value>,
     /// Hidden from the lists, still on the record. Absent on every row
@@ -34,6 +38,7 @@ pub struct EntityRow {
 pub struct NodeMeta {
     pub entity_type: String,
     pub name: String,
+    pub labels: Vec<String>,
     pub content: Option<String>,
     pub attributes: Option<Value>,
     pub archived: bool,
@@ -66,7 +71,7 @@ pub async fn current_meta(
     for i in 0..ids.len() {
         statements.push_str(&format!(
             "SELECT id, entity_type FROM $id{i};\
-             SELECT name, content, attributes, archived, valid_from \
+             SELECT name, content, attributes, archived, labels, valid_from \
              FROM entity_state WHERE entity = $id{i};"
         ));
     }
@@ -82,19 +87,21 @@ pub async fn current_meta(
         let Some(anchor) = anchors.first() else { continue };
         let Some(id) = obj_record(anchor, "id") else { continue };
         let Some(entity_type) = obj_str(anchor, "entity_type") else { continue };
-        let (name, content, attributes, archived, version) = match newest_by_valid_from(&states) {
-            Some(s) => (
-                obj_str(s, "name").unwrap_or_default(),
-                obj_str(s, "content"),
-                obj_get(s, "attributes"),
-                obj_bool(s, "archived"),
-                obj_display(s, "valid_from").unwrap_or_default(),
-            ),
-            None => (String::new(), None, None, false, String::new()),
-        };
+        let (name, content, attributes, archived, labels, version) =
+            match newest_by_valid_from(&states) {
+                Some(s) => (
+                    obj_str(s, "name").unwrap_or_default(),
+                    obj_str(s, "content"),
+                    obj_get(s, "attributes"),
+                    obj_bool(s, "archived"),
+                    obj_strings(s, "labels"),
+                    obj_display(s, "valid_from").unwrap_or_default(),
+                ),
+                None => (String::new(), None, None, false, Vec::new(), String::new()),
+            };
         out.insert(
             record_uuid(&id),
-            NodeMeta { entity_type, name, content, attributes, archived, version },
+            NodeMeta { entity_type, name, content, attributes, archived, labels, version },
         );
     }
     Ok(out)
@@ -144,7 +151,7 @@ pub async fn create_entity(
         .bind(("entity_type", entity_type.to_string()))
         .await?
         .check()?;
-    append_state(db, &anchor, name, content, attributes, false).await?;
+    append_state(db, &anchor, name, content, attributes, false, &[]).await?;
     Ok(anchor)
 }
 
@@ -236,6 +243,53 @@ pub async fn update_entity(
         // decisions, and only one of them was made here. Same rule the
         // dictionary already applies to a retired slot.
         current.archived,
+        &current.labels,
+    )
+    .await
+}
+
+/// Set the labels an entity carries (#324).
+///
+/// Everything else carries forward: this is one decision, and a write
+/// that touched the name or the attributes as a side effect would be
+/// two.
+///
+/// Every label named must already be defined — labels are created
+/// before they are attached, and a typo would otherwise produce an
+/// entity the operator believed an agent would treat specially while it
+/// never would.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] for an undefined label or a missing chain;
+/// [`KernelError::Db`] for engine errors.
+pub async fn set_labels(db: &Db, anchor: &RecordId, labels: &[String]) -> Result<()> {
+    let mut wanted: Vec<String> = Vec::new();
+    for term in labels {
+        crate::dictionary::find(db, term).await?.ok_or_else(|| {
+            KernelError::Module(format!(
+                "the dictionary defines no label '{term}' — labels are created before \
+                 they are attached"
+            ))
+        })?;
+        if !wanted.contains(term) {
+            wanted.push(term.clone());
+        }
+    }
+    let current = current_state(db, anchor).await?.ok_or_else(|| {
+        KernelError::Module(format!(
+            "entity {} has no state chain",
+            record_uuid(anchor)
+        ))
+    })?;
+    append_state(
+        db,
+        anchor,
+        &current.name,
+        current.content,
+        current.attributes,
+        current.archived,
+        &wanted,
     )
     .await
 }
@@ -265,7 +319,16 @@ pub async fn set_archived(db: &Db, anchor: &RecordId, archived: bool) -> Result<
     if current.archived == archived {
         return Ok(false);
     }
-    append_state(db, anchor, &current.name, current.content, current.attributes, archived).await?;
+    append_state(
+        db,
+        anchor,
+        &current.name,
+        current.content,
+        current.attributes,
+        archived,
+        &current.labels,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -276,6 +339,7 @@ async fn append_state(
     content: Option<String>,
     attributes: Option<Value>,
     archived: bool,
+    labels: &[String],
 ) -> Result<()> {
     let mut statement = String::from(
         "CREATE $id SET entity = $entity, name = $name, valid_from = time::now()",
@@ -288,6 +352,13 @@ async fn append_state(
     // revertible" (§15). Absent reads as not archived.
     if archived {
         statement.push_str(", archived = $archived");
+    }
+    // Written only when there ARE some, for the same reason `archived`
+    // is: an instance that has not re-provisioned has no such column,
+    // and writing it unconditionally would refuse every create and
+    // update until the operator ran provisioning.
+    if !labels.is_empty() {
+        statement.push_str(", labels = $labels");
     }
     if content.is_some() {
         statement.push_str(", content = $content");
@@ -302,6 +373,14 @@ async fn append_state(
         .bind(("name", name.to_string()));
     if archived {
         query = query.bind(("archived", true));
+    }
+    if !labels.is_empty() {
+        query = query.bind((
+            "labels",
+            Value::Array(
+                labels.iter().map(|l| Value::String(l.clone())).collect::<Vec<_>>().into(),
+            ),
+        ));
     }
     if let Some(c) = content {
         query = query.bind(("content", c));
@@ -365,7 +444,7 @@ async fn state_rows(
     // `valid_from` is projected because every ORDER BY idiom must
     // appear in the selection. Order/limit are code-controlled.
     let statement = format!(
-        "SELECT name, content, attributes, archived, valid_from FROM entity_state \
+        "SELECT name, content, attributes, archived, labels, valid_from FROM entity_state \
          WHERE entity = $entity ORDER BY valid_from {order}{}",
         limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default()
     );
@@ -465,11 +544,27 @@ pub async fn anchor_info(db: &Db, anchor: &RecordId) -> Result<(String, String)>
 fn parse_state(row: &Value) -> Option<StateRow> {
     Some(StateRow {
         name: obj_str(row, "name")?,
+        labels: obj_strings(row, "labels"),
         content: obj_str(row, "content"),
         attributes: obj_get(row, "attributes"),
         archived: obj_bool(row, "archived"),
         valid_from: obj_display(row, "valid_from").unwrap_or_default(),
     })
+}
+
+/// A `string` array column that may be absent — absent is empty, which
+/// is what an entity with no labels beyond its identity has.
+fn obj_strings(row: &Value, key: &str) -> Vec<String> {
+    match obj_get(row, key) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|i| match i {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// A `bool` column that may be absent. Absent is `false`, and that is

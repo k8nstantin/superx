@@ -103,6 +103,13 @@ DEFINE FIELD IF NOT EXISTS author_kind ON TABLE entity_state TYPE option<string>
 DEFINE FIELD IF NOT EXISTS author_uid  ON TABLE entity_state TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE entity_state TYPE option<string>;
 
+-- The labels an entity carries BEYOND what it is. Its identity stays
+-- single-valued in `entity.entity_type` — every list and every endpoint
+-- check depends on there being one answer to "what is this" — and this
+-- is everything else it is also labelled with.
+DEFINE FIELD IF NOT EXISTS labels ON TABLE entity_state TYPE option<array<string>>;
+
+
 DEFINE INDEX IF NOT EXISTS idx_entity_state_chain ON TABLE entity_state FIELDS entity, valid_from;
 
 -- ---------------------------------------------------------------- edges --
@@ -163,8 +170,7 @@ DEFINE TABLE IF NOT EXISTS label SCHEMAFULL
         FOR delete NONE;
 
 DEFINE FIELD IF NOT EXISTS key             ON TABLE label TYPE string;
-DEFINE FIELD IF NOT EXISTS label_kind      ON TABLE label TYPE string
-    ASSERT $value INSIDE ['slot', 'link'];
+DEFINE FIELD IF NOT EXISTS label_kind      ON TABLE label TYPE string;
 DEFINE FIELD IF NOT EXISTS display         ON TABLE label TYPE string;
 -- How a reader must TREAT it. Closed vocabularies, because code acts on
 -- this and free text cannot be acted on reliably.
@@ -197,6 +203,28 @@ DEFINE FIELD IF NOT EXISTS valid_from      ON TABLE label TYPE datetime;
 DEFINE FIELD IF NOT EXISTS author_kind     ON TABLE label TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS author_uid      ON TABLE label TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS via_uid         ON TABLE label TYPE option<string>;
+
+-- ------------------------------------------------- one vocabulary (#324) --
+-- ONE LIST OF LABELS. A label has a name, a meaning and an action; you
+-- attach it to an entity (`product`), to a field (`spec`) or to a
+-- relation (`contains`). Same source, same shape — "not check this and
+-- then check that, one and only" (operator, 2026-08-25).
+--
+-- `slot` and `link` were separate because they carried different extra
+-- properties: a relation label needs endpoints, a field label needed a
+-- datatype. The FIELD declares its own datatype now (#316), so that
+-- half of the split was already dead, and the endpoints simply do not
+-- apply to a label that is not on an edge.
+--
+-- WIDENED, NEVER NARROWED. The ASSERT is dropped rather than extended:
+-- every row already written as 'slot' or 'link' stays valid and stays
+-- readable exactly as it is, and nothing has to be rewritten. New
+-- labels are written as 'label'. OVERWRITE is deliberate — this file is
+-- re-applied verbatim on every provision, and `IF NOT EXISTS` on an
+-- existing field is ACCEPTED AND DOES NOT AMEND, probed on this engine
+-- rather than assumed.
+DEFINE FIELD OVERWRITE label_kind ON TABLE label TYPE string;
+
 
 DEFINE INDEX IF NOT EXISTS idx_label_chain ON TABLE label FIELDS key, label_kind, valid_from;
 

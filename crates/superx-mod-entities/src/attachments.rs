@@ -108,7 +108,7 @@ pub async fn attach_bytes(db: &Db, module_dir: &Path, up: Upload<'_>) -> Result<
     // actionable — and a typo would silently produce a file nothing
     // acts on while the operator believed it would.
     if !label.is_empty()
-        && crate::dictionary::current(db, label, crate::dictionary::SLOT).await?.is_none()
+        && crate::dictionary::find(db, label).await?.is_none()
     {
         return Err(KernelError::Module(format!(
             "the dictionary defines no label '{label}' — define it first, or leave \

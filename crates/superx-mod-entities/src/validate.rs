@@ -126,7 +126,7 @@ pub async fn subgraph(db: &Db, root: &RecordId, depth: usize) -> Result<Vec<Find
         // A `one` label holding several notes is two answers to a
         // question that has one.
         for label in &held {
-            let singular = dictionary::current(db, label, dictionary::SLOT)
+            let singular = dictionary::find(db, label)
                 .await?
                 .and_then(|d| d.cardinality)
                 .as_deref()

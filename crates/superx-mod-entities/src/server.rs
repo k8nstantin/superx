@@ -68,6 +68,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/entities/{frag}/addable-fields", get(api_addable_fields))
         .route("/api/entities/{frag}/update", post(api_update))
         .route("/api/entities/{frag}/archive", post(api_archive))
+        .route("/api/entities/{frag}/labels", post(api_entity_labels))
         .route("/api/labels/{key}/archive", post(api_label_archive))
         .route("/api/entities/{frag}/describe", post(api_describe))
         .route("/api/entities/{frag}/comment", post(api_comment))
@@ -433,6 +434,23 @@ struct ArchiveReq {
     /// toggle: a toggle sent twice by a retried request undoes itself,
     /// and the caller always knows which it meant.
     archived: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct EntityLabelsReq {
+    labels: Vec<String>,
+}
+
+async fn api_entity_labels(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+    Json(req): Json<EntityLabelsReq>,
+) -> Resp<bool> {
+    let db = module_db!(state);
+    match api::set_entity_labels(&db, &frag, &req.labels).await {
+        Ok(()) => Resp::ok(true),
+        Err(e) => Resp::err(e.to_string()),
+    }
 }
 
 async fn api_archive(

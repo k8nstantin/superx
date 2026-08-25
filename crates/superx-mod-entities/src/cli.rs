@@ -26,6 +26,8 @@ const USAGE: &str = "usage: superx entities <command>\n\
        attachments and edges at one instant, not a picker per field\n\
   list [--type <type>] [--archived]\n\
   archive <uuid-fragment> [--restore]  hide it from the lists; nothing is erased\n\
+  label <uuid-fragment> [a,b,...]     what this entity IS, beyond its type;\n\
+                       no list clears them. Each label is an action\n\
   validate [<uuid-fragment>] [--depth <n>]   does this graph make sense? (§5.5)\n\
   link <from-fragment> <to-fragment> --rel <relation-type>\n\
   unlink <from-fragment> <to-fragment> --rel <relation-type>\n\
@@ -85,6 +87,7 @@ pub async fn dispatch(kernel: &Kernel, args: &[String]) -> Result<String> {
         Some("show") => show_cmd(kernel, &args[1..]).await,
         Some("list") => list_cmd(kernel, &args[1..]).await,
         Some("archive") => archive_cmd(kernel, &args[1..]).await,
+        Some("label") => label_cmd(kernel, &args[1..]).await,
         Some("validate") => validate_cmd(kernel, &args[1..]).await,
         Some("link") => link_cmd(kernel, &args[1..], true).await,
         Some("unlink") => link_cmd(kernel, &args[1..], false).await,
@@ -196,7 +199,7 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
         }
         let mut out = format!("type '{entity_type}' carries {} slot(s)\n\n", slots.len());
         for slot in &slots {
-            let defined = crate::dictionary::current(&db, &slot.label, crate::dictionary::SLOT)
+            let defined = crate::dictionary::find(&db, &slot.label)
                 .await?;
             // The TYPE's override wins (§5.2): `description` is context on
             // a product and directive on a task. Printing the label's own
@@ -826,6 +829,29 @@ async fn validate_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     // A refusal, not a report: an operator who scripted this wants a
     // non-zero exit before the dispatch, not a message they might miss.
     Err(KernelError::Module(out))
+}
+
+/// Label an entity (#324): what it is, beyond its identity.
+///
+/// One list of labels, the same list a field draws from — "not check
+/// this and then check that, one and only" (operator, 2026-08-25). Each
+/// one carries its own action, which is what an agent reads.
+async fn label_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let db = kernel.module_db(MODULE_NAME).await?;
+    let fragment = args.first().ok_or_else(usage)?;
+    let labels: Vec<String> = args
+        .get(1)
+        .map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+        .unwrap_or_default();
+    let target = nodes::resolve_entity(&db, fragment).await?;
+    nodes::set_labels(&db, &target, &labels).await?;
+    let uuid = record_uuid(&target);
+    emit(kernel, "entity_labelled", &uuid, "", &labels.join(",")).await;
+    Ok(if labels.is_empty() {
+        format!("{uuid} carries no labels now — nothing was erased, it simply says less\n")
+    } else {
+        format!("{uuid} is labelled {}\n", labels.join(", "))
+    })
 }
 
 /// Hide an entity from the lists, or bring it back (§14).

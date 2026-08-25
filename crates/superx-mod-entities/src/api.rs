@@ -104,6 +104,10 @@ pub struct EntityDetail {
     pub version: String,
     /// Hidden from the lists, still on the record (§14).
     pub archived: bool,
+    /// The labels this entity carries beyond what it IS, each resolved
+    /// to what an agent should do about it.
+    pub labels: Vec<String>,
+    pub label_actions: Vec<LabelAction>,
     pub annotations: Vec<AnnotationView>,
     /// Active NON-TEXT edges, both directions (text-role edges show
     /// as annotations instead).
@@ -435,7 +439,7 @@ pub async fn entity_fields(db: &Db, fragment: &str) -> Result<Vec<FieldView>> {
     let mut out = Vec::new();
     for f in fields::of(db, &id).await? {
         let slot = slots.iter().find(|s| s.label == f.key);
-        let defined = dictionary::current(db, &f.key, dictionary::SLOT).await?;
+        let defined = dictionary::find(db, &f.key).await?;
         out.push(FieldView {
             semantics: slot
                 .and_then(|s| s.semantics_override.clone())
@@ -490,7 +494,7 @@ pub async fn entity_fields(db: &Db, fragment: &str) -> Result<Vec<FieldView>> {
     // say — so this is what it reads.
     for view in &mut out {
         for term in &view.labels {
-            let Some(l) = dictionary::current(db, term, dictionary::SLOT).await? else {
+            let Some(l) = dictionary::find(db, term).await? else {
                 // Declared once, gone now. Reads never fail (§7), so it
                 // surfaces as a label with no action rather than
                 // vanishing and taking its meaning with it.
@@ -568,7 +572,7 @@ pub async fn set_field(db: &Db, fragment: &str, key: &str, value: &str) -> Resul
 /// Verb errors pass through; an unknown kind is refused by name.
 pub async fn add_field(db: &Db, fragment: &str, req: &FieldReq) -> Result<()> {
     if let Some(kind) = req.value_kind.as_deref() {
-        if dictionary::current(db, &req.key, dictionary::SLOT).await?.is_none() {
+        if dictionary::find(db, &req.key).await?.is_none() {
             if !fields::is_value_kind(kind) {
                 return Err(KernelError::Module(format!(
                     "'{kind}' is not a datatype this understands — pick one of: {}",
@@ -583,7 +587,7 @@ pub async fn add_field(db: &Db, fragment: &str, req: &FieldReq) -> Result<()> {
             // on while it never would.
             let mut carried = Vec::new();
             for term in req.labels.iter().flatten() {
-                dictionary::current(db, term, dictionary::SLOT).await?.ok_or_else(|| {
+                dictionary::find(db, term).await?.ok_or_else(|| {
                     KernelError::Module(format!(
                         "the dictionary defines no label '{term}' — labels are created \
                          before they are attached. Define it first, or leave the labels \
@@ -763,6 +767,16 @@ pub async fn write_content_note(
 /// # Errors
 ///
 /// Verb errors pass through.
+/// Label an entity (#324) — what it is, beyond its identity.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn set_entity_labels(db: &Db, fragment: &str, labels: &[String]) -> Result<()> {
+    let id = nodes::resolve_entity(db, fragment).await?;
+    nodes::set_labels(db, &id, labels).await
+}
+
 /// Archive or restore an entity (§14). Returns whether anything
 /// changed — archiving what is already archived is a no-op, not an
 /// error.
@@ -867,7 +881,7 @@ pub async fn define_label(db: &Db, req: &LabelReq) -> Result<()> {
 pub async fn slots(db: &Db, entity_type: &str, include_retired: bool) -> Result<Vec<SlotView>> {
     let mut out = Vec::new();
     for slot in dictionary::slots_for(db, entity_type, include_retired).await? {
-        let defined = dictionary::current(db, &slot.label, dictionary::SLOT).await?;
+        let defined = dictionary::find(db, &slot.label).await?;
         out.push(SlotView {
             semantics: slot
                 .semantics_override
@@ -1098,6 +1112,21 @@ pub async fn detail_at(
         content: state.content,
         attributes_json: attrs_to_json(&state.attributes),
         archived: state.archived,
+        label_actions: {
+            // Resolved at READ time, like a field's — a label rewritten
+            // today changes what every entity carrying it means.
+            let mut out = Vec::new();
+            for term in &state.labels {
+                let found = dictionary::find(db, term).await?;
+                out.push(LabelAction {
+                    label: term.clone(),
+                    action: found.as_ref().and_then(|l| l.agent_note.clone()),
+                    semantics: found.map(|l| l.semantics).unwrap_or_default(),
+                });
+            }
+            out
+        },
+        labels: state.labels.clone(),
         version: state.valid_from,
         annotations,
         edges,
