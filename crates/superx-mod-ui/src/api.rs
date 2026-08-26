@@ -328,10 +328,17 @@ pub struct LiveSession {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub model: Option<String>,
+    /// The reasoning effort it is running at. The model alone does not
+    /// say what a session costs — the same model at low and at max
+    /// effort are different machines (#343).
+    pub effort: Option<String>,
     /// The newest tool it called.
     pub last_tool: Option<String>,
     pub messages: i64,
     pub lines_added: i64,
+    /// Lines this session replaced. Added alone reads `0` for a
+    /// session deep in a rewrite (#343).
+    pub lines_removed: i64,
     pub out_tokens: i64,
     pub tool_failures: i64,
     /// Seconds since its newest message.

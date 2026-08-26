@@ -583,9 +583,11 @@ struct LiveAgg {
     repo: Option<String>,
     branch: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
     last_tool: Option<String>,
     messages: i64,
     lines_added: i64,
+    lines_removed: i64,
     out_tokens: i64,
     tool_failures: i64,
     newest: Option<chrono::DateTime<chrono::Utc>>,
@@ -1030,6 +1032,14 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             if l.model.is_none() && model != "unknown" {
                 l.model = Some(model.clone());
             }
+            // Effort is switched mid-session, and it rides different
+            // messages than the model does — so it is picked up on its
+            // own first sighting, not alongside the model (#343).
+            if l.effort.is_none() {
+                if let Some(e) = &effort {
+                    l.effort = Some(e.clone());
+                }
+            }
         }
         // The cube's bucket: hourly on short ranges, daily on long
         // ones, folded HERE so the payload stays bounded however many
@@ -1405,10 +1415,14 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                         .or_default()
                                         .push((when, true));
                                 }
-                                code.live
-                                    .entry(superx_ops::record_uuid(&m.session))
-                                    .or_default()
-                                    .lines_added += n;
+                                {
+                                    let l = code
+                                        .live
+                                        .entry(superx_ops::record_uuid(&m.session))
+                                        .or_default();
+                                    l.lines_added += n;
+                                    l.lines_removed += replaced;
+                                }
                                 {
                                     let mm = code.models.entry(model.clone()).or_default();
                                     mm.lines_added += n;
@@ -2042,9 +2056,11 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                         repo: l.repo.clone(),
                         branch: l.branch.clone(),
                         model: l.model.clone(),
+                        effort: l.effort.clone(),
                         last_tool: l.last_tool.clone(),
                         messages: l.messages,
                         lines_added: l.lines_added,
+                        lines_removed: l.lines_removed,
                         out_tokens: l.out_tokens,
                         tool_failures: l.tool_failures,
                         idle_secs: idle,

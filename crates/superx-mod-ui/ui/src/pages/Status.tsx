@@ -16,6 +16,7 @@ import {
 import { fetchInsights, fetchStats, fetchStatus } from '../api'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK, INK_MUTED, TOOLTIP } from '../EChart'
 import { sessionColor } from '../Feed'
+import { LivenessDot } from '../LivenessDot'
 import { useBreadcrumb } from '../Breadcrumbs'
 
 // The Status page (issues #228, #237): the OS's captured numbers,
@@ -315,7 +316,14 @@ export default function StatusPage() {
                 <Table.Th>Model</Table.Th>
                 <Table.Th>Doing</Table.Th>
                 <Table.Th ta="right">Msgs</Table.Th>
-                <Table.Th ta="right">Lines</Table.Th>
+                <Table.Th ta="right">
+                  <Tooltip
+                    label="lines written and lines replaced — a modified line is one of each"
+                    withArrow
+                  >
+                    <span>Lines +/−</span>
+                  </Tooltip>
+                </Table.Th>
                 <Table.Th ta="right">Tokens</Table.Th>
                 <Table.Th ta="right">Fails</Table.Th>
                 <Table.Th ta="right">Idle</Table.Th>
@@ -326,15 +334,10 @@ export default function StatusPage() {
                 <Table.Tr key={l.identity}>
                   <Table.Td>
                     <Group gap={6} wrap="nowrap">
-                      <span
-                        style={{
-                          width: 8,
-                          height: 8,
-                          borderRadius: '50%',
-                          background: sessionColor(l.identity),
-                          flexShrink: 0,
-                        }}
-                      />
+                      {/* Every row here is live by construction, so the
+                          dot has one state to show — the same green the
+                          Sessions page draws (#343). */}
+                      <LivenessDot state="active" size={8} />
                       <Text size="xs" ff="monospace">
                         {l.identity.slice(0, 13)}
                       </Text>
@@ -352,9 +355,18 @@ export default function StatusPage() {
                     </Text>
                   </Table.Td>
                   <Table.Td>
-                    <Text size="xs" c="dimmed">
-                      {l.model ?? '—'}
-                    </Text>
+                    <Group gap={4} wrap="nowrap">
+                      <Text size="xs" c="dimmed">
+                        {l.model ?? '—'}
+                      </Text>
+                      {l.effort && (
+                        <Tooltip label="reasoning effort this session is running at" withArrow>
+                          <Badge variant="outline" color="pelican" size="sm">
+                            {l.effort}
+                          </Badge>
+                        </Tooltip>
+                      )}
+                    </Group>
                   </Table.Td>
                   <Table.Td>
                     {l.last_tool ? (
@@ -366,7 +378,24 @@ export default function StatusPage() {
                     )}
                   </Table.Td>
                   <Table.Td ta="right">{String(l.messages)}</Table.Td>
-                  <Table.Td ta="right">{fmtCompact(l.lines_added)}</Table.Td>
+                  {/* Added alone reads 0 for a session deep in a
+                      rewrite — show both halves (#343). */}
+                  <Table.Td ta="right">
+                    {Number(l.lines_added) === 0 && Number(l.lines_removed) === 0 ? (
+                      <Text size="xs" c="dimmed">
+                        —
+                      </Text>
+                    ) : (
+                      <Group gap={6} justify="flex-end" wrap="nowrap">
+                        <Text size="xs" c="teal.4">
+                          +{fmtCompact(l.lines_added)}
+                        </Text>
+                        <Text size="xs" c="red.4">
+                          −{fmtCompact(l.lines_removed)}
+                        </Text>
+                      </Group>
+                    )}
+                  </Table.Td>
                   <Table.Td ta="right">{fmtCompact(l.out_tokens)}</Table.Td>
                   <Table.Td ta="right" c={Number(l.tool_failures) > 0 ? 'red.4' : undefined}>
                     {String(l.tool_failures)}

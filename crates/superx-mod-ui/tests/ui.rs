@@ -1589,3 +1589,37 @@ async fn survival_and_verification_latency_are_measured() {
     let a = s.agent_stats.iter().find(|a| a.name == "claude_code").expect("agent");
     assert_eq!(a.edit_to_verify_p50_secs, 1800);
 }
+
+/// The live panel says what a session is COSTING and what it is doing
+/// to the code (#343). Effort rides its own messages, not the model's,
+/// and lines added alone reads `0` for a session deep in a rewrite —
+/// so both halves are carried.
+#[tokio::test]
+async fn a_live_row_carries_effort_and_both_halves_of_the_churn() {
+    let kernel = fresh_kernel().await;
+    let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
+
+    // Three new lines, at a stated effort. The effort sits on the
+    // message itself, beside the model.
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "effort": "xhigh",
+        "message": {"model": "claude-opus-5", "usage": {"output_tokens": 40},
+            "content": [{"type": "tool_use", "id": "w", "name": "Write",
+                "input": {"file_path": "/w/superx/new.rs", "content": "a\nb\nc"}}]}})).await;
+    // Then two existing lines rewritten into one — a net LOSS of a
+    // line, which `lines_added` on its own cannot express.
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
+            "input": {"file_path": "/w/superx/old.rs",
+                      "old_string": "one\ntwo", "new_string": "uno"}}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    assert_eq!(s.live.len(), 1, "{:?}", s.live.len());
+    let row = &s.live[0];
+    assert_eq!(row.model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(row.effort.as_deref(), Some("xhigh"), "effort is read off the message");
+    assert_eq!(row.lines_added, 4, "3 from the Write, 1 from the Edit's new_string");
+    assert_eq!(row.lines_removed, 2, "the Edit replaced two lines");
+}
