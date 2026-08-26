@@ -91,20 +91,53 @@ fn block_lines(name: &str, input: &Object) -> i64 {
 /// bar). So every stage is returned, with the pure-navigation ones
 /// dropped.
 fn command_labels(cmd: &str) -> Vec<String> {
-    let cleaned = strip_heredocs(cmd).replace("&&", ";").replace("||", ";");
-    cleaned
-        .split(SEQUENCERS)
-        .map(strip_redirections)
+    split_stages(&strip_heredocs(cmd))
+        .iter()
+        .map(|stage| strip_redirections(stage))
         .filter_map(|stage| stage_label(&stage))
         .collect()
 }
 
-/// `|`, `;` and newlines separate stages. **Not** bare `&`: a
-/// redirection like `2>&1` contains one, and splitting there produced
-/// a stage whose program was `1` — which became the most-repeated
-/// "command" on a live instance (issue #334). `&&` and `||` are
-/// handled by normalizing them to `;` first.
-const SEQUENCERS: [char; 3] = ['|', ';', '\n'];
+/// Split a command line into stages at the separators that are
+/// really separators.
+///
+/// Quoting is the whole point. `grep -E "passed|failed"` is ONE call,
+/// not two, and splitting it blind invents a stage whose program is
+/// `failed"`. Probing 5,493 live shell commands, a blind split
+/// produced 30,897 stages across 3,377 distinct labels — 1,633 of
+/// them junk like `Co-Authored-By:` and `print('`. Respecting quotes
+/// gives 24,606 stages across 258 labels, 25 of them junk. The 6,291
+/// difference was never work; it was the insides of strings.
+///
+/// `&&` splits, a lone `&` does not: `2>&1` contains one, and
+/// splitting there produced a stage whose program was `1` — the
+/// most-repeated "command" on a live instance (issue #335).
+fn split_stages(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut single, mut double) = (false, false);
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => {
+                single = !single;
+                cur.push(c);
+            }
+            '"' if !single => {
+                double = !double;
+                cur.push(c);
+            }
+            '|' | ';' | '\n' | '\r' if !single && !double => out.push(std::mem::take(&mut cur)),
+            '&' if !single && !double && chars.peek() == Some(&'&') => {
+                chars.next();
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
 
 /// Shell grammar that is not a program: keywords, punctuation, and the
 /// fragments of embedded scripts. Live QA found `let`, `t`, `assert`,
