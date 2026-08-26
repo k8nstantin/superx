@@ -38,9 +38,21 @@ const HEAT_ROWS = [...WEEKDAYS].reverse()
 function fmtCompact(n: number | bigint | null | undefined): string {
   if (n == null) return '—'
   const v = Number(n)
+  // Cache reads run to billions on a long day — 7679.1M is not a
+  // number anyone reads (#338).
+  if (v >= 1e12) return `${(v / 1e12).toFixed(1)}T`
+  if (v >= 1e9) return `${(v / 1e9).toFixed(1)}B`
   if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`
   if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`
   return String(v)
+}
+
+/// Bytes of file text that rode into a prompt (#337).
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
 function fmtAge(secs: number | bigint | null | undefined): string {
@@ -234,6 +246,27 @@ export default function StatusPage() {
     }
     return [...byDay.values()].sort((a, b) => a.t.localeCompare(b.t))
   })()
+
+  // Why is it churning? (operator insight) Directed churn is the
+  // design moving; self-directed is the agent rewriting itself.
+  const cd = s ? Number(s.churn_directed) : 0
+  const cs = s ? Number(s.churn_self) : 0
+  const directedPct = cd + cs > 0 ? Math.round((cd * 100) / (cd + cs)) : null
+  const churnCause =
+    directedPct == null
+      ? ''
+      : directedPct >= 60
+        ? 'the design is moving'
+        : directedPct <= 30
+          ? 'the agents are rewriting themselves'
+          : 'mixed — some redirection, some rework'
+  const fmtMs = (ms: number | bigint | null | undefined) => {
+    if (ms == null) return '—'
+    const v = Number(ms)
+    if (v >= 3_600_000) return `${(v / 3_600_000).toFixed(1)}h`
+    if (v >= 60_000) return `${Math.round(v / 60_000)}m`
+    return `${Math.round(v / 1000)}s`
+  }
 
   const q = s
     ? Number(s.tests_passed) + Number(s.tests_failed) > 0
@@ -662,6 +695,269 @@ export default function StatusPage() {
           </Card>
         </Grid.Col>
       </Grid>
+
+      {/* ── quality as a trend, and when it goes wrong ────────── */}
+      <Grid mb="md" gap="md">
+        <Grid.Col span={{ base: 12, lg: 8 }}>
+          <Card withBorder h="100%">
+            <Group justify="space-between" mb="xs">
+              <Title order={5}>Quality over time</Title>
+              <Text size="xs" c="dimmed">
+                tests and tool failures per hour · {windowNote}
+              </Text>
+            </Group>
+            <EChart
+              height={200}
+              option={{
+                grid: { left: 52, right: 12, top: 18, bottom: 26 },
+                tooltip: { ...TOOLTIP, trigger: 'axis' },
+                legend: {
+                  data: ['passed', 'failed', 'tool failures'],
+                  textStyle: { color: INK_MUTED },
+                  right: 0,
+                  top: -2,
+                },
+                xAxis: {
+                  type: 'category',
+                  data: (s?.quality_series ?? []).map((p) => p.t.slice(11) + ':00'),
+                  axisLabel: { color: AXIS },
+                  axisLine: { lineStyle: { color: GRID_LINE } },
+                },
+                yAxis: {
+                  type: 'value',
+                  axisLabel: { color: AXIS },
+                  splitLine: { lineStyle: { color: GRID_LINE } },
+                },
+                series: [
+                  { name: 'passed', type: 'bar', stack: 'q', itemStyle: { color: OK },
+                    data: (s?.quality_series ?? []).map((p) => Number(p.tests_passed)) },
+                  { name: 'failed', type: 'bar', stack: 'q', itemStyle: { color: FAIL },
+                    data: (s?.quality_series ?? []).map((p) => Number(p.tests_failed)) },
+                  { name: 'tool failures', type: 'line', smooth: true, itemStyle: { color: CANCEL },
+                    data: (s?.quality_series ?? []).map((p) => Number(p.tool_failures)) },
+                ],
+              }}
+            />
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 4 }}>
+          <Card withBorder h="100%">
+            <Title order={5} mb="xs">
+              Why the churn
+            </Title>
+            <Text fz={30} fw={700} ff="monospace" c={directedPct != null && directedPct <= 30 ? FAIL : OK}>
+              {directedPct == null ? '—' : `${directedPct}% directed`}
+            </Text>
+            <Text size="sm" c="dimmed" mb="xs">
+              {churnCause}
+            </Text>
+            <Tooltip
+              label="replaced lines that followed a human instruction, against those with nobody steering"
+              withArrow
+            >
+              <Group gap={2} wrap="nowrap" mb="md">
+                <div style={{ width: `${directedPct ?? 0}%`, background: OK, height: 10, borderRadius: '3px 0 0 3px' }} />
+                <div style={{ flex: 1, background: FAIL, height: 10, borderRadius: '0 3px 3px 0' }} />
+              </Group>
+            </Tooltip>
+            <SimpleGrid cols={2} spacing="xs">
+              <Counter label="Directed" value={s?.churn_directed} tone={OK} />
+              <Counter label="Self-inflicted" value={s?.churn_self} tone={FAIL} />
+            </SimpleGrid>
+            <Title order={5} mt="md" mb="xs">
+              Waiting on operations
+            </Title>
+            <SimpleGrid cols={2} spacing="xs">
+              <div>
+                <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
+                  Total wait
+                </Text>
+                <Text fz={22} fw={700} ff="monospace">
+                  {fmtMs(s?.wait_ms_total)}
+                </Text>
+              </div>
+              <div>
+                <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
+                  Median / p95
+                </Text>
+                <Text fz={22} fw={700} ff="monospace">
+                  {fmtMs(s?.wait_ms_median)} / {fmtMs(s?.wait_ms_p95)}
+                </Text>
+              </div>
+              <Counter label="Interrupted" value={s?.interrupted_calls} tone={s && Number(s.interrupted_calls) > 0 ? CANCEL : undefined} />
+            </SimpleGrid>
+          </Card>
+        </Grid.Col>
+      </Grid>
+
+      {/* ── reasoning level against churn and productivity ─────── */}
+      {(s?.efforts?.length ?? 0) > 0 && (
+        <Card withBorder mb="md">
+          <Group justify="space-between" mb="xs">
+            <Title order={5}>Reasoning level against outcome</Title>
+            <Text size="xs" c="dimmed">
+              does thinking harder produce keepable code
+            </Text>
+          </Group>
+          <Table striped>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>Effort</Table.Th>
+                <Table.Th ta="right">Msgs</Table.Th>
+                <Table.Th ta="right">Lines +</Table.Th>
+                <Table.Th ta="right">Churn</Table.Th>
+                <Table.Th ta="right">Thinking</Table.Th>
+                <Table.Th ta="right">Tok/line</Table.Th>
+                <Table.Th ta="right">Undone</Table.Th>
+                <Table.Th ta="right">Fails</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {(s?.efforts ?? []).map((e) => {
+                const a = Number(e.lines_added)
+                const d = Number(e.lines_removed)
+                const pct = a + d > 0 ? Math.round((d * 100) / (a + d)) : null
+                const tpl = a > 0 ? Math.round(Number(e.out_tokens) / a) : null
+                return (
+                  <Table.Tr key={e.name}>
+                    <Table.Td>
+                      <Badge variant="light" color="pelican">
+                        {e.name}
+                      </Badge>
+                    </Table.Td>
+                    <Table.Td ta="right">{fmtCompact(e.messages)}</Table.Td>
+                    <Table.Td ta="right" c={OK}>
+                      +{fmtCompact(a)}
+                    </Table.Td>
+                    <Table.Td ta="right" c={pct != null && pct >= 50 ? 'red.4' : undefined}>
+                      {pct == null ? '—' : `${pct}%`}
+                    </Table.Td>
+                    <Table.Td ta="right">{fmtCompact(e.thinking_tokens)}</Table.Td>
+                    <Table.Td ta="right">{tpl ?? '—'}</Table.Td>
+                    <Table.Td ta="right" c={Number(e.reverts) > 0 ? 'orange.4' : undefined}>
+                      {String(e.reverts)}
+                    </Table.Td>
+                    <Table.Td ta="right" c={Number(e.tool_failures) > 0 ? 'red.4' : undefined}>
+                      {String(e.tool_failures)}
+                    </Table.Td>
+                  </Table.Tr>
+                )
+              })}
+            </Table.Tbody>
+          </Table>
+        </Card>
+      )}
+
+      {/* ── what each agent costs per line it keeps (#337) ────── */}
+      {(s?.agent_stats?.length ?? 0) > 0 && (
+        <Card withBorder mb="md">
+          <Group justify="space-between" mb="xs">
+            <Title order={5}>Agent productivity and what it cost</Title>
+            <Text size="xs" c="dimmed">
+              tokens spent per line that survived — lower is cheaper work
+            </Text>
+          </Group>
+          <Table striped>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>Agent</Table.Th>
+                <Table.Th ta="right">Sessions</Table.Th>
+                <Table.Th ta="right">Repos</Table.Th>
+                <Table.Th ta="right">Lines +</Table.Th>
+                <Table.Th ta="right">Churn</Table.Th>
+                <Table.Th ta="right">Sent</Table.Th>
+                <Table.Th ta="right">Written</Table.Th>
+                <Table.Th ta="right">Tok/line</Table.Th>
+                <Table.Th ta="right">Undone</Table.Th>
+                <Table.Th ta="right">Fails</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {(s?.agent_stats ?? []).map((a) => {
+                const add = Number(a.lines_added)
+                const del = Number(a.lines_removed)
+                const pct = add + del > 0 ? Math.round((del * 100) / (add + del)) : null
+                // Everything the turn cost, against what it left behind.
+                const cost = add > 0 ? Math.round((Number(a.in_tokens) + Number(a.out_tokens)) / add) : null
+                return (
+                  <Table.Tr key={a.name}>
+                    <Table.Td>
+                      <Badge variant="light" color="pelican">
+                        {a.name}
+                      </Badge>
+                    </Table.Td>
+                    <Table.Td ta="right">{String(a.sessions)}</Table.Td>
+                    <Table.Td ta="right">{String(a.repos)}</Table.Td>
+                    <Table.Td ta="right" c={OK}>
+                      +{fmtCompact(add)}
+                    </Table.Td>
+                    <Table.Td ta="right" c={pct != null && pct >= 50 ? 'red.4' : undefined}>
+                      {pct == null ? '—' : `${pct}%`}
+                    </Table.Td>
+                    <Table.Td ta="right">{fmtCompact(a.in_tokens)}</Table.Td>
+                    <Table.Td ta="right">{fmtCompact(a.out_tokens)}</Table.Td>
+                    <Table.Td ta="right">{cost == null ? '—' : fmtCompact(cost)}</Table.Td>
+                    <Table.Td ta="right" c={Number(a.reverts) > 0 ? 'orange.4' : undefined}>
+                      {String(a.reverts)}
+                    </Table.Td>
+                    <Table.Td ta="right" c={Number(a.tool_failures) > 0 ? 'red.4' : undefined}>
+                      {String(a.tool_failures)}
+                    </Table.Td>
+                  </Table.Tr>
+                )
+              })}
+            </Table.Tbody>
+          </Table>
+        </Card>
+      )}
+
+      {/* ── what left this machine, and what was kept (#337) ───── */}
+      <Card withBorder mb="md">
+        <Group justify="space-between" mb="xs">
+          <Title order={5}>What left this machine</Title>
+          <Text size="xs" c="dimmed">
+            measured from your own transcripts — what the vendor does with it
+            afterwards is not observable from here
+          </Text>
+        </Group>
+        <SimpleGrid cols={{ base: 2, sm: 3, lg: 6 }} spacing="xs" mb="sm">
+          <Stat label="Sent fresh" value={fmtCompact(s?.exposure?.input_tokens ?? 0)} sub="prompt tokens" />
+          <Stat
+            label="Cached by vendor"
+            value={fmtCompact(s?.exposure?.cache_write_tokens ?? 0)}
+            sub="stored their side"
+          />
+          <Stat label="Served back" value={fmtCompact(s?.exposure?.cache_read_tokens ?? 0)} sub="cache reads" />
+          <Stat label="File text" value={fmtBytes(Number(s?.exposure?.content_bytes ?? 0))} sub="into prompts" />
+          <Stat label="Files read" value={fmtCompact(s?.exposure?.files_read ?? 0)} sub={`${s?.exposure?.repos_exposed ?? 0} repos`} />
+          <Stat label="Attachments" value={fmtCompact(s?.exposure?.attachments ?? 0)} sub="images, docs" />
+        </SimpleGrid>
+        {Number(s?.exposure?.outside_reads ?? 0) > 0 && (
+          <Text size="xs" c="orange.4" mb={4}>
+            {fmtCompact(s?.exposure?.outside_reads ?? 0)} file reads came from outside the
+            directory the agent was working in.
+          </Text>
+        )}
+        {Number(s?.exposure?.secret_hits ?? 0) > 0 ? (
+          <Card withBorder bg="dark.8" p="xs">
+            <Text size="sm" c="red.4" fw={600}>
+              {String(s?.exposure?.secret_hits)} tool result
+              {Number(s?.exposure?.secret_hits) === 1 ? '' : 's'} carried credential-shaped
+              content into a prompt
+            </Text>
+            <Text size="xs" c="dimmed">
+              {(s?.exposure?.secret_paths ?? []).slice(0, 8).join(' · ') || 'path not recorded'}
+            </Text>
+            <Text size="xs" c="dimmed" mt={4}>
+              Anything sent cannot be recalled. Rotate what was exposed.
+            </Text>
+          </Card>
+        ) : (
+          <Text size="xs" c="dimmed">
+            No credential-shaped content detected in what was sent.
+          </Text>
+        )}
+      </Card>
 
       {/* ── many agents, many repos: one row each ─────────────── */}
       <Grid mb="md" gap="md">

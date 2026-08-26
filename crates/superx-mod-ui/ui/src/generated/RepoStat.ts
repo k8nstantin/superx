@@ -15,6 +15,15 @@ name: string,
  */
 branch: string | null, messages: bigint, lines_added: bigint, lines_removed: bigint, files_touched: bigint, tests_run: bigint, tool_failures: bigint, out_tokens: bigint, 
 /**
+ * Replaced lines that followed a human instruction, and those
+ * that did not — design change vs agent confusion.
+ */
+churn_directed: bigint, churn_self: bigint, 
+/**
+ * Edits whose work a later edit undid, in this repo.
+ */
+reverts: bigint, 
+/**
  * Distinct agents that worked in it.
  */
 agents: bigint, 
