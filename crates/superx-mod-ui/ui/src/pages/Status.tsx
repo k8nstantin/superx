@@ -848,6 +848,164 @@ export default function StatusPage() {
         </Card>
       )}
 
+      {/* ── the work cube: agent × repo × bucket (#340) ───────── */}
+      {(s?.work_cells?.length ?? 0) > 0 && (
+        <Card withBorder mb="md">
+          <Group justify="space-between" mb="xs">
+            <Title order={5}>Where the work went</Title>
+            <Text size="xs" c="dimmed">
+              lines written per agent, per repo, per {range === '7d' || range === '30d' || range === 'all' ? 'day' : 'hour'}
+            </Text>
+          </Group>
+          <EChart
+            height={300}
+            option={(() => {
+              const cells = s?.work_cells ?? []
+              // One series per agent·repo pair, biggest first, the
+              // tail folded into `other` so the legend stays readable.
+              const totals = new Map<string, number>()
+              for (const c of cells) {
+                const k = `${c.agent} · ${c.repo}`
+                totals.set(k, (totals.get(k) ?? 0) + Number(c.added))
+              }
+              const top = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 7).map(([k]) => k)
+              const buckets = [...new Set(cells.map((c) => c.t))].sort()
+              const keyOf = (c: (typeof cells)[number]) => {
+                const k = `${c.agent} · ${c.repo}`
+                return top.includes(k) ? k : 'other'
+              }
+              const names = [...top, ...(cells.some((c) => keyOf(c) === 'other') ? ['other'] : [])]
+              return {
+                legend: { data: names, textStyle: { color: INK_MUTED, fontSize: 10 }, top: 0 },
+                grid: { left: 48, right: 12, top: 30, bottom: 24 },
+                xAxis: {
+                  type: 'category',
+                  data: buckets.map((b) => (b.includes('T') ? b.slice(11) + ':00' : b.slice(5))),
+                  axisLabel: { color: AXIS, fontSize: 10 },
+                  axisLine: { lineStyle: { color: GRID_LINE } },
+                },
+                yAxis: {
+                  type: 'value',
+                  axisLabel: { color: AXIS, fontSize: 10 },
+                  splitLine: { lineStyle: { color: GRID_LINE } },
+                },
+                tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
+                series: names.map((name, idx) => ({
+                  name,
+                  type: 'bar',
+                  stack: 'work',
+                  itemStyle: { color: CHART_COLORS[idx % CHART_COLORS.length] },
+                  data: buckets.map((b) =>
+                    cells
+                      .filter((c) => c.t === b && keyOf(c) === name)
+                      .reduce((acc, c) => acc + Number(c.added), 0),
+                  ),
+                })),
+              }
+            })()}
+          />
+        </Card>
+      )}
+
+      {/* ── the deeper reads (#340) ───────────────────────────── */}
+      <Grid mb="md" gap="md">
+        <Grid.Col span={{ base: 12, lg: 7 }}>
+          <Card withBorder h="100%">
+            <Group justify="space-between" mb="xs">
+              <Title order={5}>How the work behaved</Title>
+              <Text size="xs" c="dimmed">the same line count can mean opposite things</Text>
+            </Group>
+            <SimpleGrid cols={{ base: 2, sm: 3 }} spacing="xs">
+              <Stat
+                label="New files"
+                value={fmtCompact(s?.files_created)}
+                sub={`${fmtCompact(s?.files_modified)} already existed`}
+                tip="a file whose oldest event in the window created it"
+              />
+              <Stat
+                label="Repo switches"
+                value={fmtCompact(s?.repo_switches)}
+                sub="crossings mid-session"
+                tip="an agent that keeps leaving is progressing in neither repo"
+              />
+              <Stat
+                label="Edit → verify"
+                value={
+                  Number(s?.edit_to_verify_p50_secs ?? 0) > 0
+                    ? fmtMs(Number(s?.edit_to_verify_p50_secs) * 1000)
+                    : '—'
+                }
+                sub="median wait to check"
+                tip="long, with high churn, is the signature of an agent guessing"
+              />
+              <Stat
+                label="Code half-life"
+                value={
+                  Number(s?.survival_p50_mins ?? 0) > 0
+                    ? fmtMs(Number(s?.survival_p50_mins) * 60_000)
+                    : '—'
+                }
+                sub="before it was rewritten"
+                tip="minutes means thrash; hours means the design moved"
+              />
+              <Stat
+                label="Compactions"
+                value={fmtCompact(s?.compactions)}
+                sub={`${fmtMs(s?.compaction_total_ms)} lost`}
+                tip="the agent stopped, re-read its history, resumed with less of it"
+              />
+              <Stat
+                label="Churn"
+                value={`${Math.round(
+                  (Number(s?.churn_directed ?? 0) * 100) /
+                    Math.max(1, Number(s?.churn_directed ?? 0) + Number(s?.churn_self ?? 0)),
+                )}%`}
+                sub="directed by you"
+                tip="the rest the agents did to themselves"
+              />
+            </SimpleGrid>
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 5 }}>
+          <Card withBorder h="100%">
+            <Group justify="space-between" mb="xs">
+              <Title order={5}>Compaction</Title>
+              <Text size="xs" c="dimmed">dead time, per session</Text>
+            </Group>
+            {(s?.compaction_sessions?.length ?? 0) === 0 ? (
+              <Text size="xs" c="dimmed">No session hit its context ceiling in this range.</Text>
+            ) : (
+              <Table striped>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>Session</Table.Th>
+                    <Table.Th ta="right">Times</Table.Th>
+                    <Table.Th ta="right">Lost</Table.Th>
+                    <Table.Th ta="right">Context</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {(s?.compaction_sessions ?? []).slice(0, 6).map((c) => (
+                    <Table.Tr key={c.identity}>
+                      <Table.Td>
+                        <Text size="xs" ff="monospace">{c.identity.slice(0, 20)}</Text>
+                        <Text size="xs" c="dimmed">
+                          {c.repo ?? '—'}
+                          {Number(c.manual) > 0 ? ` · ${c.manual} manual` : ''}
+                        </Text>
+                      </Table.Td>
+                      <Table.Td ta="right">{String(c.count)}</Table.Td>
+                      <Table.Td ta="right" c="orange.4">{fmtMs(c.total_ms)}</Table.Td>
+                      <Table.Td ta="right">{fmtCompact(c.pre_tokens_max)}</Table.Td>
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+            )}
+          </Card>
+        </Grid.Col>
+      </Grid>
+
       {/* ── what each agent costs per line it keeps (#337) ────── */}
       {(s?.agent_stats?.length ?? 0) > 0 && (
         <Card withBorder mb="md">
@@ -868,6 +1026,9 @@ export default function StatusPage() {
                 <Table.Th ta="right">Sent</Table.Th>
                 <Table.Th ta="right">Written</Table.Th>
                 <Table.Th ta="right">Tok/line</Table.Th>
+                <Table.Th ta="right">Switches</Table.Th>
+                <Table.Th ta="right">Verify</Table.Th>
+                <Table.Th ta="right">Compact</Table.Th>
                 <Table.Th ta="right">Undone</Table.Th>
                 <Table.Th ta="right">Fails</Table.Th>
               </Table.Tr>
@@ -897,6 +1058,19 @@ export default function StatusPage() {
                     <Table.Td ta="right">{fmtCompact(a.in_tokens)}</Table.Td>
                     <Table.Td ta="right">{fmtCompact(a.out_tokens)}</Table.Td>
                     <Table.Td ta="right">{cost == null ? '—' : fmtCompact(cost)}</Table.Td>
+                    <Table.Td ta="right" c={Number(a.repo_switches) > 20 ? 'orange.4' : undefined}>
+                      {String(a.repo_switches)}
+                    </Table.Td>
+                    <Table.Td ta="right">
+                      {Number(a.edit_to_verify_p50_secs) > 0
+                        ? fmtMs(Number(a.edit_to_verify_p50_secs) * 1000)
+                        : '—'}
+                    </Table.Td>
+                    <Table.Td ta="right">
+                      {Number(a.compactions) > 0
+                        ? `${a.compactions} · ${fmtMs(a.compaction_ms)}`
+                        : '—'}
+                    </Table.Td>
                     <Table.Td ta="right" c={Number(a.reverts) > 0 ? 'orange.4' : undefined}>
                       {String(a.reverts)}
                     </Table.Td>
@@ -978,6 +1152,8 @@ export default function StatusPage() {
                   <Table.Th ta="right">+/−</Table.Th>
                   <Table.Th ta="right">Churn</Table.Th>
                   <Table.Th ta="right">Files</Table.Th>
+                  <Table.Th ta="right">New</Table.Th>
+                  <Table.Th ta="right">Half-life</Table.Th>
                   <Table.Th ta="right">Tests</Table.Th>
                   <Table.Th ta="right">Fails</Table.Th>
                 </Table.Tr>
@@ -1013,6 +1189,14 @@ export default function StatusPage() {
                         {pct == null ? '—' : `${pct}%`}
                       </Table.Td>
                       <Table.Td ta="right">{String(r.files_touched)}</Table.Td>
+                      <Table.Td ta="right" c={Number(r.files_created) > 0 ? OK : undefined}>
+                        {String(r.files_created)}
+                      </Table.Td>
+                      <Table.Td ta="right">
+                        {Number(r.survival_p50_mins) > 0
+                          ? fmtMs(Number(r.survival_p50_mins) * 60_000)
+                          : '—'}
+                      </Table.Td>
                       <Table.Td ta="right">{String(r.tests_run)}</Table.Td>
                       <Table.Td ta="right" c={Number(r.tool_failures) > 0 ? 'red.4' : undefined}>
                         {String(r.tool_failures)}

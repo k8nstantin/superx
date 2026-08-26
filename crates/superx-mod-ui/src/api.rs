@@ -261,6 +261,25 @@ pub struct StatsSummary {
     pub efforts: Vec<EffortStat>,
     /// Productivity and token cost per agent.
     pub agent_stats: Vec<AgentStat>,
+    /// Work per agent, per repo, per bucket (#340).
+    pub work_cells: Vec<WorkCell>,
+    /// Files whose oldest event in the window created them, against
+    /// files that already existed. Same line count, opposite meaning.
+    pub files_created: i64,
+    pub files_modified: i64,
+    /// An agent crossing repos inside a session — thrash, when high.
+    pub repo_switches: i64,
+    /// Median seconds from a write to the next test or build. Long,
+    /// with high churn, is the signature of an agent guessing.
+    pub edit_to_verify_p50_secs: i64,
+    /// Median minutes a line survived before something rewrote it.
+    /// Ten minutes is thrash; ten hours is the design moving.
+    pub survival_p50_mins: i64,
+    /// Compaction per session, and what it cost. (`compactions`
+    /// above is the plain event count from #308 — this is the
+    /// breakdown, so it carries its own name.)
+    pub compaction_sessions: Vec<CompactionStat>,
+    pub compaction_total_ms: i64,
     /// What left this machine and what the vendor retained.
     pub exposure: Exposure,
 }
@@ -271,6 +290,10 @@ pub struct StatsSummary {
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct RepoStat {
+    /// Median minutes code survived here before being rewritten (#340).
+    pub survival_p50_mins: i64,
+    /// Files this repo gained in the window, against files it changed.
+    pub files_created: i64,
     /// Checkout directory name.
     pub name: String,
     /// Newest branch seen for it, when the transcript carries one.
@@ -329,6 +352,44 @@ pub struct ModelStat {
     pub reverts: i64,
 }
 
+/// One cell of the work cube (#340): what ONE agent did in ONE repo
+/// in ONE time bucket. Two agents in the same repo in the same hour is
+/// the case a flat series cannot show — one writing while the other
+/// rewrites totals the same as one agent making progress.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct WorkCell {
+    /// Bucket key: hour (`…T14`) on short ranges, day on long ones.
+    pub t: String,
+    pub agent: String,
+    pub repo: String,
+    pub added: i64,
+    pub removed: i64,
+    pub files: i64,
+    pub out_tokens: i64,
+    pub messages: i64,
+}
+
+/// Context compaction is dead time (#340): the agent stops, re-reads
+/// its own history and starts again with less of it. The transcript
+/// records the trigger, how long it took and how much context was in
+/// play when it fired.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct CompactionStat {
+    pub identity: String,
+    pub agent: String,
+    pub repo: Option<String>,
+    pub count: i64,
+    pub total_ms: i64,
+    pub median_ms: i64,
+    /// Largest context seen at a compaction — how close to the ceiling.
+    pub pre_tokens_max: i64,
+    /// Fired by the runtime, not asked for.
+    pub auto: i64,
+    pub manual: i64,
+}
+
 /// Per-agent productivity and cost (operator ask on #337): tokens
 /// spent per line that survived, by agent.
 #[derive(Debug, Serialize, TS)]
@@ -346,6 +407,13 @@ pub struct AgentStat {
     pub reverts: i64,
     /// Repos this agent worked in.
     pub repos: i64,
+    /// Times it crossed from one repo to another mid-session (#340).
+    pub repo_switches: i64,
+    /// Median seconds from its writes to its next verification.
+    pub edit_to_verify_p50_secs: i64,
+    /// Compactions it sat through, and the time they took.
+    pub compactions: i64,
+    pub compaction_ms: i64,
 }
 
 /// What left this machine, and what the vendor retained (operator ask

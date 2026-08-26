@@ -14,7 +14,7 @@ use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
-    AgentStat, ChurnPoint, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount,
+    AgentStat, ChurnPoint, CompactionStat, WorkCell, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount,
     QualityPoint, RepoStat,
     SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome,
 };
@@ -370,6 +370,28 @@ struct CodeAgg {
     efforts: HashMap<String, EffortAgg>,
     /// Productivity and cost per agent (#337).
     agents: HashMap<String, AgentAgg>,
+    // ── the work cube: agent × repo × bucket (#340) ──────────────
+    cells: HashMap<(String, String, String), CellAgg>,
+    /// path → the tool of its OLDEST event in the window. The walk is
+    /// newest-first, so the last write here wins and that is the
+    /// oldest one — created-in-window falls out for free.
+    path_origin: HashMap<String, bool>,
+    /// path → repo, so created/modified splits per repo.
+    path_repo: HashMap<String, String>,
+    /// session → the repo seen at the previous (newer) message, for
+    /// counting crossings.
+    last_repo: HashMap<String, String>,
+    repo_switches: i64,
+    /// session → (time, is_write) events, reduced after the walk into
+    /// how long a write waited for its verification.
+    verify_events: HashMap<String, Vec<(chrono::DateTime<chrono::Utc>, bool)>>,
+    /// snippet key → when a LATER edit removed it. Meeting the write
+    /// that created it (earlier in the walk) yields its lifetime.
+    removed_at: HashMap<u64, chrono::DateTime<chrono::Utc>>,
+    survivals: Vec<i64>,
+    repo_survivals: HashMap<String, Vec<i64>>,
+    /// session → compaction facts (#340).
+    compact_by_session: HashMap<String, CompactAgg>,
     // ── what left this machine (#337) ────────────────────────────
     in_tokens: i64,
     cache_write: i64,
@@ -455,6 +477,27 @@ type Span = (
     i64,
 );
 
+/// One cell of the work cube (#340).
+#[derive(Default)]
+struct CellAgg {
+    added: i64,
+    removed: i64,
+    files: HashSet<String>,
+    out_tokens: i64,
+    messages: i64,
+}
+
+/// What compaction cost one session (#340).
+#[derive(Default)]
+struct CompactAgg {
+    agent: String,
+    repo: Option<String>,
+    durations: Vec<i64>,
+    pre_tokens_max: i64,
+    auto: i64,
+    manual: i64,
+}
+
 /// Per-agent productivity and cost (#337).
 #[derive(Default)]
 struct AgentAgg {
@@ -467,6 +510,19 @@ struct AgentAgg {
     tool_failures: i64,
     reverts: i64,
     repos: HashSet<String>,
+    repo_switches: i64,
+    verify_gaps: Vec<i64>,
+    compactions: i64,
+    compaction_ms: i64,
+}
+
+/// The middle value, or zero for nothing (#340).
+fn median(v: &mut [i64]) -> i64 {
+    if v.is_empty() {
+        return 0;
+    }
+    v.sort_unstable();
+    v[v.len() / 2]
 }
 
 /// The agent's own workspace is not your material. Scratchpads, task
@@ -813,13 +869,16 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             human_turns
                 .entry(superx_ops::record_uuid(&m.session))
                 .or_default()
-                .push(m.valid_from);
+                .push(m.emitted_at.unwrap_or(m.valid_from));
         }
     }
     for v in human_turns.values_mut() {
         v.sort_unstable();
     }
     let mut tools: HashMap<String, i64> = HashMap::new();
+    // 7d and longer would otherwise produce a cell per agent, per
+    // repo, per HOUR — thousands of rows nobody can read (#340).
+    let fold_days = matches!(range, "7d" | "30d" | "all");
     let mut code = CodeAgg::default();
     let mut lines_written = 0i64;
     let mut per_session: HashMap<String, SessAgg> = HashMap::new();
@@ -847,14 +906,21 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         agg.messages += 1;
         // Shape of the working day (#324): when messages landed, and
         // how many sessions were live at once.
-        code.instants.push(m.valid_from);
+        // The AGENT'S clock, not ours. `valid_from` is when
+        // SuperX captured the line; during a backfill that is
+        // one narrow window for months of work, which would
+        // pile every hour-graded figure into the hour of the
+        // backfill. `emitted_at` is when the work happened
+        // (insights.rs already reads it this way) (#340).
+        let when = m.emitted_at.unwrap_or(m.valid_from);
+        code.instants.push(when);
         let minute: u32 = m
             .valid_from
             .format("%M")
             .to_string()
             .parse()
             .unwrap_or(0);
-        let bucket5 = format!("{}-{}", m.valid_from.format("%Y-%m-%dT%H"), minute / 5);
+        let bucket5 = format!("{}-{}", when.format("%Y-%m-%dT%H"), minute / 5);
         code.concurrency
             .entry(bucket5)
             .or_default()
@@ -868,7 +934,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         if let Some(e) = &effort {
             code.efforts.entry(e.clone()).or_default().messages += 1;
         }
-        let hour_key = m.valid_from.format("%Y-%m-%dT%H").to_string();
+        let hour_key = when.format("%Y-%m-%dT%H").to_string();
         let hour_of_day: i64 = m
             .valid_from
             .format("%H")
@@ -880,17 +946,17 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         {
             let sid = superx_ops::record_uuid(&m.session);
             let entry = code.spans.entry(sid).or_insert((
-                m.valid_from,
-                m.valid_from,
+                when,
+                when,
                 superx_ops::record_uuid(&m.agent),
                 None,
                 0,
             ));
-            if m.valid_from < entry.0 {
-                entry.0 = m.valid_from;
+            if when < entry.0 {
+                entry.0 = when;
             }
-            if m.valid_from > entry.1 {
-                entry.1 = m.valid_from;
+            if when > entry.1 {
+                entry.1 = when;
             }
             entry.4 += 1;
         }
@@ -902,7 +968,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             let l = code.live.entry(sid).or_default();
             l.messages += 1;
             if l.newest.is_none() {
-                l.newest = Some(m.valid_from);
+                l.newest = Some(when);
                 l.agent = superx_ops::record_uuid(&m.agent);
             }
         }
@@ -920,7 +986,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                             .unwrap_or("operation")
                             .to_string(),
                         ms,
-                        at: m.valid_from.to_rfc3339(),
+                        at: when.to_rfc3339(),
                     });
                 }
             }
@@ -965,6 +1031,14 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                 l.model = Some(model.clone());
             }
         }
+        // The cube's bucket: hourly on short ranges, daily on long
+        // ones, folded HERE so the payload stays bounded however many
+        // agent/repo pairs exist (#340).
+        let bucket = if fold_days {
+            when.format("%Y-%m-%d").to_string()
+        } else {
+            when.format("%Y-%m-%dT%H").to_string()
+        };
         // Per-agent productivity (#337). Sessions are `agent/uuid`,
         // so the owning agent is resolved through the session.
         let sid_now = superx_ops::record_uuid(&m.session);
@@ -985,12 +1059,33 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             }
             if let Some(an) = &agent_name {
                 code.agents.entry(an.clone()).or_default().repos.insert(rk.clone());
+                code.cells
+                    .entry((an.clone(), rk.clone(), bucket.clone()))
+                    .or_default()
+                    .messages += 1;
+            }
+            // Crossing repos mid-session. The walk is newest-first, so
+            // this counts the same boundaries from the other side —
+            // a crossing is a crossing in either direction (#340).
+            let sid = superx_ops::record_uuid(&m.session);
+            match code.last_repo.get(&sid) {
+                Some(prev) if prev != rk => {
+                    code.repo_switches += 1;
+                    if let Some(an) = &agent_name {
+                        code.agents.entry(an.clone()).or_default().repo_switches += 1;
+                    }
+                    code.last_repo.insert(sid, rk.clone());
+                }
+                None => {
+                    code.last_repo.insert(sid, rk.clone());
+                }
+                _ => {}
             }
             let r = code.repos.entry(rk.clone()).or_default();
             r.messages += 1;
             r.agents.insert(superx_ops::record_uuid(&m.agent));
-            if r.last_active.is_none_or(|prev| m.valid_from > prev) {
-                r.last_active = Some(m.valid_from);
+            if r.last_active.is_none_or(|prev| when > prev) {
+                r.last_active = Some(when);
             }
             if let Some(b) = get_str(raw, "gitBranch").filter(|b| !b.is_empty()) {
                 r.branch.get_or_insert_with(|| b.to_string());
@@ -1004,6 +1099,31 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                     .or_insert_with(|| branch.to_string());
             }
             *code.projects.entry(project).or_insert(0) += 1;
+        }
+        // Compaction is dead time (#340): the agent stops, re-reads
+        // its own history and resumes with less of it. The transcript
+        // records the trigger, the duration and how much context was
+        // in play — `compact_boundary` lines are captured whole.
+        if let Some(Value::Object(cm)) = raw.get("compactMetadata") {
+            let sid = superx_ops::record_uuid(&m.session);
+            let c = code.compact_by_session.entry(sid.clone()).or_default();
+            if c.agent.is_empty() {
+                c.agent = agent_name.clone().unwrap_or_else(|| "?".to_string());
+            }
+            if c.repo.is_none() {
+                c.repo = repo_key.clone();
+            }
+            c.durations.push(get_int(cm, "durationMs"));
+            c.pre_tokens_max = c.pre_tokens_max.max(get_int(cm, "preTokens"));
+            match get_str(cm, "trigger") {
+                Some("manual") => c.manual += 1,
+                _ => c.auto += 1,
+            }
+            if let Some(an) = &agent_name {
+                let a = code.agents.entry(an.clone()).or_default();
+                a.compactions += 1;
+                a.compaction_ms += get_int(cm, "durationMs");
+            }
         }
         // Claude-style usage + blocks: raw.message.{usage, content[]}.
         if let Some(Value::Object(msg)) = raw.get("message") {
@@ -1028,6 +1148,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                 }
                 if let Some(rk) = &repo_key {
                     code.repos.entry(rk.clone()).or_default().out_tokens += out;
+                    if let Some(an) = &agent_name {
+                        code.cells
+                            .entry((an.clone(), rk.clone(), bucket.clone()))
+                            .or_default()
+                            .out_tokens += out;
+                    }
                 }
                 if let Some(Value::Object(details)) = usage.get("output_tokens_details") {
                     code.thinking += get_int(details, "thinking_tokens");
@@ -1117,6 +1243,25 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     None => {}
                                 }
                             }
+                            // A verification closes the edit→verify
+                            // pair (#340): did the agent check its
+                            // work, and how long did it wait?
+                            if SHELL_TOOLS.contains(&name.as_str()) {
+                                if let Some(Value::Object(input)) = block.get("input") {
+                                    if let Some(cmd) = get_str(input, "command") {
+                                        let verifies = command_labels(cmd).iter().any(|l| {
+                                            let (test, build, _) = classify_command(l);
+                                            test || build
+                                        });
+                                        if verifies {
+                                            code.verify_events
+                                                .entry(superx_ops::record_uuid(&m.session))
+                                                .or_default()
+                                                .push((when, false));
+                                        }
+                                    }
+                                }
+                            }
                             // When does work go wrong (#337)?
                             code.by_hour.entry(hour_of_day).or_insert((0, 0)).0 += 1;
                             // Instrument the call itself (#308).
@@ -1167,7 +1312,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 let n = block_lines(&name, input);
                                 let replaced = replaced_lines(&name, input);
                                 if n > 0 || replaced > 0 {
-                                    let hour = m.valid_from.format("%Y-%m-%dT%H").to_string();
+                                    let hour = when.format("%Y-%m-%dT%H").to_string();
                                     let slot = code.churn.entry(hour).or_insert((0, 0));
                                     slot.0 += n;
                                     slot.1 += replaced;
@@ -1188,11 +1333,11 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 let steered = human_turns
                                     .get(&superx_ops::record_uuid(&m.session))
                                     .is_some_and(|turns| {
-                                        let cut = m.valid_from - chrono::Duration::minutes(STEERING_MINUTES);
+                                        let cut = when - chrono::Duration::minutes(STEERING_MINUTES);
                                         turns
                                             .iter()
                                             .rev()
-                                            .skip_while(|h| **h > m.valid_from)
+                                            .skip_while(|h| **h > when)
                                             .take(1)
                                             .any(|h| *h >= cut)
                                     });
@@ -1227,6 +1372,38 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     let a = code.agents.entry(an.clone()).or_default();
                                     a.lines_added += n;
                                     a.lines_removed += replaced;
+                                    if let Some(rk) = &repo_key {
+                                        let cell = code
+                                            .cells
+                                            .entry((an.clone(), rk.clone(), bucket.clone()))
+                                            .or_default();
+                                        cell.added += n;
+                                        cell.removed += replaced;
+                                        if let Some(pth) = get_str(input, "file_path") {
+                                            cell.files.insert(pth.to_string());
+                                        }
+                                    }
+                                }
+                                // Did this file EXIST before the window,
+                                // or did the agent create it here? The
+                                // walk is newest-first, so the last
+                                // value written wins — and that is the
+                                // oldest event for the path (#340).
+                                if let Some(pth) = get_str(input, "file_path") {
+                                    let creates = name == "Write"
+                                        && get_str(input, "old_string").is_none();
+                                    code.path_origin.insert(pth.to_string(), creates);
+                                    if let Some(rk) = &repo_key {
+                                        code.path_repo.insert(pth.to_string(), rk.clone());
+                                    }
+                                }
+                                // A write is one half of the
+                                // edit→verify pair (#340).
+                                if n > 0 || replaced > 0 {
+                                    code.verify_events
+                                        .entry(superx_ops::record_uuid(&m.session))
+                                        .or_default()
+                                        .push((when, true));
                                 }
                                 code.live
                                     .entry(superx_ops::record_uuid(&m.session))
@@ -1239,6 +1416,25 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 }
                                 if let Some(path) = get_str(input, "file_path") {
                                     let seen = code.removed_text.entry(path.to_string()).or_default();
+                                    // How long did this text live?
+                                    // `removed_at` holds when a LATER
+                                    // edit took it out; meeting its
+                                    // author now gives the lifetime
+                                    // (#340).
+                                    if let Some(key) =
+                                        get_str(input, "new_string").and_then(snippet_key)
+                                    {
+                                        if let Some(gone) = code.removed_at.remove(&key) {
+                                            let mins = (gone - when).num_minutes().max(0);
+                                            code.survivals.push(mins);
+                                            if let Some(rk) = &repo_key {
+                                                code.repo_survivals
+                                                    .entry(rk.clone())
+                                                    .or_default()
+                                                    .push(mins);
+                                            }
+                                        }
+                                    }
                                     if let Some(key) =
                                         get_str(input, "new_string").and_then(snippet_key)
                                     {
@@ -1259,6 +1455,11 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     if let Some(key) =
                                         get_str(input, "old_string").and_then(snippet_key)
                                     {
+                                        // Remember WHEN it went, so the
+                                        // write that authored it can be
+                                        // dated when the walk reaches
+                                        // it (#340).
+                                        code.removed_at.entry(key).or_insert(when);
                                         seen.insert(key);
                                     }
                                 }
@@ -1496,11 +1697,89 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         rows.len() as i64
     };
 
+    // ── post-walk reductions (#340) ──────────────────────────────
+    // Each write waits for the next verification in its session. The
+    // events were pushed newest-first, so sort before pairing.
+    let mut verify_gaps: Vec<i64> = Vec::new();
+    for (sid, events) in &mut code.verify_events {
+        events.sort_by_key(|(at, _)| *at);
+        let mut pending: Option<chrono::DateTime<chrono::Utc>> = None;
+        for (at, is_write) in events.iter() {
+            if *is_write {
+                // The FIRST write of a streak owns the wait — later
+                // writes before the same check are the same batch.
+                pending.get_or_insert(*at);
+            } else if let Some(start) = pending.take() {
+                let secs = (*at - start).num_seconds().max(0);
+                verify_gaps.push(secs);
+                if let Some(agent) = agent_of.get(sid) {
+                    code.agents
+                        .entry(agent.clone())
+                        .or_default()
+                        .verify_gaps
+                        .push(secs);
+                }
+            }
+        }
+    }
+    // A file whose oldest event in the window was a full Write was
+    // created here; anything else already existed.
+    let mut files_created = 0i64;
+    let mut files_modified = 0i64;
+    let mut repo_created: HashMap<String, i64> = HashMap::new();
+    for (path, creates) in &code.path_origin {
+        if *creates {
+            files_created += 1;
+            if let Some(rk) = code.path_repo.get(path) {
+                *repo_created.entry(rk.clone()).or_insert(0) += 1;
+            }
+        } else {
+            files_modified += 1;
+        }
+    }
+    let mut work_cells: Vec<_> = code
+        .cells
+        .into_iter()
+        .map(|((agent, repo, t), c)| WorkCell {
+            t,
+            agent,
+            repo,
+            added: c.added,
+            removed: c.removed,
+            files: c.files.len() as i64,
+            out_tokens: c.out_tokens,
+            messages: c.messages,
+        })
+        .collect();
+    work_cells.sort_by(|a, b| a.t.cmp(&b.t).then(a.repo.cmp(&b.repo)).then(a.agent.cmp(&b.agent)));
+    let mut compaction_sessions: Vec<_> = code
+        .compact_by_session
+        .into_iter()
+        .map(|(sid, mut c)| {
+            let total: i64 = c.durations.iter().sum();
+            CompactionStat {
+                identity: identity.get(&sid).cloned().unwrap_or(sid),
+                agent: c.agent,
+                repo: c.repo,
+                count: c.durations.len() as i64,
+                total_ms: total,
+                median_ms: median(&mut c.durations),
+                pre_tokens_max: c.pre_tokens_max,
+                auto: c.auto,
+                manual: c.manual,
+            }
+        })
+        .collect();
+    compaction_sessions.sort_by_key(|c| std::cmp::Reverse(c.total_ms));
+    let compaction_total_ms: i64 = compaction_sessions.iter().map(|c| c.total_ms).sum();
+    let edit_to_verify_p50_secs = median(&mut verify_gaps);
+    let survival_p50_mins = median(&mut code.survivals);
+
     // Per-agent productivity, most productive first (#337).
     let mut agent_stats: Vec<_> = code
         .agents
         .into_iter()
-        .map(|(name, a)| AgentStat {
+        .map(|(name, mut a)| AgentStat {
             name,
             sessions: a.sessions.len() as i64,
             messages: a.messages,
@@ -1511,6 +1790,10 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             tool_failures: a.tool_failures,
             reverts: a.reverts,
             repos: a.repos.len() as i64,
+            repo_switches: a.repo_switches,
+            edit_to_verify_p50_secs: median(&mut a.verify_gaps),
+            compactions: a.compactions,
+            compaction_ms: a.compaction_ms,
         })
         .collect();
     agent_stats.sort_by_key(|a| std::cmp::Reverse(a.lines_added));
@@ -1613,6 +1896,10 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                 .repos
                 .iter()
                 .map(|(name, r)| RepoStat {
+                    survival_p50_mins: median(
+                        &mut code.repo_survivals.get(name).cloned().unwrap_or_default(),
+                    ),
+                    files_created: repo_created.get(name).copied().unwrap_or(0),
                     name: name.clone(),
                     branch: r.branch.clone(),
                     messages: r.messages,
@@ -1778,6 +2065,14 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         },
         agent_stats,
         exposure,
+        work_cells,
+        files_created,
+        files_modified,
+        repo_switches: code.repo_switches,
+        edit_to_verify_p50_secs,
+        survival_p50_mins,
+        compaction_sessions,
+        compaction_total_ms,
     })
 }
 

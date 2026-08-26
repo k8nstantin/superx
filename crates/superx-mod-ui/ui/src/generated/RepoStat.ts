@@ -7,6 +7,14 @@
  */
 export type RepoStat = { 
 /**
+ * Median minutes code survived here before being rewritten (#340).
+ */
+survival_p50_mins: bigint, 
+/**
+ * Files this repo gained in the window, against files it changed.
+ */
+files_created: bigint, 
+/**
  * Checkout directory name.
  */
 name: string, 

@@ -12,4 +12,16 @@ in_tokens: bigint, tool_failures: bigint, reverts: bigint,
 /**
  * Repos this agent worked in.
  */
-repos: bigint, };
+repos: bigint, 
+/**
+ * Times it crossed from one repo to another mid-session (#340).
+ */
+repo_switches: bigint, 
+/**
+ * Median seconds from its writes to its next verification.
+ */
+edit_to_verify_p50_secs: bigint, 
+/**
+ * Compactions it sat through, and the time they took.
+ */
+compactions: bigint, compaction_ms: bigint, };
