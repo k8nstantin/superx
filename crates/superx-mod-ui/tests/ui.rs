@@ -1419,6 +1419,8 @@ async fn productivity_and_exposure_are_measured_per_agent() {
                 "input": {"file_path": "/w/superx/src/lib.rs"}},
             {"type": "tool_use", "id": "r2", "name": "Read",
                 "input": {"file_path": "/home/me/.ssh/id_rsa"}},
+            {"type": "tool_use", "id": "r3", "name": "Read",
+                "input": {"file_path": "/private/tmp/claude-1/scratchpad/notes.md"}},
             {"type": "image", "source": {"type": "base64"}}]}})).await;
     log_tool_message(&kernel, &fast_s, &fast, serde_json::json!({
         "cwd": "/w/superx",
@@ -1447,13 +1449,16 @@ async fn productivity_and_exposure_are_measured_per_agent() {
     assert_eq!(e.input_tokens, 41_000, "1k + 40k sent fresh");
     assert_eq!(e.cache_write_tokens, 39_000, "written to the vendor's store");
     assert_eq!(e.cache_read_tokens, 500_000, "served back out of it");
-    assert_eq!(e.files_read, 2, "two distinct files pulled into prompts");
+    assert_eq!(e.files_read, 3, "three distinct files pulled into prompts");
     assert_eq!(e.repos_exposed, 1);
     assert_eq!(e.attachments, 1, "one image sent");
     assert!(e.content_bytes >= 12, "the file text the results carried");
 
     // The two signals that are worth waking up for.
-    assert_eq!(e.outside_reads, 1, "~/.ssh is not the working directory");
+    // ~/.ssh counts; the agent's own scratchpad does not — it is
+    // outside the working directory by design, and counting it buries
+    // the reads that matter.
+    assert_eq!(e.outside_reads, 1, "~/.ssh counts, the scratchpad does not");
     assert_eq!(e.secret_hits, 1);
     assert_eq!(e.secret_paths, vec!["/home/me/.ssh/id_rsa".to_string()],
         "the leak is named, not just counted");

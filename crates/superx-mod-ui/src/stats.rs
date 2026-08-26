@@ -469,6 +469,19 @@ struct AgentAgg {
     repos: HashSet<String>,
 }
 
+/// The agent's own workspace is not your material. Scratchpads, task
+/// files and agent state live outside the working directory by design;
+/// counting them buries the reads that matter. Probing 25 live
+/// transcripts, this filter took 64 flagged reads down to 6 — and all
+/// six were an agent in one repo reaching into a different one, which
+/// is precisely the signal (#338).
+fn agent_scratch(path: &str) -> bool {
+    path.contains("/.claude/")
+        || path.starts_with("/var/folders/")
+        || (path.contains("/claude-")
+            && (path.starts_with("/tmp/") || path.starts_with("/private/tmp/")))
+}
+
 /// Shapes that mean a credential is in the text. Deliberately narrow:
 /// a false positive here sends someone hunting for a leak that is not
 /// there, which is worse than silence (#337).
@@ -1131,7 +1144,10 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                         if let Some(rk) = &repo_key {
                                             code.repos_exposed.insert(rk.clone());
                                         }
-                                        if get_str(raw, "cwd").is_some_and(|c| !path.starts_with(c)) {
+                                        if get_str(raw, "cwd")
+                                            .is_some_and(|c| !path.starts_with(c))
+                                            && !agent_scratch(path)
+                                        {
                                             code.outside_reads += 1;
                                         }
                                     }
