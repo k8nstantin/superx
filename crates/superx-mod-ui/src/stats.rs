@@ -91,15 +91,109 @@ fn block_lines(name: &str, input: &Object) -> i64 {
 /// bar). So every stage is returned, with the pure-navigation ones
 /// dropped.
 fn command_labels(cmd: &str) -> Vec<String> {
-    cmd.split(SEQUENCERS)
-        .filter_map(stage_label)
+    split_stages(&strip_heredocs(cmd))
+        .iter()
+        .map(|stage| strip_redirections(stage))
+        .filter_map(|stage| stage_label(&stage))
         .collect()
 }
 
-/// `&&`, `||`, `;`, `|` and newlines all separate stages. Splitting on
-/// the single chars covers the doubled operators too — the empty
-/// stage between them simply yields no label.
-const SEQUENCERS: [char; 5] = ['|', ';', '&', '\n', '\r'];
+/// Split a command line into stages at the separators that are
+/// really separators.
+///
+/// Quoting is the whole point. `grep -E "passed|failed"` is ONE call,
+/// not two, and splitting it blind invents a stage whose program is
+/// `failed"`. Probing 5,493 live shell commands, a blind split
+/// produced 30,897 stages across 3,377 distinct labels — 1,633 of
+/// them junk like `Co-Authored-By:` and `print('`. Respecting quotes
+/// gives 24,606 stages across 258 labels, 25 of them junk. The 6,291
+/// difference was never work; it was the insides of strings.
+///
+/// `&&` splits, a lone `&` does not: `2>&1` contains one, and
+/// splitting there produced a stage whose program was `1` — the
+/// most-repeated "command" on a live instance (issue #335).
+fn split_stages(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut single, mut double) = (false, false);
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => {
+                single = !single;
+                cur.push(c);
+            }
+            '"' if !single => {
+                double = !double;
+                cur.push(c);
+            }
+            '|' | ';' | '\n' | '\r' if !single && !double => out.push(std::mem::take(&mut cur)),
+            '&' if !single && !double && chars.peek() == Some(&'&') => {
+                chars.next();
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Shell grammar that is not a program: keywords, punctuation, and the
+/// fragments of embedded scripts. Live QA found `let`, `t`, `assert`,
+/// `old`, `if` and `"""` ranking as top commands (issue #334).
+const NOT_A_PROGRAM: [&str; 22] = [
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "let", "local", "return", "break", "continue", "assert", "print", "import", "def", "class",
+];
+
+/// Everything a heredoc feeds a program is DATA, not commands. A
+/// `python3 - <<'EOF' … EOF` block was being read line by line as if
+/// each line were a shell call (issue #334).
+fn strip_heredocs(cmd: &str) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    let mut lines = cmd.lines();
+    while let Some(line) = lines.next() {
+        out.push_str(line);
+        out.push('\n');
+        // `<<EOF`, `<<'EOF'`, `<<-"EOF"` — take the delimiter and skip
+        // until it appears alone on a line.
+        if let Some(pos) = line.find("<<") {
+            let raw = line[pos + 2..]
+                .trim_start_matches('-')
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            let delim = raw.trim_matches(|c| c == '\'' || c == '"');
+            if !delim.is_empty() && delim.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                for body in lines.by_ref() {
+                    if body.trim() == delim {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Drop redirection tokens so their targets are never mistaken for
+/// programs or subcommands.
+fn strip_redirections(stage: &str) -> String {
+    stage
+        .split_whitespace()
+        .filter(|w| {
+            !(w.contains(">&")
+                || w.contains("&>")
+                || w.starts_with('>')
+                || w.starts_with('<')
+                || w.starts_with("2>")
+                || w.starts_with("1>")
+                || *w == "&")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Shell noise that is not the program: grouping, env prefixes, and
 /// wrappers that take the real command as their argument.
@@ -122,6 +216,16 @@ fn stage_label(stage: &str) -> Option<String> {
     // Navigation is not work; `cd repo && cargo test` is one call
     // about cargo.
     if prog.is_empty() || matches!(prog, "cd" | "pushd" | "popd" | "export" | "source" | ".") {
+        return None;
+    }
+    // A program starts with a letter (or is an explicit path). Anything
+    // else — a bare number from a redirection, a quote from a script
+    // body, a shell keyword — is not a command (issue #334).
+    let first = prog.chars().next()?;
+    if !(first.is_ascii_alphabetic() || first == '/' || first == '_') {
+        return None;
+    }
+    if NOT_A_PROGRAM.contains(&prog) {
         return None;
     }
     const SUBCOMMANDED: [&str; 9] = [
