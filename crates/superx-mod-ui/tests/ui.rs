@@ -1463,3 +1463,129 @@ async fn productivity_and_exposure_are_measured_per_agent() {
     assert_eq!(e.secret_paths, vec!["/home/me/.ssh/id_rsa".to_string()],
         "the leak is named, not just counted");
 }
+
+/// The work cube (#340): the same totals mean different things
+/// depending on WHO did them, WHERE, and WHEN. Two agents in one repo
+/// in the same hour is the case a flat series cannot show.
+#[tokio::test]
+async fn work_is_cubed_by_agent_repo_and_hour() {
+    let kernel = fresh_kernel().await;
+    let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
+    let (a2, s2) = seed_agent_and_session(&kernel, "gemini_cli", "bbb").await;
+
+    let write = |cwd: &str, path: &str, body: &str| serde_json::json!({
+        "cwd": cwd, "message": {"model": "claude-fable-5",
+            "usage": {"output_tokens": 50},
+            "content": [{"type": "tool_use", "id": "w", "name": "Write",
+                "input": {"file_path": path, "content": body}}]}});
+
+    // Agent one writes in superx, then crosses into the data lake.
+    log_tool_message(&kernel, &s1, &a1, write("/w/superx", "/w/superx/new.rs", "a\nb\nc")).await;
+    log_tool_message(&kernel, &s1, &a1, write("/w/lake", "/w/lake/x.py", "one")).await;
+    // Agent two works the same repo as agent one.
+    log_tool_message(&kernel, &s2, &a2, write("/w/superx", "/w/superx/other.rs", "z")).await;
+
+    // A file that already existed: its oldest event is an Edit.
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
+            "input": {"file_path": "/w/superx/old.rs", "old_string": "was", "new_string": "is"}}]}})).await;
+
+    // Compaction: the agent stopped for two minutes and resumed with
+    // less of its own history.
+    kernel.log_message(superx_kernel::NewMessage {
+        session: s1.clone(), agent: a1.clone(), role: "system".into(),
+        content: "Conversation compacted".into(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "cwd": "/w/superx", "subtype": "compact_boundary",
+            "compactMetadata": {"trigger": "auto", "preTokens": 1_000_958, "durationMs": 134_803},
+            "message": {"content": []}}))),
+        seq: None, emitted_at: None,
+    }).await.expect("compaction");
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // The cube: one cell per (agent, repo, hour).
+    let cell = |agent: &str, repo: &str| {
+        s.work_cells.iter().find(|c| c.agent == agent && c.repo == repo)
+            .unwrap_or_else(|| panic!("no cell for {agent} in {repo}: {:?}",
+                s.work_cells.iter().map(|c| (&c.agent, &c.repo)).collect::<Vec<_>>()))
+    };
+    // 3 lines from the Write plus the 1-line Edit below — same agent,
+    // same repo, same hour, so the same cell.
+    assert_eq!(cell("claude_code", "superx").added, 4);
+    assert_eq!(cell("claude_code", "superx").removed, 1, "the Edit replaced a line");
+    assert_eq!(cell("claude_code", "lake").added, 1);
+    assert_eq!(cell("gemini_cli", "superx").added, 1, "same repo, different agent, own cell");
+    assert_eq!(cell("claude_code", "superx").files, 2, "new.rs and old.rs");
+
+    // Crossing repos mid-session is thrash when it is frequent.
+    // superx → lake → superx: two crossings, and that is the point.
+    // An agent that keeps leaving is not progressing in either repo.
+    assert_eq!(s.repo_switches, 2);
+    let a = s.agent_stats.iter().find(|a| a.name == "claude_code").expect("agent");
+    assert_eq!(a.repo_switches, 2);
+    assert_eq!(s.agent_stats.iter().find(|a| a.name == "gemini_cli").expect("g").repo_switches, 0);
+
+    // New files against files that already existed.
+    assert_eq!(s.files_created, 3, "new.rs, x.py, other.rs");
+    assert_eq!(s.files_modified, 1, "old.rs was edited, not created");
+
+    // Compaction, per session and in total.
+    assert_eq!(s.compaction_total_ms, 134_803, "two minutes of dead time");
+    let c = s.compaction_sessions.first().expect("a compacted session");
+    assert_eq!(c.count, 1);
+    assert_eq!(c.auto, 1);
+    assert_eq!(c.manual, 0);
+    assert_eq!(c.pre_tokens_max, 1_000_958, "it hit the ceiling");
+    assert_eq!(c.agent, "claude_code");
+    assert_eq!(a.compactions, 1);
+    assert_eq!(a.compaction_ms, 134_803);
+}
+
+/// Two numbers that separate a thrashing agent from a moving design
+/// (#340): how long code survived before something rewrote it, and how
+/// long a write waited for its verification.
+#[tokio::test]
+async fn survival_and_verification_latency_are_measured() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+
+    let at = |mins: i64, body: serde_json::Value| {
+        let mut m = superx_kernel::NewMessage {
+            session: session.clone(), agent: agent.clone(), role: "assistant".into(),
+            content: String::new(),
+            raw: Some(superx_kernel::message::json_to_object(&body)),
+            seq: None, emitted_at: Some(t0 + chrono::Duration::minutes(mins)),
+        };
+        m.content = String::new();
+        m
+    };
+    let edit = |old: &str, new: &str| serde_json::json!({
+        "cwd": "/w/superx", "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
+            "input": {"file_path": "/w/superx/a.rs", "old_string": old, "new_string": new}}]}});
+    let shell = |cmd: &str| serde_json::json!({
+        "cwd": "/w/superx", "message": {"content": [{"type": "tool_use", "id": "b", "name": "Bash",
+            "input": {"command": cmd}}]}});
+
+    // Snippets must clear the 12-character noise floor `snippet_key`
+    // applies — a three-word fragment is not evidence of anything.
+    const FIRST: &str = "let value = compute_the_thing();";
+    const SECOND: &str = "let value = compute_it_differently();";
+
+    // t+0   the agent writes FIRST
+    // t+30  it runs the tests      → 30 minutes before anything is checked
+    // t+50  it rewrites FIRST away → FIRST survived 50 minutes
+    kernel.log_message(at(0, edit("let value = stub_placeholder();", FIRST))).await.expect("write");
+    kernel.log_message(at(30, shell("cargo test --workspace"))).await.expect("verify");
+    kernel.log_message(at(50, edit(FIRST, SECOND))).await.expect("rewrite");
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    assert_eq!(s.survival_p50_mins, 50, "`first` lived fifty minutes before being replaced");
+    assert_eq!(s.edit_to_verify_p50_secs, 1800, "half an hour before anything was checked");
+    let repo = s.repos.iter().find(|r| r.name == "superx").expect("repo");
+    assert_eq!(repo.survival_p50_mins, 50, "the repo carries its own half-life");
+    let a = s.agent_stats.iter().find(|a| a.name == "claude_code").expect("agent");
+    assert_eq!(a.edit_to_verify_p50_secs, 1800);
+}
