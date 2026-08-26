@@ -14,8 +14,9 @@ use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
-    ChurnPoint, LiveSession, ModelStat, NameCount, RepoStat, SessionStat, StatsSummary,
-    TimeCount, ToolOutcome,
+    AgentStat, ChurnPoint, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount,
+    QualityPoint, RepoStat,
+    SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome,
 };
 
 /// Telemetry window backing the events/min timeline (same bound the
@@ -341,6 +342,20 @@ struct CodeAgg {
     concurrency: HashMap<String, HashSet<String>>,
     /// Message instants, for the quiet-stretch measure.
     instants: Vec<chrono::DateTime<chrono::Utc>>,
+    // ── time-graded outcomes and the cost of time (#337) ────────
+    /// Outcomes per hour, keyed `YYYY-MM-DDTHH`.
+    quality: HashMap<String, (i64, i64, i64)>,
+    /// (calls, failures) by hour of day.
+    by_hour: HashMap<i64, (i64, i64)>,
+    /// Every `durationMs` seen, for median and p95.
+    waits: Vec<i64>,
+    slowest: Vec<SlowOp>,
+    interrupted: i64,
+    /// Per session: first/last instant, agent, repo, message count.
+    spans: HashMap<String, Span>,
+    /// Replaced lines with and without a human instruction behind them.
+    churn_directed: i64,
+    churn_self: i64,
     // ── quality, from what the commands printed (#327) ───────────
     tests_passed: i64,
     tests_failed: i64,
@@ -351,6 +366,21 @@ struct CodeAgg {
     // ── the repo and model dimensions (#325, #328) ───────────────
     repos: HashMap<String, RepoAgg>,
     models: HashMap<String, ModelAgg>,
+    /// Outcomes per reasoning level (#337).
+    efforts: HashMap<String, EffortAgg>,
+    /// Productivity and cost per agent (#337).
+    agents: HashMap<String, AgentAgg>,
+    // ── what left this machine (#337) ────────────────────────────
+    in_tokens: i64,
+    cache_write: i64,
+    cache_read: i64,
+    content_bytes: i64,
+    files_read: HashSet<String>,
+    repos_exposed: HashSet<String>,
+    attachments: i64,
+    outside_reads: i64,
+    secret_hits: i64,
+    secret_paths: HashSet<String>,
     /// Per-session live state, keyed by session uuid.
     live: HashMap<String, LiveAgg>,
     languages: HashMap<String, i64>,
@@ -402,6 +432,9 @@ fn snippet_key(s: &str) -> Option<u64> {
 #[derive(Default)]
 struct RepoAgg {
     branch: Option<String>,
+    churn_directed: i64,
+    churn_self: i64,
+    reverts: i64,
     messages: i64,
     lines_added: i64,
     lines_removed: i64,
@@ -411,6 +444,56 @@ struct RepoAgg {
     out_tokens: i64,
     agents: HashSet<String>,
     last_active: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One session's span: first seen, last seen, agent, repo, messages.
+type Span = (
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+    String,
+    Option<String>,
+    i64,
+);
+
+/// Per-agent productivity and cost (#337).
+#[derive(Default)]
+struct AgentAgg {
+    sessions: HashSet<String>,
+    messages: i64,
+    lines_added: i64,
+    lines_removed: i64,
+    out_tokens: i64,
+    in_tokens: i64,
+    tool_failures: i64,
+    reverts: i64,
+    repos: HashSet<String>,
+}
+
+/// Shapes that mean a credential is in the text. Deliberately narrow:
+/// a false positive here sends someone hunting for a leak that is not
+/// there, which is worse than silence (#337).
+fn looks_like_secret(text: &str) -> bool {
+    text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----")
+        || text.contains("AKIA")
+        || text.contains("ghp_")
+        || text.contains("github_pat_")
+        || text.contains("xoxb-")
+        || text.contains("sk-ant-")
+        || text.contains("-----BEGIN OPENSSH")
+}
+
+/// Outcomes attributable to one reasoning level (#337).
+#[derive(Default)]
+struct EffortAgg {
+    messages: i64,
+    lines_added: i64,
+    lines_removed: i64,
+    out_tokens: i64,
+    thinking_tokens: i64,
+    tool_failures: i64,
+    reverts: i64,
+    tests_passed: i64,
+    tests_failed: i64,
 }
 
 /// Outcomes attributable to one model (issue #328).
@@ -482,6 +565,13 @@ pub fn range_cutoff(range: &str) -> Option<chrono::Duration> {
     }
 }
 
+/// How recently a human turn must have happened for a rewrite to
+/// count as DIRECTED rather than self-inflicted (#337). Ten minutes
+/// is long enough to cover "do it differently" landing before the
+/// rewrite, short enough that unrelated later work is not credited
+/// to it.
+const STEERING_MINUTES: i64 = 10; // skill-allow: §9-const — analysis window, render-layer
+
 /// Rows the range walk will read at most. A month of heavy agent work
 /// is far more than a page needs; the payload says when it truncated
 /// rather than pretending the sample is the whole range.
@@ -509,7 +599,8 @@ fn count_word(w: &str) -> &str {
 /// What a shell command printed, mined for outcomes (issue #327).
 /// Test tallies come from the shapes real runners emit; diagnostics
 /// from compiler prefixes.
-fn score_output(text: &str, code: &mut CodeAgg) {
+fn score_output(text: &str, code: &mut CodeAgg, hour_key: &str) {
+    let before = (code.tests_passed, code.tests_failed);
     let lines: Vec<&str> = text.lines().collect();
     let scan: Vec<&&str> = if lines.len() <= SCAN_EDGE * 2 {
         lines.iter().collect()
@@ -570,6 +661,11 @@ fn score_output(text: &str, code: &mut CodeAgg) {
             code.compile_errors += 1;
         }
     }
+    // Attribute this run's tallies to the hour it happened in, so
+    // quality reads as a trend (#337).
+    let slot = code.quality.entry(hour_key.to_string()).or_insert((0, 0, 0));
+    slot.0 += code.tests_passed - before.0;
+    slot.1 += code.tests_failed - before.1;
 }
 
 /// One in-engine `count() GROUP ALL` over a table.
@@ -638,6 +734,8 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
     let sessions_total = sessions.len() as i64;
     // uuid → "agent/uuid8" display identity.
     let mut identity: HashMap<String, String> = HashMap::new();
+    // uuid → the agent that owns the session (#337).
+    let mut agent_of: HashMap<String, String> = HashMap::new();
     for s in &sessions {
         let name = match &s.payload {
             Value::Object(o) => get_str(o, "name").unwrap_or("?").to_string(),
@@ -646,6 +744,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         let agent = name.split('/').next().unwrap_or("?").to_string();
         let uuid = superx_ops::record_uuid(&s.entity_id);
         identity.insert(uuid.clone(), format!("{agent}/{}", &uuid[..uuid.len().min(8)]));
+        agent_of.insert(uuid, agent);
     }
 
     let mut modules_total = 0i64;
@@ -689,11 +788,33 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
     // fixed window is BY DEFINITION the newest N, so reporting it as
     // "sampled" on the default view was just wrong (review of #330).
     let truncated = cutoff.is_some() && msgs.len() as u32 >= cap;
+
+    // Churn has two very different causes (operator insight, #337):
+    // the agent rewriting its own work, or the design moving under it.
+    // A rewrite that FOLLOWS a human turn is directed; one with nobody
+    // steering is the agent going in circles. Collect the human turns
+    // per session first, so each write can ask "was anyone steering?"
+    let mut human_turns: HashMap<String, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
+    for m in &msgs {
+        if m.role == "user" {
+            human_turns
+                .entry(superx_ops::record_uuid(&m.session))
+                .or_default()
+                .push(m.valid_from);
+        }
+    }
+    for v in human_turns.values_mut() {
+        v.sort_unstable();
+    }
     let mut tools: HashMap<String, i64> = HashMap::new();
     let mut code = CodeAgg::default();
     let mut lines_written = 0i64;
     let mut per_session: HashMap<String, SessAgg> = HashMap::new();
     let mut outcomes: HashMap<String, Outcome> = HashMap::new();
+    // tool_use_id → the path it touched, and the ids whose output
+    // already looked like a credential before the call went by (#337).
+    let mut call_paths: HashMap<String, String> = HashMap::new();
+    let mut secret_pending: HashSet<String> = HashSet::new();
     // tool_use_id → (tool name, model, repo). A `tool_result` message
     // carries NO model of its own, so a failure attributed from the
     // result would land on `unknown`; it belongs to whoever made the
@@ -727,6 +848,40 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             .insert(superx_ops::record_uuid(&m.session));
 
         let Some(raw) = &m.raw else { continue };
+
+        // Reasoning level, where the agent reports it (#337): does
+        // thinking harder produce keepable code, or just cost more?
+        let effort = get_str(raw, "effort").map(str::to_string);
+        if let Some(e) = &effort {
+            code.efforts.entry(e.clone()).or_default().messages += 1;
+        }
+        let hour_key = m.valid_from.format("%Y-%m-%dT%H").to_string();
+        let hour_of_day: i64 = m
+            .valid_from
+            .format("%H")
+            .to_string()
+            .parse()
+            .unwrap_or(0);
+
+        // The 24×7 picture (#337): every session's span in the range.
+        {
+            let sid = superx_ops::record_uuid(&m.session);
+            let entry = code.spans.entry(sid).or_insert((
+                m.valid_from,
+                m.valid_from,
+                superx_ops::record_uuid(&m.agent),
+                None,
+                0,
+            ));
+            if m.valid_from < entry.0 {
+                entry.0 = m.valid_from;
+            }
+            if m.valid_from > entry.1 {
+                entry.1 = m.valid_from;
+            }
+            entry.4 += 1;
+        }
+
         // Live state (#325): newest-first, so the first sighting of a
         // session carries its freshest facts.
         {
@@ -736,6 +891,31 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             if l.newest.is_none() {
                 l.newest = Some(m.valid_from);
                 l.agent = superx_ops::record_uuid(&m.agent);
+            }
+        }
+
+        // What the agents WAITED on (#337). durationMs sits on the
+        // system lines that close a long operation; the median in a
+        // real transcript is ~100s, so this is real wall-clock.
+        if let Some(Value::Number(n)) = raw.get("durationMs") {
+            if let Some(ms) = n.to_int().filter(|&v| v > 0) {
+                code.waits.push(ms);
+                if code.slowest.len() < 400 {
+                    code.slowest.push(SlowOp {
+                        label: get_str(raw, "slug")
+                            .or_else(|| get_str(raw, "type"))
+                            .unwrap_or("operation")
+                            .to_string(),
+                        ms,
+                        at: m.valid_from.to_rfc3339(),
+                    });
+                }
+            }
+        }
+        // Commands that were stopped before finishing.
+        if let Some(Value::Object(tur)) = raw.get("toolUseResult") {
+            if matches!(tur.get("interrupted"), Some(Value::Bool(true))) {
+                code.interrupted += 1;
             }
         }
 
@@ -772,6 +952,15 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                 l.model = Some(model.clone());
             }
         }
+        // Per-agent productivity (#337). Sessions are `agent/uuid`,
+        // so the owning agent is resolved through the session.
+        let sid_now = superx_ops::record_uuid(&m.session);
+        let agent_name = agent_of.get(&sid_now).cloned();
+        if let Some(an) = &agent_name {
+            let a = code.agents.entry(an.clone()).or_default();
+            a.messages += 1;
+            a.sessions.insert(sid_now.clone());
+        }
         // Which repo the agent was standing in (#308, #325).
         let repo_key = get_str(raw, "cwd").map(|c| c.rsplit('/').next().unwrap_or(c).to_string());
         if let Some(rk) = &repo_key {
@@ -780,6 +969,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             if l.repo.is_none() {
                 l.repo = Some(rk.clone());
                 l.branch = get_str(raw, "gitBranch").filter(|b| !b.is_empty()).map(str::to_string);
+            }
+            if let Some(an) = &agent_name {
+                code.agents.entry(an.clone()).or_default().repos.insert(rk.clone());
             }
             let r = code.repos.entry(rk.clone()).or_default();
             r.messages += 1;
@@ -810,12 +1002,36 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                     .out_tokens += out;
                 agg.out_tokens += out;
                 code.out_tokens += out;
+                if let Some(an) = &agent_name {
+                    code.agents.entry(an.clone()).or_default().out_tokens += out;
+                }
                 code.models.entry(model.clone()).or_default().out_tokens += out;
+                if let Some(e) = &effort {
+                    let ea = code.efforts.entry(e.clone()).or_default();
+                    ea.out_tokens += out;
+                    if let Some(Value::Object(details)) = usage.get("output_tokens_details") {
+                        ea.thinking_tokens += get_int(details, "thinking_tokens");
+                    }
+                }
                 if let Some(rk) = &repo_key {
                     code.repos.entry(rk.clone()).or_default().out_tokens += out;
                 }
                 if let Some(Value::Object(details)) = usage.get("output_tokens_details") {
                     code.thinking += get_int(details, "thinking_tokens");
+                }
+                // What left this machine (#337). `input_tokens` is the
+                // prompt sent fresh this turn; cache CREATION is the
+                // content the vendor wrote to its own store to reuse;
+                // cache READS are that stored content being served
+                // back. Together they are the transmitted volume.
+                let inp = get_int(usage, "input_tokens");
+                let cw = get_int(usage, "cache_creation_input_tokens");
+                let cr = get_int(usage, "cache_read_input_tokens");
+                code.in_tokens += inp;
+                code.cache_write += cw;
+                code.cache_read += cr;
+                if let Some(an) = &agent_name {
+                    code.agents.entry(an.clone()).or_default().in_tokens += inp + cw;
                 }
             }
             if let Some(Value::Array(blocks)) = msg.get("content") {
@@ -841,9 +1057,20 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 match pending_results.remove(id) {
                                     Some(true) => {
                                         entry.failed += 1;
+                                        code.by_hour.entry(hour_of_day).or_insert((0, 0)).1 += 1;
+                                        code.quality
+                                            .entry(hour_key.clone())
+                                            .or_insert((0, 0, 0))
+                                            .2 += 1;
                                         code.models.entry(model.clone()).or_default().tool_failures += 1;
+                                        if let Some(e) = &effort {
+                                            code.efforts.entry(e.clone()).or_default().tool_failures += 1;
+                                        }
                                         if let Some(rk) = &repo_key {
                                             code.repos.entry(rk.clone()).or_default().tool_failures += 1;
+                                        }
+                                        if let Some(an) = &agent_name {
+                                            code.agents.entry(an.clone()).or_default().tool_failures += 1;
                                         }
                                         code.live
                                             .entry(superx_ops::record_uuid(&m.session))
@@ -864,7 +1091,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                             if let Some(id) = get_str(block, "id") {
                                 match pending_output.remove(id) {
                                     Some(text) if SHELL_TOOLS.contains(&name.as_str()) => {
-                                        score_output(&text, &mut code);
+                                        score_output(&text, &mut code, &hour_key);
                                     }
                                     // Output already seen but the tool
                                     // was not a shell: drop it.
@@ -877,6 +1104,8 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     None => {}
                                 }
                             }
+                            // When does work go wrong (#337)?
+                            code.by_hour.entry(hour_of_day).or_insert((0, 0)).0 += 1;
                             // Instrument the call itself (#308).
                             if name.starts_with("mcp__") {
                                 code.mcp += 1;
@@ -889,6 +1118,31 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                             }
                             if READ_TOOLS.contains(&name.as_str()) {
                                 code.reads += 1;
+                            }
+                            // Exposure (#337): a read puts file text
+                            // into the next prompt, so the path is
+                            // what left the machine. A path outside
+                            // the directory the agent was working in
+                            // is exposure nobody asked for.
+                            if let Some(Value::Object(input)) = block.get("input") {
+                                if let Some(path) = get_str(input, "file_path") {
+                                    if READ_TOOLS.contains(&name.as_str()) {
+                                        code.files_read.insert(path.to_string());
+                                        if let Some(rk) = &repo_key {
+                                            code.repos_exposed.insert(rk.clone());
+                                        }
+                                        if get_str(raw, "cwd").is_some_and(|c| !path.starts_with(c)) {
+                                            code.outside_reads += 1;
+                                        }
+                                    }
+                                    if let Some(id) = get_str(block, "id") {
+                                        if secret_pending.remove(id) {
+                                            code.secret_paths.insert(path.to_string());
+                                        } else {
+                                            call_paths.insert(id.to_string(), path.to_string());
+                                        }
+                                    }
+                                }
                             }
                             if WRITE_TOOLS.contains(&name.as_str()) {
                                 code.writes += 1;
@@ -910,13 +1164,53 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 // later edit — one undo relationship.
                                 // A flip-flop therefore scores twice,
                                 // which is the honest reading.
+                                // Directed or self-inflicted? A rewrite
+                                // that follows a human turn is the
+                                // design moving; one with nobody
+                                // steering is the agent going in
+                                // circles (operator insight, #337).
+                                let steered = human_turns
+                                    .get(&superx_ops::record_uuid(&m.session))
+                                    .is_some_and(|turns| {
+                                        let cut = m.valid_from - chrono::Duration::minutes(STEERING_MINUTES);
+                                        turns
+                                            .iter()
+                                            .rev()
+                                            .skip_while(|h| **h > m.valid_from)
+                                            .take(1)
+                                            .any(|h| *h >= cut)
+                                    });
+                                if replaced > 0 {
+                                    if steered {
+                                        code.churn_directed += replaced;
+                                    } else {
+                                        code.churn_self += replaced;
+                                    }
+                                }
+                                if let Some(e) = &effort {
+                                    let ea = code.efforts.entry(e.clone()).or_default();
+                                    ea.lines_added += n;
+                                    ea.lines_removed += replaced;
+                                }
                                 if let Some(rk) = &repo_key {
                                     let r = code.repos.entry(rk.clone()).or_default();
                                     r.lines_added += n;
                                     r.lines_removed += replaced;
+                                    if replaced > 0 {
+                                        if steered {
+                                            r.churn_directed += replaced;
+                                        } else {
+                                            r.churn_self += replaced;
+                                        }
+                                    }
                                     if let Some(pth) = get_str(input, "file_path") {
                                         r.files.insert(pth.to_string());
                                     }
+                                }
+                                if let Some(an) = &agent_name {
+                                    let a = code.agents.entry(an.clone()).or_default();
+                                    a.lines_added += n;
+                                    a.lines_removed += replaced;
                                 }
                                 code.live
                                     .entry(superx_ops::record_uuid(&m.session))
@@ -934,7 +1228,16 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     {
                                         if seen.contains(&key) {
                                             code.reverts += 1;
+                                            if let Some(an) = &agent_name {
+                                                code.agents.entry(an.clone()).or_default().reverts += 1;
+                                            }
                                             code.models.entry(model.clone()).or_default().reverts += 1;
+                                            if let Some(e) = &effort {
+                                                code.efforts.entry(e.clone()).or_default().reverts += 1;
+                                            }
+                                            if let Some(rk) = &repo_key {
+                                                code.repos.entry(rk.clone()).or_default().reverts += 1;
+                                            }
                                         }
                                     }
                                     if let Some(key) =
@@ -984,6 +1287,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 }
                             }
                         }
+                        Some("image") | Some("document") => code.attachments += 1,
                         Some("tool_result") => {
                             let Some(id) = get_str(block, "tool_use_id") else { continue };
                             let failed = matches!(block.get("is_error"), Some(Value::Bool(true)));
@@ -995,10 +1299,24 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                             // score when the call resolves (review of
                             // #330).
                             if let Some(text) = get_str(block, "content") {
+                                // Everything a tool returns is carried
+                                // into the next prompt verbatim (#337).
+                                code.content_bytes += text.len() as i64;
+                                if looks_like_secret(text) {
+                                    code.secret_hits += 1;
+                                    match call_paths.remove(id) {
+                                        Some(path) => {
+                                            code.secret_paths.insert(path);
+                                        }
+                                        None => {
+                                            secret_pending.insert(id.to_string());
+                                        }
+                                    }
+                                }
                                 if shell_calls.remove(id) {
                                     // The call already went by and it
                                     // was a shell: score immediately.
-                                    score_output(text, &mut code);
+                                    score_output(text, &mut code, &hour_key);
                                 } else {
                                     pending_output.insert(id.to_string(), text.to_string());
                                 }
@@ -1009,6 +1327,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     let entry = outcomes.entry(name).or_default();
                                     if failed {
                                         entry.failed += 1;
+                                        if let Some(an) = &agent_name {
+                                            code.agents.entry(an.clone()).or_default().tool_failures += 1;
+                                        }
                                         // The call's model and repo, not
                                         // this result message's.
                                         if let Some(cm) = call_model {
@@ -1159,6 +1480,38 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         rows.len() as i64
     };
 
+    // Per-agent productivity, most productive first (#337).
+    let mut agent_stats: Vec<_> = code
+        .agents
+        .into_iter()
+        .map(|(name, a)| AgentStat {
+            name,
+            sessions: a.sessions.len() as i64,
+            messages: a.messages,
+            lines_added: a.lines_added,
+            lines_removed: a.lines_removed,
+            out_tokens: a.out_tokens,
+            in_tokens: a.in_tokens,
+            tool_failures: a.tool_failures,
+            reverts: a.reverts,
+            repos: a.repos.len() as i64,
+        })
+        .collect();
+    agent_stats.sort_by_key(|a| std::cmp::Reverse(a.lines_added));
+    let mut secret_paths: Vec<String> = code.secret_paths.into_iter().collect();
+    secret_paths.sort();
+    let exposure = Exposure {
+        input_tokens: code.in_tokens,
+        cache_write_tokens: code.cache_write,
+        cache_read_tokens: code.cache_read,
+        content_bytes: code.content_bytes,
+        files_read: code.files_read.len() as i64,
+        repos_exposed: code.repos_exposed.len() as i64,
+        attachments: code.attachments,
+        outside_reads: code.outside_reads,
+        secret_hits: code.secret_hits,
+        secret_paths,
+    };
     Ok(StatsSummary {
         agents,
         sessions_total,
@@ -1253,6 +1606,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                     tests_run: r.tests_run,
                     tool_failures: r.tool_failures,
                     out_tokens: r.out_tokens,
+                    churn_directed: r.churn_directed,
+                    churn_self: r.churn_self,
+                    reverts: r.reverts,
                     agents: r.agents.len() as i64,
                     last_active: r.last_active.map(|t| t.to_rfc3339()).unwrap_or_default(),
                 })
@@ -1277,6 +1633,91 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                 .collect();
             v.sort_by(|a, b| b.messages.cmp(&a.messages).then(a.name.cmp(&b.name)));
             v.truncate(8);
+            v
+        },
+        churn_directed: code.churn_directed,
+        churn_self: code.churn_self,
+        efforts: {
+            let mut v: Vec<EffortStat> = code
+                .efforts
+                .iter()
+                .map(|(name, e)| EffortStat {
+                    name: name.clone(),
+                    messages: e.messages,
+                    lines_added: e.lines_added,
+                    lines_removed: e.lines_removed,
+                    out_tokens: e.out_tokens,
+                    thinking_tokens: e.thinking_tokens,
+                    tool_failures: e.tool_failures,
+                    reverts: e.reverts,
+                    tests_passed: e.tests_passed,
+                    tests_failed: e.tests_failed,
+                })
+                .collect();
+            v.sort_by(|a, b| b.messages.cmp(&a.messages).then(a.name.cmp(&b.name)));
+            v
+        },
+        quality_series: {
+            let mut pts: Vec<QualityPoint> = code
+                .quality
+                .iter()
+                .map(|(t, (p, f, tf))| QualityPoint {
+                    t: t.clone(),
+                    tests_passed: *p,
+                    tests_failed: *f,
+                    tool_failures: *tf,
+                })
+                .collect();
+            pts.sort_by(|a, b| a.t.cmp(&b.t));
+            pts
+        },
+        fail_by_hour: {
+            let mut v: Vec<HourRate> = code
+                .by_hour
+                .iter()
+                .map(|(h, (calls, failures))| HourRate {
+                    hour: *h,
+                    calls: *calls,
+                    failures: *failures,
+                })
+                .collect();
+            v.sort_by_key(|h| h.hour);
+            v
+        },
+        wait_ms_total: code.waits.iter().sum(),
+        wait_ms_median: {
+            let mut w = code.waits.clone();
+            w.sort_unstable();
+            w.get(w.len() / 2).copied().unwrap_or(0)
+        },
+        wait_ms_p95: {
+            let mut w = code.waits.clone();
+            w.sort_unstable();
+            let idx = (w.len() as f64 * 0.95) as usize;
+            w.get(idx.min(w.len().saturating_sub(1))).copied().unwrap_or(0)
+        },
+        slowest: {
+            let mut v = code.slowest.clone();
+            v.sort_by_key(|o| std::cmp::Reverse(o.ms));
+            v.truncate(8);
+            v
+        },
+        interrupted_calls: code.interrupted,
+        timeline: {
+            let mut v: Vec<SessionSpan> = code
+                .spans
+                .iter()
+                .map(|(sid, (start, end, agent, repo, msgs))| SessionSpan {
+                    identity: sid.clone(),
+                    agent: agent.clone(),
+                    repo: repo.clone(),
+                    start: start.to_rfc3339(),
+                    end: end.to_rfc3339(),
+                    messages: *msgs,
+                })
+                .collect();
+            v.sort_by(|a, b| b.end.cmp(&a.end));
+            v.truncate(20);
             v
         },
         live: {
@@ -1319,6 +1760,8 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                 .max()
                 .unwrap_or(0)
         },
+        agent_stats,
+        exposure,
     })
 }
 

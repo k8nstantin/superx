@@ -233,6 +233,36 @@ pub struct StatsSummary {
     /// Sessions with a message in the last five minutes, busiest
     /// first — what is happening right now.
     pub live: Vec<LiveSession>,
+
+    // ── time-graded quality and cost of time (issue #337) ─────────
+    /// Outcomes per hour, oldest first.
+    pub quality_series: Vec<QualityPoint>,
+    /// Tool calls and failures by hour of day.
+    pub fail_by_hour: Vec<HourRate>,
+    /// Wall-clock the agents spent inside long operations, summed.
+    pub wait_ms_total: i64,
+    pub wait_ms_median: i64,
+    pub wait_ms_p95: i64,
+    /// The longest operations seen, descending.
+    pub slowest: Vec<SlowOp>,
+    /// Commands that were stopped before finishing.
+    pub interrupted_calls: i64,
+    /// Every session's span in the range, newest first.
+    pub timeline: Vec<SessionSpan>,
+
+    // ── why the churn (operator insight on #337) ──────────────────
+    /// Replaced lines that followed a human instruction — the design
+    /// moved, and rewriting was the point.
+    pub churn_directed: i64,
+    /// Replaced lines with no instruction behind them — the agent
+    /// rewriting its own work.
+    pub churn_self: i64,
+    /// Reasoning level against churn and productivity.
+    pub efforts: Vec<EffortStat>,
+    /// Productivity and token cost per agent.
+    pub agent_stats: Vec<AgentStat>,
+    /// What left this machine and what the vendor retained.
+    pub exposure: Exposure,
 }
 
 /// Per-repo work (issue #325): agents run across many repos at once,
@@ -252,6 +282,12 @@ pub struct RepoStat {
     pub tests_run: i64,
     pub tool_failures: i64,
     pub out_tokens: i64,
+    /// Replaced lines that followed a human instruction, and those
+    /// that did not — design change vs agent confusion.
+    pub churn_directed: i64,
+    pub churn_self: i64,
+    /// Edits whose work a later edit undid, in this repo.
+    pub reverts: i64,
     /// Distinct agents that worked in it.
     pub agents: i64,
     /// Newest activity, RFC3339.
@@ -291,6 +327,117 @@ pub struct ModelStat {
     pub out_tokens: i64,
     pub tool_failures: i64,
     pub reverts: i64,
+}
+
+/// Per-agent productivity and cost (operator ask on #337): tokens
+/// spent per line that survived, by agent.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct AgentStat {
+    pub name: String,
+    pub sessions: i64,
+    pub messages: i64,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub out_tokens: i64,
+    /// Tokens sent TO the vendor on this agent's behalf.
+    pub in_tokens: i64,
+    pub tool_failures: i64,
+    pub reverts: i64,
+    /// Repos this agent worked in.
+    pub repos: i64,
+}
+
+/// What left this machine, and what the vendor retained (operator ask
+/// on #337). Fresh input tokens are content sent this turn; cache
+/// WRITES are content the vendor stored on its side for reuse; cache
+/// READS are that stored content being served back. Bytes are the
+/// file text that tool results carried into prompts.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct Exposure {
+    pub input_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cache_read_tokens: i64,
+    /// Bytes of file/command output read into context.
+    pub content_bytes: i64,
+    /// Distinct files whose contents were read into a prompt.
+    pub files_read: i64,
+    /// Repos any of that content came from.
+    pub repos_exposed: i64,
+    /// Images and pasted attachments sent.
+    pub attachments: i64,
+    /// Files read from OUTSIDE the repo the session was working in —
+    /// the exposure you did not ask for.
+    pub outside_reads: i64,
+    /// Tool results whose content matched a secret shape (keys,
+    /// tokens, private-key headers) and therefore went into a prompt.
+    pub secret_hits: i64,
+    /// The paths those hits came from, deduplicated.
+    pub secret_paths: Vec<String>,
+}
+
+/// Outcomes per reasoning effort (operator ask on #337): does
+/// thinking harder actually produce keepable code, or just cost more?
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct EffortStat {
+    /// `low`, `medium`, `high`… as the agent reports it.
+    pub name: String,
+    pub messages: i64,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub out_tokens: i64,
+    pub thinking_tokens: i64,
+    pub tool_failures: i64,
+    pub reverts: i64,
+    pub tests_passed: i64,
+    pub tests_failed: i64,
+}
+
+/// One hour of outcomes — quality as a trend rather than a number
+/// (issue #337). Same shape as the churn series so both charts read
+/// the same way.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct QualityPoint {
+    pub t: String,
+    pub tests_passed: i64,
+    pub tests_failed: i64,
+    pub tool_failures: i64,
+}
+
+/// Tool outcomes bucketed by hour OF DAY — when does the work go
+/// wrong (issue #337).
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct HourRate {
+    /// 0–23, the agent's own clock.
+    pub hour: i64,
+    pub calls: i64,
+    pub failures: i64,
+}
+
+/// One session's span across the range — the 24×7 picture (#337).
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct SessionSpan {
+    pub identity: String,
+    pub agent: String,
+    pub repo: Option<String>,
+    /// RFC3339 bounds of its activity inside the range.
+    pub start: String,
+    pub end: String,
+    pub messages: i64,
+}
+
+/// A long operation — what the agents waited on (#337).
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct SlowOp {
+    pub label: String,
+    pub ms: i64,
+    pub at: String,
 }
 
 /// One hour of code movement.

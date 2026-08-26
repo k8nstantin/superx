@@ -1307,3 +1307,154 @@ async fn quality_scoring_only_trusts_shell_output() {
     assert!(!w.truncated, "the default window is not a truncated range");
     assert_eq!(w.range, "window");
 }
+
+/// Churn has two causes and they are separable (#337): a rewrite that
+/// follows a human turn is the design moving; one with nobody steering
+/// is the agent rewriting its own work. Plus the effort dimension and
+/// the cost of waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn churn_is_attributed_and_effort_is_measured() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let steered = kernel.create_entity("node_session").await.expect("s1");
+    let alone = kernel.create_entity("node_session").await.expect("s2");
+
+    let edit = |path: &str, old: &str, new: &str| {
+        serde_json::json!({"cwd": "/w/demo", "effort": "high",
+            "message": {"model": "claude-fable-5",
+                "usage": {"output_tokens": 90, "output_tokens_details": {"thinking_tokens": 40}},
+                "content": [{"type": "tool_use", "id": "e", "name": "Edit",
+                    "input": {"file_path": path, "old_string": old, "new_string": new}}]}})
+    };
+
+    // Session A: the operator says something, THEN the agent rewrites.
+    kernel.log_message(superx_kernel::NewMessage {
+        session: steered.clone(), agent: agent.clone(), role: "user".into(),
+        content: "actually, do it the other way".into(), raw: None, seq: None, emitted_at: None,
+    }).await.expect("human turn");
+    log_tool_message(&kernel, &steered, &agent,
+        edit("/w/demo/a.rs", "one\ntwo", "three\nfour")).await;
+
+    // Session B: no instruction — the agent is going in circles.
+    log_tool_message(&kernel, &alone, &agent,
+        edit("/w/demo/b.rs", "alpha\nbeta\ngamma", "delta")).await;
+
+    // A long operation, and a command that had to be stopped.
+    kernel.log_message(superx_kernel::NewMessage {
+        session: alone.clone(), agent: agent.clone(), role: "system".into(), content: String::new(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "durationMs": 620000, "slug": "cargo-build", "message": {"content": []}}))),
+        seq: None, emitted_at: None,
+    }).await.expect("slow op");
+    kernel.log_message(superx_kernel::NewMessage {
+        session: alone.clone(), agent: agent.clone(), role: "tool".into(), content: String::new(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "toolUseResult": {"interrupted": true, "stdout": ""}, "message": {"content": []}}))),
+        seq: None, emitted_at: None,
+    }).await.expect("interrupted");
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // The steered rewrite replaced 2 lines; the unsteered one replaced 3.
+    assert_eq!(s.churn_directed, 2, "the design moved — an instruction preceded it");
+    assert_eq!(s.churn_self, 3, "nobody was steering — the agent rewrote itself");
+
+    // The repo carries the same split, so "why is this repo churning?"
+    // has an answer rather than a number.
+    let repo = s.repos.iter().find(|r| r.name == "demo").expect("demo repo");
+    assert_eq!(repo.churn_directed, 2);
+    assert_eq!(repo.churn_self, 3);
+
+    // Reasoning level against churn and productivity.
+    let high = s.efforts.iter().find(|e| e.name == "high").expect("high effort");
+    assert_eq!(high.lines_added, 3, "2 + 1 new lines");
+    assert_eq!(high.lines_removed, 5, "2 + 3 replaced");
+    assert_eq!(high.thinking_tokens, 80, "40 per edit message");
+    assert!(high.messages >= 2);
+
+    // What the agents waited on, and what had to be killed.
+    assert_eq!(s.wait_ms_total, 620_000, "one ten-minute operation");
+    assert_eq!(s.slowest.first().map(|o| o.label.as_str()), Some("cargo-build"));
+    assert_eq!(s.interrupted_calls, 1);
+
+    // Both sessions appear on the timeline with real bounds.
+    assert_eq!(s.timeline.len(), 2, "{:?}", s.timeline.len());
+    assert!(s.timeline.iter().all(|t| !t.start.is_empty() && t.messages > 0));
+}
+
+/// Two questions the operator asked of the telemetry (#337): what does
+/// each agent cost per line it produced, and how much of my material
+/// left this machine? Both are measured, not estimated — the token
+/// counts are the vendor's own, and the bytes are the text the tool
+/// results carried into the next prompt.
+#[tokio::test]
+async fn productivity_and_exposure_are_measured_per_agent() {
+    let kernel = fresh_kernel().await;
+    let (fast, fast_s) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
+    let (slow, slow_s) = seed_agent_and_session(&kernel, "gemini_cli", "bbb").await;
+
+    // A productive agent: 40k tokens in, 3 lines out.
+    log_tool_message(&kernel, &fast_s, &fast, serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"model": "claude-fable-5",
+            "usage": {"input_tokens": 1_000, "cache_creation_input_tokens": 39_000,
+                      "cache_read_input_tokens": 500_000, "output_tokens": 700},
+            "content": [{"type": "tool_use", "id": "w1", "name": "Write",
+                "input": {"file_path": "/w/superx/a.rs", "content": "one\ntwo\nthree"}}]}})).await;
+
+    // An expensive one: the same 40k in, a single line out.
+    log_tool_message(&kernel, &slow_s, &slow, serde_json::json!({
+        "cwd": "/w/other",
+        "message": {"model": "gemini-3-pro",
+            "usage": {"input_tokens": 40_000, "output_tokens": 200},
+            "content": [{"type": "tool_use", "id": "w2", "name": "Write",
+                "input": {"file_path": "/w/other/b.rs", "content": "solo"}}]}})).await;
+
+    // Reads: one inside the working directory, one far outside it —
+    // and the outside one comes back holding a private key.
+    log_tool_message(&kernel, &fast_s, &fast, serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"model": "claude-fable-5", "content": [
+            {"type": "tool_use", "id": "r1", "name": "Read",
+                "input": {"file_path": "/w/superx/src/lib.rs"}},
+            {"type": "tool_use", "id": "r2", "name": "Read",
+                "input": {"file_path": "/home/me/.ssh/id_rsa"}},
+            {"type": "image", "source": {"type": "base64"}}]}})).await;
+    log_tool_message(&kernel, &fast_s, &fast, serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"model": "claude-fable-5", "content": [
+            {"type": "tool_result", "tool_use_id": "r1", "content": "fn main() {}"},
+            {"type": "tool_result", "tool_use_id": "r2",
+                "content": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blb\n"}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // Per agent: the productive one is first, and each carries the
+    // tokens it spent so cost-per-line is a division, not a guess.
+    let a = s.agent_stats.iter().find(|a| a.name == "claude_code").expect("claude_code");
+    let b = s.agent_stats.iter().find(|a| a.name == "gemini_cli").expect("gemini_cli");
+    assert_eq!(a.lines_added, 3);
+    assert_eq!(b.lines_added, 1);
+    assert_eq!(a.in_tokens, 40_000, "fresh prompt + what the vendor cached");
+    assert_eq!(b.in_tokens, 40_000, "same spend, a third of the output");
+    assert_eq!(a.out_tokens, 700);
+    assert_eq!(a.repos, 1);
+    assert_eq!(a.sessions, 1);
+    assert_eq!(s.agent_stats[0].name, "claude_code", "most productive first");
+
+    // Exposure: what left, and what the vendor kept.
+    let e = &s.exposure;
+    assert_eq!(e.input_tokens, 41_000, "1k + 40k sent fresh");
+    assert_eq!(e.cache_write_tokens, 39_000, "written to the vendor's store");
+    assert_eq!(e.cache_read_tokens, 500_000, "served back out of it");
+    assert_eq!(e.files_read, 2, "two distinct files pulled into prompts");
+    assert_eq!(e.repos_exposed, 1);
+    assert_eq!(e.attachments, 1, "one image sent");
+    assert!(e.content_bytes >= 12, "the file text the results carried");
+
+    // The two signals that are worth waking up for.
+    assert_eq!(e.outside_reads, 1, "~/.ssh is not the working directory");
+    assert_eq!(e.secret_hits, 1);
+    assert_eq!(e.secret_paths, vec!["/home/me/.ssh/id_rsa".to_string()],
+        "the leak is named, not just counted");
+}
