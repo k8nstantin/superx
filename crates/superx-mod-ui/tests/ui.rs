@@ -1599,27 +1599,35 @@ async fn a_live_row_carries_effort_and_both_halves_of_the_churn() {
     let kernel = fresh_kernel().await;
     let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
 
-    // Three new lines, at a stated effort. The effort sits on the
-    // message itself, beside the model.
+    // Three new lines, on a message that names the MODEL and no
+    // effort.
     log_tool_message(&kernel, &s1, &a1, serde_json::json!({
-        "cwd": "/w/superx", "effort": "xhigh",
+        "cwd": "/w/superx",
         "message": {"model": "claude-opus-5", "usage": {"output_tokens": 40},
             "content": [{"type": "tool_use", "id": "w", "name": "Write",
                 "input": {"file_path": "/w/superx/new.rs", "content": "a\nb\nc"}}]}})).await;
     // Then two existing lines rewritten into one — a net LOSS of a
-    // line, which `lines_added` on its own cannot express.
+    // line, which `lines_added` on its own cannot express — on a
+    // message that names the EFFORT and no model.
+    //
+    // The split is the point: carry effort alongside the model and
+    // this row comes back with none, because the message that states
+    // the effort has no model to hang it on. Newest-first, so this is
+    // the first message the walk sees.
     log_tool_message(&kernel, &s1, &a1, serde_json::json!({
-        "cwd": "/w/superx",
+        "cwd": "/w/superx", "effort": "xhigh",
         "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
             "input": {"file_path": "/w/superx/old.rs",
                       "old_string": "one\ntwo", "new_string": "uno"}}]}})).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
 
-    assert_eq!(s.live.len(), 1, "{:?}", s.live.len());
+    assert_eq!(s.live.len(), 1, "{:?}",
+        s.live.iter().map(|l| &l.identity).collect::<Vec<_>>());
     let row = &s.live[0];
     assert_eq!(row.model.as_deref(), Some("claude-opus-5"));
-    assert_eq!(row.effort.as_deref(), Some("xhigh"), "effort is read off the message");
+    assert_eq!(row.effort.as_deref(), Some("xhigh"),
+        "effort is read off its OWN message, not the model's");
     assert_eq!(row.lines_added, 4, "3 from the Write, 1 from the Edit's new_string");
     assert_eq!(row.lines_removed, 2, "the Edit replaced two lines");
 }

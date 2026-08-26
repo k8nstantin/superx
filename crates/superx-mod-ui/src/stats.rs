@@ -1036,9 +1036,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             // messages than the model does — so it is picked up on its
             // own first sighting, not alongside the model (#343).
             if l.effort.is_none() {
-                if let Some(e) = &effort {
-                    l.effort = Some(e.clone());
-                }
+                l.effort = effort.clone();
             }
         }
         // The cube's bucket: hourly on short ranges, daily on long

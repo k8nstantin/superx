@@ -9,7 +9,7 @@ import { useFeedHistory } from '../useFeedHistory'
 import type { SseEvent } from '../generated/SseEvent'
 import type { SessionView } from '../generated/SessionView'
 import { useBreadcrumb } from '../Breadcrumbs'
-import { LivenessDot, type Liveness } from '../LivenessDot'
+import { LivenessDot, liveness, type Liveness } from '../LivenessDot'
 
 export default function SessionsPage() {
   const [selected, setSelected] = useState<SessionView | null>(null)
@@ -23,20 +23,6 @@ export default function SessionsPage() {
   ) : (
     <SessionList onOpen={setSelected} />
   )
-}
-
-// Liveness thresholds (render-layer presentation, issue #162):
-// a session is ACTIVE while its newest message is fresher than this…
-const ACTIVE_MS = 5 * 60 * 1000
-// …PAUSED until this, ENDED after.
-const PAUSED_MS = 24 * 60 * 60 * 1000
-
-function liveness(lastActive: string | null): Liveness {
-  if (!lastActive) return 'unknown'
-  const age = Date.now() - new Date(lastActive).getTime()
-  if (age < ACTIVE_MS) return 'active'
-  if (age < PAUSED_MS) return 'paused'
-  return 'ended'
 }
 
 const LIVENESS_RANK: Record<Liveness, number> = { active: 0, paused: 1, ended: 2, unknown: 3 }
