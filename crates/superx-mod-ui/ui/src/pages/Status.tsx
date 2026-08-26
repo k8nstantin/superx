@@ -38,6 +38,10 @@ const HEAT_ROWS = [...WEEKDAYS].reverse()
 function fmtCompact(n: number | bigint | null | undefined): string {
   if (n == null) return '—'
   const v = Number(n)
+  // Cache reads run to billions on a long day — 7679.1M is not a
+  // number anyone reads (#338).
+  if (v >= 1e12) return `${(v / 1e12).toFixed(1)}T`
+  if (v >= 1e9) return `${(v / 1e9).toFixed(1)}B`
   if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`
   if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`
   return String(v)
