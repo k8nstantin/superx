@@ -413,6 +413,34 @@ const SEEDED: &[Seed] = &[
     },
 ];
 
+/// Is the vocabulary SuperX ships with present?
+///
+/// Not "is the dictionary empty": since #333 a provisioned instance has
+/// labels for its types before anything has seeded the shipped
+/// vocabulary, so emptiness stopped being the question. This asks the
+/// one that matters — can prose written right now be interpreted.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn shipped_is_present(db: &Db) -> Result<bool> {
+    // ONE READ, and keyed the way `seed` itself is — by (key, kind).
+    // `find` answers by name across every kind, so a name that exists
+    // only as something else counted as present: since #333 defines a
+    // label for each entity TYPE, `repo` looked seeded while the shipped
+    // slot label of that name was still missing. A query per shipped
+    // label also never short-circuits in the seeded case, which is the
+    // case every prose write hits.
+    let present: std::collections::HashSet<(String, String)> = list(db, true)
+        .await?
+        .into_iter()
+        .map(|l| (l.key, l.label_kind))
+        .collect();
+    Ok(SEEDED
+        .iter()
+        .all(|s| present.contains(&(s.key.to_string(), s.kind.to_string()))))
+}
+
 /// Seed the shipped dictionary; returns how many rows were new.
 /// Idempotent — a label that already has a chain is left alone, so
 /// re-provisioning never resurrects a definition the operator changed.
@@ -738,6 +766,62 @@ pub async fn slots_for(db: &Db, entity_type: &str, include_retired: bool) -> Res
         .filter(|s| include_retired || s.active)
         .collect();
     out.sort_by_key(|s| s.display_order);
+    Ok(out)
+}
+
+/// The slots EVERYTHING an entity is carries, in display order.
+///
+/// Since #333 an entity is a set of labels, so what it may carry follows
+/// from all of them: `bind_slot("role", "mandate")` declares that a role
+/// has a mandate, and a `product` labelled `role` is a role. Reading
+/// slots from the anchor type alone made every such declaration
+/// unreachable — the field could not be set, was never offered, and the
+/// audit checked a requirement against the wrong list.
+///
+/// One read for the whole set (the `IN $ts` idiom `notes::for_entities`
+/// already uses), and a label declared by two of the carried names is
+/// one slot: the first name that declares it wins, so the anchor type
+/// keeps precedence over a label added later.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn slots_for_any(
+    db: &Db,
+    carried: &[String],
+    include_retired: bool,
+) -> Result<Vec<TypeSlot>> {
+    if carried.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut resp = db
+        .query(
+            "SELECT * FROM type_label WHERE entity_type IN $ts \
+             ORDER BY valid_from ASC, id ASC",
+        )
+        .bind(("ts", carried.to_vec()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    // Latest row per (type, label) wins — the chain read, per type.
+    let mut heads: std::collections::BTreeMap<(String, String), TypeSlot> =
+        std::collections::BTreeMap::new();
+    for row in &rows {
+        if let Some(slot) = parse_slot(row) {
+            heads.insert((slot.entity_type.clone(), slot.label.clone()), slot);
+        }
+    }
+    let mut out: Vec<TypeSlot> = Vec::new();
+    for name in carried {
+        let mut of_type: Vec<TypeSlot> = heads
+            .values()
+            .filter(|s| &s.entity_type == name)
+            .filter(|s| include_retired || s.active)
+            .filter(|s| !out.iter().any(|k| k.label == s.label))
+            .cloned()
+            .collect();
+        of_type.sort_by_key(|s| s.display_order);
+        out.append(&mut of_type);
+    }
     Ok(out)
 }
 

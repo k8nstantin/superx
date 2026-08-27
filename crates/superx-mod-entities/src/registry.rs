@@ -63,6 +63,24 @@ pub async fn seed_types(db: &Db) -> Result<usize> {
     Ok(created)
 }
 
+/// Is this name registered as a relation kind?
+///
+/// The question "may an entity carry this as a label" needs it: #324
+/// merged the label kinds, so a relation's label can be written as plain
+/// `label` and the kind no longer answers it. The registry does.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn is_relation(db: &Db, name: &str) -> Result<bool> {
+    let mut resp = db
+        .query("SELECT category FROM entity_type WHERE name = $name LIMIT 1")
+        .bind(("name", name.to_string()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    Ok(rows.first().and_then(|r| obj_str(r, "category")).as_deref() == Some("relation"))
+}
+
 /// All registered types, ordered by category then name.
 ///
 /// # Errors
@@ -121,8 +139,28 @@ pub async fn add_type(
     }
 }
 
-/// Check-then-create against the UNIQUE name index. Returns whether a
-/// row was created; a lost race reads as "already there".
+/// Check-then-create against the UNIQUE name index, AND define the name
+/// as a label when it is an entity kind. Returns whether a row was
+/// created; a lost race reads as "already there".
+///
+/// AND AS A LABEL (#333). What a thing IS belongs in the same vocabulary
+/// as everything else about it: one list, so `product` can carry an
+/// action a runner reads exactly as `spec` does, and an entity's
+/// identity is simply the first label it carries.
+///
+/// HERE, not in the seed loop, because a type the OPERATOR invents needs
+/// it for the same reason a shipped one does — `types add role entity`
+/// followed by `create --label role` refused its own type otherwise.
+///
+/// ENTITY KINDS ONLY. A relation name is already a label in the shipped
+/// dictionary, written with its endpoints and its acyclicity; defining
+/// it again as an entity label wrote a SECOND chain for the same name
+/// under a different kind, so `contains` and `depends_on` had two
+/// contradictory meanings and the one a reader got depended on which
+/// wrote last. Nothing carries a relation as its identity anyway.
+///
+/// Defined only when nothing defines it yet, so a name the operator has
+/// already given a meaning is never overruled.
 async fn insert_type(
     db: &Db,
     name: &str,
@@ -135,6 +173,11 @@ async fn insert_type(
         .await?;
     let existing: Vec<Value> = resp.take(0)?;
     if !existing.is_empty() {
+        // BACKFILL, not skip. An instance provisioned before #333 has
+        // every type row and no type labels, so returning here left the
+        // whole feature off on exactly the instances that upgrade into
+        // it.
+        define_as_label(db, name, category, description).await?;
         return Ok(false);
     }
 
@@ -161,11 +204,37 @@ async fn insert_type(
         .await?
         .check()
     };
-    match outcome {
-        Ok(_) => Ok(true),
-        Err(e) if e.to_string().contains("already") => Ok(false),
-        Err(e) => Err(e.into()),
+    let created = match outcome {
+        Ok(_) => true,
+        Err(e) if e.to_string().contains("already") => false,
+        Err(e) => return Err(e.into()),
+    };
+    define_as_label(db, name, category, description).await?;
+    Ok(created)
+}
+
+/// Give an ENTITY kind a label of the same name, once.
+async fn define_as_label(
+    db: &Db,
+    name: &str,
+    category: &str,
+    description: Option<&str>,
+) -> Result<()> {
+    if category != "entity" || crate::dictionary::find(db, name).await?.is_some() {
+        return Ok(());
     }
+    crate::dictionary::define(db, crate::dictionary::Definition {
+        key: name,
+        kind: crate::dictionary::LABEL,
+        display: name,
+        // What a thing IS is background an agent reads, not an
+        // instruction it obeys — a label that BINDS is a deliberate act,
+        // never a side effect of seeding.
+        semantics: "context",
+        description,
+        ..Default::default()
+    })
+    .await
 }
 
 /// Pull a string field out of a dynamic row object.

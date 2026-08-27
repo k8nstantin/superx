@@ -18,7 +18,8 @@ const DEFAULT_MAX_DEPTH: usize = 5; // skill-allow: §9-const — bootstrap fall
 const ANCESTOR_MAX_DEPTH: usize = 12; // skill-allow: §9-const — render-layer bound, not a policy tunable
 
 const USAGE: &str = "usage: superx entities <command>\n\
-  create --type <type> [--describe <text>] [--content <text>] [--attrs <json>] <name…>\n\
+  create --type <type> [--label a,b] [--describe <text>] [--content <text>]\n\
+         [--attrs <json>] <name…>   --label is everything else it IS\n\
   update <uuid-fragment> [--name <name>] [--content <text>] [--attrs <json>]\n\
          (--attrs REPLACES the whole attributes object; omit to keep it)\n\
   show <uuid-fragment> [--history] [--as-of <rfc3339>]\n\
@@ -229,7 +230,18 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let labels = crate::dictionary::list(&db, include_archived).await?;
     let revision = crate::dictionary::revision(&db).await?;
     let mut out = format!("dictionary — revision {revision}\n");
-    for kind in [crate::dictionary::SLOT, crate::dictionary::LINK] {
+    // EVERY KIND PRESENT, discovered from the rows. Iterating a fixed
+    // [slot, link] pair hid every label written under the merged kind
+    // #324 introduced — including the type labels — so `create --label`
+    // could refuse a name the operator had no command to look up.
+    let mut kinds: Vec<&str> = Vec::new();
+    for l in &labels {
+        if !kinds.contains(&l.label_kind.as_str()) {
+            kinds.push(&l.label_kind);
+        }
+    }
+    kinds.sort_unstable();
+    for kind in kinds {
         let of_kind: Vec<_> = labels.iter().filter(|l| l.label_kind == kind).collect();
         if of_kind.is_empty() {
             continue;
@@ -634,6 +646,10 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let mut describe = None;
     let mut content = None;
     let mut attrs = None;
+    // Everything else this thing IS (#333). "I create a root entity of
+    // `role` — DBA. The database it manages is another entity with a
+    // label `resource`. And we can have many labels per entity."
+    let mut labels: Vec<String> = Vec::new();
     let mut name_words: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -654,6 +670,10 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
                 attrs = Some(next_value(args, i)?);
                 i += 2;
             }
+            "--label" => {
+                labels.extend(csv(&next_value(args, i)?));
+                i += 2;
+            }
             word => {
                 name_words.push(word.to_string());
                 i += 1;
@@ -667,9 +687,18 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let name = name_words.join(" ");
     let attributes = attrs.as_deref().map(parse_attrs).transpose()?;
 
+    // BEFORE THE WRITE. An undefined label refused after the anchor
+    // exists leaves it there forever, unlabelled and undescribed, in a
+    // substrate with no delete.
+    let labels = nodes::check_labels(&db, &labels).await?;
+
     let anchor = nodes::create_entity(&db, &entity_type, &name, content, attributes).await?;
     let uuid = record_uuid(&anchor);
     emit(kernel, "entity_created", &uuid, &entity_type, &name).await;
+    if !labels.is_empty() {
+        nodes::set_labels(&db, &anchor, &labels).await?;
+        emit(kernel, "entity_labelled", &uuid, &entity_type, &labels.join(",")).await;
+    }
     if let Some(text) = describe {
         // One event, and it names what happened: prose was written on
         // this entity. The pair that used to go out here — an
@@ -839,10 +868,7 @@ async fn validate_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
 async fn label_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
     let fragment = args.first().ok_or_else(usage)?;
-    let labels: Vec<String> = args
-        .get(1)
-        .map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
-        .unwrap_or_default();
+    let labels: Vec<String> = args.get(1).map(|v| csv(v)).unwrap_or_default();
     let target = nodes::resolve_entity(&db, fragment).await?;
     nodes::set_labels(&db, &target, &labels).await?;
     let uuid = record_uuid(&target);

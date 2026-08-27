@@ -286,14 +286,31 @@ async fn a_never_seeded_dictionary_is_seeded_before_the_first_prose_write() {
     registry::seed_types(&db).await.expect("types");
     // Deliberately NOT dictionary::seed — this is the provisioned-but-
     // never-started instance.
-    assert_eq!(dictionary::revision(&db).await.expect("rev"), 0);
+    //
+    // Seeding TYPES now defines their labels too (#333: what a thing is
+    // lives in the same vocabulary as everything else about it), so the
+    // revision is not zero. What is still missing is the SHIPPED
+    // dictionary — `description` and the rest — which is what the prose
+    // write below has to seed on its way past.
+    let after_types = dictionary::revision(&db).await.expect("rev");
+    assert!(
+        dictionary::find(&db, "description").await.expect("read").is_none(),
+        "the shipped dictionary is not there yet, which is the state under test"
+    );
 
     let product = create_entity(&db, "product", "Ledger", None, None).await.expect("create");
     notes::write(&db, &product, "description", "it works", &Author::operator())
         .await
         .expect("a provisioned instance can be described");
 
-    assert!(dictionary::revision(&db).await.expect("rev") > 0, "seeded on the way past");
+    assert!(
+        dictionary::revision(&db).await.expect("rev") > after_types,
+        "seeded on the way past"
+    );
+    assert!(
+        dictionary::find(&db, "description").await.expect("read").is_some(),
+        "and the label the write needed now exists"
+    );
     assert_eq!(
         notes::for_entity(&db, &product, false).await.expect("read")[0].body,
         "it works"

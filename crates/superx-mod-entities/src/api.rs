@@ -433,8 +433,7 @@ pub struct FieldView {
 /// Verb errors pass through.
 pub async fn entity_fields(db: &Db, fragment: &str) -> Result<Vec<FieldView>> {
     let id = nodes::resolve_entity(db, fragment).await?;
-    let (entity_type, _) = nodes::anchor_info(db, &id).await?;
-    let slots = dictionary::slots_for(db, &entity_type, false).await?;
+    let slots = dictionary::slots_for_any(db, &nodes::labels_of(db, &id).await?, false).await?;
 
     let mut out = Vec::new();
     for f in fields::of(db, &id).await? {
@@ -529,8 +528,7 @@ pub async fn addable_fields(db: &Db, fragment: &str) -> Result<Vec<FieldOffer>> 
     let id = nodes::resolve_entity(db, fragment).await?;
     let held: std::collections::HashSet<String> =
         fields::of(db, &id).await?.into_iter().map(|f| f.key).collect();
-    let (entity_type, _) = nodes::anchor_info(db, &id).await?;
-    let slots = dictionary::slots_for(db, &entity_type, false).await?;
+    let slots = dictionary::slots_for_any(db, &nodes::labels_of(db, &id).await?, false).await?;
 
     Ok(dictionary::list(db, false)
         .await?
@@ -1105,6 +1103,7 @@ pub async fn detail_at(
         })
         .collect();
 
+    let is = nodes::identity(&entity_type, &state.labels);
     Ok(EntityDetail {
         id: record_uuid(&id),
         entity_type,
@@ -1115,8 +1114,14 @@ pub async fn detail_at(
         label_actions: {
             // Resolved at READ time, like a field's — a label rewritten
             // today changes what every entity carrying it means.
+            //
+            // OVER EVERYTHING IT IS, anchor type first (#333): `product`
+            // carries an action a runner reads exactly as `spec` does,
+            // and this is where a runner reads it. `labels` below stays
+            // what it says — the labels BEYOND the type — because the
+            // type has its own field and the UI renders it there.
             let mut out = Vec::new();
-            for term in &state.labels {
+            for term in &is {
                 let found = dictionary::find(db, term).await?;
                 out.push(LabelAction {
                     label: term.clone(),

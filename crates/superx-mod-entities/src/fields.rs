@@ -165,6 +165,13 @@ pub async fn set(db: &Db, entity: &RecordId, key: &str, value: &str) -> Result<(
 pub async fn of(db: &Db, entity: &RecordId) -> Result<Vec<Field>> {
     let (entity_type, _) = crate::nodes::anchor_info(db, entity).await?;
     let state = current_state(db, entity).await?;
+    // WHAT IT MAY CARRY FOLLOWS WHAT IT IS, all of it (#333): a
+    // `product` labelled `role` carries what `role` declares, or the
+    // declaration is unreachable and the field can never be set.
+    let is = crate::nodes::identity(
+        &entity_type,
+        &state.as_ref().map(|s| s.labels.clone()).unwrap_or_default(),
+    );
     let bag = match state.and_then(|s| s.attributes) {
         Some(Value::Object(o)) => o,
         _ => Object::new(),
@@ -172,7 +179,7 @@ pub async fn of(db: &Db, entity: &RecordId) -> Result<Vec<Field>> {
 
     let mut out = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    for slot in dictionary::slots_for(db, &entity_type, false).await? {
+    for slot in dictionary::slots_for_any(db, &is, false).await? {
         let Some(declared) = dictionary::find(db, &slot.label).await? else {
             continue;
         };
@@ -381,11 +388,15 @@ pub async fn validate_bag(
     incoming: &Object,
 ) -> Result<Object> {
     let (entity_type, _) = crate::nodes::anchor_info(db, entity).await?;
-    let slots = dictionary::slots_for(db, &entity_type, false).await?;
 
     // What the entity already holds, read once: it decides both which
     // keys are grandfathered and whether a required one is being dropped.
     let current = current_state(db, entity).await?;
+    let is = crate::nodes::identity(
+        &entity_type,
+        &current.as_ref().map(|s| s.labels.clone()).unwrap_or_default(),
+    );
+    let slots = dictionary::slots_for_any(db, &is, false).await?;
     let before = match current.and_then(|s| s.attributes) {
         Some(Value::Object(o)) => o,
         _ => Object::new(),

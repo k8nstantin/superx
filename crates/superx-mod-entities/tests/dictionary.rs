@@ -887,9 +887,12 @@ async fn an_entity_carries_labels_and_each_one_is_an_action() {
 
     let product = nodes::create_entity(&db, "product", "Desk", None, None).await.expect("p");
     let frag = superx_ops::record_uuid(&product);
-    assert!(
-        api::detail(&db, &frag).await.expect("detail").labels.is_empty(),
-        "nothing beyond what it is, to start"
+    let d = api::detail(&db, &frag).await.expect("detail");
+    assert!(d.labels.is_empty(), "nothing beyond what it is, to start");
+    assert_eq!(
+        d.label_actions.iter().map(|a| a.label.as_str()).collect::<Vec<_>>(),
+        vec!["product"],
+        "what it IS is on the same list, and a runner reads it here"
     );
 
     api::set_entity_labels(&db, &frag, &["spec".to_string(), "playbook".to_string()])
@@ -898,8 +901,17 @@ async fn an_entity_carries_labels_and_each_one_is_an_action() {
 
     let d = api::detail(&db, &frag).await.expect("detail");
     assert_eq!(d.labels, vec!["spec".to_string(), "playbook".to_string()]);
-    assert_eq!(d.label_actions.len(), 2, "each resolves to what an agent does about it");
-    assert!(d.label_actions.iter().all(|a| a.action.is_some()));
+    // ANCHOR TYPE FIRST, then everything else it is labelled with — one
+    // list, resolved once, which is what a runner reads.
+    assert_eq!(
+        d.label_actions.iter().map(|a| a.label.as_str()).collect::<Vec<_>>(),
+        vec!["product", "spec", "playbook"],
+        "each resolves to what an agent does about it"
+    );
+    assert!(
+        d.label_actions.iter().filter(|a| a.label != "product").all(|a| a.action.is_some()),
+        "a shipped slot label says what to do about it; a type label may simply be context"
+    );
     assert_eq!(d.name, "Desk", "and labelling changed nothing else");
     assert_eq!(d.entity_type, "product", "its identity is untouched");
 
@@ -912,6 +924,7 @@ async fn an_entity_carries_labels_and_each_one_is_an_action() {
     api::set_entity_labels(&db, &frag, &[]).await.expect("clear");
     let d = api::detail(&db, &frag).await.expect("detail");
     assert!(d.labels.is_empty());
+    assert_eq!(d.label_actions.len(), 1, "it is still a product");
     assert_eq!(d.name, "Desk");
 }
 
@@ -1037,4 +1050,71 @@ async fn a_merged_kind_label_can_still_be_argued_about() {
     let held = notes::for_target(&db, &target, false).await.expect("read");
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].body, "should this be binding?");
+}
+
+/// REAL STARTUP ORDER: `lib.rs::startup` seeds the type registry and
+/// THEN the shipped dictionary. Every other test in this file seeds the
+/// dictionary first, and that is the one order under which the collision
+/// below cannot happen — which is why nothing caught it.
+///
+/// A relation's name belongs to the shipped dictionary, written with its
+/// endpoints and its acyclicity. Defining it a SECOND time as an entity
+/// label — what #333 did for every registry name, relations included —
+/// left `contains` with two chains under two kinds and two contradictory
+/// meanings, and which one a reader got depended on which wrote last.
+/// Nothing carries a relation as its identity, so it never needed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_order_leaves_one_meaning_per_name() {
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::seed(&db).await.expect("dictionary");
+
+    let all = dictionary::list(&db, true).await.expect("list");
+    for name in ["contains", "depends_on", "comments"] {
+        let kinds: Vec<&str> =
+            all.iter().filter(|l| l.key == name).map(|l| l.label_kind.as_str()).collect();
+        assert_eq!(kinds.len(), 1, "'{name}' means one thing, not {kinds:?}");
+    }
+
+    // And it keeps its teeth. Before, `acyclic` survived only by luck of
+    // write order: the entity-label row carried none.
+    let contains = dictionary::find(&db, "contains").await.expect("find").expect("defined");
+    assert_eq!(contains.label_kind, LINK);
+    assert!(contains.acyclic, "a cycle in `contains` is still refused");
+
+    // An ENTITY type is a label, which is the feature #333 shipped.
+    let product = dictionary::find(&db, "product").await.expect("find").expect("defined");
+    assert_eq!(product.semantics, "context", "what a thing is, is background");
+}
+
+/// A provisioned-but-never-started instance can be described.
+///
+/// The self-heal before the first prose write asks whether the SHIPPED
+/// vocabulary is present. It used to ask whether the dictionary was
+/// empty, and #333 made a provisioned instance non-empty — it has a
+/// label per entity type before anything seeds `description`. This pins
+/// the state the heal exists for, in the order startup produces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn type_labels_alone_are_not_the_shipped_vocabulary() {
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    assert!(
+        dictionary::find(&db, "product").await.expect("find").is_some(),
+        "the type labels are there"
+    );
+    assert!(
+        !dictionary::shipped_is_present(&db).await.expect("present"),
+        "but `description` and the rest are not, so prose cannot be interpreted yet"
+    );
+
+    dictionary::seed(&db).await.expect("dictionary");
+    assert!(dictionary::shipped_is_present(&db).await.expect("present"));
+    // Presence is keyed (name, kind) like the seed itself, so a name
+    // that exists only as some OTHER kind never counts as the shipped
+    // label of that name.
+    assert!(
+        dictionary::current(&db, "description", SLOT).await.expect("cur").is_some(),
+        "and it is the slot label that is present, not merely the name"
+    );
 }
