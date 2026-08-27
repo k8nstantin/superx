@@ -16,7 +16,7 @@ import {
 import { fetchInsights, fetchStats, fetchStatus } from '../api'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK, INK_MUTED, TOOLTIP } from '../EChart'
 import { sessionColor } from '../Feed'
-import { LivenessDot, livenessFromIdle } from '../LivenessDot'
+import { LivenessDot } from '../LivenessDot'
 import { useBreadcrumb } from '../Breadcrumbs'
 
 // The Status page (issues #228, #237): the OS's captured numbers,
@@ -318,7 +318,7 @@ export default function StatusPage() {
                 <Table.Th ta="right">Msgs</Table.Th>
                 <Table.Th ta="right">
                   <Tooltip
-                    label="lines written and lines replaced — a modified line is one of each"
+                    label="lines written, and lines an edit replaced — a whole-file Write counts entirely as added"
                     withArrow
                   >
                     <span>Lines +/−</span>
@@ -334,12 +334,16 @@ export default function StatusPage() {
                 <Table.Tr key={l.identity}>
                   <Table.Td>
                     <Group gap={6} wrap="nowrap">
-                      {/* The same green the Sessions page draws (#343),
-                          derived from the idle figure rather than
-                          asserted: the server cuts this panel at 300s
-                          but the page refetches every 15s, so a row can
-                          outlive the cut before its next fetch. */}
-                      <LivenessDot state={livenessFromIdle(Number(l.idle_secs))} size={8} />
+                      {/* The same green the Sessions page draws (#343).
+                          Stated, not re-derived: the server already cut
+                          this panel to the activity window, and asking
+                          the question a second time on the client only
+                          created a boundary the two answered differently
+                          — a row at exactly the cut came back yellow
+                          (#344 review). `idle_secs` cannot settle it
+                          either; it is computed server-side and never
+                          advances between fetches. */}
+                      <LivenessDot state="active" size={8} />
                       <Text size="xs" ff="monospace">
                         {l.identity.slice(0, 13)}
                       </Text>
@@ -358,15 +362,16 @@ export default function StatusPage() {
                   </Table.Td>
                   <Table.Td>
                     {/* An effort qualifies a model — never shown on its
-                        own, the way Sessions gates the same pair. */}
+                        own, the way Sessions gates the same pair. The
+                        model carries the weight: a coloured badge beside
+                        dimmed grey text put the eye on `xhigh` in a
+                        column headed Model (#344 review). */}
                     {l.model ? (
                       <Group gap={4} wrap="nowrap">
-                        <Text size="xs" c="dimmed">
-                          {l.model}
-                        </Text>
+                        <Text size="xs">{l.model}</Text>
                         {l.effort && (
                           <Tooltip label="reasoning effort this session is running at" withArrow>
-                            <Badge variant="outline" color="pelican" size="sm">
+                            <Badge variant="outline" color="gray" size="xs">
                               {l.effort}
                             </Badge>
                           </Tooltip>
@@ -391,12 +396,22 @@ export default function StatusPage() {
                   {/* Added alone reads 0 for a session deep in a
                       rewrite — show both halves (#343). */}
                   <Table.Td ta="right">
+                    {/* `size="sm"` is the Table's own size. Mantine's
+                        Text defaults to `md`, so an unsized Text is
+                        LARGER than the bare cells beside it, not equal
+                        to them (#344 review). */}
                     {Number(l.lines_added) === 0 && Number(l.lines_removed) === 0 ? (
-                      <Text c="dimmed">—</Text>
+                      <Text size="sm" c="dimmed">
+                        —
+                      </Text>
                     ) : (
                       <Group gap={6} justify="flex-end" wrap="nowrap">
-                        <Text c={OK}>+{fmtCompact(l.lines_added)}</Text>
-                        <Text c={FAIL}>−{fmtCompact(l.lines_removed)}</Text>
+                        <Text size="sm" c={OK}>
+                          +{fmtCompact(l.lines_added)}
+                        </Text>
+                        <Text size="sm" c={FAIL}>
+                          −{fmtCompact(l.lines_removed)}
+                        </Text>
                       </Group>
                     )}
                   </Table.Td>

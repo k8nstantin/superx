@@ -932,7 +932,11 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
 
         // Reasoning level, where the agent reports it (#337): does
         // thinking harder produce keepable code, or just cost more?
-        let effort = get_str(raw, "effort").map(str::to_string);
+        // `get_str` hands back `Some("")` for an empty JSON string, and
+        // a first-sighting latch would take that as the answer and mask
+        // the real effort on an older message — the same trap `branch`
+        // sidesteps below (#344 review).
+        let effort = get_str(raw, "effort").filter(|e| !e.is_empty()).map(str::to_string);
         if let Some(e) = &effort {
             code.efforts.entry(e.clone()).or_default().messages += 1;
         }
@@ -1413,7 +1417,10 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                         .or_default()
                                         .push((when, true));
                                 }
-                                {
+                                // Guarded like its two siblings above:
+                                // without it every Bash and Read block
+                                // allocated a session key to add zero.
+                                if n > 0 || replaced > 0 {
                                     let l = code
                                         .live
                                         .entry(superx_ops::record_uuid(&m.session))
@@ -2043,9 +2050,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                 .filter_map(|(sid, l)| {
                     let newest = l.newest?;
                     let idle = (now - newest).num_seconds();
-                    // Live means a message in the last five minutes —
-                    // the same threshold the Sessions page uses.
-                    if idle > 300 {
+                    // Live means a message inside the activity window.
+                    // This read the bare `300` the Sessions page also
+                    // hardcodes, so raising `attr_ui_active_session_secs`
+                    // moved `sessions_active` and left this panel behind
+                    // (#344 review, §9). One resolved value now.
+                    if idle > active_secs {
                         return None;
                     }
                     Some(LiveSession {

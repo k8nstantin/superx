@@ -1619,6 +1619,11 @@ async fn a_live_row_carries_effort_and_both_halves_of_the_churn() {
         "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
             "input": {"file_path": "/w/superx/old.rs",
                       "old_string": "one\ntwo", "new_string": "uno"}}]}})).await;
+    // Newest of all, and it states an EMPTY effort. A first-sighting
+    // latch that accepts `""` would take this as the answer and bury
+    // the real one below it — the row would report no effort at all.
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "effort": "", "message": {"content": []}})).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
 
@@ -1627,7 +1632,7 @@ async fn a_live_row_carries_effort_and_both_halves_of_the_churn() {
     let row = &s.live[0];
     assert_eq!(row.model.as_deref(), Some("claude-opus-5"));
     assert_eq!(row.effort.as_deref(), Some("xhigh"),
-        "effort is read off its OWN message, not the model's");
+        "effort is read off its OWN message, not the model's — and an empty one never masks it");
     assert_eq!(row.lines_added, 4, "3 from the Write, 1 from the Edit's new_string");
     assert_eq!(row.lines_removed, 2, "the Edit replaced two lines");
 }

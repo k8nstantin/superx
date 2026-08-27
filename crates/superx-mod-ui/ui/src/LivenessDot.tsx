@@ -13,16 +13,14 @@ const ACTIVE_SECS = 5 * 60
 // …PAUSED until this, ENDED after.
 const PAUSED_SECS = 24 * 60 * 60
 
-// One threshold pair, two call sites. Sessions has a timestamp, Status
-// has the seconds-since figure the server already computed — the same
-// question asked with different arithmetic, so the cut lives here
-// rather than being restated per page (#343 review).
+// For callers holding a timestamp. A caller whose row the SERVER has
+// already cut to the activity window should pass `active` outright
+// rather than re-deriving: re-deriving means two thresholds that must
+// agree, and they did not — the server keeps `idle <= active_secs`
+// while this returns `paused` at exactly the boundary (#344 review).
 export function liveness(lastActive: string | null): Liveness {
   if (!lastActive) return 'unknown'
-  return livenessFromIdle((Date.now() - new Date(lastActive).getTime()) / 1000)
-}
-
-export function livenessFromIdle(idleSecs: number): Liveness {
+  const idleSecs = (Date.now() - new Date(lastActive).getTime()) / 1000
   if (idleSecs < ACTIVE_SECS) return 'active'
   if (idleSecs < PAUSED_SECS) return 'paused'
   return 'ended'
