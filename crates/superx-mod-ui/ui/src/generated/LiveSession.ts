@@ -24,4 +24,38 @@ lines_removed: bigint, out_tokens: bigint, tool_failures: bigint,
 /**
  * Seconds since its newest message.
  */
-idle_secs: bigint, };
+idle_secs: bigint, 
+/**
+ * The paths its newest calls touched, most recent first. An idle
+ * row that names three files is legible; one that names none is
+ * a number.
+ */
+files_now: Array<string>, 
+/**
+ * A classified state rather than a raw tool name: `writing`,
+ * `verifying`, `reading`, `thinking`, `waiting`. `Bash` alone
+ * does not distinguish `cargo test` from `ls`.
+ */
+doing: string, 
+/**
+ * Reasoning tokens this session has spent. An idle session that
+ * is thinking is not the same as one blocked on a build.
+ */
+thinking_tokens: bigint, 
+/**
+ * Seconds its newest long operation reported, when one did —
+ * so a session parked on an eight-minute build says so instead
+ * of reading as idle.
+ */
+waiting_secs: bigint, 
+/**
+ * Share of THIS session's replaced lines that nobody asked for.
+ * Rising here is the agent starting to rewrite itself.
+ */
+self_churn_pct: bigint, 
+/**
+ * Files it has touched three or more times in the window.
+ * Rework of rework — the compounding signal, and the one worth
+ * interrupting on.
+ */
+files_revisited: bigint, };

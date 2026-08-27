@@ -1636,3 +1636,76 @@ async fn a_live_row_carries_effort_and_both_halves_of_the_churn() {
     assert_eq!(row.lines_added, 4, "3 from the Write, 1 from the Edit's new_string");
     assert_eq!(row.lines_removed, 2, "the Edit replaced two lines");
 }
+
+/// Branch is a DIMENSION, not a label (#350). Two branches worked in
+/// one repo must separate — and each must carry its own churn split,
+/// its own outcome and its own quality, or one cannot be said to be
+/// worse than the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn churn_and_quality_separate_by_branch() {
+    let kernel = fresh_kernel().await;
+    let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
+    let (a2, s2) = seed_agent_and_session(&kernel, "gemini_cli", "bbb").await;
+
+    let write = |branch: &str, path: &str, body: &str| serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": branch,
+        "message": {"model": "claude-opus-5", "usage": {"output_tokens": 10},
+            "content": [{"type": "tool_use", "id": "w", "name": "Write",
+                "input": {"file_path": path, "content": body}}]}});
+    let edit = |branch: &str, path: &str, old: &str, new: &str| serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": branch,
+        "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
+            "input": {"file_path": path, "old_string": old, "new_string": new}}]}});
+
+    // Branch A: writes three lines and never rewrites them.
+    log_tool_message(&kernel, &s1, &a1, write("feat/good", "/w/superx/a.rs", "a\nb\nc")).await;
+    // Branch B, same repo: writes one line then rewrites two, with no
+    // human turn behind it — self-churn.
+    log_tool_message(&kernel, &s2, &a2, write("feat/bad", "/w/superx/b.rs", "x")).await;
+    log_tool_message(&kernel, &s2, &a2, edit("feat/bad", "/w/superx/b.rs", "one\ntwo", "uno")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // One repo, but TWO branch rows — the separation is the point.
+    assert_eq!(s.repos.len(), 1, "both branches are the same checkout");
+    let br = |name: &str| {
+        s.branches.iter().find(|b| b.branch == name).unwrap_or_else(|| {
+            panic!("no row for {name}: {:?}",
+                s.branches.iter().map(|b| (&b.repo, &b.branch)).collect::<Vec<_>>())
+        })
+    };
+    assert_eq!(s.branches.len(), 2, "{:?}",
+        s.branches.iter().map(|b| &b.branch).collect::<Vec<_>>());
+
+    let good = br("feat/good");
+    assert_eq!(good.repo, "superx");
+    assert_eq!(good.lines_added, 3);
+    assert_eq!(good.lines_removed, 0, "nothing was rewritten here");
+    assert_eq!(good.self_churn_pct, 0);
+    assert_eq!(good.agents, 1);
+
+    let bad = br("feat/bad");
+    assert_eq!(bad.lines_added, 2, "1 from the Write, 1 from the Edit");
+    assert_eq!(bad.lines_removed, 2, "the Edit replaced two lines");
+    assert_eq!(bad.churn_self, 2, "no human turn preceded it");
+    assert_eq!(bad.churn_directed, 0);
+    assert_eq!(bad.self_churn_pct, 100, "every replaced line was unasked");
+    assert_eq!(bad.rework_pct, 100, "it removed as much as it added");
+
+    // Quality ranks them, and the worse branch sorts FIRST — the one
+    // with the most to fix is the one to look at.
+    assert!(bad.quality_pct >= 0 && good.quality_pct >= 0, "both are scorable");
+    assert!(bad.quality_pct < good.quality_pct,
+        "bad={} good={}", bad.quality_pct, good.quality_pct);
+    assert_eq!(s.branches[0].branch, "feat/bad", "worst first");
+
+    // No tests ran on either, so the pass rate must read as ABSENT
+    // rather than as total failure.
+    assert_eq!(good.test_pass_pct, -1, "untested is not failed");
+
+    // The agent dimension carries the same split, so agents compare on
+    // outcome and not just volume.
+    let ga = s.agent_stats.iter().find(|a| a.name == "gemini_cli").expect("gemini");
+    assert_eq!(ga.churn_self, 2);
+    assert_eq!(ga.churn_directed, 0);
+}

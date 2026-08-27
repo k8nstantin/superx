@@ -7,6 +7,7 @@ import {
   Collapse,
   Grid,
   Group,
+  Progress,
   SimpleGrid,
   Table,
   Text,
@@ -315,6 +316,17 @@ export default function StatusPage() {
                 <Table.Th>Repo</Table.Th>
                 <Table.Th>Model</Table.Th>
                 <Table.Th>Doing</Table.Th>
+                <Table.Th>Files now</Table.Th>
+                <Table.Th ta="right">
+                  <Tooltip
+                    label="unasked share of its own rewrites, and files it has come back to three or more times — the compounding signal"
+                    withArrow
+                    multiline
+                    w={280}
+                  >
+                    <span>Circling</span>
+                  </Tooltip>
+                </Table.Th>
                 <Table.Th ta="right">Msgs</Table.Th>
                 <Table.Th ta="right">
                   <Tooltip
@@ -384,12 +396,75 @@ export default function StatusPage() {
                     )}
                   </Table.Td>
                   <Table.Td>
-                    {l.last_tool ? (
-                      <Badge size="sm" variant="light">
-                        {l.last_tool}
+                    {/* The classified state, not the raw tool name —
+                        `Bash` cannot tell `cargo test` from `ls`. The
+                        tool name stays, in the tooltip (#350). */}
+                    <Tooltip label={l.last_tool ?? 'no tool call in this window'} withArrow>
+                      <Badge
+                        size="sm"
+                        variant="light"
+                        color={
+                          l.doing === 'writing'
+                            ? 'teal'
+                            : l.doing === 'verifying'
+                              ? 'blue'
+                              : l.doing === 'thinking'
+                                ? 'grape'
+                                : l.doing === 'waiting'
+                                  ? 'yellow'
+                                  : 'gray'
+                        }
+                      >
+                        {l.doing}
+                        {l.doing === 'waiting' && Number(l.waiting_secs) > 0
+                          ? ` ${fmtAge(l.waiting_secs)}`
+                          : ''}
                       </Badge>
+                    </Tooltip>
+                  </Table.Td>
+                  {/* Which files, right now. An idle row that names
+                      three files is legible; one that names none is a
+                      number. */}
+                  <Table.Td>
+                    {(l.files_now ?? []).length === 0 ? (
+                      <Text size="xs" c="dimmed">
+                        —
+                      </Text>
                     ) : (
-                      '—'
+                      <Tooltip label={(l.files_now ?? []).join('\n')} withArrow multiline w={420}>
+                        <Text size="xs" ff="monospace" c="dimmed" lineClamp={1}>
+                          {(l.files_now ?? [])
+                            .map((f) => f.split('/').slice(-1)[0])
+                            .join(' · ')}
+                        </Text>
+                      </Tooltip>
+                    )}
+                  </Table.Td>
+                  {/* The leading indicator: rewriting its own work with
+                      nobody asking, and files it keeps coming back to.
+                      This is the column worth interrupting on. */}
+                  <Table.Td ta="right">
+                    {Number(l.files_revisited) === 0 && Number(l.self_churn_pct) === 0 ? (
+                      <Text size="sm" c="dimmed">
+                        —
+                      </Text>
+                    ) : (
+                      <Tooltip
+                        label={`${l.self_churn_pct}% of replaced lines unasked · ${l.files_revisited} file(s) touched ${3}+ times`}
+                        withArrow
+                      >
+                        <Text
+                          size="sm"
+                          c={
+                            Number(l.self_churn_pct) >= 50 || Number(l.files_revisited) >= 2
+                              ? FAIL
+                              : undefined
+                          }
+                        >
+                          {l.self_churn_pct}%
+                          {Number(l.files_revisited) > 0 ? ` ·${l.files_revisited}` : ''}
+                        </Text>
+                      </Tooltip>
                     )}
                   </Table.Td>
                   <Table.Td ta="right">{String(l.messages)}</Table.Td>
@@ -1180,6 +1255,133 @@ export default function StatusPage() {
           </Text>
         )}
       </Card>
+
+      {/* ── the branch dimension: which branch has the most to fix ── */}
+      {(s?.branches?.length ?? 0) > 0 && (
+        <Card withBorder mb="md">
+          <Group justify="space-between" mb="xs">
+            <Title order={5}>Branches — worst first</Title>
+            <Text size="xs" c="dimmed">
+              two branches in one repo no longer sum into one row
+            </Text>
+          </Group>
+          <Table striped highlightOnHover>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>Branch</Table.Th>
+                <Table.Th ta="right">
+                  <Tooltip
+                    label="30% steering · 25% keep rate · 20% test pass · 15% tool success · 10% half-life. Components with no data are dropped, not scored zero."
+                    withArrow
+                    multiline
+                    w={300}
+                  >
+                    <span>Quality</span>
+                  </Tooltip>
+                </Table.Th>
+                <Table.Th ta="right">
+                  <Tooltip
+                    label="share of replaced lines nobody asked for — the spaghetti signal"
+                    withArrow
+                  >
+                    <span>Unasked</span>
+                  </Tooltip>
+                </Table.Th>
+                <Table.Th ta="right">Lines +/−</Table.Th>
+                <Table.Th ta="right">Rework</Table.Th>
+                <Table.Th ta="right">
+                  <Tooltip label="minutes means thrash; hours means the design moved" withArrow>
+                    <span>Half-life</span>
+                  </Tooltip>
+                </Table.Th>
+                <Table.Th ta="right">Tests</Table.Th>
+                <Table.Th ta="right">Reverts</Table.Th>
+                <Table.Th ta="right">Fails</Table.Th>
+                <Table.Th ta="right">Agents</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {(s?.branches ?? []).map((b) => {
+                const q = Number(b.quality_pct)
+                const unasked = Number(b.self_churn_pct)
+                const pass = Number(b.test_pass_pct)
+                return (
+                  <Table.Tr key={`${b.repo}/${b.branch}`}>
+                    <Table.Td>
+                      <Text size="xs" ff="monospace">
+                        {b.branch}
+                      </Text>
+                      <Text size="xs" c="dimmed">
+                        {b.repo}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td ta="right">
+                      {q < 0 ? (
+                        <Tooltip label="nothing measurable happened on this branch" withArrow>
+                          <Text size="sm" c="dimmed">
+                            —
+                          </Text>
+                        </Tooltip>
+                      ) : (
+                        <Group gap={6} justify="flex-end" wrap="nowrap">
+                          <Progress
+                            value={q}
+                            w={54}
+                            size="sm"
+                            color={q >= 70 ? 'teal' : q >= 40 ? 'yellow' : 'red'}
+                          />
+                          <Text size="sm" ff="monospace">
+                            {q}%
+                          </Text>
+                        </Group>
+                      )}
+                    </Table.Td>
+                    <Table.Td ta="right" c={unasked >= 50 ? FAIL : undefined}>
+                      {Number(b.churn_directed) + Number(b.churn_self) === 0
+                        ? '—'
+                        : `${unasked}%`}
+                    </Table.Td>
+                    <Table.Td ta="right">
+                      <Text span size="xs" c={OK}>
+                        +{fmtCompact(b.lines_added)}
+                      </Text>{' '}
+                      <Text span size="xs" c={FAIL}>
+                        −{fmtCompact(b.lines_removed)}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td ta="right">
+                      {Number(b.lines_added) === 0 ? '—' : `${Number(b.rework_pct)}%`}
+                    </Table.Td>
+                    <Table.Td ta="right">
+                      {Number(b.survival_p50_mins) === 0
+                        ? '—'
+                        : fmtAge(Number(b.survival_p50_mins) * 60)}
+                    </Table.Td>
+                    <Table.Td ta="right">
+                      {pass < 0 ? (
+                        <Tooltip label="this branch ran no tests" withArrow>
+                          <Text size="xs" c="dimmed">
+                            none
+                          </Text>
+                        </Tooltip>
+                      ) : (
+                        <Text size="xs" c={pass >= 90 ? OK : FAIL}>
+                          {pass}%
+                        </Text>
+                      )}
+                    </Table.Td>
+                    <Table.Td ta="right" c={Number(b.reverts) > 0 ? FAIL : undefined}>
+                      {String(b.reverts)}
+                    </Table.Td>
+                    <Table.Td ta="right">{String(b.tool_failures)}</Table.Td>
+                    <Table.Td ta="right">{String(b.agents)}</Table.Td>
+                  </Table.Tr>
+                )
+              })}
+            </Table.Tbody>
+          </Table>
+        </Card>
+      )}
 
       {/* ── many agents, many repos: one row each ─────────────── */}
       <Grid mb="md" gap="md">
