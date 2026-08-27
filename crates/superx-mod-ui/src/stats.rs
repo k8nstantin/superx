@@ -578,7 +578,10 @@ fn branch_derived(b: &BranchAgg) -> BranchDerived {
     // -1, not 0: a branch that ran no tests must not read like one
     // whose tests all failed.
     let test_pass_pct = if tests > 0 { pct(b.tests_passed, tests) } else { -1 };
-    let failures_per_100 = pct(b.tool_failures * 100, b.tool_calls);
+    // `pct` already scales by 100 — multiplying first made one failure
+    // in a hundred calls read as 100, and zeroed the tool-success
+    // component for any branch above a 1% failure rate.
+    let failures_per_100 = pct(b.tool_failures, b.tool_calls);
     let mut survivals = b.survivals.clone();
     let survival_p50_mins = median(&mut survivals);
     let mut gaps = b.verify_gaps.clone();

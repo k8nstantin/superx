@@ -1664,6 +1664,20 @@ async fn churn_and_quality_separate_by_branch() {
     log_tool_message(&kernel, &s2, &a2, write("feat/bad", "/w/superx/b.rs", "x")).await;
     log_tool_message(&kernel, &s2, &a2, edit("feat/bad", "/w/superx/b.rs", "one\ntwo", "uno")).await;
 
+    // A failing call on the bad branch, so the failure RATE is
+    // exercised: `pct` already scales by 100, and multiplying before
+    // it made one failure in a hundred calls read as a hundred.
+    log_tool_message(&kernel, &s2, &a2, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/bad",
+        "message": {"content": [{"type": "tool_use", "id": "b1", "name": "Bash",
+            "input": {"command": "ls /nope"}}]}})).await;
+    // The verdict rides a LATER message: the walk is newest-first, so
+    // the result must be seen before the call it belongs to.
+    log_tool_message(&kernel, &s2, &a2, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/bad",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "b1", "is_error": true}]}})).await;
+
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
 
     // One repo, but TWO branch rows — the separation is the point.
@@ -1691,6 +1705,11 @@ async fn churn_and_quality_separate_by_branch() {
     assert_eq!(bad.churn_directed, 0);
     assert_eq!(bad.self_churn_pct, 100, "every replaced line was unasked");
     assert_eq!(bad.rework_pct, 100, "it removed as much as it added");
+    // 1 failure across 3 calls is 33 per 100 — not 100, which is what
+    // a double scaling produced.
+    assert_eq!(bad.tool_calls, 3, "Write, Edit and the Bash");
+    assert_eq!(bad.tool_failures, 1);
+    assert_eq!(bad.failures_per_100, 33, "one in three, not saturated");
 
     // Quality ranks them, and the worse branch sorts FIRST — the one
     // with the most to fix is the one to look at.
