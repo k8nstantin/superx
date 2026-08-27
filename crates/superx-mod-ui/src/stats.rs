@@ -583,9 +583,11 @@ struct LiveAgg {
     repo: Option<String>,
     branch: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
     last_tool: Option<String>,
     messages: i64,
     lines_added: i64,
+    lines_removed: i64,
     out_tokens: i64,
     tool_failures: i64,
     newest: Option<chrono::DateTime<chrono::Utc>>,
@@ -930,7 +932,11 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
 
         // Reasoning level, where the agent reports it (#337): does
         // thinking harder produce keepable code, or just cost more?
-        let effort = get_str(raw, "effort").map(str::to_string);
+        // `get_str` hands back `Some("")` for an empty JSON string, and
+        // a first-sighting latch would take that as the answer and mask
+        // the real effort on an older message — the same trap `branch`
+        // sidesteps below (#344 review).
+        let effort = get_str(raw, "effort").filter(|e| !e.is_empty()).map(str::to_string);
         if let Some(e) = &effort {
             code.efforts.entry(e.clone()).or_default().messages += 1;
         }
@@ -1029,6 +1035,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             let l = code.live.entry(sid).or_default();
             if l.model.is_none() && model != "unknown" {
                 l.model = Some(model.clone());
+            }
+            // Effort is switched mid-session, and it rides different
+            // messages than the model does — so it is picked up on its
+            // own first sighting, not alongside the model (#343).
+            if l.effort.is_none() {
+                l.effort = effort.clone();
             }
         }
         // The cube's bucket: hourly on short ranges, daily on long
@@ -1405,10 +1417,17 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                         .or_default()
                                         .push((when, true));
                                 }
-                                code.live
-                                    .entry(superx_ops::record_uuid(&m.session))
-                                    .or_default()
-                                    .lines_added += n;
+                                // Guarded like its two siblings above:
+                                // without it every Bash and Read block
+                                // allocated a session key to add zero.
+                                if n > 0 || replaced > 0 {
+                                    let l = code
+                                        .live
+                                        .entry(superx_ops::record_uuid(&m.session))
+                                        .or_default();
+                                    l.lines_added += n;
+                                    l.lines_removed += replaced;
+                                }
                                 {
                                     let mm = code.models.entry(model.clone()).or_default();
                                     mm.lines_added += n;
@@ -2031,9 +2050,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                 .filter_map(|(sid, l)| {
                     let newest = l.newest?;
                     let idle = (now - newest).num_seconds();
-                    // Live means a message in the last five minutes —
-                    // the same threshold the Sessions page uses.
-                    if idle > 300 {
+                    // Live means a message inside the activity window.
+                    // This read the bare `300` the Sessions page also
+                    // hardcodes, so raising `attr_ui_active_session_secs`
+                    // moved `sessions_active` and left this panel behind
+                    // (#344 review, §9). One resolved value now.
+                    if idle > active_secs {
                         return None;
                     }
                     Some(LiveSession {
@@ -2042,9 +2064,11 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                         repo: l.repo.clone(),
                         branch: l.branch.clone(),
                         model: l.model.clone(),
+                        effort: l.effort.clone(),
                         last_tool: l.last_tool.clone(),
                         messages: l.messages,
                         lines_added: l.lines_added,
+                        lines_removed: l.lines_removed,
                         out_tokens: l.out_tokens,
                         tool_failures: l.tool_failures,
                         idle_secs: idle,

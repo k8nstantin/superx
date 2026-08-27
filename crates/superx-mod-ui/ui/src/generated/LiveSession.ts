@@ -7,9 +7,20 @@
  */
 export type LiveSession = { identity: string, agent: string, repo: string | null, branch: string | null, model: string | null, 
 /**
+ * The reasoning effort it is running at. The model alone does not
+ * say what a session costs — the same model at low and at max
+ * effort are different machines (#343).
+ */
+effort: string | null, 
+/**
  * The newest tool it called.
  */
-last_tool: string | null, messages: bigint, lines_added: bigint, out_tokens: bigint, tool_failures: bigint, 
+last_tool: string | null, messages: bigint, lines_added: bigint, 
+/**
+ * Lines this session replaced. Added alone reads `0` for a
+ * session deep in a rewrite (#343).
+ */
+lines_removed: bigint, out_tokens: bigint, tool_failures: bigint, 
 /**
  * Seconds since its newest message.
  */

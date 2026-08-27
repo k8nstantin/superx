@@ -9,6 +9,7 @@ import { useFeedHistory } from '../useFeedHistory'
 import type { SseEvent } from '../generated/SseEvent'
 import type { SessionView } from '../generated/SessionView'
 import { useBreadcrumb } from '../Breadcrumbs'
+import { LivenessDot, liveness, type Liveness } from '../LivenessDot'
 
 export default function SessionsPage() {
   const [selected, setSelected] = useState<SessionView | null>(null)
@@ -24,48 +25,7 @@ export default function SessionsPage() {
   )
 }
 
-// Liveness thresholds (render-layer presentation, issue #162):
-// a session is ACTIVE while its newest message is fresher than this…
-const ACTIVE_MS = 5 * 60 * 1000
-// …PAUSED until this, ENDED after.
-const PAUSED_MS = 24 * 60 * 60 * 1000
-
-type Liveness = 'active' | 'paused' | 'ended' | 'unknown'
-
-function liveness(lastActive: string | null): Liveness {
-  if (!lastActive) return 'unknown'
-  const age = Date.now() - new Date(lastActive).getTime()
-  if (age < ACTIVE_MS) return 'active'
-  if (age < PAUSED_MS) return 'paused'
-  return 'ended'
-}
-
 const LIVENESS_RANK: Record<Liveness, number> = { active: 0, paused: 1, ended: 2, unknown: 3 }
-
-function LivenessDot({ state }: { state: Liveness }) {
-  const styles: Record<Liveness, React.CSSProperties> = {
-    // Alive: green, pulsing glow.
-    active: { background: '#30d158', boxShadow: '0 0 6px 2px rgba(48,209,88,0.7)', animation: 'sx-glow 1.4s ease-in-out infinite' },
-    paused: { background: '#fdd835' },
-    // Stopped: flat red, no glow.
-    ended: { background: '#e03131' },
-    unknown: { background: '#555' },
-  }
-  return (
-    <Tooltip label={state} withArrow>
-      <span
-        style={{
-          display: 'inline-block',
-          width: 10,
-          height: 10,
-          borderRadius: '50%',
-          verticalAlign: 'middle',
-          ...styles[state],
-        }}
-      />
-    </Tooltip>
-  )
-}
 
 // Context is a FINITE window (issue #202): render usage as a bar —
 // green through mid-range, yellow from 70%, red when full (≥90%).
@@ -116,7 +76,6 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
   })
   return (
     <Card withBorder>
-      <style>{'@keyframes sx-glow { 0%, 100% { box-shadow: 0 0 4px 1px rgba(48,209,88,0.5); } 50% { box-shadow: 0 0 10px 4px rgba(48,209,88,0.9); } }'}</style>
       <Title order={5} mb="xs">
         Sessions — click one to open its feed
       </Title>
