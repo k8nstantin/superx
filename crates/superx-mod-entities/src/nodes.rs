@@ -260,15 +260,28 @@ pub async fn update_entity(
 /// [`KernelError::Db`] for engine errors.
 pub async fn labels_of(db: &Db, anchor: &RecordId) -> Result<Vec<String>> {
     let (entity_type, _) = anchor_info(db, anchor).await?;
-    let mut out = vec![entity_type];
-    if let Some(state) = current_state(db, anchor).await? {
-        for l in state.labels {
-            if !out.contains(&l) {
-                out.push(l);
-            }
+    let extra = current_state(db, anchor).await?.map(|s| s.labels).unwrap_or_default();
+    Ok(identity(&entity_type, &extra))
+}
+
+/// The same answer, from metadata a caller ALREADY holds.
+///
+/// The resolution rule lives here and only here. Membership was added to
+/// the link check first and read as a special case there, which left
+/// every other reader — the audit, the fields a thing may carry, what an
+/// agent is told it is — still asking the anchor for a single answer, so
+/// the write path and the read path disagreed about the same entity
+/// (#333 follow-up). A caller with a batched read (`current_meta`, a
+/// graph walk) resolves through this and pays no query at all.
+#[must_use]
+pub fn identity(entity_type: &str, labels: &[String]) -> Vec<String> {
+    let mut out = vec![entity_type.to_string()];
+    for l in labels {
+        if !out.contains(l) {
+            out.push(l.clone());
         }
     }
-    Ok(out)
+    out
 }
 /// Set the labels an entity carries (#324).
 ///
@@ -281,23 +294,20 @@ pub async fn labels_of(db: &Db, anchor: &RecordId) -> Result<Vec<String>> {
 /// entity the operator believed an agent would treat specially while it
 /// never would.
 ///
+/// A RELATION IS NOT SOMETHING AN ENTITY IS. Since #333 an entity's
+/// labels answer "what is this", and endpoint rules resolve against that
+/// set — so a thing labelled `contains` or `depends_on` would satisfy
+/// rules written about the shape of an edge. The registry already
+/// records which names are relations; that is the test, rather than the
+/// label's kind, because #324 merged the kinds and a relation label can
+/// now be written as plain `label`.
+///
 /// # Errors
 ///
-/// [`KernelError::Module`] for an undefined label or a missing chain;
-/// [`KernelError::Db`] for engine errors.
+/// [`KernelError::Module`] for an undefined label, a relation name, or a
+/// missing chain; [`KernelError::Db`] for engine errors.
 pub async fn set_labels(db: &Db, anchor: &RecordId, labels: &[String]) -> Result<()> {
-    let mut wanted: Vec<String> = Vec::new();
-    for term in labels {
-        crate::dictionary::find(db, term).await?.ok_or_else(|| {
-            KernelError::Module(format!(
-                "the dictionary defines no label '{term}' — labels are created before \
-                 they are attached"
-            ))
-        })?;
-        if !wanted.contains(term) {
-            wanted.push(term.clone());
-        }
-    }
+    let wanted = check_labels(db, labels).await?;
     let current = current_state(db, anchor).await?.ok_or_else(|| {
         KernelError::Module(format!(
             "entity {} has no state chain",
@@ -314,6 +324,40 @@ pub async fn set_labels(db: &Db, anchor: &RecordId, labels: &[String]) -> Result
         &wanted,
     )
     .await
+}
+
+/// Are these labels attachable, and what is the list without repeats?
+///
+/// Separate from [`set_labels`] so a caller can ask BEFORE it writes
+/// anything. `create --label` asked after: the anchor, its first state
+/// row and the creation event were already in an append-only substrate
+/// when a typo failed, leaving an entity that exists forever, carries
+/// nothing, and cannot be deleted.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] for an undefined label or a relation name;
+/// [`KernelError::Db`] for engine errors.
+pub async fn check_labels(db: &Db, labels: &[String]) -> Result<Vec<String>> {
+    let mut wanted: Vec<String> = Vec::new();
+    for term in labels {
+        crate::dictionary::find(db, term).await?.ok_or_else(|| {
+            KernelError::Module(format!(
+                "the dictionary defines no label '{term}' — labels are created before \
+                 they are attached"
+            ))
+        })?;
+        if crate::registry::is_relation(db, term).await? {
+            return Err(KernelError::Module(format!(
+                "'{term}' names a relation — it is how two entities connect, not \
+                 something one of them IS"
+            )));
+        }
+        if !wanted.contains(term) {
+            wanted.push(term.clone());
+        }
+    }
+    Ok(wanted)
 }
 
 /// Archive or restore an entity: hidden from the lists, still on the

@@ -230,7 +230,18 @@ async fn labels_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let labels = crate::dictionary::list(&db, include_archived).await?;
     let revision = crate::dictionary::revision(&db).await?;
     let mut out = format!("dictionary — revision {revision}\n");
-    for kind in [crate::dictionary::SLOT, crate::dictionary::LINK] {
+    // EVERY KIND PRESENT, discovered from the rows. Iterating a fixed
+    // [slot, link] pair hid every label written under the merged kind
+    // #324 introduced — including the type labels — so `create --label`
+    // could refuse a name the operator had no command to look up.
+    let mut kinds: Vec<&str> = Vec::new();
+    for l in &labels {
+        if !kinds.contains(&l.label_kind.as_str()) {
+            kinds.push(&l.label_kind);
+        }
+    }
+    kinds.sort_unstable();
+    for kind in kinds {
         let of_kind: Vec<_> = labels.iter().filter(|l| l.label_kind == kind).collect();
         if of_kind.is_empty() {
             continue;
@@ -660,11 +671,7 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
                 i += 2;
             }
             "--label" => {
-                labels = next_value(args, i)?
-                    .split(',')
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect();
+                labels.extend(csv(&next_value(args, i)?));
                 i += 2;
             }
             word => {
@@ -679,6 +686,11 @@ async fn create_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     }
     let name = name_words.join(" ");
     let attributes = attrs.as_deref().map(parse_attrs).transpose()?;
+
+    // BEFORE THE WRITE. An undefined label refused after the anchor
+    // exists leaves it there forever, unlabelled and undescribed, in a
+    // substrate with no delete.
+    let labels = nodes::check_labels(&db, &labels).await?;
 
     let anchor = nodes::create_entity(&db, &entity_type, &name, content, attributes).await?;
     let uuid = record_uuid(&anchor);
@@ -856,10 +868,7 @@ async fn validate_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
 async fn label_cmd(kernel: &Kernel, args: &[String]) -> Result<String> {
     let db = kernel.module_db(MODULE_NAME).await?;
     let fragment = args.first().ok_or_else(usage)?;
-    let labels: Vec<String> = args
-        .get(1)
-        .map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
-        .unwrap_or_default();
+    let labels: Vec<String> = args.get(1).map(|v| csv(v)).unwrap_or_default();
     let target = nodes::resolve_entity(&db, fragment).await?;
     nodes::set_labels(&db, &target, &labels).await?;
     let uuid = record_uuid(&target);

@@ -545,11 +545,21 @@ fn str_field(o: &Object, key: &str) -> Option<String> {
 ///   this is a real state and not only a test artifact.
 /// * the label **genuinely does not exist**.
 ///
-/// Seeding an EMPTY dictionary settles which one it is. An initialized
-/// dictionary is never touched, so writing prose can never move the
-/// revision that readers cache against — and because archiving appends
-/// rather than deletes, an archived label leaves the table non-empty and
-/// can never be resurrected by this path.
+/// Seeding settles which one it is, and only when the SHIPPED vocabulary
+/// is absent — the state a provisioned-but-never-started instance is in.
+/// An instance that has it is never touched, so writing prose there can
+/// never move the revision that readers cache against, and because
+/// archiving appends rather than deletes, an archived label still counts
+/// as present and can never be resurrected by this path.
+///
+/// The narrower claim this once made — that an instance with ANY
+/// dictionary is never written — stopped being true when the test became
+/// presence rather than emptiness (#333): an instance seeded under a
+/// release that predates a later shipped label has a large, in-use
+/// dictionary and is missing one row, so one prose write naming an
+/// undefined label heals it and bumps the revision. That is the heal
+/// working, but it is a write, and a reader's cached revision goes stale
+/// because of it.
 async fn require_label(db: &Db, label: &str) -> Result<dictionary::LabelRow> {
     if let Some(defined) = dictionary::find(db, label).await? {
         return Ok(defined);

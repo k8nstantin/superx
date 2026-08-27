@@ -1683,9 +1683,14 @@ async fn a_role_is_specialised_out_of_entities_and_labels() {
     let d = api::detail(&db, &dba_frag).await.expect("detail");
     assert_eq!(d.labels, vec!["role".to_string()], "what it is, beyond its anchor type");
     assert_eq!(
-        d.label_actions[0].action.as_deref(),
+        d.label_actions.iter().find(|a| a.label == "role").and_then(|a| a.action.as_deref()),
         Some("This is who you are. Act within it and nothing beyond it."),
         "and what an agent does about being that"
+    );
+    assert!(
+        d.label_actions.iter().any(|a| a.label == "product"),
+        "one list: what it IS resolves here too, exactly as `role` does — {:?}",
+        d.label_actions.iter().map(|a| &a.label).collect::<Vec<_>>()
     );
 
     // Its mandate, resolved to an action.
@@ -1766,4 +1771,230 @@ async fn a_rule_written_about_a_label_reaches_whatever_carries_it() {
         .expect_err("a plain product does not supervise");
     assert!(err.to_string().contains("product"), "{err}");
     assert!(err.to_string().contains("role"), "{err}");
+}
+
+/// THE AUDIT AND THE WRITE PATH ANSWER "WHAT IS THIS" THE SAME WAY.
+///
+/// #333 taught `edges::link` to resolve endpoints by membership and left
+/// every other reader asking the anchor for a single answer. So the
+/// write path admitted this edge and `entities validate` — the check an
+/// operator runs BEFORE dispatching agents at a graph — reported the
+/// same edge broken: "'supervises' starts at role — this one starts at a
+/// product". A correct graph audited as invalid, once per such edge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_audit_agrees_with_the_write_path_about_what_a_thing_is() {
+    use superx_mod_entities::dictionary::Definition;
+    use superx_mod_entities::{api, edges, nodes, validate};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::define(&db, Definition {
+        key: "role",
+        kind: dictionary::LABEL,
+        display: "role",
+        semantics: "context",
+        ..Default::default()
+    })
+    .await
+    .expect("role");
+    dictionary::define(&db, Definition {
+        key: "supervises",
+        kind: dictionary::LABEL,
+        display: "supervises",
+        semantics: "governance",
+        source_types: Some(&["role".to_string()]),
+        ..Default::default()
+    })
+    .await
+    .expect("only a role supervises");
+    registry::add_type(&db, "supervises", "relation", None).await.expect("relation");
+
+    let dba = nodes::create_entity(&db, "product", "DBA", None, None).await.expect("p");
+    api::set_entity_labels(&db, &superx_ops::record_uuid(&dba), &["role".to_string()])
+        .await
+        .expect("label");
+    let task = nodes::create_entity(&db, "task", "Verify", None, None).await.expect("t");
+    edges::link(&db, &dba, &task, "supervises").await.expect("the write path allows it");
+
+    let findings = validate::subgraph(&db, &dba, 3).await.expect("audit");
+    assert!(
+        !findings.iter().any(|f| f.detail.contains("supervises")),
+        "the audit must not call broken what the write path allowed: {:?}",
+        findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
+    );
+
+    // And it still finds the edge that genuinely does not fit.
+    let plain = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p2");
+    // Straight into the substrate, past the guard — how such a row got
+    // there before the rule existed.
+    db.query(
+        "RELATE $from->edge->$to SET edge_uid = $uid, rel_type = 'supervises', \
+         active = true, valid_from = time::now()",
+    )
+    .bind(("from", plain.clone()))
+    .bind(("to", task.clone()))
+    .bind(("uid", uuid::Uuid::now_v7().to_string()))
+    .await
+    .expect("write")
+    .check()
+    .expect("the pre-rule shape");
+    let findings = validate::subgraph(&db, &plain, 3).await.expect("audit");
+    assert!(
+        findings.iter().any(|f| f.detail.contains("supervises")),
+        "a plain product does not supervise, and the audit says so: {:?}",
+        findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
+    );
+}
+
+/// WHAT A THING MAY CARRY FOLLOWS EVERYTHING IT IS.
+///
+/// `bind_slot("role", "url")` declares that a role has one. Read from
+/// the anchor type alone, the declaration was unreachable: the field was
+/// never offered, could not be set, and the audit checked a requirement
+/// against the wrong list — so a label could describe an entity but
+/// never equip it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_declared_on_a_label_reaches_whatever_carries_it() {
+    use superx_mod_entities::dictionary::Definition;
+    use superx_mod_entities::notes::Author;
+    use superx_mod_entities::{api, nodes};
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    dictionary::define(&db, Definition {
+        key: "role",
+        kind: dictionary::LABEL,
+        display: "role",
+        semantics: "context",
+        ..Default::default()
+    })
+    .await
+    .expect("role");
+    dictionary::bind_slot(&db, "role", "url", false, None, &Author::operator())
+        .await
+        .expect("a role has a url");
+
+    let dba = nodes::create_entity(&db, "product", "DBA", None, None).await.expect("p");
+    let frag = superx_ops::record_uuid(&dba);
+
+    // Not a role yet: nothing it is declares a `url`, so it is not one of
+    // its fields — only a term it could adopt ad hoc.
+    let before = api::entity_fields(&db, &frag).await.expect("fields");
+    assert!(
+        !before.iter().any(|f| f.key == "url"),
+        "{:?}",
+        before.iter().map(|f| &f.key).collect::<Vec<_>>()
+    );
+    assert!(
+        api::addable_fields(&db, &frag)
+            .await
+            .expect("offers")
+            .iter()
+            .any(|o| o.key == "url" && !o.on_the_type),
+        "ad hoc, because nothing it is declares one"
+    );
+
+    api::set_entity_labels(&db, &frag, &["role".to_string()]).await.expect("label");
+
+    let after = api::entity_fields(&db, &frag).await.expect("fields");
+    assert!(
+        after.iter().any(|f| f.key == "url"),
+        "now it is a role, and a role declares one: {:?}",
+        after.iter().map(|f| &f.key).collect::<Vec<_>>()
+    );
+
+    api::add_field(&db, &frag, &api::FieldReq {
+        key: "url".into(),
+        value: "https://example.invalid/dba".into(),
+        value_kind: None,
+        labels: None,
+    })
+    .await
+    .expect("and it can be set");
+    let fields = api::entity_fields(&db, &frag).await.expect("fields");
+    assert!(fields.iter().any(|f| f.key == "url"), "{:?}", fields.iter().map(|f| &f.key).collect::<Vec<_>>());
+}
+
+/// A RELATION IS NOT SOMETHING AN ENTITY IS.
+///
+/// Endpoint rules resolve against an entity's labels, so a thing
+/// labelled `depends_on` would satisfy rules written about the shape of
+/// an edge. The registry says which names are relations; the label's
+/// kind cannot, because #324 merged the kinds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entity_cannot_claim_a_relation_as_what_it_is() {
+    use superx_mod_entities::nodes;
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    let p = nodes::create_entity(&db, "product", "Widget", None, None).await.expect("p");
+
+    let err = nodes::set_labels(&db, &p, &["depends_on".to_string()])
+        .await
+        .expect_err("a product is not a depends_on");
+    assert!(err.to_string().contains("relation"), "{err}");
+
+    // The label it legitimately carries is unaffected.
+    nodes::set_labels(&db, &p, &["spec".to_string()]).await.expect("a spec it may carry");
+}
+
+/// A TYPE THE OPERATOR INVENTS IS A LABEL LIKE A SHIPPED ONE.
+///
+/// The label write lived in the seed loop, so `types add role entity`
+/// produced a type whose own name the dictionary did not define — and
+/// `create --type role --label role` then refused the type it was
+/// creating. An instance that already had its type rows got nothing at
+/// all, which is every instance that upgrades into the feature.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_type_added_at_runtime_is_a_label_too() {
+    use superx_mod_entities::nodes;
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+    registry::add_type(&db, "role", "entity", Some("who an agent is")).await.expect("add");
+
+    let defined = dictionary::find(&db, "role").await.expect("find").expect("defined with it");
+    assert_eq!(defined.description.as_deref(), Some("who an agent is"));
+
+    let dba = nodes::create_entity(&db, "role", "DBA", None, None).await.expect("p");
+    nodes::set_labels(&db, &dba, &["role".to_string()]).await.expect("its own type");
+
+    // A relation added at runtime gets no entity label: nothing carries
+    // a relation as its identity, and a second chain for the name is how
+    // one term came to mean two things.
+    registry::add_type(&db, "escalates", "relation", None).await.expect("add");
+    assert!(
+        dictionary::find(&db, "escalates").await.expect("find").is_none(),
+        "a relation's meaning is the link label, written with its endpoints"
+    );
+}
+
+/// NOTHING IS WRITTEN UNTIL THE LABELS RESOLVE.
+///
+/// `create --label` validated after the anchor, its first state row and
+/// the creation event were already in a substrate with no delete, so a
+/// typo left an entity that exists forever, carries nothing, and cannot
+/// be removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn labels_are_resolved_before_anything_is_created() {
+    use superx_mod_entities::nodes;
+
+    let db = fresh_db().await;
+    registry::seed_types(&db).await.expect("types");
+
+    nodes::check_labels(&db, &["rol".to_string()])
+        .await
+        .expect_err("a typo is refused before a write, not after one");
+    assert!(
+        nodes::list_entities(&db, None).await.expect("list").is_empty(),
+        "and nothing was created on the way to finding out"
+    );
+
+    // The same call is what `set_labels` itself uses, so the two can
+    // never disagree about what is attachable.
+    assert_eq!(
+        nodes::check_labels(&db, &["spec".to_string(), "spec".to_string()]).await.expect("ok"),
+        vec!["spec".to_string()],
+        "and it is the deduped list a write would use"
+    );
 }

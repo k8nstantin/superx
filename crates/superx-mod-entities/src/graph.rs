@@ -16,6 +16,11 @@ use crate::nodes::current_meta;
 pub struct GraphNode {
     pub id: RecordId,
     pub entity_type: String,
+    /// The labels the current state carries BEYOND the anchor type.
+    /// Read here because `current_meta` returns them anyway: a reader
+    /// resolving "what is this" (the audit, an endpoint rule) would
+    /// otherwise re-query per node what the walk already had (#333).
+    pub labels: Vec<String>,
     pub name: String,
     /// FLEXIBLE attributes of the current state (prompt context).
     pub attributes: Option<superx_kernel::types::Value>,
@@ -128,19 +133,21 @@ async fn push_level(
     let mut by_entity = crate::notes::for_entities(db, level, false).await?;
     for id in level {
         let uuid = record_uuid(id);
-        let (entity_type, name, attributes, version) = match meta.get(&uuid) {
+        let (entity_type, labels, name, attributes, version) = match meta.get(&uuid) {
             Some(m) => (
                 m.entity_type.clone(),
+                m.labels.clone(),
                 m.name.clone(),
                 m.attributes.clone(),
                 m.version.clone(),
             ),
-            None => (String::new(), String::new(), None, String::new()),
+            None => (String::new(), Vec::new(), String::new(), None, String::new()),
         };
         let notes = by_entity.remove(&uuid).unwrap_or_default();
         nodes.push(GraphNode {
             id: id.clone(),
             entity_type,
+            labels,
             name,
             attributes,
             version,

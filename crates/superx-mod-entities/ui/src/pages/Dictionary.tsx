@@ -8,11 +8,11 @@ import {
   Checkbox,
   Grid,
   Group,
-  MultiSelect,
   ScrollArea,
   Select,
   Switch,
   Table,
+  TagsInput,
   Text,
   TextInput,
   Textarea,
@@ -101,12 +101,22 @@ export default function DictionaryPage() {
     void qc.invalidateQueries({ queryKey: ['vocabulary'] })
   }
 
+  // WHAT A RULE CAN BE WRITTEN ABOUT. Since #333 an entity is a set of
+  // labels and endpoint rules resolve against that set, so "starts at:
+  // role" is a rule about a LABEL — offering only registry type names
+  // meant the headline case could not be declared here at all, and the
+  // page rendered endpoint values its own editor could not reproduce.
+  const carriable = [
+    ...(types.data ?? []).map((t) => t.name),
+    ...(labels.data ?? []).map((l) => l.key),
+  ].filter((name, i, all) => all.indexOf(name) === i)
+
   return (
     <Grid gap="md">
       <Grid.Col span={{ base: 12, md: 5 }}>
         <DefineLabel
           vocab={vocab.data}
-          types={(types.data ?? []).map((t) => t.name)}
+          types={carriable}
           onDone={refresh}
         />
       </Grid.Col>
@@ -128,8 +138,8 @@ export default function DictionaryPage() {
           </Text>
           <Select
             label="Type"
-            placeholder="pick a type to design"
-            data={(types.data ?? []).map((t) => t.name)}
+            placeholder="pick a type or label to design"
+            data={carriable}
             value={forType}
             onChange={setForType}
             searchable
@@ -321,22 +331,20 @@ function DefineLabel({
         </>
       ) : (
         <>
-          <MultiSelect
+          <TagsInput
             label="Starts at"
-            description="leave empty to accept anything — enforcement arrives with the declaration"
+            description="a type or a label — leave empty to accept anything; enforcement arrives with the declaration"
             data={types}
             value={sourceTypes}
             onChange={setSourceTypes}
-            searchable
             mb="xs"
           />
-          <MultiSelect
+          <TagsInput
             label="Points at"
             description="a link that does not fit is refused when somebody tries to make it"
             data={types}
             value={targetTypes}
             onChange={setTargetTypes}
-            searchable
             mb="xs"
           />
           <TextInput

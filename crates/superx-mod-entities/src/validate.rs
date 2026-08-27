@@ -46,6 +46,20 @@ pub async fn subgraph(db: &Db, root: &RecordId, depth: usize) -> Result<Vec<Find
     let mut findings = Vec::new();
     let sub = graph::subgraph(db, root, depth, false).await?;
 
+    // WHAT EVERY NODE IS, resolved once from the walk itself. The BFS
+    // visits both ends of every edge it collects, and `current_meta`
+    // already returned the anchor type and the state labels for each —
+    // so membership costs nothing here, while asking per edge cost four
+    // round trips and, worse, asked the ANCHOR: the write path admitted
+    // an edge by membership (#333) and this reported the same edge
+    // broken, so a correct graph audited as invalid.
+    let identity: std::collections::HashMap<String, Vec<String>> = sub
+        .nodes
+        .iter()
+        .map(|n| (record_uuid(&n.id), nodes::identity(&n.entity_type, &n.labels)))
+        .collect();
+    let carried = |uuid: &str| identity.get(uuid).cloned().unwrap_or_default();
+
     // --- edges: endpoints, and cycles in an acyclic label ------------
     let mut seen_labels: HashSet<String> = HashSet::new();
     for edge in &sub.edges {
@@ -62,27 +76,30 @@ pub async fn subgraph(db: &Db, root: &RecordId, depth: usize) -> Result<Vec<Find
             });
             continue;
         };
-        let from = nodes::resolve_entity(db, &edge.from).await?;
-        let to = nodes::resolve_entity(db, &edge.to).await?;
-        let (from_type, _) = nodes::anchor_info(db, &from).await?;
-        let (to_type, _) = nodes::anchor_info(db, &to).await?;
-        if !label.source_types.is_empty() && !label.source_types.contains(&from_type) {
+        let from_is = carried(&edge.from);
+        let to_is = carried(&edge.to);
+        if !label.source_types.is_empty()
+            && !from_is.iter().any(|l| label.source_types.contains(l))
+        {
             findings.push(Finding {
                 subject: format!("{} -[{}]-> {}", &edge.from[..8], edge.rel_type, &edge.to[..8]),
                 detail: format!(
-                    "'{}' starts at {} — this one starts at a {from_type}",
+                    "'{}' starts at {} — this one starts at {}",
                     edge.rel_type,
-                    label.source_types.join(" or ")
+                    label.source_types.join(" or "),
+                    from_is.join(" + ")
                 ),
             });
         }
-        if !label.target_types.is_empty() && !label.target_types.contains(&to_type) {
+        if !label.target_types.is_empty() && !to_is.iter().any(|l| label.target_types.contains(l))
+        {
             findings.push(Finding {
                 subject: format!("{} -[{}]-> {}", &edge.from[..8], edge.rel_type, &edge.to[..8]),
                 detail: format!(
-                    "'{}' points at {} — this one points at a {to_type}",
+                    "'{}' points at {} — this one points at {}",
                     edge.rel_type,
-                    label.target_types.join(" or ")
+                    label.target_types.join(" or "),
+                    to_is.join(" + ")
                 ),
             });
         }
@@ -106,7 +123,8 @@ pub async fn subgraph(db: &Db, root: &RecordId, depth: usize) -> Result<Vec<Find
     // --- entities: what their type says they must carry --------------
     for node in &sub.nodes {
         let uuid = record_uuid(&node.id);
-        let slots = dictionary::slots_for(db, &node.entity_type, false).await?;
+        let is = nodes::identity(&node.entity_type, &node.labels);
+        let slots = dictionary::slots_for_any(db, &is, false).await?;
         let held: HashSet<String> =
             notes::for_entity(db, &node.id, false).await?.into_iter().map(|n| n.label).collect();
         for slot in slots.iter().filter(|s| s.required) {
