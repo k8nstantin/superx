@@ -82,12 +82,16 @@ export type Datatype = (typeof DATATYPES)[number]
 /// How tall a field wants to be, in grid rows. A date needs a box; prose
 /// needs room. This is the default a new field lands with — the designer
 /// overrides it and the override is saved.
+/// In grid rows. Measured against what the card actually needs: a
+/// header line, padding, and the control. Two rows (66px) clipped a
+/// number and a date box at 77px — and a clipped field is one you cannot
+/// finish typing into.
 export const NATURAL_HEIGHT: Record<Datatype, number> = {
   text: 6,
   json: 6,
-  number: 2,
-  boolean: 2,
-  datetime: 2,
+  number: 3,
+  boolean: 3,
+  datetime: 3,
 }
 
 export const NATURAL_WIDTH: Record<Datatype, number> = {

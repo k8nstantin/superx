@@ -329,6 +329,11 @@ function AddField({ frag }: { frag: string }) {
           data={DATATYPES as unknown as string[]}
           value={datatype}
           onChange={setDatatype}
+          // A field HAS a datatype — there is no such thing as one
+          // without. Mantine lets you deselect by clicking the current
+          // option, which left the control blank and the next field
+          // silently defaulting.
+          allowDeselect={false}
           w={140}
         />
         <ActionIcon
