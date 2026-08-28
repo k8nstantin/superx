@@ -96,6 +96,13 @@ pub const MODULE_UI_URL_PARAM: &str = "attr_module_ui_url";
 const CORE_UI_MODULE: &str = "ui";
 const CORE_UI_PORT_PARAM: &str = "attr_ui_port";
 
+/// Where the core dashboard listens when its port parameter is unset —
+/// which on a default instance it IS, because a module that never had
+/// its port overridden has nothing to publish. Substrate first, this
+/// last: the same bootstrap-fallback shape as [`DEFAULT_UI_PORT`], and
+/// overridden the moment the parameter exists.
+const CORE_UI_DEFAULT_PORT: u16 = 5150; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
 /// Where the core dashboard lives, for this instance, right now.
 ///
 /// A module on its own port is a dead end without this: the operator
@@ -115,15 +122,20 @@ pub async fn core_dashboard_url(kernel: &Kernel) -> Option<String> {
     {
         return Some(url);
     }
-    // Else its port, which is what the core UI actually publishes today.
-    match kernel.get_parameter(entity, CORE_UI_PORT_PARAM).await {
+    // Else its port. Unset is the DEFAULT case, not the broken one — a
+    // module keeps its default port until someone moves it — so an
+    // absent parameter resolves to the default rather than to no link
+    // at all, which is what left the button dead on every stock
+    // instance.
+    let port = match kernel.get_parameter(entity, CORE_UI_PORT_PARAM).await {
         Ok(Some(Value::Number(n))) => n
             .to_int()
             .and_then(|i| u16::try_from(i).ok())
             .filter(|&p| p > 0)
-            .map(|p| format!("http://127.0.0.1:{p}")),
-        _ => None,
-    }
+            .unwrap_or(CORE_UI_DEFAULT_PORT),
+        _ => CORE_UI_DEFAULT_PORT,
+    };
+    Some(format!("http://127.0.0.1:{port}"))
 }
 
 /// How many hops the graph opens at.

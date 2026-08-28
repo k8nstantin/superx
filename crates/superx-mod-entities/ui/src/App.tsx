@@ -39,16 +39,17 @@ export default function App() {
               that is visibly there. The URL comes from the substrate
               (D-UI2), never hardcoded, so moving the core UI does not
               strand anyone. */}
-          <Button
-            component="a"
-            href={core ?? '/'}
-            variant="subtle"
-            size="compact-sm"
-            leftSection="←"
-            disabled={!core}
-          >
-            SuperX
-          </Button>
+          {core && (
+            <Button
+              component="a"
+              href={core}
+              variant="subtle"
+              size="compact-sm"
+              leftSection="←"
+            >
+              SuperX
+            </Button>
+          )}
           <Title order={4}>entities</Title>
           <Text size="xs" c="dimmed" ff="monospace">
             uuid7 · attributes · edges

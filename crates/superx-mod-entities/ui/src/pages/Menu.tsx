@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
+  Anchor,
   Badge,
   Button,
   Card,
@@ -186,13 +187,26 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
                     {props.via} →
                   </Text>
                 )}
-                <Text
+                {/* A LINK, NOT A CLICKABLE WORD. Opening an entity was
+                    already wired to this text, but nothing said so —
+                    plain body copy with a cursor is not an affordance,
+                    and the click ALSO bubbled to the row, so the one
+                    guess an operator might make toggled the branch
+                    instead. An anchor looks like what it is, takes
+                    keyboard focus, and keeps the row's expander to
+                    itself. */}
+                <Anchor
+                  component="button"
+                  type="button"
                   size="sm"
-                  style={{ cursor: 'pointer' }}
-                  onClick={() => onOpen(props.uuid ?? node.value)}
+                  underline="hover"
+                  onClick={(ev) => {
+                    ev.stopPropagation()
+                    onOpen(props.uuid ?? node.value)
+                  }}
                 >
                   {node.label}
-                </Text>
+                </Anchor>
                 {(props.labels ?? []).map((l) => (
                   <Badge key={l.uuid} size="xs" variant="light">
                     {l.name}
