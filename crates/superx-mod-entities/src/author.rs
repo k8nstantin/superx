@@ -35,12 +35,6 @@ impl Author {
         Self { kind: "operator".to_string(), uid: None, via: None }
     }
 
-    /// The module itself, writing what it must.
-    #[must_use]
-    pub fn system() -> Self {
-        Self { kind: "system".to_string(), uid: None, via: None }
-    }
-
     /// An author a caller claims to be.
     ///
     /// # Errors

@@ -186,6 +186,20 @@ pub enum Direction {
     Both,
 }
 
+/// Which entities have at least one live edge leaving them, in ONE read.
+///
+/// A listing needs exactly this and nothing more: whether a row opens.
+/// Asking `of` per row turned one screen into a scan of the edge table
+/// per entity.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn sources(db: &Db) -> Result<std::collections::HashSet<String>> {
+    let mut resp = db.query("SELECT *, in, out FROM entity_edge").await?;
+    Ok(live(resp.take(0)?).into_iter().map(|e| record_uuid(&e.from)).collect())
+}
+
 /// Every version of one edge, oldest first — including every time it was
 /// cut and put back.
 ///
@@ -283,9 +297,8 @@ pub struct Subgraph {
 /// of a round trip per level. A four-deep role graph is one query, and
 /// so is a ten-deep one.
 ///
-/// Two requests in total, whatever the depth: the traversal, then the
-/// live edges among everything it reached. The second is what a drawing
-/// needs — names and labels on the connections, not just the shape.
+/// One request per level, each bounded by the frontier — so the cost
+/// follows what is reachable, not the size of the edge history.
 ///
 /// `label` narrows it to one kind of connection, which is what makes a
 /// tree out of a graph: "follow `contains` from here" is a hierarchy,
@@ -300,54 +313,57 @@ pub async fn walk(
     label: Option<&RecordId>,
     depth: usize,
 ) -> Result<Subgraph> {
-    // ONE READ FOR THE LIVE EDGES, then the walk over them.
+    // ONE READ PER LEVEL, bounded by the frontier.
     //
-    // The traversal used to run in the engine, which reads better and is
-    // what a relation is for — but SurrealQL filters ROWS, and "is this
-    // edge still connected" is a question about a CHAIN: unlinking
-    // appends `active = false` and leaves the earlier row untouched, so
-    // a row-level filter followed connections that had been cut and the
-    // graph grew orphans. Resolving the chains first and walking those
-    // is correct, and it is still one round trip for any depth.
-    let mut resp = db.query("SELECT *, in, out FROM entity_edge").await?;
-    let all = live(resp.take(0)?);
-    let edges: Vec<Edge> = all
-        .into_iter()
-        .filter(|e| label.is_none_or(|l| e.labels.contains(l)))
-        .collect();
-
+    // The traversal cannot be left to the engine: SurrealQL filters
+    // ROWS, and "is this edge still connected" is a question about a
+    // CHAIN — unlinking appends `active = false` and leaves the earlier
+    // row untouched, so a row-level filter followed connections that had
+    // been cut. But reading the WHOLE table to resolve chains in Rust
+    // was worse: cost grew with every version ever written, whatever the
+    // depth asked for. Asking per level keeps it proportional to what is
+    // actually reachable.
     let mut nodes = vec![Reached { entity: root.clone(), depth: 0 }];
     let mut seen: HashSet<String> = HashSet::new();
     seen.insert(record_uuid(root));
     let mut frontier = vec![root.clone()];
+    let mut edges: Vec<Edge> = Vec::new();
 
     // BREADTH FIRST, so the depth recorded is the SHORTEST way there. A
     // depth-first walk records whichever branch happened to arrive
     // first, which paints a direct neighbour as though it were far away.
     for d in 1..=depth {
-        let mut next: Vec<RecordId> = Vec::new();
-        for from in &frontier {
-            for e in edges.iter().filter(|e| record_uuid(&e.from) == record_uuid(from)) {
-                if seen.insert(record_uuid(&e.to)) {
-                    nodes.push(Reached { entity: e.to.clone(), depth: d });
-                    next.push(e.to.clone());
-                }
-            }
-        }
-        if next.is_empty() {
+        if frontier.is_empty() {
             break;
         }
+        let mut resp = db
+            .query("SELECT *, in, out FROM entity_edge WHERE in IN $ids")
+            .bind(("ids", frontier.clone()))
+            .await?;
+        let level: Vec<Edge> = live(resp.take(0)?)
+            .into_iter()
+            .filter(|e| label.is_none_or(|l| e.labels.contains(l)))
+            .collect();
+
+        let mut next: Vec<RecordId> = Vec::new();
+        for e in &level {
+            if seen.insert(record_uuid(&e.to)) {
+                nodes.push(Reached { entity: e.to.clone(), depth: d });
+                next.push(e.to.clone());
+            }
+        }
+        edges.extend(level);
         frontier = next;
     }
 
-    // Only the connections BETWEEN things actually reached.
+    // Only the connections BETWEEN things actually reached — a level
+    // read brings back edges pointing past the depth budget too.
     let reached: HashSet<String> = nodes.iter().map(|n| record_uuid(&n.entity)).collect();
-    let edges = edges
-        .into_iter()
-        .filter(|e| {
-            reached.contains(&record_uuid(&e.from)) && reached.contains(&record_uuid(&e.to))
-        })
-        .collect();
+    edges.retain(|e| {
+        reached.contains(&record_uuid(&e.from)) && reached.contains(&record_uuid(&e.to))
+    });
+    edges.sort_by(|a, b| a.uid.cmp(&b.uid));
+    edges.dedup_by(|a, b| a.uid == b.uid);
 
     Ok(Subgraph { nodes, edges })
 }

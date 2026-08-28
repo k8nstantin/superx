@@ -106,5 +106,14 @@ export function isDatatype(s: string): s is Datatype {
   return (DATATYPES as readonly string[]).includes(s)
 }
 
-/// The attribute an entity's own screen layout is saved in.
+/// Attributes the module keeps for itself. They are ordinary rows — the
+/// store has no notion of a reserved name — but they are machinery, not
+/// something the operator typed, so the field list leaves them out.
+///
+/// `archived` especially: rendering it as a checkbox let someone flip it
+/// straight past the Archive button, leaving the header saying one thing
+/// and the record another.
 export const SCREEN = 'screen'
+export const ARCHIVED = 'archived'
+export const NAME = 'name'
+export const MACHINERY: readonly string[] = [SCREEN, ARCHIVED]

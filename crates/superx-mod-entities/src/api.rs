@@ -212,24 +212,31 @@ pub async fn children(
         Some(l) => Some(entity::resolve(db, l).await?),
         None => None,
     };
+    let mine = edge::of(db, &id, Direction::Out).await?;
+    let kids: Vec<(RecordId, String)> = mine
+        .into_iter()
+        .filter(|e| filter.as_ref().is_none_or(|f| e.labels.contains(f)))
+        .map(|e| (e.to, e.name))
+        .collect();
+    let ids: Vec<RecordId> = kids.iter().map(|(id, _)| id.clone()).collect();
+    let held = attribute::of_many(db, &ids, false).await?;
+    let parents = edge::sources(db).await?;
+    let mut names = NameCache::default();
     let mut out = Vec::new();
-    for e in edge::of(db, &id, Direction::Out).await? {
-        if let Some(f) = &filter {
-            if !e.labels.contains(f) {
-                continue;
-            }
+    for (child, via) in kids {
+        let attrs = held.get(&record_uuid(&child)).map_or(&[][..], Vec::as_slice);
+        // ARCHIVED IS ARCHIVED EVERYWHERE. The root list hid it and the
+        // tree did not, so a thing put away vanished from the top of the
+        // menu and stayed visible one level down.
+        if entity::archived_in(attrs) {
+            continue;
         }
-        let child = e.to.clone();
-        // One more hop only to answer "is there an arrow to draw" — the
-        // tree needs it to decide whether the row expands at all.
-        let deeper = edge::of(db, &child, Direction::Out).await?;
+        let labels = entity::labels_in(attrs);
         out.push(TreeNodeView {
-            name: entity::name_of(db, &child).await?.unwrap_or_default(),
-            labels: label_views(db, &entity::labels_of(db, &child).await?).await?,
-            has_children: deeper
-                .iter()
-                .any(|d| filter.as_ref().is_none_or(|f| d.labels.contains(f))),
-            via: Some(e.name),
+            name: entity::name_in(attrs).unwrap_or_default(),
+            labels: names.views(db, &labels).await?,
+            has_children: parents.contains(&record_uuid(&child)),
+            via: Some(via),
             uuid: record_uuid(&child),
         });
     }
@@ -247,6 +254,10 @@ pub async fn roots(db: &Db, include_archived: bool) -> Result<Vec<TreeNodeView>>
     // thousands of round trips.
     let ids = entity::list(db, include_archived).await?;
     let held = attribute::of_many(db, &ids, false).await?;
+    // AND ONE READ FOR "DOES THIS OPEN". Asking `edge::of` per row was
+    // the same N+1 the comment above claims to have removed — 500
+    // entities meant 500 scans of the edge table.
+    let parents = edge::sources(db).await?;
     let mut names = NameCache::default();
     let mut out = Vec::new();
     for id in &ids {
@@ -255,7 +266,7 @@ pub async fn roots(db: &Db, include_archived: bool) -> Result<Vec<TreeNodeView>>
         out.push(TreeNodeView {
             name: entity::name_in(mine).unwrap_or_default(),
             labels: names.views(db, &labels).await?,
-            has_children: !edge::of(db, id, Direction::Out).await?.is_empty(),
+            has_children: parents.contains(&record_uuid(id)),
             via: None,
             uuid: record_uuid(id),
         });
@@ -305,23 +316,41 @@ pub async fn graph(
         None => None,
     };
     let sub = edge::walk(db, &id, filter.as_ref(), depth).await?;
+    // ONE attribute read for every node at once, and one name lookup per
+    // DISTINCT label however often it recurs. Asking per node meant the
+    // same handful of label entities were fetched hundreds of times.
+    let reached: Vec<RecordId> = sub.nodes.iter().map(|n| n.entity.clone()).collect();
+    let held = attribute::of_many(db, &reached, false).await?;
+    let mut names = NameCache::default();
     let mut nodes = Vec::new();
     for n in &sub.nodes {
+        let mine = held.get(&record_uuid(&n.entity)).map_or(&[][..], Vec::as_slice);
+        // Something put away is not part of the picture.
+        if entity::archived_in(mine) {
+            continue;
+        }
+        let labels = entity::labels_in(mine);
         nodes.push(GraphNodeView {
             uuid: record_uuid(&n.entity),
-            name: entity::name_of(db, &n.entity).await?.unwrap_or_default(),
+            name: entity::name_in(mine).unwrap_or_default(),
             depth: n.depth,
-            labels: label_views(db, &entity::labels_of(db, &n.entity).await?).await?,
+            labels: names.views(db, &labels).await?,
         });
     }
+    let shown: std::collections::HashSet<&str> =
+        nodes.iter().map(|n| n.uuid.as_str()).collect();
     let mut edges = Vec::new();
     for e in &sub.edges {
+        let (from, to) = (record_uuid(&e.from), record_uuid(&e.to));
+        if !shown.contains(from.as_str()) || !shown.contains(to.as_str()) {
+            continue;
+        }
         edges.push(GraphEdgeView {
             uid: e.uid.clone(),
             name: e.name.clone(),
-            from: record_uuid(&e.from),
-            to: record_uuid(&e.to),
-            labels: label_views(db, &e.labels).await?,
+            from,
+            to,
+            labels: names.views(db, &e.labels).await?,
         });
     }
     Ok(GraphView { nodes, edges })
@@ -431,21 +460,6 @@ fn from_json(datatype: &str, c: &serde_json::Value) -> Result<Value> {
         KernelError::Module(format!("'{s}' is not an RFC 3339 instant: {e}"))
     })?;
     Ok(Value::Datetime(parsed.with_timezone(&chrono::Utc).into()))
-}
-
-async fn label_view(db: &Db, id: &RecordId) -> Result<LabelView> {
-    Ok(LabelView {
-        uuid: record_uuid(id),
-        name: entity::name_of(db, id).await?.unwrap_or_default(),
-    })
-}
-
-async fn label_views(db: &Db, ids: &[RecordId]) -> Result<Vec<LabelView>> {
-    let mut out = Vec::new();
-    for id in ids {
-        out.push(label_view(db, id).await?);
-    }
-    Ok(out)
 }
 
 fn attribute_view(a: attribute::Attribute) -> AttributeView {

@@ -67,6 +67,7 @@ pub async fn serve(kernel: &Kernel, db: superx_kernel::Db, port: u16) -> Result<
 
 use async_trait::async_trait;
 use superx_kernel::types::Value;
+use superx_ops::record_uuid;
 use superx_kernel::{
     Kernel, KernelModule, KernelModuleDescriptor, NodeKind, Result, KERNEL_MODULES,
 };
@@ -249,9 +250,15 @@ pub(crate) fn obj_display(row: &Value, key: &str) -> Option<String> {
 /// guaranteed to sort the way the instants do.
 pub(crate) fn newest_by_valid_from(rows: &[Value]) -> Option<&Value> {
     rows.iter().max_by_key(|r| {
-        obj_display(r, "valid_from")
+        let at = obj_display(r, "valid_from")
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
             .map(|t| t.with_timezone(&chrono::Utc))
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        // TIE-BREAK ON THE ID. Two appends can land in the same clock
+        // tick — a batch write, a coarse clock, or the amend-then-restore
+        // pair archiving does — and `max_by_key` then returns whichever
+        // row the engine happened to hand back last. uuid7 ids are
+        // time-ordered, so the larger one is the later write.
+        (at, obj_record(r, "id").map(|i| record_uuid(&i)))
     })
 }

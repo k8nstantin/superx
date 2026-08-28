@@ -319,6 +319,17 @@ pub async fn resolve(db: &Db, fragment: &str) -> Result<RecordId> {
     if fragment.is_empty() {
         return Err(KernelError::Module("no entity given".to_string()));
     }
+    // A WHOLE UUID IS NOT A SEARCH. The UI only ever sends complete
+    // ones, and every write resolves the entity plus one per label — so
+    // scanning the table for something we can address directly turned a
+    // single save into several full reads.
+    if let Ok(uuid) = fragment.parse::<uuid::Uuid>() {
+        let anchor = RecordId::new("entity", superx_kernel::types::Uuid::from(uuid));
+        if exists(db, &anchor).await? {
+            return Ok(anchor);
+        }
+        return Err(KernelError::Module(format!("no entity matches '{fragment}'")));
+    }
     let hits: Vec<RecordId> = list(db, true)
         .await?
         .into_iter()

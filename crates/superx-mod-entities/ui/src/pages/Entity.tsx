@@ -20,6 +20,10 @@ import 'react-grid-layout/css/styles.css'
 import 'react-resizable/css/styles.css'
 import {
   DATATYPES,
+  MACHINERY,
+  NAME,
+  fetchRoots,
+  linkEntities,
   NATURAL_HEIGHT,
   NATURAL_WIDTH,
   SCREEN,
@@ -58,8 +62,19 @@ export default function EntityTab({
   const [dragged, setDragged] = useState<LayoutItem[] | null>(null)
   const dirty = dragged !== null
 
+  // A DECLARATION IS NOT A FIELD. An attribute carrying labels and no
+  // content is how the model says what a thing IS — rendering it as a
+  // prose editor meant one click on Save wrote `<p></p>` into it, and
+  // because `labels_in` counts only content-less attributes, the entity
+  // silently stopped being a role. Declarations show as chips in the
+  // header instead, where they can be removed on purpose.
   const fields = useMemo(
-    () => (e.data?.attributes ?? []).filter((a) => a.name !== SCREEN),
+    () =>
+      (e.data?.attributes ?? []).filter(
+        (a) =>
+          !MACHINERY.includes(a.name) &&
+          !(a.content === null && a.labels.length > 0),
+      ),
     [e.data],
   )
   const saved = useMemo(() => {
@@ -156,6 +171,8 @@ export default function EntityTab({
         </Text>
       </Card>
 
+      <Declare frag={frag} existing={e.data.labels.map((l) => l.uuid)} />
+      <Link frag={frag} />
       <AddField frag={frag} />
 
       <GridLayout
@@ -210,6 +227,132 @@ export default function EntityTab({
   )
 }
 
+/// Pick another entity by name. Everything in this model points at
+/// something else — a label, the far end of a link — so choosing one is
+/// the single most repeated act on this page.
+function EntityPicker({
+  label,
+  description,
+  exclude,
+  value,
+  onChange,
+}: {
+  label: string
+  description?: string
+  exclude: string
+  value: string | null
+  onChange: (v: string | null) => void
+}) {
+  const all = useQuery({ queryKey: ['roots', true], queryFn: () => fetchRoots(true) })
+  const data = (all.data ?? [])
+    .filter((e) => e.uuid !== exclude)
+    .map((e) => ({ value: e.uuid, label: e.name || e.uuid.slice(0, 8) }))
+  return (
+    <Select
+      label={label}
+      description={description}
+      data={data}
+      value={value}
+      onChange={onChange}
+      searchable
+      clearable
+      nothingFoundMessage="no entity by that name"
+      style={{ flex: 1 }}
+    />
+  )
+}
+
+/// SAY WHAT A THING IS. An attribute carrying labels and no content is
+/// the whole mechanism — there is no separate "type" to set, and the
+/// label is just another entity.
+function Declare({ frag, existing }: { frag: string; existing: string[] }) {
+  const qc = useQueryClient()
+  const [label, setLabel] = useState<string | null>(null)
+  const declare = useMutation({
+    mutationFn: () =>
+      putAttribute(frag, {
+        name: 'is',
+        datatype: 'text',
+        content: null,
+        labels: [...existing, label ?? ''],
+      }),
+    onSuccess: () => {
+      setLabel(null)
+      void qc.invalidateQueries({ queryKey: ['entity', frag] })
+    },
+  })
+  return (
+    <Card withBorder padding="sm" mb="md">
+      <Group align="flex-end" gap="sm">
+        <EntityPicker
+          label="This is a…"
+          description="a label is an entity; what it MEANS is a field on it"
+          exclude={frag}
+          value={label}
+          onChange={setLabel}
+        />
+        <Button
+          onClick={() => label && declare.mutate()}
+          loading={declare.isPending}
+          disabled={!label}
+        >
+          Label it
+        </Button>
+      </Group>
+      {declare.error && (
+        <Text c="red" size="sm" mt="xs">
+          {String(declare.error)}
+        </Text>
+      )}
+    </Card>
+  )
+}
+
+/// CONNECT IT TO SOMETHING. The connection carries a name and its own
+/// labels — what it MEANS is the label, not the name.
+function Link({ frag }: { frag: string }) {
+  const qc = useQueryClient()
+  const [to, setTo] = useState<string | null>(null)
+  const [name, setName] = useState('')
+  const [label, setLabel] = useState<string | null>(null)
+  const link = useMutation({
+    mutationFn: () => linkEntities(frag, to ?? '', name.trim(), label ? [label] : []),
+    onSuccess: () => {
+      setTo(null)
+      setName('')
+      setLabel(null)
+      void qc.invalidateQueries({ queryKey: ['entity', frag] })
+    },
+  })
+  return (
+    <Card withBorder padding="sm" mb="md">
+      <Group align="flex-end" gap="sm">
+        <TextInput
+          label="Connection"
+          placeholder="signs in with"
+          value={name}
+          onChange={(e) => setName(e.currentTarget.value)}
+          style={{ flex: 1 }}
+        />
+        <EntityPicker label="to" exclude={frag} value={to} onChange={setTo} />
+        <EntityPicker label="meaning" exclude={frag} value={label} onChange={setLabel} />
+        <Button
+          onClick={() => to && name.trim() && link.mutate()}
+          loading={link.isPending}
+          disabled={!to || !name.trim()}
+        >
+          Link
+        </Button>
+      </Group>
+      {link.error && (
+        <Text c="red" size="sm" mt="xs">
+          {String(link.error)}
+        </Text>
+      )}
+    </Card>
+  )
+}
+
 /// One field, rendered by its datatype. Five datatypes, five controls,
 /// and `text` and `json` share one.
 function Field({
@@ -222,6 +365,7 @@ function Field({
   readOnly: boolean
 }) {
   const qc = useQueryClient()
+  const [draft, setDraft] = useState<string | number | undefined>(undefined)
   const write = useMutation({
     mutationFn: (content: unknown) =>
       putAttribute(frag, {
@@ -241,7 +385,12 @@ function Field({
       case 'number':
         return (
           <NumberInput
-            value={typeof field.content === 'number' ? field.content : undefined}
+            // CONTROLLED NEEDS onChange. Mantine treats a defined
+            // `value` as controlled and defaults the setter to a no-op,
+            // so a field that already held a number could not be typed
+            // into at all — only empty ones appeared to work.
+            value={draft ?? (typeof field.content === 'number' ? field.content : '')}
+            onChange={setDraft}
             onBlur={(ev) => {
               // BLANK IS NOT ZERO. `Number('')` is 0 and passes a NaN
               // check, so clicking into an empty field and out again
@@ -250,7 +399,10 @@ function Field({
               const raw = ev.currentTarget.value.trim()
               if (raw === '') return
               const n = Number(raw)
-              if (!Number.isNaN(n)) write.mutate(n)
+              // AND ONLY WHEN IT CHANGED. Tabbing through a field used
+              // to append an identical version to a record that can
+              // never be pruned.
+              if (!Number.isNaN(n) && n !== field.content) write.mutate(n)
             }}
           />
         )
@@ -270,14 +422,40 @@ function Field({
           <TextInput
             type="datetime-local"
             defaultValue={toLocalInput(field.content)}
-            onBlur={(ev) =>
-              ev.currentTarget.value &&
-              write.mutate(new Date(ev.currentTarget.value).toISOString())
-            }
+            onBlur={(ev) => {
+              if (!ev.currentTarget.value) return
+              const iso = new Date(ev.currentTarget.value).toISOString()
+              // Comparing instants, not strings: the stored form and the
+              // one we build differ in precision.
+              const now = typeof field.content === 'string' ? Date.parse(field.content) : NaN
+              if (Date.parse(iso) !== now) write.mutate(iso)
+            }}
+          />
+        )
+      case 'text':
+        // THE NAME IS ONE LINE. Sending it through the prose editor made
+        // Save rewrite it as `<p>DBA</p>`, and every list, title and
+        // link chip then read the literal markup.
+        if (field.name === NAME) {
+          return (
+            <TextInput
+              defaultValue={typeof field.content === 'string' ? field.content : ''}
+              onBlur={(ev) => {
+                const v = ev.currentTarget.value.trim()
+                if (v && v !== field.content) write.mutate(v)
+              }}
+            />
+          )
+        }
+        return (
+          <Editor
+            value={field.content}
+            json={false}
+            onSave={(v) => write.mutate(v)}
           />
         )
       default:
-        // text AND json: the same editor. Only the storage differs.
+        // json shares the editor; only the storage differs.
         return (
           <Editor
             value={field.content}

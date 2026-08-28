@@ -28,14 +28,23 @@ import { createEntity, fetchChildren, fetchRoots, type TreeNodeView } from '../a
 // Mantine's Tree does the lazy half natively: `hasChildren` with no
 // children triggers `onLoadChildren` on first expand.
 
-function toNode(v: TreeNodeView): TreeNodeData {
-  // `hasChildren` with NO `children` key is what marks a node as lazy —
-  // an empty `children` array means "expanded, and there is nothing
-  // here", so `onLoadChildren` never fires.
+/// A node's key is its PATH, not its uuid.
+///
+/// The data is a graph: an entity can hang under two parents at once,
+/// and both rows would then share one key — one arrow would open both,
+/// `mergeAsyncChildren` would splice the fetched level into whichever it
+/// found first, and React would see duplicate keys among siblings. The
+/// uuid rides in `nodeProps` for opening the entity; the path is what
+/// makes a DAG renderable as a tree.
+///
+/// `hasChildren` with NO `children` key is what marks a node as lazy —
+/// an empty `children` array means "expanded, and there is nothing
+/// here", so `onLoadChildren` never fires.
+function toNode(v: TreeNodeView, parentKey = ''): TreeNodeData {
   return {
-    value: v.uuid,
+    value: parentKey ? `${parentKey}/${v.uuid}` : v.uuid,
     label: v.name || '(unnamed)',
-    nodeProps: { labels: v.labels, via: v.via },
+    nodeProps: { labels: v.labels, via: v.via, uuid: v.uuid },
     hasChildren: v.has_children,
   }
 }
@@ -63,7 +72,7 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
   // refetch adds and removes roots and leaves loaded children alone.
   const [data, setData] = useState<TreeNodeData[]>([])
   useEffect(() => {
-    const fresh = (roots.data ?? []).map(toNode)
+    const fresh = (roots.data ?? []).map((n) => toNode(n))
     setData((current) => {
       const held = new Map(current.map((n) => [n.value, n]))
       return fresh.map((n) => {
@@ -75,8 +84,10 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
 
   const tree = useTree({
     onLoadChildren: async (value) => {
-      const kids = await fetchChildren(value)
-      setData((current) => mergeAsyncChildren(current, value, kids.map(toNode)))
+      // The key is a path; the entity to ask about is its last segment.
+      const uuid = value.split('/').pop() ?? value
+      const kids = await fetchChildren(uuid)
+      setData((current) => mergeAsyncChildren(current, value, kids.map((k) => toNode(k, value))))
     },
   })
 
@@ -139,6 +150,7 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
             const props = (node.nodeProps ?? {}) as {
               labels?: { uuid: string; name: string }[]
               via?: string | null
+              uuid?: string
             }
             return (
               <Group gap="xs" {...elementProps} wrap="nowrap" py={2}>
@@ -162,7 +174,7 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
                 <Text
                   size="sm"
                   style={{ cursor: 'pointer' }}
-                  onClick={() => onOpen(node.value)}
+                  onClick={() => onOpen(props.uuid ?? node.value)}
                 >
                   {node.label}
                 </Text>
