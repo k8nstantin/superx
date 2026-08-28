@@ -231,3 +231,103 @@ async fn a_role_that_watches_teams_and_texts_whatsapp() {
         "and both frequencies are on the record, with who set them"
     );
 }
+
+/// THE MODULE NEVER INTERPRETS, and this is the test that keeps it true.
+///
+/// > "The entity does not give a shit about handling. It only has
+/// >  attributes, edges and labels. Whoever uses entities knows how to
+/// >  treat it. I can add another concept down the road besides labels
+/// >  and nothing changes for the entities — only the process that reads
+/// >  them knows what's up. Entities don't even know it's there."
+/// >  — operator, 2026-08-28
+///
+/// So a label called `role` must be worth exactly as much to this module
+/// as a label called `zzz`: no branch, no special case, no meaning. The
+/// day someone writes `if name == "role"`, that property is gone and
+/// this fails.
+///
+/// Two names ARE known here, and only two — `name` and `archived` — and
+/// both are store concerns: what appears in a list, and what is hidden
+/// from one. Neither says what a thing IS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_word_in_the_vocabulary_means_anything_to_the_module() {
+    let db = fresh_db().await;
+    let op = Author::operator();
+
+    // Two entities, identical but for the words used. If the module has
+    // an opinion about any of these names, the two stop matching.
+    let loaded = ["role", "credential", "task", "label", "mandate", "contains", "schedule"];
+    let neutral = ["zzz1", "zzz2", "zzz3", "zzz4", "zzz5", "zzz6", "zzz7"];
+
+    let mut shapes = Vec::new();
+    for words in [loaded, neutral] {
+        let subject = entity::create(&db, words[0], &op).await.expect("e");
+        let marker = entity::create(&db, words[1], &op).await.expect("m");
+        let target = entity::create(&db, words[2], &op).await.expect("t");
+
+        entity::declare(&db, &subject, words[3], std::slice::from_ref(&marker), &op)
+            .await
+            .expect("declare");
+        attribute::add(
+            &db,
+            &subject,
+            Write {
+                name: words[4],
+                datatype: "text",
+                content: text("some prose"),
+                labels: std::slice::from_ref(&marker),
+                options: None,
+            },
+            &op,
+        )
+        .await
+        .expect("attribute");
+        edge::link(&db, &subject, &target, words[5], std::slice::from_ref(&marker), &op)
+            .await
+            .expect("edge");
+
+        let held = attribute::of(&db, &subject, false).await.expect("held");
+        let walked = edge::walk(&db, &subject, None, 4).await.expect("walk");
+        shapes.push((
+            held.len(),
+            held.iter().map(|a| a.labels.len()).collect::<Vec<_>>(),
+            entity::labels_of(&db, &subject).await.expect("l").len(),
+            entity::is_archived(&db, &subject).await.expect("a"),
+            walked.nodes.len(),
+            walked.edges.len(),
+        ));
+    }
+    assert_eq!(
+        shapes[0], shapes[1],
+        "a label called `role` is worth exactly what a label called `zzz2` is worth"
+    );
+
+    // And the two names that ARE known are known for storage reasons
+    // only: one decides what a thing is called, the other whether it is
+    // listed. Neither is asked what the thing IS.
+    let thing = entity::create(&db, "Thing", &op).await.expect("e");
+    assert_eq!(entity::name_of(&db, &thing).await.expect("n").as_deref(), Some("Thing"));
+    assert!(!entity::is_archived(&db, &thing).await.expect("a"));
+
+    // Any other name is inert, however meaningful it looks.
+    for inert in ["type", "kind", "class", "status", "state", "parent", "owner"] {
+        attribute::add(
+            &db,
+            &thing,
+            Write {
+                name: inert,
+                datatype: "text",
+                content: text("looks important, means nothing here"),
+                labels: &[],
+                options: None,
+            },
+            &op,
+        )
+        .await
+        .expect("stored like any other");
+    }
+    assert_eq!(entity::name_of(&db, &thing).await.expect("n").as_deref(), Some("Thing"));
+    assert!(!entity::is_archived(&db, &thing).await.expect("a"), "`state` is not `archived`");
+    // three entities per pass, twice over, plus the one above.
+    assert_eq!(entity::list(&db, false).await.expect("list").len(), 3 + 3 + 1);
+}
