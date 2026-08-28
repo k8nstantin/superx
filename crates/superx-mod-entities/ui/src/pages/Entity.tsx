@@ -22,6 +22,7 @@ import {
   DATATYPES,
   MACHINERY,
   NAME,
+  NAME_HEIGHT,
   fetchRoots,
   linkEntities,
   NATURAL_HEIGHT,
@@ -114,7 +115,13 @@ export default function EntityTab({
         return found
       }
       const dt = (isDatatype(f.datatype) ? f.datatype : 'text') as Datatype
-      const item = { i: f.uid, x: 0, y, w: NATURAL_WIDTH[dt], h: NATURAL_HEIGHT[dt] }
+      // THE NAME IS SIZED LIKE WHAT IT IS. It is a text field, but it
+      // renders as a single line rather than the prose editor every
+      // other text field gets — so taking text's height gave a 36px
+      // input a 168px box, and the first thing anyone saw on opening an
+      // entity was a card that was five-sixths empty.
+      const h = f.name === NAME ? NAME_HEIGHT : NATURAL_HEIGHT[dt]
+      const item = { i: f.uid, x: 0, y, w: NATURAL_WIDTH[dt], h }
       y += item.h
       return item
     })
@@ -404,20 +411,20 @@ function Field({
     if (readOnly) return <Text size="sm" c="dimmed">{preview(field)}</Text>
     switch (field.datatype) {
       case 'number':
+        // THE BLUR IS CAUGHT ON THE WRAPPER, NOT THE INPUT. Mantine's
+        // NumberInput binds its own onBlur to the underlying control and
+        // does not compose the one it is handed, so this commit never
+        // ran — a number typed into this field was simply lost, the one
+        // datatype in the set that could not be saved at all. focusout
+        // bubbles, so the wrapper sees it and the commit is ours again.
         return (
-          <NumberInput
-            // CONTROLLED NEEDS onChange. Mantine treats a defined
-            // `value` as controlled and defaults the setter to a no-op,
-            // so a field that already held a number could not be typed
-            // into at all — only empty ones appeared to work.
-            value={draft ?? (typeof field.content === 'number' ? field.content : '')}
-            onChange={setDraft}
-            onBlur={(ev) => {
+          <div
+            onBlur={() => {
               // BLANK IS NOT ZERO. `Number('')` is 0 and passes a NaN
               // check, so clicking into an empty field and out again
               // used to write an explicit 0 onto the permanent record
               // with the operator's name on it.
-              const raw = ev.currentTarget.value.trim()
+              const raw = String(draft ?? '').trim()
               if (raw === '') return
               const n = Number(raw)
               // AND ONLY WHEN IT CHANGED. Tabbing through a field used
@@ -425,7 +432,16 @@ function Field({
               // never be pruned.
               if (!Number.isNaN(n) && n !== field.content) write.mutate(n)
             }}
-          />
+          >
+            <NumberInput
+              // CONTROLLED NEEDS onChange. Mantine treats a defined
+              // `value` as controlled and defaults the setter to a no-op,
+              // so a field that already held a number could not be typed
+              // into at all — only empty ones appeared to work.
+              value={draft ?? (typeof field.content === 'number' ? field.content : '')}
+              onChange={setDraft}
+            />
+          </div>
         )
       case 'boolean':
         return (

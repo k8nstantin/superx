@@ -220,7 +220,14 @@ pub async fn children(
         .collect();
     let ids: Vec<RecordId> = kids.iter().map(|(id, _)| id.clone()).collect();
     let held = attribute::of_many(db, &ids, false).await?;
-    let parents = edge::sources(db).await?;
+    // The same visibility the menu uses one level up, so an expander
+    // here promises exactly what expanding it will show.
+    let visible: std::collections::HashSet<String> = entity::list(db, false)
+        .await?
+        .iter()
+        .map(record_uuid)
+        .collect();
+    let parents = edge::sources(db, &visible).await?;
     let mut names = NameCache::default();
     let mut out = Vec::new();
     for (child, via) in kids {
@@ -263,9 +270,16 @@ pub async fn roots(db: &Db, include_archived: bool) -> Result<Vec<TreeNodeView>>
     // DISTINCT label. Asking per row turned the first screen into
     // thousands of round trips.
     let all = entity::list(db, include_archived).await?;
+    // WHAT THE MENU CAN SEE, which is what both questions below are
+    // really about. Archiving an entity used to take everything it
+    // pointed at out of the tree with it: the target still had an
+    // inbound edge, so it was not a root, and the only row that led to
+    // it was hidden — leaving it in the store and nowhere on screen.
+    let visible: std::collections::HashSet<String> =
+        all.iter().map(record_uuid).collect();
     // AND ONE READ EACH for "does this open" and "is this a root".
-    let parents = edge::sources(db).await?;
-    let children = edge::targets(db).await?;
+    let parents = edge::sources(db, &visible).await?;
+    let children = edge::targets(db, &visible).await?;
     let ids: Vec<RecordId> = all
         .iter()
         .filter(|id| !children.contains(&record_uuid(id)))

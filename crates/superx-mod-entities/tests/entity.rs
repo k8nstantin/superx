@@ -7,7 +7,7 @@
 use superx_kernel::types::Value;
 use superx_mod_entities::attribute::{self, Write};
 use superx_mod_entities::author::Author;
-use superx_mod_entities::{entity, SCHEMA_DDL};
+use superx_mod_entities::{api, edge, entity, SCHEMA_DDL};
 
 async fn fresh_db() -> superx_kernel::Db {
     let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
@@ -713,4 +713,78 @@ async fn depth_is_the_shortest_path_not_the_first_one_found() {
     };
     assert_eq!(depth_of(&leaf), Some(1), "leaf is a direct child of root");
     assert_eq!(depth_of(&mid), Some(1));
+}
+
+/// ARCHIVING A PARENT MUST NOT TAKE ITS CHILDREN WITH IT.
+///
+/// The menu's top level is "entities nothing points at", and archived
+/// entities are hidden from it. Those two rules together used to delete
+/// a thing from the interface without deleting it from the store: the
+/// child still had an inbound edge so it was no root, and the only row
+/// that led to it was the one just put away. It was in the database and
+/// on no screen, with nothing an operator could click to get it back.
+///
+/// A parent that cannot be seen is not a parent for this purpose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archiving_a_parent_gives_its_children_back_to_the_top_level() {
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let parent = entity::create(&db, "Parent", &op).await.expect("parent");
+    let child = entity::create(&db, "Child", &op).await.expect("child");
+    edge::link(&db, &parent, &child, "owns", &[], &op).await.expect("link");
+
+    let names = |rows: &[api::TreeNodeView]| {
+        rows.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+    };
+
+    // While the parent is visible the child hangs off it, not the top.
+    let top = api::roots(&db, false).await.expect("roots");
+    assert!(names(&top).contains(&"Parent".to_string()));
+    assert!(
+        !names(&top).contains(&"Child".to_string()),
+        "a child reachable by expanding must not also sit at the root"
+    );
+
+    entity::archive(&db, &parent, &op).await.expect("archive");
+
+    let top = api::roots(&db, false).await.expect("roots after archive");
+    assert!(
+        !names(&top).contains(&"Parent".to_string()),
+        "the archived parent is hidden"
+    );
+    assert!(
+        names(&top).contains(&"Child".to_string()),
+        "the child is reachable again — archiving the only way in must not \
+         leave it in the store and off every screen"
+    );
+}
+
+/// The mirror of the same rule: an expander must open on something.
+///
+/// `has_children` counted any live outbound edge, including ones landing
+/// on an entity the menu hides — so a row wore a chevron that expanded
+/// to an empty list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_only_opens_when_there_is_something_behind_it() {
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let parent = entity::create(&db, "Parent", &op).await.expect("parent");
+    let child = entity::create(&db, "Child", &op).await.expect("child");
+    edge::link(&db, &parent, &child, "owns", &[], &op).await.expect("link");
+
+    let opens = |rows: &[api::TreeNodeView], who: &str| {
+        rows.iter().find(|r| r.name == who).map(|r| r.has_children)
+    };
+
+    let top = api::roots(&db, false).await.expect("roots");
+    assert_eq!(opens(&top, "Parent"), Some(true), "it has a visible child");
+
+    entity::archive(&db, &child, &op).await.expect("archive child");
+
+    let top = api::roots(&db, false).await.expect("roots after archive");
+    assert_eq!(
+        opens(&top, "Parent"),
+        Some(false),
+        "its only child is hidden, so the chevron would open on nothing"
+    );
 }

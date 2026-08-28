@@ -48,12 +48,25 @@ export default function GraphTab({
         // Focus a node's own adjacency on hover — the only way to read a
         // dense patch without moving anything.
         emphasis: { focus: 'adjacency' },
+        // SPREAD TO FILL THE BOX. Repulsion that grows with the node
+        // count is backwards for the graphs anyone actually opens: four
+        // entities got the weakest push and huddled in one corner of an
+        // otherwise empty card with their labels on top of each other.
+        // A small graph pushes hard and uses the room; a large one eases
+        // off so it does not fly apart.
+        center: ['50%', '50%'],
         force: {
-          repulsion: 90 + g.data.nodes.length * 8,
-          edgeLength: [60, 160],
-          gravity: 0.08,
+          repulsion: Math.max(240, 1400 / Math.sqrt(g.data.nodes.length || 1)),
+          edgeLength: [90, 220],
+          // Enough pull to settle in the middle of the card. Weaker and
+          // the cluster drifts into a corner even when it has room; the
+          // repulsion above is what keeps it from collapsing back in.
+          gravity: 0.18,
         },
         label: { show: true, color: '#EDE4F4', fontSize: 11, position: 'right' },
+        // Two names in the same place are worse than one name: where
+        // they collide, the one further down the draw order steps out.
+        labelLayout: { hideOverlap: true },
         edgeLabel: { show: true, color: '#8F7BA5', fontSize: 9, formatter: '{c}' },
         lineStyle: { color: '#5C4470', curveness: 0.08 },
         data: g.data.nodes.map((n) => ({

@@ -95,6 +95,11 @@ export const NATURAL_HEIGHT: Record<Datatype, number> = {
   datetime: 3,
 }
 
+/// The name's own height. It is `text`, but it is the one text field
+/// drawn as a single line, so it is sized against that control and not
+/// against the editor.
+export const NAME_HEIGHT = 3
+
 export const NATURAL_WIDTH: Record<Datatype, number> = {
   text: 12,
   json: 12,

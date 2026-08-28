@@ -186,18 +186,30 @@ pub enum Direction {
     Both,
 }
 
-/// Which entities have at least one live edge leaving them, in ONE read.
+/// Which entities have at least one live edge leaving them AND landing
+/// somewhere `visible`, in ONE read.
 ///
 /// A listing needs exactly this and nothing more: whether a row opens.
 /// Asking `of` per row turned one screen into a scan of the edge table
 /// per entity.
 ///
+/// THE FAR END HAS TO BE VISIBLE. The menu hides archived entities, so
+/// an edge into one is not a path anyone can walk there — counting it
+/// left rows wearing an expander that opened on nothing.
+///
 /// # Errors
 ///
 /// [`KernelError::Db`] for engine errors.
-pub async fn sources(db: &Db) -> Result<std::collections::HashSet<String>> {
+pub async fn sources(
+    db: &Db,
+    visible: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>> {
     let mut resp = db.query("SELECT *, in, out FROM entity_edge").await?;
-    Ok(live(resp.take(0)?).into_iter().map(|e| record_uuid(&e.from)).collect())
+    Ok(live(resp.take(0)?)
+        .into_iter()
+        .filter(|e| visible.contains(&record_uuid(&e.to)))
+        .map(|e| record_uuid(&e.from))
+        .collect())
 }
 
 /// Which entities have at least one live edge pointing AT them, in one
@@ -210,9 +222,16 @@ pub async fn sources(db: &Db) -> Result<std::collections::HashSet<String>> {
 /// # Errors
 ///
 /// [`KernelError::Db`] for engine errors.
-pub async fn targets(db: &Db) -> Result<std::collections::HashSet<String>> {
+pub async fn targets(
+    db: &Db,
+    visible: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>> {
     let mut resp = db.query("SELECT *, in, out FROM entity_edge").await?;
-    Ok(live(resp.take(0)?).into_iter().map(|e| record_uuid(&e.to)).collect())
+    Ok(live(resp.take(0)?)
+        .into_iter()
+        .filter(|e| visible.contains(&record_uuid(&e.from)))
+        .map(|e| record_uuid(&e.to))
+        .collect())
 }
 
 /// Every version of one edge, oldest first — including every time it was
