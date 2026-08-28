@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/superx-kernel", "crates/superx-mod-entities", "crates/superx-mod-hello", "crates/superx-mod-ui", "crates/superx-ops", "crates/superx"]
+members = ["crates/superx-kernel", "crates/superx-mod-hello", "crates/superx-mod-ui", "crates/superx-ops", "crates/superx"]
 
 [workspace.package]
 version = "1.1.0"
@@ -10,7 +10,6 @@ rust-version = "1.83"
 
 [workspace.dependencies]
 superx-kernel = { path = "crates/superx-kernel" }
-superx-mod-entities = { path = "crates/superx-mod-entities" }
 superx-mod-hello = { path = "crates/superx-mod-hello" }
 superx-mod-ui = { path = "crates/superx-mod-ui" }
 superx-ops = { path = "crates/superx-ops" }
