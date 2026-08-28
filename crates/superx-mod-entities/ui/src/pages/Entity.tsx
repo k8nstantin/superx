@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ActionIcon,
@@ -55,8 +55,8 @@ export default function EntityTab({
   const qc = useQueryClient()
   const e = useQuery({ queryKey: ['entity', frag], queryFn: () => fetchEntity(frag) })
   const [design, setDesign] = useState(false)
-  const [layout, setLayout] = useState<LayoutItem[]>([])
-  const [dirty, setDirty] = useState(false)
+  const [dragged, setDragged] = useState<LayoutItem[] | null>(null)
+  const dirty = dragged !== null
 
   const fields = useMemo(
     () => (e.data?.attributes ?? []).filter((a) => a.name !== SCREEN),
@@ -67,11 +67,17 @@ export default function EntityTab({
     return Array.isArray(s?.content) ? (s.content as LayoutItem[]) : []
   }, [e.data])
 
-  // A field with no saved position lands below everything, at the size
-  // its datatype asks for. That is the whole default layout.
-  useEffect(() => {
+  // THE LAYOUT MUST EXIST ON THE FIRST RENDER. Computing it in an
+  // effect was wrong twice over: the grid mounts with nothing, defaults
+  // every field to one cell, and never re-syncs — and a refetch (React
+  // Query does one when the window regains focus) rebuilt it mid-drag,
+  // throwing the arrangement away and clearing the unsaved flag with it.
+  //
+  // So it is derived during render, and a drag simply overrides it until
+  // it is saved or the fields change underneath.
+  const computed = useMemo(() => {
     let y = 0
-    const next: LayoutItem[] = fields.map((f) => {
+    return fields.map((f) => {
       const found = saved.find((l) => l.i === f.uid)
       if (found) {
         y = Math.max(y, found.y + found.h)
@@ -82,9 +88,9 @@ export default function EntityTab({
       y += item.h
       return item
     })
-    setLayout(next)
-    setDirty(false)
   }, [fields, saved])
+
+  const layout = dragged ?? computed
 
   const save = useMutation({
     mutationFn: () => {
@@ -97,7 +103,7 @@ export default function EntityTab({
       })
     },
     onSuccess: () => {
-      setDirty(false)
+      setDragged(null)
       void qc.invalidateQueries({ queryKey: ['entity', frag] })
     },
   })
@@ -164,10 +170,11 @@ export default function EntityTab({
           cancel: 'input,textarea,button,[contenteditable],.bn-container',
         }}
         resizeConfig={{ enabled: design }}
-        onLayoutChange={(l) => {
-          setLayout([...l])
-          if (design) setDirty(true)
-        }}
+        // Only a deliberate move counts as a change: the grid also emits
+        // this on mount, and treating that as an edit would light up
+        // Save before anyone touched anything.
+        onDragStop={(l) => setDragged([...l])}
+        onResizeStop={(l) => setDragged([...l])}
       >
         {fields.map((f) => (
           <div key={f.uid}>

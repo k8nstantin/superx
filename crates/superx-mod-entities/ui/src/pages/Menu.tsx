@@ -29,14 +29,15 @@ import { createEntity, fetchChildren, fetchRoots, type TreeNodeView } from '../a
 // children triggers `onLoadChildren` on first expand.
 
 function toNode(v: TreeNodeView): TreeNodeData {
+  // `hasChildren` with NO `children` key is what marks a node as lazy —
+  // an empty `children` array means "expanded, and there is nothing
+  // here", so `onLoadChildren` never fires.
   return {
     value: v.uuid,
     label: v.name || '(unnamed)',
     nodeProps: { labels: v.labels, via: v.via },
-    children: v.has_children ? [] : undefined,
-    // Mantine reads this to decide whether the row opens at all.
-    ...(v.has_children ? { hasChildren: true } : {}),
-  } as TreeNodeData
+    hasChildren: v.has_children,
+  }
 }
 
 export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) {
