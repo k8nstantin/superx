@@ -39,6 +39,45 @@
 -- registry: new labels and new kinds of connection are DATA, and this
 -- file never changes to add one.
 --
+--
+-- FIVE DATATYPES, AND THE SCREEN DRAWS ITSELF -------------------------
+--
+--   text      a string      → a rich text editor, always
+--   number    int or float  → a numeric input
+--   boolean   true / false  → a checkbox
+--   datetime  an instant    → a date and time picker
+--   json      object/array  → a structured editor
+--
+-- The datatype says what the value IS. How it is EDITED follows from it
+-- with no configuration, which is the whole point: add a `text`
+-- attribute and you get an editor, without anyone writing a screen.
+-- Every system that solves this splits the two — Directus has `type` and
+-- `interface`, JSON Schema has `schema` and `uiSchema` — and every one
+-- of them derives a default so the common case needs nothing.
+--
+-- `text` IS ALWAYS THE SAME EDITOR. Two text attributes on one entity
+-- are the same widget; what makes one a description and the other a
+-- comment is the LABEL it carries, never a different control.
+--
+-- The richer types other tools offer — email, url, currency, percent,
+-- rating, colour, select — are WIDGETS over these five, not storage of
+-- their own. That is how a handful of real types becomes twenty-five
+-- field kinds without twenty-five ways for data to be wrong.
+--
+-- `options` is the per-attribute override: a width, a placeholder, a
+-- choice list. Absent means the default, which is the usual case. The
+-- SCREEN for a whole kind of thing lives elsewhere and needs nothing
+-- here — it is an attribute on the LABEL, because a label is an entity
+-- and can hold one. Design `role` once and everything carrying `role`
+-- renders that way.
+--
+-- WHAT THE STORE CANNOT DO FOR US. `content` is `any`, so the engine
+-- cannot check that a `number` holds a number — the warning every
+-- entity-attribute-value model comes with, and the way they rot. The
+-- WRITE PATH must validate content against datatype on every write.
+-- That is not a nicety here; it is the only thing standing where a
+-- column type normally stands.
+--
 -- MANY LABELS, ALL OPTIONAL, everywhere — and MANY EDGES between the
 -- same two entities, each with its own name, labels and history. Nothing
 -- is single-valued, because the moment one thing is, something true
@@ -108,8 +147,10 @@ DEFINE FIELD IF NOT EXISTS entity      ON TABLE entity_attribute TYPE record<ent
 DEFINE FIELD IF NOT EXISTS name        ON TABLE entity_attribute TYPE string;
 DEFINE FIELD IF NOT EXISTS labels      ON TABLE entity_attribute TYPE option<array<record<entity>>>
     ASSERT $value == NONE OR array::all($value, |$l| record::exists($l));
-DEFINE FIELD IF NOT EXISTS datatype    ON TABLE entity_attribute TYPE string;
+DEFINE FIELD IF NOT EXISTS datatype    ON TABLE entity_attribute TYPE string
+    ASSERT $value INSIDE ['text', 'number', 'boolean', 'datetime', 'json'];
 DEFINE FIELD IF NOT EXISTS content     ON TABLE entity_attribute TYPE any;
+DEFINE FIELD IF NOT EXISTS options     ON TABLE entity_attribute TYPE option<object> FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS active      ON TABLE entity_attribute TYPE bool;
 DEFINE FIELD IF NOT EXISTS valid_from  ON TABLE entity_attribute TYPE datetime;
 DEFINE FIELD IF NOT EXISTS author_kind ON TABLE entity_attribute TYPE option<string>;
