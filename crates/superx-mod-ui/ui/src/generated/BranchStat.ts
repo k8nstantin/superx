@@ -16,10 +16,17 @@ export type BranchStat = { repo: string, branch: string, messages: bigint, sessi
  * Replaced lines that followed a human instruction, and those
  * that did not — design change vs agent going in circles.
  */
-churn_directed: bigint, churn_self: bigint, tests_passed: bigint, tests_failed: bigint, compile_errors: bigint, tool_calls: bigint, tool_failures: bigint, reverts: bigint, 
+churn_directed: bigint, churn_self: bigint, 
+/**
+ * Test INVOCATIONS. With `test_pass_pct == -1`, this separates a
+ * branch that never ran a suite from one whose output the scanner
+ * could not parse — they are not the same thing (#354 review).
+ */
+tests_run: bigint, tests_passed: bigint, tests_failed: bigint, compile_errors: bigint, tool_calls: bigint, tool_failures: bigint, reverts: bigint, 
 /**
  * Minutes code survived here before something rewrote it.
- * Minutes means thrash; hours means the design moved.
+ * Minutes means thrash; hours means the design moved. -1 when
+ * nothing was rewritten, so 0 can mean what it says.
  */
 survival_p50_mins: bigint, edit_to_verify_p50_secs: bigint, out_tokens: bigint, last_active: string, 
 /**

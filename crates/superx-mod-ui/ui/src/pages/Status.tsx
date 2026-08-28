@@ -319,7 +319,7 @@ export default function StatusPage() {
                 <Table.Th>Files now</Table.Th>
                 <Table.Th ta="right">
                   <Tooltip
-                    label="unasked share of its own rewrites, and files it has come back to three or more times — the compounding signal"
+                    label={`unasked share of its own rewrites, and files it has come back to ${s?.revisit_at ?? 3} or more times — the compounding signal`}
                     withArrow
                     multiline
                     w={280}
@@ -410,15 +410,11 @@ export default function StatusPage() {
                               ? 'blue'
                               : l.doing === 'thinking'
                                 ? 'grape'
-                                : l.doing === 'waiting'
-                                  ? 'yellow'
-                                  : 'gray'
+                                : 'gray'
                         }
                       >
                         {l.doing}
-                        {l.doing === 'waiting' && Number(l.waiting_secs) > 0
-                          ? ` ${fmtAge(l.waiting_secs)}`
-                          : ''}
+                        {Number(l.last_op_secs) > 0 ? ` · ${fmtAge(l.last_op_secs)}` : ''}
                       </Badge>
                     </Tooltip>
                   </Table.Td>
@@ -431,7 +427,16 @@ export default function StatusPage() {
                         —
                       </Text>
                     ) : (
-                      <Tooltip label={(l.files_now ?? []).join('\n')} withArrow multiline w={420}>
+                      <Tooltip
+                        label={
+                          <span style={{ whiteSpace: 'pre-line' }}>
+                            {(l.files_now ?? []).join('\n')}
+                          </span>
+                        }
+                        withArrow
+                        multiline
+                        w={420}
+                      >
                         <Text size="xs" ff="monospace" c="dimmed" lineClamp={1}>
                           {(l.files_now ?? [])
                             .map((f) => f.split('/').slice(-1)[0])
@@ -450,7 +455,7 @@ export default function StatusPage() {
                       </Text>
                     ) : (
                       <Tooltip
-                        label={`${l.self_churn_pct}% of replaced lines unasked · ${l.files_revisited} file(s) touched ${3}+ times`}
+                        label={`${l.self_churn_pct}% of replaced lines unasked · ${l.files_revisited} file(s) touched ${s?.revisit_at ?? ''}+ times`}
                         withArrow
                       >
                         <Text
@@ -1146,6 +1151,21 @@ export default function StatusPage() {
                 <Table.Th ta="right">Repos</Table.Th>
                 <Table.Th ta="right">Lines +</Table.Th>
                 <Table.Th ta="right">Churn</Table.Th>
+                <Table.Th ta="right">
+                  <Tooltip
+                    label="share of this agent's replaced lines that nobody asked for — the same split the branch table shows"
+                    withArrow
+                    multiline
+                    w={280}
+                  >
+                    <span>Unasked</span>
+                  </Tooltip>
+                </Table.Th>
+                <Table.Th ta="right">
+                  <Tooltip label="tests this agent's commands reported passing" withArrow>
+                    <span>Tests</span>
+                  </Tooltip>
+                </Table.Th>
                 <Table.Th ta="right">Sent</Table.Th>
                 <Table.Th ta="right">Written</Table.Th>
                 <Table.Th ta="right">Tok/line</Table.Th>
@@ -1163,6 +1183,11 @@ export default function StatusPage() {
                 const pct = add + del > 0 ? Math.round((del * 100) / (add + del)) : null
                 // Everything the turn cost, against what it left behind.
                 const cost = add > 0 ? Math.round((Number(a.in_tokens) + Number(a.out_tokens)) / add) : null
+                const churnTotal = Number(a.churn_directed) + Number(a.churn_self)
+                const unasked =
+                  churnTotal > 0 ? Math.round((Number(a.churn_self) * 100) / churnTotal) : null
+                const tests = Number(a.tests_passed) + Number(a.tests_failed)
+                const passPct = tests > 0 ? Math.round((Number(a.tests_passed) * 100) / tests) : null
                 return (
                   <Table.Tr key={a.name}>
                     <Table.Td>
@@ -1177,6 +1202,28 @@ export default function StatusPage() {
                     </Table.Td>
                     <Table.Td ta="right" c={pct != null && pct >= 50 ? 'red.4' : undefined}>
                       {pct == null ? '—' : `${pct}%`}
+                    </Table.Td>
+                    {/* Outcome, not volume (#350): two agents can write
+                        the same diff and only one was asked to rewrite
+                        what it rewrote, and only one's tests passed. */}
+                    <Table.Td ta="right" c={unasked != null && unasked >= 50 ? FAIL : undefined}>
+                      {unasked == null ? '—' : `${unasked}%`}
+                    </Table.Td>
+                    <Table.Td ta="right">
+                      {tests === 0 ? (
+                        <Text size="xs" c="dimmed">
+                          —
+                        </Text>
+                      ) : (
+                        <Tooltip
+                          label={`${a.tests_passed} passed · ${a.tests_failed} failed · ${a.compile_errors} compile error(s)`}
+                          withArrow
+                        >
+                          <Text size="xs" c={passPct != null && passPct >= 90 ? OK : FAIL}>
+                            {passPct}%
+                          </Text>
+                        </Tooltip>
+                      )}
                     </Table.Td>
                     <Table.Td ta="right">{fmtCompact(a.in_tokens)}</Table.Td>
                     <Table.Td ta="right">{fmtCompact(a.out_tokens)}</Table.Td>
@@ -1353,15 +1400,36 @@ export default function StatusPage() {
                       {Number(b.lines_added) === 0 ? '—' : `${Number(b.rework_pct)}%`}
                     </Table.Td>
                     <Table.Td ta="right">
-                      {Number(b.survival_p50_mins) === 0
-                        ? '—'
-                        : fmtAge(Number(b.survival_p50_mins) * 60)}
+                      {/* -1 is "nothing was rewritten". 0 is the WORST
+                          case — rewritten inside a minute — and used to
+                          render as a dash on exactly the row worth
+                          interrupting. */}
+                      {Number(b.survival_p50_mins) < 0 ? (
+                        <Text size="xs" c="dimmed">
+                          —
+                        </Text>
+                      ) : Number(b.survival_p50_mins) === 0 ? (
+                        <Tooltip label="rewritten within a minute" withArrow>
+                          <Text size="xs" c={FAIL}>
+                            &lt;1m
+                          </Text>
+                        </Tooltip>
+                      ) : (
+                        fmtAge(Number(b.survival_p50_mins) * 60)
+                      )}
                     </Table.Td>
                     <Table.Td ta="right">
                       {pass < 0 ? (
-                        <Tooltip label="this branch ran no tests" withArrow>
-                          <Text size="xs" c="dimmed">
-                            none
+                        <Tooltip
+                          label={
+                            Number(b.tests_run) > 0
+                              ? `${b.tests_run} test run(s), but no tally could be read from the output`
+                              : 'this branch ran no tests'
+                          }
+                          withArrow
+                        >
+                          <Text size="xs" c={Number(b.tests_run) > 0 ? 'yellow.5' : 'dimmed'}>
+                            {Number(b.tests_run) > 0 ? 'unread' : 'none'}
                           </Text>
                         </Tooltip>
                       ) : (

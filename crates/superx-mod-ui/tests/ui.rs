@@ -1728,3 +1728,62 @@ async fn churn_and_quality_separate_by_branch() {
     assert_eq!(ga.churn_self, 2);
     assert_eq!(ga.churn_directed, 0);
 }
+
+/// The outcome plumbing #354's review found untested: a command's
+/// tallies must reach the branch, the agent AND the reasoning level
+/// that ran it, and a failure must land on the branch whichever of the
+/// two resolution arms pairs it with its call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_outcomes_reach_branch_agent_and_effort() {
+    let kernel = fresh_kernel().await;
+    let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
+
+    // Output is scored when the CALL resolves the stashed text, so the
+    // result must be the NEWER message — logged second, seen first by
+    // a newest-first walk.
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/x", "effort": "high",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash",
+             "input": {"command": "cargo test --workspace"}}]}})).await;
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+            "is_error": false,
+            "content": "test result: ok. 7 passed; 2 failed; 0 ignored"}]}})).await;
+
+    // The OTHER arm, which is where the bug was: the CALL is seen first
+    // — so it is the newer message — and the verdict then resolves
+    // through `call_names`. That arm attributed to agents, models and
+    // repos but not branches, so a failing branch reported a clean
+    // failure rate and scored full marks on tool success.
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "t2",
+            "is_error": true}]}})).await;
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "t2", "name": "Bash",
+             "input": {"command": "cargo build"}}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    let b = s.branches.iter().find(|b| b.branch == "feat/x").expect("branch row");
+    assert_eq!(b.tests_passed, 7, "the tally reached the branch");
+    assert_eq!(b.tests_failed, 2);
+    assert_eq!(b.test_pass_pct, 77, "7 of 9");
+    assert_eq!(b.tests_run, 1, "one test invocation, so -1 could not mean 'never ran'");
+    // The point of the fix: the failure that resolved through the OTHER
+    // arm is on the branch, not silently dropped.
+    assert_eq!(b.tool_failures, 1, "the call-first failure reached the branch");
+    assert!(b.tool_calls >= 2, "calls = {}", b.tool_calls);
+
+    let a = s.agent_stats.iter().find(|a| a.name == "claude_code").expect("agent");
+    assert_eq!(a.tests_passed, 7, "and the agent, so agents compare on outcome");
+    assert_eq!(a.tests_failed, 2);
+
+    let e = s.efforts.iter().find(|e| e.name == "high").expect("effort row");
+    assert_eq!(e.tests_passed, 7, "efforts carried these fields and nothing ever set them");
+    assert_eq!(e.tests_failed, 2);
+}

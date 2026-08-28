@@ -231,6 +231,10 @@ pub struct StatsSummary {
     pub repos: Vec<RepoStat>,
     /// Per repo × BRANCH, worst quality first (#350).
     pub branches: Vec<BranchStat>,
+    /// The touch count at which a file counts as revisited, so the UI
+    /// states the threshold it is actually using instead of repeating
+    /// a literal that can drift from it (#354 review).
+    pub revisit_at: i64,
     pub models: Vec<ModelStat>,
     /// Sessions with a message in the last five minutes, busiest
     /// first — what is happening right now.
@@ -358,10 +362,12 @@ pub struct LiveSession {
     /// Reasoning tokens this session has spent. An idle session that
     /// is thinking is not the same as one blocked on a build.
     pub thinking_tokens: i64,
-    /// Seconds its newest long operation reported, when one did —
-    /// so a session parked on an eight-minute build says so instead
-    /// of reading as idle.
-    pub waiting_secs: i64,
+    /// How long its newest long operation took. `durationMs` rides
+    /// the line that CLOSES an operation, so this is elapsed time of
+    /// something finished — it cannot say the session is still blocked,
+    /// and an earlier version of this field claimed exactly that
+    /// (#354 review). Reported as context, never as a state.
+    pub last_op_secs: i64,
 
     // ── is it spiralling? the leading indicators (#350) ──────────
     /// Share of THIS session's replaced lines that nobody asked for.
@@ -398,6 +404,10 @@ pub struct BranchStat {
     /// that did not — design change vs agent going in circles.
     pub churn_directed: i64,
     pub churn_self: i64,
+    /// Test INVOCATIONS. With `test_pass_pct == -1`, this separates a
+    /// branch that never ran a suite from one whose output the scanner
+    /// could not parse — they are not the same thing (#354 review).
+    pub tests_run: i64,
     pub tests_passed: i64,
     pub tests_failed: i64,
     pub compile_errors: i64,
@@ -405,7 +415,8 @@ pub struct BranchStat {
     pub tool_failures: i64,
     pub reverts: i64,
     /// Minutes code survived here before something rewrote it.
-    /// Minutes means thrash; hours means the design moved.
+    /// Minutes means thrash; hours means the design moved. -1 when
+    /// nothing was rewritten, so 0 can mean what it says.
     pub survival_p50_mins: i64,
     pub edit_to_verify_p50_secs: i64,
     pub out_tokens: i64,

@@ -582,8 +582,16 @@ fn branch_derived(b: &BranchAgg) -> BranchDerived {
     // in a hundred calls read as 100, and zeroed the tool-success
     // component for any branch above a 1% failure rate.
     let failures_per_100 = pct(b.tool_failures, b.tool_calls);
-    let mut survivals = b.survivals.clone();
-    let survival_p50_mins = median(&mut survivals);
+    // -1 for NO data. `median` returns 0 for an empty slice, and a
+    // branch where everything was overwritten inside a minute also
+    // medians to 0 — so 0 was rendering as a dash on precisely the
+    // worst branch, while the blend docked it 10 points (#354 review).
+    let survival_p50_mins = if b.survivals.is_empty() {
+        -1
+    } else {
+        let mut survivals = b.survivals.clone();
+        median(&mut survivals)
+    };
     let mut gaps = b.verify_gaps.clone();
 
     let mut parts: Vec<(i64, i64)> = Vec::new();
@@ -692,6 +700,9 @@ struct BranchAgg {
     files: HashSet<String>,
     churn_directed: i64,
     churn_self: i64,
+    /// Test INVOCATIONS, so an unparsed run is distinguishable from a
+    /// branch that never ran one (#354 review).
+    tests_run: i64,
     tests_passed: i64,
     tests_failed: i64,
     compile_errors: i64,
@@ -724,12 +735,34 @@ struct LiveAgg {
     files_now: Vec<String>,
     doing: Option<String>,
     thinking_tokens: i64,
-    waiting_ms: i64,
+    last_op_ms: i64,
     churn_directed: i64,
     churn_self: i64,
     /// How many times each path was written in this session, for the
     /// rework-of-rework count.
     path_hits: HashMap<String, i64>,
+}
+
+/// What a live session is doing, strongest claim first. Three sites
+/// used to race with `get_or_insert_with`, so the state was decided by
+/// content-block ARRAY ORDER: a message emitting `[Read(lib.rs),
+/// Bash(cargo test)]` reported `reading` because the exposure branch
+/// ran first, and reversing the blocks changed the answer (#354
+/// review). Verifying beats writing beats reading, whatever order the
+/// blocks arrive in.
+fn doing_rank(state: &str) -> u8 {
+    match state {
+        "verifying" => 3,
+        "writing" => 2,
+        "reading" => 1,
+        _ => 0,
+    }
+}
+
+fn claim_doing(l: &mut LiveAgg, state: &str) {
+    if l.doing.as_deref().map(doing_rank).unwrap_or(0) < doing_rank(state) {
+        l.doing = Some(state.to_string());
+    }
 }
 
 /// How many paths the live panel names per row, and the touch count at
@@ -899,6 +932,7 @@ fn attribute_quality(
     code: &mut CodeAgg,
     branch_pair: &Option<(String, String)>,
     agent_name: &Option<String>,
+    effort: &Option<String>,
     (passed, failed, errors): (i64, i64, i64),
 ) {
     if passed == 0 && failed == 0 && errors == 0 {
@@ -915,6 +949,15 @@ fn attribute_quality(
         a.tests_passed += passed;
         a.tests_failed += failed;
         a.compile_errors += errors;
+    }
+    // `EffortStat` has carried these fields all along and nothing ever
+    // incremented them, so the API reported that every reasoning level
+    // had run zero tests. This is the third consumer of the same
+    // deltas (#354 review).
+    if let Some(e) = effort {
+        let ea = code.efforts.entry(e.clone()).or_default();
+        ea.tests_passed += passed;
+        ea.tests_failed += failed;
     }
 }
 
@@ -1072,7 +1115,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
     // carries NO model of its own, so a failure attributed from the
     // result would land on `unknown`; it belongs to whoever made the
     // call (#328).
-    let mut call_names: HashMap<String, (String, Option<String>, Option<String>)> = HashMap::new();
+    // Tool name, and the model / repo / BRANCH the CALL was made on —
+    // not the result message's, which may sit elsewhere. The branch was
+    // missing, so failures resolved through this arm never reached a
+    // branch row while `tool_calls` still counted them (#354 review).
+    type CallCtx = (String, Option<String>, Option<String>, Option<(String, String)>);
+    let mut call_names: HashMap<String, CallCtx> = HashMap::new();
     // Results seen before their call (the walk is newest-first).
     let mut pending_results: HashMap<String, bool> = HashMap::new();
     // Output text held until the call names the tool that produced it.
@@ -1164,12 +1212,13 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         if let Some(Value::Number(n)) = raw.get("durationMs") {
             if let Some(ms) = n.to_int().filter(|&v| v > 0) {
                 code.waits.push(ms);
-                // The newest long operation this session reported, so
-                // a row parked on a build can say so (#350).
+                // The newest long operation this session reported.
+                // Elapsed time of something FINISHED — context, not a
+                // claim that it is still running (#354 review).
                 {
                     let l = code.live.entry(superx_ops::record_uuid(&m.session)).or_default();
-                    if l.waiting_ms == 0 {
-                        l.waiting_ms = ms;
+                    if l.last_op_ms == 0 {
+                        l.last_op_ms = ms;
                     }
                 }
                 if code.slowest.len() < 400 {
@@ -1465,7 +1514,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     None => {
                                         call_names.insert(
                                             id.to_string(),
-                                            (name.clone(), Some(model.clone()), repo_key.clone()),
+                                            (
+                                                name.clone(),
+                                                Some(model.clone()),
+                                                repo_key.clone(),
+                                                branch_pair.clone(),
+                                            ),
                                         );
                                     }
                                 }
@@ -1477,7 +1531,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     Some(text) if SHELL_TOOLS.contains(&name.as_str()) => {
                                         let d = score_output(&text, &mut code, &hour_key);
                                         attribute_quality(
-                                            &mut code, &branch_pair, &agent_name, d,
+                                            &mut code, &branch_pair, &agent_name, &effort, d,
                                         );
                                     }
                                     // Output already seen but the tool
@@ -1510,11 +1564,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             // the session VERIFYING,
                                             // which `Bash` alone cannot
                                             // say (#350).
-                                            code.live
-                                                .entry(superx_ops::record_uuid(&m.session))
-                                                .or_default()
-                                                .doing
-                                                .get_or_insert_with(|| "verifying".to_string());
+                                            claim_doing(
+                                                code.live
+                                                    .entry(superx_ops::record_uuid(&m.session))
+                                                    .or_default(),
+                                                "verifying",
+                                            );
                                         }
                                     }
                                 }
@@ -1548,8 +1603,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                                 .live
                                                 .entry(superx_ops::record_uuid(&m.session))
                                                 .or_default();
-                                            l.doing
-                                                .get_or_insert_with(|| "reading".to_string());
+                                            claim_doing(l, "reading");
                                             if l.files_now.len() < LIVE_FILES
                                                 && !l.files_now.iter().any(|x| x == path)
                                             {
@@ -1636,7 +1690,15 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     }
                                     if let Some(pth) = get_str(input, "file_path") {
                                         b.files.insert(pth.to_string());
-                                        code.path_branch.insert(pth.to_string(), key.clone());
+                                        // Only a real write OWNS a path.
+                                        // Unguarded, every Read mapped
+                                        // its path to a branch for a
+                                        // files-created lookup that only
+                                        // ever asks about writes.
+                                        if n > 0 || replaced > 0 {
+                                            code.path_branch
+                                                .insert(pth.to_string(), key.clone());
+                                        }
                                     }
                                 }
                                 if let Some(rk) = &repo_key {
@@ -1726,7 +1788,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             l.files_now.push(pth.to_string());
                                         }
                                     }
-                                    l.doing.get_or_insert_with(|| "writing".to_string());
+                                    claim_doing(l, "writing");
                                 }
                                 {
                                     let mm = code.models.entry(model.clone()).or_default();
@@ -1828,6 +1890,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             if let Some(rk) = &repo_key {
                                                 code.repos.entry(rk.clone()).or_default().tests_run += 1;
                                             }
+                                            if let Some(key) = &branch_pair {
+                                                code.branches.entry(key.clone()).or_default().tests_run += 1;
+                                            }
                                         }
                                         if is_build {
                                             code.builds += 1;
@@ -1870,14 +1935,14 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     // The call already went by and it
                                     // was a shell: score immediately.
                                     let d = score_output(text, &mut code, &hour_key);
-                                    attribute_quality(&mut code, &branch_pair, &agent_name, d);
+                                    attribute_quality(&mut code, &branch_pair, &agent_name, &effort, d);
                                 } else {
                                     pending_output.insert(id.to_string(), text.to_string());
                                 }
                             }
 
                             match call_names.remove(id) {
-                                Some((name, call_model, call_repo)) => {
+                                Some((name, call_model, call_repo, call_branch)) => {
                                     let entry = outcomes.entry(name).or_default();
                                     if failed {
                                         entry.failed += 1;
@@ -1891,6 +1956,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                         }
                                         if let Some(cr) = call_repo {
                                             code.repos.entry(cr).or_default().tool_failures += 1;
+                                        }
+                                        if let Some(cb) = call_branch {
+                                            code.branches.entry(cb).or_default().tool_failures += 1;
                                         }
                                     } else {
                                         entry.ok += 1;
@@ -2266,6 +2334,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                             .unwrap_or(0),
                         churn_directed: b.churn_directed,
                         churn_self: b.churn_self,
+                        tests_run: b.tests_run,
                         tests_passed: b.tests_passed,
                         tests_failed: b.tests_failed,
                         compile_errors: b.compile_errors,
@@ -2291,11 +2360,19 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             // masquerade as the worst branch on the machine.
             v.sort_by(|a, b| {
                 let key = |s: &BranchStat| if s.quality_pct < 0 { i64::MAX } else { s.quality_pct };
-                key(a).cmp(&key(b)).then(b.messages.cmp(&a.messages))
+                // Final tiebreak by name, as every sibling sort does,
+                // so tied rows do not reshuffle between refreshes and
+                // change which survive the truncate (#354 review).
+                key(a)
+                    .cmp(&key(b))
+                    .then(b.messages.cmp(&a.messages))
+                    .then(a.repo.cmp(&b.repo))
+                    .then(a.branch.cmp(&b.branch))
             });
             v.truncate(16);
             v
         },
+        revisit_at: REVISIT_AT,
         repos: {
             let mut v: Vec<RepoStat> = code
                 .repos
@@ -2463,17 +2540,23 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                         // the silence IS rather than leaving it blank —
                         // reasoning, blocked on a long call, or simply
                         // quiet (#350).
+                        // No classifiable call: say what the silence
+                        // IS. `waiting` used to live here, inferred
+                        // from a `durationMs` that reports a FINISHED
+                        // operation — so it announced a session was
+                        // blocked on a build that had already returned,
+                        // and any session that ever reported a duration
+                        // could never read as quiet (#354 review). The
+                        // duration is still carried, as context.
                         doing: l.doing.clone().unwrap_or_else(|| {
                             if l.thinking_tokens > 0 {
                                 "thinking".to_string()
-                            } else if l.waiting_ms > 0 {
-                                "waiting".to_string()
                             } else {
                                 "quiet".to_string()
                             }
                         }),
                         thinking_tokens: l.thinking_tokens,
-                        waiting_secs: l.waiting_ms / 1000,
+                        last_op_secs: l.last_op_ms / 1000,
                         self_churn_pct: pct(
                             l.churn_self,
                             l.churn_directed + l.churn_self,

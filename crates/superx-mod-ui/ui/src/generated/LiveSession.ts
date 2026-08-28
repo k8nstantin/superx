@@ -43,11 +43,13 @@ doing: string,
  */
 thinking_tokens: bigint, 
 /**
- * Seconds its newest long operation reported, when one did —
- * so a session parked on an eight-minute build says so instead
- * of reading as idle.
+ * How long its newest long operation took. `durationMs` rides
+ * the line that CLOSES an operation, so this is elapsed time of
+ * something finished — it cannot say the session is still blocked,
+ * and an earlier version of this field claimed exactly that
+ * (#354 review). Reported as context, never as a state.
  */
-waiting_secs: bigint, 
+last_op_secs: bigint, 
 /**
  * Share of THIS session's replaced lines that nobody asked for.
  * Rising here is the agent starting to rewrite itself.

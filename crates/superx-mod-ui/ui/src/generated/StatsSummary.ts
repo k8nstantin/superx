@@ -192,7 +192,13 @@ interventions: bigint, repos: Array<RepoStat>,
 /**
  * Per repo × BRANCH, worst quality first (#350).
  */
-branches: Array<BranchStat>, models: Array<ModelStat>, 
+branches: Array<BranchStat>, 
+/**
+ * The touch count at which a file counts as revisited, so the UI
+ * states the threshold it is actually using instead of repeating
+ * a literal that can drift from it (#354 review).
+ */
+revisit_at: bigint, models: Array<ModelStat>, 
 /**
  * Sessions with a message in the last five minutes, busiest
  * first — what is happening right now.
