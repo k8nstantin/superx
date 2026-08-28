@@ -19,9 +19,27 @@
 //! worth following — all of that is the reader's judgement, and this
 //! module knows nothing about who the reader is.
 //!
-//! Module contract (epic #141): own database `superx/entities`, own
-//! service account, own dir, own log (`target: "entities"`), own CLI
-//! namespace.
+//! MODULE CONTRACT (D17). This is a self-contained mini-app, not a
+//! library the kernel calls into:
+//!
+//!   own database   `superx/entities`, with its own service account
+//!   own schema     `schema/entities.surql`, applied at provision
+//!   own directory  `modules/entities/`, for anything it puts on disk
+//!   own log        `target: "entities"`
+//!   own UI         its own server on its own port, publishing its URL
+//!                  to the substrate so the core dashboard finds it
+//!                  there and never through an import (D-UI2). The port
+//!                  parameter and the server arrive WITH the UI — code
+//!                  for a surface that does not exist yet is the same
+//!                  debt as code for one that no longer does.
+//!
+//! AND NO CLI, DELIBERATELY. The database is the interface: another
+//! module reads these tables, and a person uses the UI. A command
+//! namespace would be a third surface saying the same things in a third
+//! shape, and the last one drifted from the other two — it rendered
+//! prose that a reader then scraped for uuids. The trait's default
+//! answers `superx entities …` with "this module has no CLI", which is
+//! the truth.
 //!
 //! The schema is designed and locked first, code after (§11). This is
 //! the ground cleared and the foundation laid; the verbs land on top of
@@ -86,14 +104,6 @@ impl KernelModule for EntitiesModule {
 
     fn needs_dir(&self) -> bool {
         true
-    }
-
-    async fn cli(&self, _kernel: &Kernel, _args: &[String]) -> Result<String> {
-        Err(superx_kernel::KernelError::Module(
-            "entities: no verbs yet — the schema is laid, the code is being written \
-             on top of it (epic #353)"
-                .to_string(),
-        ))
     }
 }
 
