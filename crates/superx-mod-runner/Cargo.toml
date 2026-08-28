@@ -19,5 +19,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+superx-mod-entities = { path = "../superx-mod-entities" }
 surrealdb.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

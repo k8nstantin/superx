@@ -3814,6 +3814,7 @@ dependencies = [
  "serde",
  "serde_json",
  "superx-kernel",
+ "superx-mod-entities",
  "superx-ops",
  "surrealdb",
  "tokio",
