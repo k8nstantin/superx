@@ -45,7 +45,12 @@
 //! the ground cleared and the foundation laid; the verbs land on top of
 //! it.
 
+pub mod attribute;
+pub mod author;
+pub mod entity;
+
 use async_trait::async_trait;
+use superx_kernel::types::Value;
 use superx_kernel::{
     Kernel, KernelModule, KernelModuleDescriptor, NodeKind, Result, KERNEL_MODULES,
 };
@@ -109,3 +114,65 @@ impl KernelModule for EntitiesModule {
 
 #[linkme::distributed_slice(KERNEL_MODULES)]
 static ENTITIES_REGISTRATION: &'static (dyn KernelModule + Sync) = &EntitiesModule;
+
+/// A column that may be absent, with NONE and NULL both read as absent.
+pub(crate) fn obj_get(row: &Value, key: &str) -> Option<Value> {
+    match row {
+        Value::Object(o) => o
+            .get(key)
+            .filter(|v| !matches!(v, Value::None | Value::Null))
+            .cloned(),
+        _ => None,
+    }
+}
+
+pub(crate) fn obj_str(row: &Value, key: &str) -> Option<String> {
+    match obj_get(row, key) {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    }
+}
+
+pub(crate) fn obj_record(row: &Value, key: &str) -> Option<superx_kernel::types::RecordId> {
+    match obj_get(row, key) {
+        Some(Value::RecordId(r)) => Some(r),
+        _ => None,
+    }
+}
+
+pub(crate) fn obj_records(row: &Value, key: &str) -> Vec<superx_kernel::types::RecordId> {
+    match obj_get(row, key) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|i| match i {
+                Value::RecordId(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A `bool` column that may be absent. Absent is `false`.
+pub(crate) fn obj_bool(row: &Value, key: &str) -> bool {
+    matches!(obj_get(row, key), Some(Value::Bool(true)))
+}
+
+pub(crate) fn obj_display(row: &Value, key: &str) -> Option<String> {
+    obj_get(row, key).map(|v| match v {
+        Value::Datetime(d) => d.to_string(),
+        other => format!("{other:?}"),
+    })
+}
+
+/// The newest row of a small set, compared as PARSED datetimes. Lexical
+/// RFC3339 comparison is a trap: the engine's rendering is not
+/// guaranteed to sort the way the instants do.
+pub(crate) fn newest_by_valid_from(rows: &[Value]) -> Option<&Value> {
+    rows.iter().max_by_key(|r| {
+        obj_display(r, "valid_from")
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+    })
+}

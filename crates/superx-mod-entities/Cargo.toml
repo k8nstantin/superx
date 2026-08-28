@@ -1,23 +1,16 @@
 [package]
 name = "superx-mod-entities"
-description = "The product graph substrate: typed entities as nodes, native SurrealDB edges, text-as-entity, full append-only history"
+description = "Entities, attributes and edges — the substrate a product or a role is designed in"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-axum.workspace = true
 chrono.workspace = true
 linkme.workspace = true
-mime_guess = "2"
-rust-embed = "8"
-serde.workspace = true
-serde_json.workspace = true
-ts-rs.workspace = true
 superx-kernel = { path = "../superx-kernel" }
 superx-ops = { path = "../superx-ops" }
-tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 uuid.workspace = true
 
