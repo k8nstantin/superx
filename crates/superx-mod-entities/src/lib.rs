@@ -87,6 +87,45 @@ pub const DEFAULT_UI_PORT: u16 = 5151; // skill-allow: §9-const — bootstrap f
 /// finds it in the substrate and never through code coupling.
 pub const MODULE_UI_URL_PARAM: &str = "attr_module_ui_url";
 
+/// The core dashboard's registry name, and the parameter carrying its
+/// port. Named here as SUBSTRATE COORDINATES, not as a dependency: this
+/// crate does not import `superx-mod-ui`, it looks the core dashboard up
+/// where every module publishes itself (D-UI2). If the core UI is not
+/// registered, or not running, the answer is simply "no way home shown"
+/// — never a hardcoded guess at someone else's port.
+const CORE_UI_MODULE: &str = "ui";
+const CORE_UI_PORT_PARAM: &str = "attr_ui_port";
+
+/// Where the core dashboard lives, for this instance, right now.
+///
+/// A module on its own port is a dead end without this: the operator
+/// arrives from the core UI and the browser's back button is not a
+/// control they can see. Resolved ONCE at startup and handed to the
+/// service, so it costs nothing per request.
+pub async fn core_dashboard_url(kernel: &Kernel) -> Option<String> {
+    let entity = kernel
+        .find_module_by_name(NodeKind::KernelModule, CORE_UI_MODULE)
+        .await
+        .ok()
+        .flatten()?;
+    // The universal convention first — a module that publishes its URL
+    // has already answered the question, wherever it is listening.
+    if let Ok(Some(Value::String(url))) =
+        kernel.get_parameter(entity.clone(), MODULE_UI_URL_PARAM).await
+    {
+        return Some(url);
+    }
+    // Else its port, which is what the core UI actually publishes today.
+    match kernel.get_parameter(entity, CORE_UI_PORT_PARAM).await {
+        Ok(Some(Value::Number(n))) => n
+            .to_int()
+            .and_then(|i| u16::try_from(i).ok())
+            .filter(|&p| p > 0)
+            .map(|p| format!("http://127.0.0.1:{p}")),
+        _ => None,
+    }
+}
+
 /// How many hops the graph opens at.
 pub const DEFAULT_GRAPH_DEPTH: usize = 2; // skill-allow: §9-const — bootstrap fallback, param-overridable
 

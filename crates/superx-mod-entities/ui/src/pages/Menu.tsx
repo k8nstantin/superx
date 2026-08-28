@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  Alert,
   Badge,
   Button,
   Card,
@@ -137,7 +138,21 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
 
       <Card withBorder padding="md">
         {roots.isLoading && <Loader size="sm" />}
-        {roots.data?.length === 0 && (
+        {/* SAY WHAT WENT WRONG. This rendered an empty box when the read
+            failed, so an unprovisioned instance looked like a blank page
+            with no explanation — the reader cannot tell "nothing here"
+            from "this is broken". */}
+        {roots.error && (
+          <Alert color="red" title="Cannot read entities">
+            <Text size="sm">{String(roots.error)}</Text>
+            <Text size="xs" c="dimmed" mt="xs">
+              If this says a table does not exist, the module's database has not been
+              provisioned into this shape yet: retire the old one with
+              schema/retire-v1.surql, then run superx modules provision entities.
+            </Text>
+          </Alert>
+        )}
+        {!roots.error && roots.data?.length === 0 && (
           <Text c="dimmed" size="sm">
             Nothing yet. Add an entity above.
           </Text>

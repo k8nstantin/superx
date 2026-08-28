@@ -1,5 +1,7 @@
 import { useState } from 'react'
-import { AppShell, Group, Tabs, Text, Title } from '@mantine/core'
+import { useQuery } from '@tanstack/react-query'
+import { AppShell, Button, Container, Group, Tabs, Text, Title } from '@mantine/core'
+import { fetchPing } from './api'
 import MenuTab from './pages/Menu'
 import EntityTab from './pages/Entity'
 import GraphTab from './pages/Graph'
@@ -18,6 +20,8 @@ import GraphTab from './pages/Graph'
 export default function App() {
   const [open, setOpen] = useState<string | null>(null)
   const [tab, setTab] = useState<string | null>('menu')
+  const ping = useQuery({ queryKey: ['ping'], queryFn: fetchPing })
+  const core = ping.data?.core_url ?? null
 
   const openEntity = (uuid: string) => {
     setOpen(uuid)
@@ -27,7 +31,24 @@ export default function App() {
   return (
     <AppShell header={{ height: 52 }} padding="md">
       <AppShell.Header>
-        <Group h="100%" px="md" gap="sm" wrap="nowrap">
+        <Group h="100%" px="md" gap="md" wrap="nowrap">
+          {/* BACK TO SUPERX. This module runs on its own port, so
+              without a way home the operator is stranded on it — the
+              dashboard it came from is a different origin, and the
+              browser's back button is not a substitute for a control
+              that is visibly there. The URL comes from the substrate
+              (D-UI2), never hardcoded, so moving the core UI does not
+              strand anyone. */}
+          <Button
+            component="a"
+            href={core ?? '/'}
+            variant="subtle"
+            size="compact-sm"
+            leftSection="←"
+            disabled={!core}
+          >
+            SuperX
+          </Button>
           <Title order={4}>entities</Title>
           <Text size="xs" c="dimmed" ff="monospace">
             uuid7 · attributes · edges
@@ -35,6 +56,10 @@ export default function App() {
         </Group>
       </AppShell.Header>
       <AppShell.Main>
+        {/* A COLUMN, NOT THE WHOLE MONITOR. Short labels and form rows
+            stretched across a wide screen are unreadable, and the tree
+            looked like a list floating in a void. */}
+        <Container size="lg" px={0}>
         {/* keepMounted, deliberately. The header above promises the menu
             keeps its place; MenuTab holds that place in local state, so
             unmounting it collapsed every expanded branch and refetched
@@ -60,6 +85,7 @@ export default function App() {
             {open && <GraphTab frag={open} onOpen={openEntity} />}
           </Tabs.Panel>
         </Tabs>
+        </Container>
       </AppShell.Main>
     </AppShell>
   )

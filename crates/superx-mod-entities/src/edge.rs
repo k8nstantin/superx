@@ -200,6 +200,21 @@ pub async fn sources(db: &Db) -> Result<std::collections::HashSet<String>> {
     Ok(live(resp.take(0)?).into_iter().map(|e| record_uuid(&e.from)).collect())
 }
 
+/// Which entities have at least one live edge pointing AT them, in one
+/// read.
+///
+/// The menu needs it to know what a root is: a tree whose top level is
+/// every entity is not a tree, it is a list — and a child then appears
+/// twice, once at the root and once under its parent.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn targets(db: &Db) -> Result<std::collections::HashSet<String>> {
+    let mut resp = db.query("SELECT *, in, out FROM entity_edge").await?;
+    Ok(live(resp.take(0)?).into_iter().map(|e| record_uuid(&e.to)).collect())
+}
+
 /// Every version of one edge, oldest first — including every time it was
 /// cut and put back.
 ///

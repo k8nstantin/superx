@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ActionIcon,
@@ -60,6 +60,21 @@ export default function EntityTab({
   const e = useQuery({ queryKey: ['entity', frag], queryFn: () => fetchEntity(frag) })
   const [design, setDesign] = useState(false)
   const [dragged, setDragged] = useState<LayoutItem[] | null>(null)
+  const gridBox = useRef<HTMLDivElement>(null)
+  const [gridWidth, setGridWidth] = useState(0)
+  useEffect(() => {
+    const box = gridBox.current
+    if (!box) return
+    const ro = new ResizeObserver(([entry]) =>
+      setGridWidth(entry.contentRect.width),
+    )
+    ro.observe(box)
+    setGridWidth(box.clientWidth)
+    return () => ro.disconnect()
+    // Re-observe when the fields first render: the box does not exist
+    // while the entity is loading, so a mount-only effect would attach
+    // to nothing and leave the grid at zero forever.
+  }, [e.data?.uuid])
   const dirty = dragged !== null
 
   // A DECLARATION IS NOT A FIELD. An attribute carrying labels and no
@@ -175,10 +190,15 @@ export default function EntityTab({
       <Link frag={frag} />
       <AddField frag={frag} />
 
+      {/* THE GRID NEEDS A NUMBER, THE PAGE HAS A WIDTH. react-grid-layout
+          computes column geometry in pixels, so a hardcoded width either
+          overflows a narrow window or leaves a gutter on a wide one.
+          Measure the column the fields actually sit in. */}
+      <div ref={gridBox}>
       <GridLayout
         className="layout"
         layout={layout}
-        width={1100}
+        width={gridWidth}
         gridConfig={{ cols: COLS, rowHeight: 28 }}
         // Dragging is OFF until you turn design on, and a click inside a
         // field must never start a drag — otherwise typing moves the box.
@@ -199,6 +219,7 @@ export default function EntityTab({
           </div>
         ))}
       </GridLayout>
+      </div>
 
       {e.data.links.length > 0 && (
         <Card withBorder padding="md" mt="md">

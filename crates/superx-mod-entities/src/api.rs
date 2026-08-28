@@ -243,7 +243,17 @@ pub async fn children(
     Ok(out)
 }
 
-/// Every entity, for the top of the menu.
+/// The TOP of the menu: entities nothing points at.
+///
+/// A tree whose first level is every entity is a list, and a child shows
+/// up twice — once at the root and once under its parent. A root is
+/// something with no live edge pointing at it; everything else is
+/// reachable by expanding, which is what the tree is for.
+///
+/// An entity that only has edges pointing IN and none out is still
+/// reachable from its parent. One caught in a cycle with no way in from
+/// outside would not be — so anything unreachable is surfaced rather
+/// than hidden.
 ///
 /// # Errors
 ///
@@ -252,12 +262,19 @@ pub async fn roots(db: &Db, include_archived: bool) -> Result<Vec<TreeNodeView>>
     // ONE read of every entity's attributes, and one name lookup per
     // DISTINCT label. Asking per row turned the first screen into
     // thousands of round trips.
-    let ids = entity::list(db, include_archived).await?;
-    let held = attribute::of_many(db, &ids, false).await?;
-    // AND ONE READ FOR "DOES THIS OPEN". Asking `edge::of` per row was
-    // the same N+1 the comment above claims to have removed — 500
-    // entities meant 500 scans of the edge table.
+    let all = entity::list(db, include_archived).await?;
+    // AND ONE READ EACH for "does this open" and "is this a root".
     let parents = edge::sources(db).await?;
+    let children = edge::targets(db).await?;
+    let ids: Vec<RecordId> = all
+        .iter()
+        .filter(|id| !children.contains(&record_uuid(id)))
+        .cloned()
+        .collect();
+    // Nothing unreachable is hidden: an entity every path points into
+    // but none leads out of would otherwise vanish from the menu.
+    let ids = if ids.is_empty() { all } else { ids };
+    let held = attribute::of_many(db, &ids, false).await?;
     let mut names = NameCache::default();
     let mut out = Vec::new();
     for id in &ids {

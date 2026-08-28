@@ -32,6 +32,9 @@ struct Assets;
 #[derive(Clone)]
 struct AppState {
     db: superx_kernel::Db,
+    /// The core dashboard, resolved from the substrate at startup so the
+    /// module's header can offer a way back to it.
+    core_url: Option<String>,
 }
 
 /// Bind and spawn the entities service.
@@ -45,6 +48,7 @@ pub async fn spawn(kernel: &Kernel, db: superx_kernel::Db, port: u16) -> Result<
     // it the socket stays bound after shutdown and a re-enable cannot
     // bind.
     let stop = kernel.module_token(MODULE_NAME);
+    let core_url = crate::core_dashboard_url(kernel).await;
     let app = Router::new()
         .route("/api/ping", get(ping))
         .route("/api/entities", get(list).post(create))
@@ -55,7 +59,7 @@ pub async fn spawn(kernel: &Kernel, db: superx_kernel::Db, port: u16) -> Result<
         .route("/api/entities/{frag}/link", post(link))
         .route("/api/entities/{frag}/archive", post(archive))
         .fallback(get(assets))
-        .with_state(AppState { db });
+        .with_state(AppState { db, core_url });
 
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -80,10 +84,11 @@ fn fail(e: KernelError) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, e.to_string())
 }
 
-async fn ping() -> Json<serde_json::Value> {
+async fn ping(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "module": MODULE_NAME,
         "version": env!("CARGO_PKG_VERSION"),
+        "core_url": state.core_url,
     }))
 }
 
