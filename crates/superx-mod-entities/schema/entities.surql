@@ -17,16 +17,30 @@
 --
 --   an entity     uuid7 · name 'DBA'          · labels [role]
 --   a field       uuid7 · name 'house_rules'  · labels [mandate]  · content
---   an edge       uuid7 · name 'runs on'      · labels [contains] · content = another entity
---                 (datatype 'link' — that is the whole of what makes
---                  a field an edge)
+--   an edge       uuid7 · name 'runs backups' · labels [contains] · and
+--                 the thing at the other end
 --   a label       uuid7 · name 'role'         · labels [label]
 --
--- THERE IS NO EDGE TABLE AND NO LABEL TABLE. An edge is a field whose
--- content is a link to another entity; what the connection MEANS is its
--- labels. A label is an entity carrying the label `label`; what it means
--- is a field on it. Both extend by writing data, never by changing this
--- file.
+-- AN EDGE IS A CUSTOM FIELD THAT POINTS AT SOMETHING. It carries a
+-- name, labels, history and an author exactly as any other field does;
+-- the only difference is where it is STORED — as a native relation, so
+-- the engine can walk it.
+--
+-- That difference is not decoration. Roles and products get deep, and a
+-- link kept as an ordinary field can only be followed one level per
+-- query: to continue you must look up the next entity's fields, which is
+-- not a path the engine can traverse. Probed on this engine, a native
+-- relation answers the whole thing at once —
+--
+--     entity:x.{..6}->(edge WHERE …)->entity
+--
+-- walks six levels, filtered to the labels you care about, in ONE query,
+-- and returns the nested subtree. Six round trips against one is the
+-- difference between a graph you can read and a graph you assemble.
+--
+-- THERE IS NO LABEL TABLE. A label is an entity carrying the label
+-- `label`; what it means is a field on it. New labels and new link kinds
+-- are data, never a change to this file.
 --
 -- MANY LABELS, EVERYWHERE, and all optional. A rule can be a `mandate`
 -- and a `constraint` at once; a connection can be a `link` and a
@@ -67,7 +81,7 @@ DEFINE USER IF NOT EXISTS superx_mod_entities ON DATABASE
     ROLES EDITOR
     DURATION FOR TOKEN 1h, FOR SESSION NONE;
 
--- --------------------------------------------------------------- 1 of 3 --
+-- --------------------------------------------------------------- 1 of 4 --
 -- THE ANCHOR. A uuid7 and the instant it came into being — nothing that
 -- can ever change, which is exactly what makes it safe for every label
 -- reference and every link in the database to point at it forever.
@@ -80,7 +94,7 @@ DEFINE TABLE IF NOT EXISTS entity SCHEMAFULL
 
 DEFINE FIELD IF NOT EXISTS created_at ON TABLE entity TYPE datetime;
 
--- --------------------------------------------------------------- 2 of 3 --
+-- --------------------------------------------------------------- 2 of 4 --
 -- WHAT THE THING IS RIGHT NOW: its name and its labels. Renaming,
 -- relabelling, deleting and undoing are all the same act — append a new
 -- version. Current is the latest valid_from for the anchor.
@@ -112,7 +126,7 @@ DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE entity_state TYPE option<string>
 DEFINE INDEX IF NOT EXISTS idx_entity_state_chain
     ON TABLE entity_state FIELDS entity, valid_from;
 
--- --------------------------------------------------------------- 3 of 3 --
+-- --------------------------------------------------------------- 3 of 4 --
 -- THE FIELDS. Constructed exactly like a thing — uuid7, name, labels —
 -- plus what they belong to and what they hold.
 --
@@ -143,14 +157,7 @@ DEFINE FIELD IF NOT EXISTS name     ON TABLE field TYPE string;
 DEFINE FIELD IF NOT EXISTS labels   ON TABLE field TYPE option<array<record<entity>>>
     ASSERT $value == NONE OR array::all($value, |$l| record::exists($l));
 DEFINE FIELD IF NOT EXISTS datatype ON TABLE field TYPE string;
--- A LINK MUST RESOLVE, exactly as a label must. `$this` reaches the
--- sibling column, so the check applies only where it means something: a
--- field declared `link` must point at an entity that exists, and a field
--- holding prose is untouched by it. Without this a link to nothing is
--- storable, and it is the same silent wrong as a dangling label —
--- something that reads as a connection with nothing at the other end.
-DEFINE FIELD IF NOT EXISTS content  ON TABLE field TYPE any
-    ASSERT $this.datatype != 'link' OR record::exists($value);
+DEFINE FIELD IF NOT EXISTS content  ON TABLE field TYPE any;
 DEFINE FIELD IF NOT EXISTS active     ON TABLE field TYPE bool;
 DEFINE FIELD IF NOT EXISTS valid_from ON TABLE field TYPE datetime;
 DEFINE FIELD IF NOT EXISTS author_kind ON TABLE field TYPE option<string>;
@@ -161,9 +168,39 @@ DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE field TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS idx_field_chain  ON TABLE field FIELDS uid, valid_from;
 -- Everything said about one thing — the read every reader makes.
 DEFINE INDEX IF NOT EXISTS idx_field_entity ON TABLE field FIELDS entity, valid_from;
--- WHAT POINTS AT THIS. Following a link forwards is free — the links are
--- fields of the entity you already hold. Backwards is the question a
--- graph normally needs a second edge direction to answer, and without
--- this index it is a table scan. EXPLAIN confirms the engine takes it:
--- `WHERE content = entity:x` plans as an IndexScan on this index.
-DEFINE INDEX IF NOT EXISTS idx_field_content ON TABLE field FIELDS content;
+
+-- --------------------------------------------------------------- 4 of 4 --
+-- THE LINKS. A custom field like any other — uid, name, labels, history,
+-- author — stored as a native relation so the graph can be WALKED.
+--
+-- The engine holds record pointers, so a hop costs a node's degree and
+-- never the table size, and it goes both ways for free: `->edge->` for
+-- what this points at, `<-edge<-` for what points at it. ENFORCED means
+-- an edge to an anchor that does not exist is refused, which is the same
+-- guarantee the label ASSERT gives.
+--
+-- Linking appends a row with a fresh uid. UNLINKING appends another on
+-- the SAME uid with active = false, and undoing appends a third — so a
+-- connection that was cut is still on the record, with who cut it.
+DEFINE TABLE IF NOT EXISTS edge SCHEMAFULL TYPE RELATION IN entity OUT entity ENFORCED
+    PERMISSIONS
+        FOR select FULL
+        FOR create FULL
+        FOR update NONE
+        FOR delete NONE;
+
+DEFINE FIELD IF NOT EXISTS uid    ON TABLE edge TYPE string;
+DEFINE FIELD IF NOT EXISTS name   ON TABLE edge TYPE string;
+-- WHAT THE CONNECTION MEANS. Same mechanism, same enforcement as
+-- everywhere else: `contains`, `depends_on`, `consults` are entities.
+DEFINE FIELD IF NOT EXISTS labels ON TABLE edge TYPE option<array<record<entity>>>
+    ASSERT $value == NONE OR array::all($value, |$l| record::exists($l));
+DEFINE FIELD IF NOT EXISTS active     ON TABLE edge TYPE bool;
+DEFINE FIELD IF NOT EXISTS valid_from ON TABLE edge TYPE datetime;
+-- Granting reach IS an edge — a role linked to a credential linked to a
+-- target — so who linked it is the authorization record itself.
+DEFINE FIELD IF NOT EXISTS author_kind ON TABLE edge TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS author_uid  ON TABLE edge TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE edge TYPE option<string>;
+
+DEFINE INDEX IF NOT EXISTS idx_edge_chain ON TABLE edge FIELDS uid, valid_from;
