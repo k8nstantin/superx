@@ -31,7 +31,7 @@ struct Assets;
 
 #[derive(Clone)]
 struct AppState {
-    kernel: Kernel,
+    db: superx_kernel::Db,
 }
 
 /// Bind and spawn the entities service.
@@ -39,7 +39,7 @@ struct AppState {
 /// # Errors
 ///
 /// [`KernelError::Module`] when the port cannot be bound.
-pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
+pub async fn spawn(kernel: &Kernel, db: superx_kernel::Db, port: u16) -> Result<()> {
     // Stop means stop: the kernel cancels this token on disable or
     // restart and axum closes the listener, releasing the port. Without
     // it the socket stays bound after shutdown and a re-enable cannot
@@ -55,7 +55,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/entities/{frag}/link", post(link))
         .route("/api/entities/{frag}/archive", post(archive))
         .fallback(get(assets))
-        .with_state(AppState { kernel });
+        .with_state(AppState { db });
 
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -71,16 +71,6 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         }
     });
     Ok(())
-}
-
-/// The module's own db, or an honest error. Unprovisioned is a real
-/// state, not a bug: the OS runs and this module waits.
-async fn db(state: &AppState) -> std::result::Result<superx_kernel::Db, (StatusCode, String)> {
-    state
-        .kernel
-        .module_db(MODULE_NAME)
-        .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("not provisioned: {e}")))
 }
 
 fn fail(e: KernelError) -> (StatusCode, String) {
@@ -107,16 +97,16 @@ async fn list(
     State(state): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> std::result::Result<Json<Vec<api::TreeNodeView>>, (StatusCode, String)> {
-    let db = db(&state).await?;
-    api::roots(&db, q.archived).await.map(Json).map_err(fail)
+    let db = &state.db;
+    api::roots(db, q.archived).await.map(Json).map_err(fail)
 }
 
 async fn create(
     State(state): State<AppState>,
     Json(req): Json<api::CreateReq>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let db = db(&state).await?;
-    let uuid = api::create(&db, &req, &Author::operator()).await.map_err(fail)?;
+    let db = &state.db;
+    let uuid = api::create(db, &req, &Author::operator()).await.map_err(fail)?;
     Ok(Json(serde_json::json!({ "uuid": uuid })))
 }
 
@@ -124,8 +114,8 @@ async fn detail(
     State(state): State<AppState>,
     AxumPath(frag): AxumPath<String>,
 ) -> std::result::Result<Json<api::EntityView>, (StatusCode, String)> {
-    let db = db(&state).await?;
-    api::detail(&db, &frag).await.map(Json).map_err(fail)
+    let db = &state.db;
+    api::detail(db, &frag).await.map(Json).map_err(fail)
 }
 
 #[derive(Deserialize)]
@@ -138,8 +128,8 @@ async fn children(
     AxumPath(frag): AxumPath<String>,
     Query(q): Query<LabelQuery>,
 ) -> std::result::Result<Json<Vec<api::TreeNodeView>>, (StatusCode, String)> {
-    let db = db(&state).await?;
-    api::children(&db, &frag, q.label.as_deref()).await.map(Json).map_err(fail)
+    let db = &state.db;
+    api::children(db, &frag, q.label.as_deref()).await.map(Json).map_err(fail)
 }
 
 #[derive(Deserialize)]
@@ -153,9 +143,9 @@ async fn graph(
     AxumPath(frag): AxumPath<String>,
     Query(q): Query<GraphQuery>,
 ) -> std::result::Result<Json<api::GraphView>, (StatusCode, String)> {
-    let db = db(&state).await?;
+    let db = &state.db;
     let depth = q.depth.unwrap_or(crate::DEFAULT_GRAPH_DEPTH).clamp(1, crate::MAX_GRAPH_DEPTH);
-    api::graph(&db, &frag, q.label.as_deref(), depth).await.map(Json).map_err(fail)
+    api::graph(db, &frag, q.label.as_deref(), depth).await.map(Json).map_err(fail)
 }
 
 async fn put_attribute(
@@ -163,8 +153,8 @@ async fn put_attribute(
     AxumPath(frag): AxumPath<String>,
     Json(req): Json<api::AttributeReq>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let db = db(&state).await?;
-    let uid = api::put_attribute(&db, &frag, &req, &Author::operator()).await.map_err(fail)?;
+    let db = &state.db;
+    let uid = api::put_attribute(db, &frag, &req, &Author::operator()).await.map_err(fail)?;
     Ok(Json(serde_json::json!({ "uid": uid })))
 }
 
@@ -173,8 +163,8 @@ async fn link(
     AxumPath(frag): AxumPath<String>,
     Json(req): Json<api::LinkReq>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let db = db(&state).await?;
-    let uid = api::link(&db, &frag, &req, &Author::operator()).await.map_err(fail)?;
+    let db = &state.db;
+    let uid = api::link(db, &frag, &req, &Author::operator()).await.map_err(fail)?;
     Ok(Json(serde_json::json!({ "uid": uid })))
 }
 
@@ -188,12 +178,12 @@ async fn archive(
     AxumPath(frag): AxumPath<String>,
     Json(req): Json<ArchiveReq>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let db = db(&state).await?;
-    let id = crate::entity::resolve(&db, &frag).await.map_err(fail)?;
+    let db = &state.db;
+    let id = crate::entity::resolve(db, &frag).await.map_err(fail)?;
     let changed = if req.archived {
-        crate::entity::archive(&db, &id, &Author::operator()).await
+        crate::entity::archive(db, &id, &Author::operator()).await
     } else {
-        crate::entity::unarchive(&db, &id, &Author::operator()).await
+        crate::entity::unarchive(db, &id, &Author::operator()).await
     }
     .map_err(fail)?;
     Ok(Json(serde_json::json!({ "changed": changed })))

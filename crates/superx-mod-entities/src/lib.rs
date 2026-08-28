@@ -52,6 +52,19 @@ pub mod edge;
 pub mod entity;
 mod server;
 
+/// Start the module's service against a database the caller already
+/// has. The dev harness (`examples/demo.rs`) uses it to drive the
+/// dashboard without a provisioned instance; startup uses it with the
+/// module's own db.
+///
+/// # Errors
+///
+/// [`KernelError::Module`](superx_kernel::KernelError::Module) when the
+/// port cannot be bound.
+pub async fn serve(kernel: &Kernel, db: superx_kernel::Db, port: u16) -> Result<()> {
+    server::spawn(kernel, db, port).await
+}
+
 use async_trait::async_trait;
 use superx_kernel::types::Value;
 use superx_kernel::{
@@ -134,18 +147,29 @@ impl KernelModule for EntitiesModule {
         // Provisioning is an operator step. An unprovisioned module must
         // not fail the boot walk: the OS runs, and the module waits for
         // `superx modules provision entities`.
-        match kernel.module_db(MODULE_NAME).await {
-            Ok(_) => tracing::info!(target: "entities", "substrate ready"),
-            Err(e) => tracing::warn!(
-                target: "entities",
-                "own db unavailable — entity verbs disabled until provisioned: {e}"
-            ),
-        }
+        // Resolve the db ONCE. Unprovisioned is a real state, not a
+        // bug — the OS runs and this module waits for
+        // `superx modules provision entities` — so the service simply
+        // does not come up rather than answering every request with a
+        // 503 it could have known about at boot.
+        let db = match kernel.module_db(MODULE_NAME).await {
+            Ok(db) => {
+                tracing::info!(target: "entities", "substrate ready");
+                db
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "entities",
+                    "own db unavailable — module idle until provisioned: {e}"
+                );
+                return Ok(());
+            }
+        };
         // The module's OWN service on its OWN port, and its URL
         // published to the substrate so the core dashboard discovers it
         // there rather than by importing anything (D-UI2).
         let port = resolved_ui_port(kernel).await;
-        server::spawn(kernel.clone(), port).await?;
+        server::spawn(kernel, db, port).await?;
         let url = format!("http://127.0.0.1:{port}");
         if let Ok(Some(entity)) =
             kernel.find_module_by_name(NodeKind::KernelModule, MODULE_NAME).await
