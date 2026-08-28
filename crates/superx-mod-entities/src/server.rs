@@ -11,7 +11,8 @@
 //! There is no second path into the data.
 
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -20,6 +21,13 @@ use superx_kernel::{Kernel, KernelError, Result};
 use crate::api;
 use crate::author::Author;
 use crate::MODULE_NAME;
+
+/// The built dashboard (Vite output). Debug builds read from disk, so
+/// `npm run build` is enough to see a change; release builds embed the
+/// files in the binary, so the module ships as one artefact.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "ui/dist/"]
+struct Assets;
 
 #[derive(Clone)]
 struct AppState {
@@ -46,6 +54,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/entities/{frag}/graph", get(graph))
         .route("/api/entities/{frag}/link", post(link))
         .route("/api/entities/{frag}/archive", post(archive))
+        .fallback(get(assets))
         .with_state(AppState { kernel });
 
     let addr = format!("127.0.0.1:{port}");
@@ -188,4 +197,18 @@ async fn archive(
     }
     .map_err(fail)?;
     Ok(Json(serde_json::json!({ "changed": changed })))
+}
+
+/// Serve the built UI, falling back to `index.html` so a deep link
+/// reloads instead of 404ing.
+async fn assets(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let file = if path.is_empty() { "index.html" } else { path };
+    match Assets::get(file).or_else(|| Assets::get("index.html")) {
+        Some(content) => {
+            let mime = mime_guess::from_path(file).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "no ui built").into_response(),
+    }
 }

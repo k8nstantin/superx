@@ -3779,6 +3779,8 @@ dependencies = [
  "axum",
  "chrono",
  "linkme",
+ "mime_guess",
+ "rust-embed",
  "serde",
  "serde_json",
  "superx-kernel",
