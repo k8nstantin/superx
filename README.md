@@ -31,7 +31,31 @@ superx read <fragment> --live  # one conversation: history, then live
 superx actions --live          # the action stream as it happens
 ```
 
-### 2. Everything above capture is a module
+### 2. Models the work as a graph
+
+The entities module is the substrate a product or a role is designed in. Three tables, and one idea.
+
+- **An entity is a uuid7.** Like a social security number: you can change your name and you are still you. So the row holds nothing that can change, and every edge and every label anchors to it — a rename cannot ripple through the graph, because the name was never in the graph.
+- **Everything else is an attribute** — its name included. Any number, of five datatypes: `text`, `number`, `boolean`, `datetime`, `json`. Each has its own history, its own author and its own labels.
+- **A label is an entity.** `role` is a row, and what `role` MEANS is an attribute on it. There is no label table and no type registry: a new label or a new kind of connection is data, never a migration.
+- **An edge is an attribute the engine can walk** — a native relation, so following a deep graph costs a node's degree rather than a round trip per level.
+- **Nothing here interprets anything.** The module enforces two things: a label must exist, and a value must be what its datatype says. What a role does, whether a mandate binds, which links are worth following — the reader's judgement. A test pins it: a label called `role` behaves exactly like one called `zzz`.
+
+![A product graph](superx-mod-website/img/graph.png)
+
+**The database is the interface.** There is no `superx entities` command: a person uses the dashboard, and another module reads the tables. A third surface saying the same things in a third shape is how the last one drifted.
+
+Each entity carries its real ancestor path, and the module ships its own dashboard on its own port:
+
+![An entity, with its ancestor path](superx-mod-website/img/entity.png)
+
+### 3. Runs it (being rebuilt)
+
+The scheduler is being rebuilt. The previous one reached into the entities module's internals, which the module contract forbids — modules depend on the kernel, never on each other — and it has been removed rather than patched around.
+
+What replaces it reads the substrate: an ordered list of entities in its own parameters, and a walk of each one's graph. Entities does not know it exists, and will not.
+
+### 4. Everything above capture is a module
 
 The kernel owns boot, capture, the telemetry stream, the substrate verbs and the module registry. Every other capability is a module that gets, by contract: its own database (`superx/<name>`) and service account, its own directory, log target, CLI namespace, substrate parameters, UUIDv7 identity, and optionally its own HTTP UI discovered from the substrate. Modules depend on the kernel and never on each other; several of a kind can coexist; they can be enabled and disabled on a running OS, and one failing to register does not stop the rest from booting.
 
@@ -40,7 +64,10 @@ The kernel owns boot, capture, the telemetry stream, the substrate verbs and the
 | `kernel` | substrate, boot, module registry | `superx status · logs` |
 | `capture` | the capture loop over every discovered agent | `superx agents · sessions · read` |
 | `ui` | the core dashboard — status, live feed, sessions, console | `superx ui url` |
+| `entities` | entities, attributes, edges + its own dashboard | its own port; no CLI |
 | `hello` | the contribution template | `superx hello greet` |
+
+![The entity list](superx-mod-website/img/entities.png)
 
 ---
 
@@ -61,6 +88,7 @@ Upgrades are `git pull`, `cargo build`, `superx restart` — the schema self-upg
 | crate | lines | what it is |
 |---|---:|---|
 | `superx-kernel` | 7.5k | substrate verbs, boot, capture engine, adapters, telemetry, module registry |
+| `superx-mod-entities` | 1.5k | entities, attributes and edges, its HTTP API and its own React dashboard |
 | `superx-mod-ui` | 3.1k | the core dashboard: typed API, SSE, four pages |
 | `superx` | 1.6k | the CLI and the initialize/lifecycle flow |
 | `superx-ops` | 0.7k | shared runners and renderers |
