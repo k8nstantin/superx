@@ -40,36 +40,43 @@
 -- file never changes to add one.
 --
 --
--- FIVE DATATYPES, AND THE SCREEN DRAWS ITSELF -------------------------
+-- FIVE DATATYPES, AND THAT IS THE WHOLE OF IT ------------------------
 --
---   text      a string      → a rich text editor, always
---   number    int or float  → a numeric input
---   boolean   true / false  → a checkbox
---   datetime  an instant    → a date and time picker
---   json      object/array  → a structured editor
+--   text      → the editor. Always. Big, and resizable.
+--   json      → the SAME editor. Only the storage differs.
+--   number    → a small numeric box
+--   boolean   → a checkbox
+--   datetime  → a box just wide enough for a date
 --
--- The datatype says what the value IS. How it is EDITED follows from it
--- with no configuration, which is the whole point: add a `text`
--- attribute and you get an editor, without anyone writing a screen.
--- Every system that solves this splits the two — Directus has `type` and
--- `interface`, JSON Schema has `schema` and `uiSchema` — and every one
--- of them derives a default so the common case needs nothing.
+-- ONE RENDERING PER DATATYPE, and two of them share it. There is no
+-- widget layer, no interface setting, no type-to-control mapping to
+-- configure. An email is `text` with a label that says `email`; a url is
+-- `text` with a label that says `url`; a price is `number` with a label
+-- that says what it is. The LABEL carries the meaning — that is what
+-- labels are for — and adding twenty-five field kinds would be
+-- twenty-five ways for data to be wrong in exchange for nothing.
+--
+-- WHY `json` EXISTS AT ALL, given it edits like text. Because the
+-- database can see INSIDE it and cannot see inside a string. Probed:
+-- stored as `json`, `content.replicas` reads 3 and
+-- `WHERE content.replicas > 2` finds the row; the identical bytes stored
+-- as `text` return NONE and match nothing. It is not for a person typing
+-- into a form — it is for what an agent writes back, so structured
+-- output stays queryable instead of becoming a lump that has to be
+-- re-parsed forever.
 --
 -- `text` IS ALWAYS THE SAME EDITOR. Two text attributes on one entity
--- are the same widget; what makes one a description and the other a
--- comment is the LABEL it carries, never a different control.
+-- get the same control; one is a description and one is a comment
+-- because of the label they carry, never because of a different widget.
 --
--- The richer types other tools offer — email, url, currency, percent,
--- rating, colour, select — are WIDGETS over these five, not storage of
--- their own. That is how a handful of real types becomes twenty-five
--- field kinds without twenty-five ways for data to be wrong.
+-- FIELDS STACK IN THE ORDER THEY WERE ADDED, and that costs nothing to
+-- store: uuid7 is time-ordered, so creation order IS the record id
+-- order. Add a description and get an editor; add another text labelled
+-- `comment` and it sits below it; add a date and get a small box under
+-- that. No ordering column, no layout step, no screen to build.
 --
--- `options` is the per-attribute override: a width, a placeholder, a
--- choice list. Absent means the default, which is the usual case. The
--- SCREEN for a whole kind of thing lives elsewhere and needs nothing
--- here — it is an attribute on the LABEL, because a label is an entity
--- and can hold one. Design `role` once and everything carrying `role`
--- renders that way.
+-- `options` is where a resize lands, and anything else one particular
+-- field wants. Absent in the ordinary case, which is nearly all of them.
 --
 -- WHAT THE STORE CANNOT DO FOR US. `content` is `any`, so the engine
 -- cannot check that a `number` holds a number — the warning every
@@ -78,10 +85,6 @@
 -- That is not a nicety here; it is the only thing standing where a
 -- column type normally stands.
 --
--- MANY LABELS, ALL OPTIONAL, everywhere — and MANY EDGES between the
--- same two entities, each with its own name, labels and history. Nothing
--- is single-valued, because the moment one thing is, something true
--- cannot be written down.
 --
 -- WHAT THIS MODULE ENFORCES, and it is only this: every label named must
 -- exist, and no edge may point at an entity that does not. What a role
