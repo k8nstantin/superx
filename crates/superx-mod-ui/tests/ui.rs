@@ -1636,3 +1636,154 @@ async fn a_live_row_carries_effort_and_both_halves_of_the_churn() {
     assert_eq!(row.lines_added, 4, "3 from the Write, 1 from the Edit's new_string");
     assert_eq!(row.lines_removed, 2, "the Edit replaced two lines");
 }
+
+/// Branch is a DIMENSION, not a label (#350). Two branches worked in
+/// one repo must separate — and each must carry its own churn split,
+/// its own outcome and its own quality, or one cannot be said to be
+/// worse than the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn churn_and_quality_separate_by_branch() {
+    let kernel = fresh_kernel().await;
+    let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
+    let (a2, s2) = seed_agent_and_session(&kernel, "gemini_cli", "bbb").await;
+
+    let write = |branch: &str, path: &str, body: &str| serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": branch,
+        "message": {"model": "claude-opus-5", "usage": {"output_tokens": 10},
+            "content": [{"type": "tool_use", "id": "w", "name": "Write",
+                "input": {"file_path": path, "content": body}}]}});
+    let edit = |branch: &str, path: &str, old: &str, new: &str| serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": branch,
+        "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
+            "input": {"file_path": path, "old_string": old, "new_string": new}}]}});
+
+    // Branch A: writes three lines and never rewrites them.
+    log_tool_message(&kernel, &s1, &a1, write("feat/good", "/w/superx/a.rs", "a\nb\nc")).await;
+    // Branch B, same repo: writes one line then rewrites two, with no
+    // human turn behind it — self-churn.
+    log_tool_message(&kernel, &s2, &a2, write("feat/bad", "/w/superx/b.rs", "x")).await;
+    log_tool_message(&kernel, &s2, &a2, edit("feat/bad", "/w/superx/b.rs", "one\ntwo", "uno")).await;
+
+    // A failing call on the bad branch, so the failure RATE is
+    // exercised: `pct` already scales by 100, and multiplying before
+    // it made one failure in a hundred calls read as a hundred.
+    log_tool_message(&kernel, &s2, &a2, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/bad",
+        "message": {"content": [{"type": "tool_use", "id": "b1", "name": "Bash",
+            "input": {"command": "ls /nope"}}]}})).await;
+    // The verdict rides a LATER message: the walk is newest-first, so
+    // the result must be seen before the call it belongs to.
+    log_tool_message(&kernel, &s2, &a2, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/bad",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "b1", "is_error": true}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // One repo, but TWO branch rows — the separation is the point.
+    assert_eq!(s.repos.len(), 1, "both branches are the same checkout");
+    let br = |name: &str| {
+        s.branches.iter().find(|b| b.branch == name).unwrap_or_else(|| {
+            panic!("no row for {name}: {:?}",
+                s.branches.iter().map(|b| (&b.repo, &b.branch)).collect::<Vec<_>>())
+        })
+    };
+    assert_eq!(s.branches.len(), 2, "{:?}",
+        s.branches.iter().map(|b| &b.branch).collect::<Vec<_>>());
+
+    let good = br("feat/good");
+    assert_eq!(good.repo, "superx");
+    assert_eq!(good.lines_added, 3);
+    assert_eq!(good.lines_removed, 0, "nothing was rewritten here");
+    assert_eq!(good.self_churn_pct, 0);
+    assert_eq!(good.agents, 1);
+
+    let bad = br("feat/bad");
+    assert_eq!(bad.lines_added, 2, "1 from the Write, 1 from the Edit");
+    assert_eq!(bad.lines_removed, 2, "the Edit replaced two lines");
+    assert_eq!(bad.churn_self, 2, "no human turn preceded it");
+    assert_eq!(bad.churn_directed, 0);
+    assert_eq!(bad.self_churn_pct, 100, "every replaced line was unasked");
+    assert_eq!(bad.rework_pct, 100, "it removed as much as it added");
+    // 1 failure across 3 calls is 33 per 100 — not 100, which is what
+    // a double scaling produced.
+    assert_eq!(bad.tool_calls, 3, "Write, Edit and the Bash");
+    assert_eq!(bad.tool_failures, 1);
+    assert_eq!(bad.failures_per_100, 33, "one in three, not saturated");
+
+    // Quality ranks them, and the worse branch sorts FIRST — the one
+    // with the most to fix is the one to look at.
+    assert!(bad.quality_pct >= 0 && good.quality_pct >= 0, "both are scorable");
+    assert!(bad.quality_pct < good.quality_pct,
+        "bad={} good={}", bad.quality_pct, good.quality_pct);
+    assert_eq!(s.branches[0].branch, "feat/bad", "worst first");
+
+    // No tests ran on either, so the pass rate must read as ABSENT
+    // rather than as total failure.
+    assert_eq!(good.test_pass_pct, -1, "untested is not failed");
+
+    // The agent dimension carries the same split, so agents compare on
+    // outcome and not just volume.
+    let ga = s.agent_stats.iter().find(|a| a.name == "gemini_cli").expect("gemini");
+    assert_eq!(ga.churn_self, 2);
+    assert_eq!(ga.churn_directed, 0);
+}
+
+/// The outcome plumbing #354's review found untested: a command's
+/// tallies must reach the branch, the agent AND the reasoning level
+/// that ran it, and a failure must land on the branch whichever of the
+/// two resolution arms pairs it with its call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_outcomes_reach_branch_agent_and_effort() {
+    let kernel = fresh_kernel().await;
+    let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
+
+    // Output is scored when the CALL resolves the stashed text, so the
+    // result must be the NEWER message — logged second, seen first by
+    // a newest-first walk.
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/x", "effort": "high",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash",
+             "input": {"command": "cargo test --workspace"}}]}})).await;
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+            "is_error": false,
+            "content": "test result: ok. 7 passed; 2 failed; 0 ignored"}]}})).await;
+
+    // The OTHER arm, which is where the bug was: the CALL is seen first
+    // — so it is the newer message — and the verdict then resolves
+    // through `call_names`. That arm attributed to agents, models and
+    // repos but not branches, so a failing branch reported a clean
+    // failure rate and scored full marks on tool success.
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "t2",
+            "is_error": true}]}})).await;
+    log_tool_message(&kernel, &s1, &a1, serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "t2", "name": "Bash",
+             "input": {"command": "cargo build"}}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    let b = s.branches.iter().find(|b| b.branch == "feat/x").expect("branch row");
+    assert_eq!(b.tests_passed, 7, "the tally reached the branch");
+    assert_eq!(b.tests_failed, 2);
+    assert_eq!(b.test_pass_pct, 77, "7 of 9");
+    assert_eq!(b.tests_run, 1, "one test invocation, so -1 could not mean 'never ran'");
+    // The point of the fix: the failure that resolved through the OTHER
+    // arm is on the branch, not silently dropped.
+    assert_eq!(b.tool_failures, 1, "the call-first failure reached the branch");
+    assert!(b.tool_calls >= 2, "calls = {}", b.tool_calls);
+
+    let a = s.agent_stats.iter().find(|a| a.name == "claude_code").expect("agent");
+    assert_eq!(a.tests_passed, 7, "and the agent, so agents compare on outcome");
+    assert_eq!(a.tests_failed, 2);
+
+    let e = s.efforts.iter().find(|e| e.name == "high").expect("effort row");
+    assert_eq!(e.tests_passed, 7, "efforts carried these fields and nothing ever set them");
+    assert_eq!(e.tests_failed, 2);
+}

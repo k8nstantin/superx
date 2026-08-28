@@ -229,6 +229,12 @@ pub struct StatsSummary {
 
     // ── the repo and model dimensions (#325, #328) ────────────────
     pub repos: Vec<RepoStat>,
+    /// Per repo × BRANCH, worst quality first (#350).
+    pub branches: Vec<BranchStat>,
+    /// The touch count at which a file counts as revisited, so the UI
+    /// states the threshold it is actually using instead of repeating
+    /// a literal that can drift from it (#354 review).
+    pub revisit_at: i64,
     pub models: Vec<ModelStat>,
     /// Sessions with a message in the last five minutes, busiest
     /// first — what is happening right now.
@@ -343,6 +349,90 @@ pub struct LiveSession {
     pub tool_failures: i64,
     /// Seconds since its newest message.
     pub idle_secs: i64,
+
+    // ── what it is doing RIGHT NOW (#350) ────────────────────────
+    /// The paths its newest calls touched, most recent first. An idle
+    /// row that names three files is legible; one that names none is
+    /// a number.
+    pub files_now: Vec<String>,
+    /// A classified state rather than a raw tool name: `writing`,
+    /// `verifying`, `reading`, `thinking`, `waiting`. `Bash` alone
+    /// does not distinguish `cargo test` from `ls`.
+    pub doing: String,
+    /// Reasoning tokens this session has spent. An idle session that
+    /// is thinking is not the same as one blocked on a build.
+    pub thinking_tokens: i64,
+    /// How long its newest long operation took. `durationMs` rides
+    /// the line that CLOSES an operation, so this is elapsed time of
+    /// something finished — it cannot say the session is still blocked,
+    /// and an earlier version of this field claimed exactly that
+    /// (#354 review). Reported as context, never as a state.
+    pub last_op_secs: i64,
+
+    // ── is it spiralling? the leading indicators (#350) ──────────
+    /// Share of THIS session's replaced lines that nobody asked for.
+    /// Rising here is the agent starting to rewrite itself.
+    pub self_churn_pct: i64,
+    /// Files it has touched three or more times in the window.
+    /// Rework of rework — the compounding signal, and the one worth
+    /// interrupting on.
+    pub files_revisited: i64,
+}
+
+/// One BRANCH of one repo (issue #350). `RepoStat` collapses every
+/// branch worked in a repo into a single row and keeps the newest
+/// branch name as a label, so a branch landing a feature and a branch
+/// thrashing sum to steady progress across both — the same blindness
+/// the work cube fixed for agent × repo × hour.
+///
+/// The derived figures at the bottom are the answer to "which branch
+/// has the most to fix": each stands alone, and `quality_pct` blends
+/// them by the weights documented on `branch_quality`.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct BranchStat {
+    pub repo: String,
+    pub branch: String,
+    pub messages: i64,
+    pub sessions: i64,
+    pub agents: i64,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub files_touched: i64,
+    pub files_created: i64,
+    /// Replaced lines that followed a human instruction, and those
+    /// that did not — design change vs agent going in circles.
+    pub churn_directed: i64,
+    pub churn_self: i64,
+    /// Test INVOCATIONS. With `test_pass_pct == -1`, this separates a
+    /// branch that never ran a suite from one whose output the scanner
+    /// could not parse — they are not the same thing (#354 review).
+    pub tests_run: i64,
+    pub tests_passed: i64,
+    pub tests_failed: i64,
+    pub compile_errors: i64,
+    pub tool_calls: i64,
+    pub tool_failures: i64,
+    pub reverts: i64,
+    /// Minutes code survived here before something rewrote it.
+    /// Minutes means thrash; hours means the design moved. -1 when
+    /// nothing was rewritten, so 0 can mean what it says.
+    pub survival_p50_mins: i64,
+    pub edit_to_verify_p50_secs: i64,
+    pub out_tokens: i64,
+    pub last_active: String,
+    // ── derived reads, each meaningful on its own ────────────────
+    /// Share of replaced lines that nobody asked for. The spaghetti
+    /// signal: high here with a short half-life is an agent circling.
+    pub self_churn_pct: i64,
+    /// Removed against added — how much of the work undid work.
+    pub rework_pct: i64,
+    /// -1 when the branch ran no tests, so "untested" cannot be
+    /// mistaken for "failed everything".
+    pub test_pass_pct: i64,
+    pub failures_per_100: i64,
+    /// The blend. -1 when nothing measurable happened on the branch.
+    pub quality_pct: i64,
 }
 
 /// Per-model outcomes (issue #328): which model actually produces
@@ -421,6 +511,12 @@ pub struct AgentStat {
     /// Compactions it sat through, and the time they took.
     pub compactions: i64,
     pub compaction_ms: i64,
+    // ── outcome, so agents compare on more than volume (#350) ────
+    pub churn_directed: i64,
+    pub churn_self: i64,
+    pub tests_passed: i64,
+    pub tests_failed: i64,
+    pub compile_errors: i64,
 }
 
 /// What left this machine, and what the vendor retained (operator ask

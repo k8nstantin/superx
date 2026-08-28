@@ -14,9 +14,7 @@ use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
-    AgentStat, ChurnPoint, CompactionStat, WorkCell, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount,
-    QualityPoint, RepoStat,
-    SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome,
+    AgentStat, BranchStat, ChurnPoint, CompactionStat, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount, QualityPoint, RepoStat, SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome, WorkCell,
 };
 
 /// Telemetry window backing the events/min timeline (same bound the
@@ -365,6 +363,13 @@ struct CodeAgg {
     interventions: i64,
     // ── the repo and model dimensions (#325, #328) ───────────────
     repos: HashMap<String, RepoAgg>,
+    /// Per (repo, branch) — the dimension `repos` collapses (#350).
+    branches: HashMap<(String, String), BranchAgg>,
+    /// Newest branch each session was on, so post-walk reductions
+    /// keyed by session (verify gaps) can reach a branch.
+    session_branch: HashMap<String, (String, String)>,
+    /// Path → the (repo, branch) that owned it, for files-created.
+    path_branch: HashMap<String, (String, String)>,
     models: HashMap<String, ModelAgg>,
     /// Outcomes per reasoning level (#337).
     efforts: HashMap<String, EffortAgg>,
@@ -514,6 +519,112 @@ struct AgentAgg {
     verify_gaps: Vec<i64>,
     compactions: i64,
     compaction_ms: i64,
+    // ── outcome, not volume (#350) ───────────────────────────────
+    /// Two agents can write the same number of lines and only one of
+    /// them was asked to rewrite what it rewrote.
+    churn_directed: i64,
+    churn_self: i64,
+    tests_passed: i64,
+    tests_failed: i64,
+    compile_errors: i64,
+}
+
+/// A branch's quality as five components and one blend (#350).
+///
+/// The weights are HERE, in the open, and the UI renders every
+/// component beside the blend — a composite nobody can audit is worse
+/// than no composite. Each sub-score is 0..100 with 100 good:
+///
+/// | weight | component | why it carries that much |
+/// |---|---|---|
+/// | 30 | steering — `100 - self_churn_pct` | rewriting with nobody asking is the spaghetti signal |
+/// | 25 | keep rate — `100 - rework_pct` | work that undid work |
+/// | 20 | test pass rate | whether it actually ran |
+/// | 15 | tool success | an agent fighting its tools |
+/// | 10 | durability — half-life against `DURABLE_MINS` | thrash vs a design that moved |
+///
+/// A component with NO data is dropped and the remaining weights are
+/// renormalised, so a branch that ran no tests does not read like a
+/// branch whose tests all failed. When nothing at all is measurable
+/// the blend is -1, which the UI renders as a dash.
+const DURABLE_MINS: i64 = 120; // skill-allow: §9-const — analysis scale, render-layer
+
+fn pct(part: i64, whole: i64) -> i64 {
+    if whole <= 0 {
+        return 0;
+    }
+    (part * 100 / whole).clamp(0, 100)
+}
+
+/// Every derived figure a branch row carries. Computed together
+/// because they all come from the same aggregate and the blend needs
+/// each of them — nine loose arguments was the wrong shape for one
+/// question about one struct.
+struct BranchDerived {
+    self_churn_pct: i64,
+    rework_pct: i64,
+    test_pass_pct: i64,
+    failures_per_100: i64,
+    survival_p50_mins: i64,
+    edit_to_verify_p50_secs: i64,
+    quality_pct: i64,
+}
+
+fn branch_derived(b: &BranchAgg) -> BranchDerived {
+    let churn = b.churn_directed + b.churn_self;
+    let tests = b.tests_passed + b.tests_failed;
+    let self_churn_pct = pct(b.churn_self, churn);
+    let rework_pct = pct(b.lines_removed, b.lines_added);
+    // -1, not 0: a branch that ran no tests must not read like one
+    // whose tests all failed.
+    let test_pass_pct = if tests > 0 { pct(b.tests_passed, tests) } else { -1 };
+    // `pct` already scales by 100 — multiplying first made one failure
+    // in a hundred calls read as 100, and zeroed the tool-success
+    // component for any branch above a 1% failure rate.
+    let failures_per_100 = pct(b.tool_failures, b.tool_calls);
+    // -1 for NO data. `median` returns 0 for an empty slice, and a
+    // branch where everything was overwritten inside a minute also
+    // medians to 0 — so 0 was rendering as a dash on precisely the
+    // worst branch, while the blend docked it 10 points (#354 review).
+    let survival_p50_mins = if b.survivals.is_empty() {
+        -1
+    } else {
+        let mut survivals = b.survivals.clone();
+        median(&mut survivals)
+    };
+    let mut gaps = b.verify_gaps.clone();
+
+    let mut parts: Vec<(i64, i64)> = Vec::new();
+    if churn > 0 {
+        parts.push((30, 100 - self_churn_pct));
+    }
+    if b.lines_added > 0 {
+        parts.push((25, (100 - rework_pct).clamp(0, 100)));
+    }
+    if test_pass_pct >= 0 {
+        parts.push((20, test_pass_pct));
+    }
+    if b.tool_calls > 0 {
+        parts.push((15, (100 - failures_per_100).clamp(0, 100)));
+    }
+    if !b.survivals.is_empty() {
+        parts.push((10, pct(survival_p50_mins, DURABLE_MINS)));
+    }
+    let weight: i64 = parts.iter().map(|(w, _)| w).sum();
+
+    BranchDerived {
+        self_churn_pct,
+        rework_pct,
+        test_pass_pct,
+        failures_per_100,
+        survival_p50_mins,
+        edit_to_verify_p50_secs: median(&mut gaps),
+        quality_pct: if weight == 0 {
+            -1
+        } else {
+            parts.iter().map(|(w, s)| w * s).sum::<i64>() / weight
+        },
+    }
 }
 
 /// The middle value, or zero for nothing (#340).
@@ -576,6 +687,34 @@ struct ModelAgg {
     reverts: i64,
 }
 
+/// One branch of one repo (#350). Everything `RepoAgg` carries, plus
+/// the outcome fields that previously only existed globally — a branch
+/// with no quality attached cannot be compared to another.
+#[derive(Default)]
+struct BranchAgg {
+    messages: i64,
+    sessions: HashSet<String>,
+    agents: HashSet<String>,
+    lines_added: i64,
+    lines_removed: i64,
+    files: HashSet<String>,
+    churn_directed: i64,
+    churn_self: i64,
+    /// Test INVOCATIONS, so an unparsed run is distinguishable from a
+    /// branch that never ran one (#354 review).
+    tests_run: i64,
+    tests_passed: i64,
+    tests_failed: i64,
+    compile_errors: i64,
+    tool_calls: i64,
+    tool_failures: i64,
+    reverts: i64,
+    out_tokens: i64,
+    last_active: Option<chrono::DateTime<chrono::Utc>>,
+    survivals: Vec<i64>,
+    verify_gaps: Vec<i64>,
+}
+
 /// What one session is doing, for the live panel (#325).
 #[derive(Default)]
 struct LiveAgg {
@@ -591,7 +730,45 @@ struct LiveAgg {
     out_tokens: i64,
     tool_failures: i64,
     newest: Option<chrono::DateTime<chrono::Utc>>,
+    // ── #350: what it is doing, and whether it is circling ───────
+    /// Newest-first, capped — the walk sees the freshest calls first.
+    files_now: Vec<String>,
+    doing: Option<String>,
+    thinking_tokens: i64,
+    last_op_ms: i64,
+    churn_directed: i64,
+    churn_self: i64,
+    /// How many times each path was written in this session, for the
+    /// rework-of-rework count.
+    path_hits: HashMap<String, i64>,
 }
+
+/// What a live session is doing, strongest claim first. Three sites
+/// used to race with `get_or_insert_with`, so the state was decided by
+/// content-block ARRAY ORDER: a message emitting `[Read(lib.rs),
+/// Bash(cargo test)]` reported `reading` because the exposure branch
+/// ran first, and reversing the blocks changed the answer (#354
+/// review). Verifying beats writing beats reading, whatever order the
+/// blocks arrive in.
+fn doing_rank(state: &str) -> u8 {
+    match state {
+        "verifying" => 3,
+        "writing" => 2,
+        "reading" => 1,
+        _ => 0,
+    }
+}
+
+fn claim_doing(l: &mut LiveAgg, state: &str) {
+    if l.doing.as_deref().map(doing_rank).unwrap_or(0) < doing_rank(state) {
+        l.doing = Some(state.to_string());
+    }
+}
+
+/// How many paths the live panel names per row, and the touch count at
+/// which a file counts as revisited (#350).
+const LIVE_FILES: usize = 4; // skill-allow: §9-const — render-layer cap
+const REVISIT_AT: i64 = 3; // skill-allow: §9-const — analysis threshold, render-layer
 
 #[derive(Default)]
 struct SessAgg {
@@ -670,8 +847,12 @@ fn count_word(w: &str) -> &str {
 /// What a shell command printed, mined for outcomes (issue #327).
 /// Test tallies come from the shapes real runners emit; diagnostics
 /// from compiler prefixes.
-fn score_output(text: &str, code: &mut CodeAgg, hour_key: &str) {
-    let before = (code.tests_passed, code.tests_failed);
+/// Returns what THIS run contributed — passed, failed, compile errors
+/// — so the caller can attribute it to the branch and the agent that
+/// produced it (#350). The hour bucket is attributed here because it
+/// has no other caller; branch and agent do.
+fn score_output(text: &str, code: &mut CodeAgg, hour_key: &str) -> (i64, i64, i64) {
+    let before = (code.tests_passed, code.tests_failed, code.compile_errors);
     let lines: Vec<&str> = text.lines().collect();
     let scan: Vec<&&str> = if lines.len() <= SCAN_EDGE * 2 {
         lines.iter().collect()
@@ -737,6 +918,47 @@ fn score_output(text: &str, code: &mut CodeAgg, hour_key: &str) {
     let slot = code.quality.entry(hour_key.to_string()).or_insert((0, 0, 0));
     slot.0 += code.tests_passed - before.0;
     slot.1 += code.tests_failed - before.1;
+    (
+        code.tests_passed - before.0,
+        code.tests_failed - before.1,
+        code.compile_errors - before.2,
+    )
+}
+
+/// Hang one command's outcome on the branch and the agent that ran it
+/// (#350). Both are the point: a branch cannot be ranked without an
+/// outcome, and an agent compared on volume alone is not compared.
+fn attribute_quality(
+    code: &mut CodeAgg,
+    branch_pair: &Option<(String, String)>,
+    agent_name: &Option<String>,
+    effort: &Option<String>,
+    (passed, failed, errors): (i64, i64, i64),
+) {
+    if passed == 0 && failed == 0 && errors == 0 {
+        return;
+    }
+    if let Some(key) = branch_pair {
+        let b = code.branches.entry(key.clone()).or_default();
+        b.tests_passed += passed;
+        b.tests_failed += failed;
+        b.compile_errors += errors;
+    }
+    if let Some(an) = agent_name {
+        let a = code.agents.entry(an.clone()).or_default();
+        a.tests_passed += passed;
+        a.tests_failed += failed;
+        a.compile_errors += errors;
+    }
+    // `EffortStat` has carried these fields all along and nothing ever
+    // incremented them, so the API reported that every reasoning level
+    // had run zero tests. This is the third consumer of the same
+    // deltas (#354 review).
+    if let Some(e) = effort {
+        let ea = code.efforts.entry(e.clone()).or_default();
+        ea.tests_passed += passed;
+        ea.tests_failed += failed;
+    }
 }
 
 /// One in-engine `count() GROUP ALL` over a table.
@@ -893,7 +1115,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
     // carries NO model of its own, so a failure attributed from the
     // result would land on `unknown`; it belongs to whoever made the
     // call (#328).
-    let mut call_names: HashMap<String, (String, Option<String>, Option<String>)> = HashMap::new();
+    // Tool name, and the model / repo / BRANCH the CALL was made on —
+    // not the result message's, which may sit elsewhere. The branch was
+    // missing, so failures resolved through this arm never reached a
+    // branch row while `tool_calls` still counted them (#354 review).
+    type CallCtx = (String, Option<String>, Option<String>, Option<(String, String)>);
+    let mut call_names: HashMap<String, CallCtx> = HashMap::new();
     // Results seen before their call (the walk is newest-first).
     let mut pending_results: HashMap<String, bool> = HashMap::new();
     // Output text held until the call names the tool that produced it.
@@ -985,6 +1212,15 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         if let Some(Value::Number(n)) = raw.get("durationMs") {
             if let Some(ms) = n.to_int().filter(|&v| v > 0) {
                 code.waits.push(ms);
+                // The newest long operation this session reported.
+                // Elapsed time of something FINISHED — context, not a
+                // claim that it is still running (#354 review).
+                {
+                    let l = code.live.entry(superx_ops::record_uuid(&m.session)).or_default();
+                    if l.last_op_ms == 0 {
+                        l.last_op_ms = ms;
+                    }
+                }
                 if code.slowest.len() < 400 {
                     code.slowest.push(SlowOp {
                         label: get_str(raw, "slug")
@@ -1060,8 +1296,18 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             a.messages += 1;
             a.sessions.insert(sid_now.clone());
         }
-        // Which repo the agent was standing in (#308, #325).
+        // Which repo the agent was standing in (#308, #325), and which
+        // branch of it (#350).
         let repo_key = get_str(raw, "cwd").map(|c| c.rsplit('/').next().unwrap_or(c).to_string());
+        let branch_key =
+            get_str(raw, "gitBranch").filter(|b| !b.is_empty()).map(str::to_string);
+        // The (repo, branch) pair, present only when both are known —
+        // a write with no branch belongs to no branch row rather than
+        // to a guessed one.
+        let branch_pair: Option<(String, String)> = repo_key
+            .as_ref()
+            .zip(branch_key.as_ref())
+            .map(|(r, b)| (r.clone(), b.clone()));
         if let Some(rk) = &repo_key {
             let sid = superx_ops::record_uuid(&m.session);
             let l = code.live.entry(sid).or_default();
@@ -1101,6 +1347,22 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             }
             if let Some(b) = get_str(raw, "gitBranch").filter(|b| !b.is_empty()) {
                 r.branch.get_or_insert_with(|| b.to_string());
+            }
+            // The branch dimension (#350). `repos` keeps the newest
+            // branch as a LABEL; this keys on it, so two branches in
+            // one repo stop summing into one row.
+            if let Some(bk) = &branch_key {
+                let key = (rk.clone(), bk.clone());
+                // Newest-first, so the first sighting is the branch the
+                // session is on now.
+                code.session_branch.entry(sid_now.clone()).or_insert_with(|| key.clone());
+                let b = code.branches.entry(key).or_default();
+                b.messages += 1;
+                b.sessions.insert(sid_now.clone());
+                b.agents.insert(superx_ops::record_uuid(&m.agent));
+                if b.last_active.is_none_or(|prev| when > prev) {
+                    b.last_active = Some(when);
+                }
             }
         }
         if let Some(cwd) = get_str(raw, "cwd") {
@@ -1167,8 +1429,18 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                             .out_tokens += out;
                     }
                 }
+                if let Some(key) = &branch_pair {
+                    code.branches.entry(key.clone()).or_default().out_tokens += out;
+                }
                 if let Some(Value::Object(details)) = usage.get("output_tokens_details") {
-                    code.thinking += get_int(details, "thinking_tokens");
+                    let th = get_int(details, "thinking_tokens");
+                    code.thinking += th;
+                    // Per session (#350): idle-because-reasoning reads
+                    // differently from idle-because-blocked.
+                    code.live
+                        .entry(superx_ops::record_uuid(&m.session))
+                        .or_default()
+                        .thinking_tokens += th;
                 }
                 // What left this machine (#337). `input_tokens` is the
                 // prompt sent fresh this turn; cache CREATION is the
@@ -1203,6 +1475,10 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                             }
                             let entry = outcomes.entry(name.clone()).or_default();
                             entry.calls += 1;
+                            // Denominator for failures-per-100 (#350).
+                            if let Some(key) = &branch_pair {
+                                code.branches.entry(key.clone()).or_default().tool_calls += 1;
+                            }
                             // The result may already have gone by.
                             if let Some(id) = get_str(block, "id") {
                                 match pending_results.remove(id) {
@@ -1216,6 +1492,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                         code.models.entry(model.clone()).or_default().tool_failures += 1;
                                         if let Some(e) = &effort {
                                             code.efforts.entry(e.clone()).or_default().tool_failures += 1;
+                                        }
+                                        if let Some(key) = &branch_pair {
+                                            code.branches
+                                                .entry(key.clone())
+                                                .or_default()
+                                                .tool_failures += 1;
                                         }
                                         if let Some(rk) = &repo_key {
                                             code.repos.entry(rk.clone()).or_default().tool_failures += 1;
@@ -1232,7 +1514,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     None => {
                                         call_names.insert(
                                             id.to_string(),
-                                            (name.clone(), Some(model.clone()), repo_key.clone()),
+                                            (
+                                                name.clone(),
+                                                Some(model.clone()),
+                                                repo_key.clone(),
+                                                branch_pair.clone(),
+                                            ),
                                         );
                                     }
                                 }
@@ -1242,7 +1529,10 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                             if let Some(id) = get_str(block, "id") {
                                 match pending_output.remove(id) {
                                     Some(text) if SHELL_TOOLS.contains(&name.as_str()) => {
-                                        score_output(&text, &mut code, &hour_key);
+                                        let d = score_output(&text, &mut code, &hour_key);
+                                        attribute_quality(
+                                            &mut code, &branch_pair, &agent_name, &effort, d,
+                                        );
                                     }
                                     // Output already seen but the tool
                                     // was not a shell: drop it.
@@ -1270,6 +1560,16 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                                 .entry(superx_ops::record_uuid(&m.session))
                                                 .or_default()
                                                 .push((when, false));
+                                            // A test or build run is
+                                            // the session VERIFYING,
+                                            // which `Bash` alone cannot
+                                            // say (#350).
+                                            claim_doing(
+                                                code.live
+                                                    .entry(superx_ops::record_uuid(&m.session))
+                                                    .or_default(),
+                                                "verifying",
+                                            );
                                         }
                                     }
                                 }
@@ -1298,6 +1598,18 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 if let Some(path) = get_str(input, "file_path") {
                                     if READ_TOOLS.contains(&name.as_str()) {
                                         code.files_read.insert(path.to_string());
+                                        {
+                                            let l = code
+                                                .live
+                                                .entry(superx_ops::record_uuid(&m.session))
+                                                .or_default();
+                                            claim_doing(l, "reading");
+                                            if l.files_now.len() < LIVE_FILES
+                                                && !l.files_now.iter().any(|x| x == path)
+                                            {
+                                                l.files_now.push(path.to_string());
+                                            }
+                                        }
                                         if let Some(rk) = &repo_key {
                                             code.repos_exposed.insert(rk.clone());
                                         }
@@ -1365,6 +1677,30 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     ea.lines_added += n;
                                     ea.lines_removed += replaced;
                                 }
+                                if let Some(key) = &branch_pair {
+                                    let b = code.branches.entry(key.clone()).or_default();
+                                    b.lines_added += n;
+                                    b.lines_removed += replaced;
+                                    if replaced > 0 {
+                                        if steered {
+                                            b.churn_directed += replaced;
+                                        } else {
+                                            b.churn_self += replaced;
+                                        }
+                                    }
+                                    if let Some(pth) = get_str(input, "file_path") {
+                                        b.files.insert(pth.to_string());
+                                        // Only a real write OWNS a path.
+                                        // Unguarded, every Read mapped
+                                        // its path to a branch for a
+                                        // files-created lookup that only
+                                        // ever asks about writes.
+                                        if n > 0 || replaced > 0 {
+                                            code.path_branch
+                                                .insert(pth.to_string(), key.clone());
+                                        }
+                                    }
+                                }
                                 if let Some(rk) = &repo_key {
                                     let r = code.repos.entry(rk.clone()).or_default();
                                     r.lines_added += n;
@@ -1384,6 +1720,13 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     let a = code.agents.entry(an.clone()).or_default();
                                     a.lines_added += n;
                                     a.lines_removed += replaced;
+                                    if replaced > 0 {
+                                        if steered {
+                                            a.churn_directed += replaced;
+                                        } else {
+                                            a.churn_self += replaced;
+                                        }
+                                    }
                                     if let Some(rk) = &repo_key {
                                         let cell = code
                                             .cells
@@ -1427,6 +1770,25 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                         .or_default();
                                     l.lines_added += n;
                                     l.lines_removed += replaced;
+                                    if replaced > 0 {
+                                        if steered {
+                                            l.churn_directed += replaced;
+                                        } else {
+                                            l.churn_self += replaced;
+                                        }
+                                    }
+                                    // Which files, and how often each —
+                                    // a path written three times is
+                                    // rework of rework (#350).
+                                    if let Some(pth) = get_str(input, "file_path") {
+                                        *l.path_hits.entry(pth.to_string()).or_insert(0) += 1;
+                                        if l.files_now.len() < LIVE_FILES
+                                            && !l.files_now.iter().any(|f| f == pth)
+                                        {
+                                            l.files_now.push(pth.to_string());
+                                        }
+                                    }
+                                    claim_doing(l, "writing");
                                 }
                                 {
                                     let mm = code.models.entry(model.clone()).or_default();
@@ -1452,6 +1814,17 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                                     .or_default()
                                                     .push(mins);
                                             }
+                                            // Half-life per branch: the
+                                            // component that separates
+                                            // thrash from a design that
+                                            // moved (#350).
+                                            if let Some(key) = &branch_pair {
+                                                code.branches
+                                                    .entry(key.clone())
+                                                    .or_default()
+                                                    .survivals
+                                                    .push(mins);
+                                            }
                                         }
                                     }
                                     if let Some(key) =
@@ -1468,6 +1841,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             }
                                             if let Some(rk) = &repo_key {
                                                 code.repos.entry(rk.clone()).or_default().reverts += 1;
+                                            }
+                                            if let Some(key) = &branch_pair {
+                                                code.branches
+                                                    .entry(key.clone())
+                                                    .or_default()
+                                                    .reverts += 1;
                                             }
                                         }
                                     }
@@ -1511,6 +1890,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             if let Some(rk) = &repo_key {
                                                 code.repos.entry(rk.clone()).or_default().tests_run += 1;
                                             }
+                                            if let Some(key) = &branch_pair {
+                                                code.branches.entry(key.clone()).or_default().tests_run += 1;
+                                            }
                                         }
                                         if is_build {
                                             code.builds += 1;
@@ -1552,14 +1934,15 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 if shell_calls.remove(id) {
                                     // The call already went by and it
                                     // was a shell: score immediately.
-                                    score_output(text, &mut code, &hour_key);
+                                    let d = score_output(text, &mut code, &hour_key);
+                                    attribute_quality(&mut code, &branch_pair, &agent_name, &effort, d);
                                 } else {
                                     pending_output.insert(id.to_string(), text.to_string());
                                 }
                             }
 
                             match call_names.remove(id) {
-                                Some((name, call_model, call_repo)) => {
+                                Some((name, call_model, call_repo, call_branch)) => {
                                     let entry = outcomes.entry(name).or_default();
                                     if failed {
                                         entry.failed += 1;
@@ -1573,6 +1956,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                         }
                                         if let Some(cr) = call_repo {
                                             code.repos.entry(cr).or_default().tool_failures += 1;
+                                        }
+                                        if let Some(cb) = call_branch {
+                                            code.branches.entry(cb).or_default().tool_failures += 1;
                                         }
                                     } else {
                                         entry.ok += 1;
@@ -1738,6 +2124,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                         .verify_gaps
                         .push(secs);
                 }
+                // Verify latency per branch (#350). The events are
+                // keyed by session, so the branch comes through the
+                // session's newest branch.
+                if let Some(key) = code.session_branch.get(sid).cloned() {
+                    code.branches.entry(key).or_default().verify_gaps.push(secs);
+                }
             }
         }
     }
@@ -1746,11 +2138,15 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
     let mut files_created = 0i64;
     let mut files_modified = 0i64;
     let mut repo_created: HashMap<String, i64> = HashMap::new();
+    let mut branch_created: HashMap<(String, String), i64> = HashMap::new();
     for (path, creates) in &code.path_origin {
         if *creates {
             files_created += 1;
             if let Some(rk) = code.path_repo.get(path) {
                 *repo_created.entry(rk.clone()).or_insert(0) += 1;
+            }
+            if let Some(key) = code.path_branch.get(path) {
+                *branch_created.entry(key.clone()).or_insert(0) += 1;
             }
         } else {
             files_modified += 1;
@@ -1813,6 +2209,11 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             edit_to_verify_p50_secs: median(&mut a.verify_gaps),
             compactions: a.compactions,
             compaction_ms: a.compaction_ms,
+            churn_directed: a.churn_directed,
+            churn_self: a.churn_self,
+            tests_passed: a.tests_passed,
+            tests_failed: a.tests_failed,
+            compile_errors: a.compile_errors,
         })
         .collect();
     agent_stats.sort_by_key(|a| std::cmp::Reverse(a.lines_added));
@@ -1910,6 +2311,68 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         denials: code.denials,
         compactions: code.compactions,
         interventions: code.interventions,
+        // The branch dimension (#350), ranked worst-quality first —
+        // the branch with the most to fix is the one you want to see.
+        branches: {
+            let mut v: Vec<BranchStat> = code
+                .branches
+                .iter()
+                .map(|((repo, branch), b)| {
+                    let d = branch_derived(b);
+                    BranchStat {
+                        repo: repo.clone(),
+                        branch: branch.clone(),
+                        messages: b.messages,
+                        sessions: b.sessions.len() as i64,
+                        agents: b.agents.len() as i64,
+                        lines_added: b.lines_added,
+                        lines_removed: b.lines_removed,
+                        files_touched: b.files.len() as i64,
+                        files_created: branch_created
+                            .get(&(repo.clone(), branch.clone()))
+                            .copied()
+                            .unwrap_or(0),
+                        churn_directed: b.churn_directed,
+                        churn_self: b.churn_self,
+                        tests_run: b.tests_run,
+                        tests_passed: b.tests_passed,
+                        tests_failed: b.tests_failed,
+                        compile_errors: b.compile_errors,
+                        tool_calls: b.tool_calls,
+                        tool_failures: b.tool_failures,
+                        reverts: b.reverts,
+                        survival_p50_mins: d.survival_p50_mins,
+                        edit_to_verify_p50_secs: d.edit_to_verify_p50_secs,
+                        out_tokens: b.out_tokens,
+                        last_active: b
+                            .last_active
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_default(),
+                        self_churn_pct: d.self_churn_pct,
+                        rework_pct: d.rework_pct,
+                        test_pass_pct: d.test_pass_pct,
+                        failures_per_100: d.failures_per_100,
+                        quality_pct: d.quality_pct,
+                    }
+                })
+                .collect();
+            // Unscorable branches sort last, not first: -1 must not
+            // masquerade as the worst branch on the machine.
+            v.sort_by(|a, b| {
+                let key = |s: &BranchStat| if s.quality_pct < 0 { i64::MAX } else { s.quality_pct };
+                // Final tiebreak by name, as every sibling sort does,
+                // so tied rows do not reshuffle between refreshes and
+                // change which survive the truncate (#354 review).
+                key(a)
+                    .cmp(&key(b))
+                    .then(b.messages.cmp(&a.messages))
+                    .then(a.repo.cmp(&b.repo))
+                    .then(a.branch.cmp(&b.branch))
+            });
+            v.truncate(16);
+            v
+        },
+        revisit_at: REVISIT_AT,
         repos: {
             let mut v: Vec<RepoStat> = code
                 .repos
@@ -2072,6 +2535,37 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                         out_tokens: l.out_tokens,
                         tool_failures: l.tool_failures,
                         idle_secs: idle,
+                        files_now: l.files_now.clone(),
+                        // No classifiable call in the window: say what
+                        // the silence IS rather than leaving it blank —
+                        // reasoning, blocked on a long call, or simply
+                        // quiet (#350).
+                        // No classifiable call: say what the silence
+                        // IS. `waiting` used to live here, inferred
+                        // from a `durationMs` that reports a FINISHED
+                        // operation — so it announced a session was
+                        // blocked on a build that had already returned,
+                        // and any session that ever reported a duration
+                        // could never read as quiet (#354 review). The
+                        // duration is still carried, as context.
+                        doing: l.doing.clone().unwrap_or_else(|| {
+                            if l.thinking_tokens > 0 {
+                                "thinking".to_string()
+                            } else {
+                                "quiet".to_string()
+                            }
+                        }),
+                        thinking_tokens: l.thinking_tokens,
+                        last_op_secs: l.last_op_ms / 1000,
+                        self_churn_pct: pct(
+                            l.churn_self,
+                            l.churn_directed + l.churn_self,
+                        ),
+                        files_revisited: l
+                            .path_hits
+                            .values()
+                            .filter(|&&h| h >= REVISIT_AT)
+                            .count() as i64,
                     })
                 })
                 .collect();

@@ -24,4 +24,4 @@ edit_to_verify_p50_secs: bigint,
 /**
  * Compactions it sat through, and the time they took.
  */
-compactions: bigint, compaction_ms: bigint, };
+compactions: bigint, compaction_ms: bigint, churn_directed: bigint, churn_self: bigint, tests_passed: bigint, tests_failed: bigint, compile_errors: bigint, };
