@@ -18,6 +18,8 @@
 --   an entity     uuid7 · name 'DBA'          · labels [role]
 --   a field       uuid7 · name 'house_rules'  · labels [mandate]  · content
 --   an edge       uuid7 · name 'runs on'      · labels [contains] · content = another entity
+--                 (datatype 'link' — that is the whole of what makes
+--                  a field an edge)
 --   a label       uuid7 · name 'role'         · labels [label]
 --
 -- THERE IS NO EDGE TABLE AND NO LABEL TABLE. An edge is a field whose
@@ -141,7 +143,14 @@ DEFINE FIELD IF NOT EXISTS name     ON TABLE field TYPE string;
 DEFINE FIELD IF NOT EXISTS labels   ON TABLE field TYPE option<array<record<entity>>>
     ASSERT $value == NONE OR array::all($value, |$l| record::exists($l));
 DEFINE FIELD IF NOT EXISTS datatype ON TABLE field TYPE string;
-DEFINE FIELD IF NOT EXISTS content  ON TABLE field TYPE any;
+-- A LINK MUST RESOLVE, exactly as a label must. `$this` reaches the
+-- sibling column, so the check applies only where it means something: a
+-- field declared `link` must point at an entity that exists, and a field
+-- holding prose is untouched by it. Without this a link to nothing is
+-- storable, and it is the same silent wrong as a dangling label —
+-- something that reads as a connection with nothing at the other end.
+DEFINE FIELD IF NOT EXISTS content  ON TABLE field TYPE any
+    ASSERT $this.datatype != 'link' OR record::exists($value);
 DEFINE FIELD IF NOT EXISTS active     ON TABLE field TYPE bool;
 DEFINE FIELD IF NOT EXISTS valid_from ON TABLE field TYPE datetime;
 DEFINE FIELD IF NOT EXISTS author_kind ON TABLE field TYPE option<string>;
@@ -152,3 +161,9 @@ DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE field TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS idx_field_chain  ON TABLE field FIELDS uid, valid_from;
 -- Everything said about one thing — the read every reader makes.
 DEFINE INDEX IF NOT EXISTS idx_field_entity ON TABLE field FIELDS entity, valid_from;
+-- WHAT POINTS AT THIS. Following a link forwards is free — the links are
+-- fields of the entity you already hold. Backwards is the question a
+-- graph normally needs a second edge direction to answer, and without
+-- this index it is a table scan. EXPLAIN confirms the engine takes it:
+-- `WHERE content = entity:x` plans as an IndexScan on this index.
+DEFINE INDEX IF NOT EXISTS idx_field_content ON TABLE field FIELDS content;
