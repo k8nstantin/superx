@@ -79,14 +79,44 @@ pub async fn create(db: &Db, name: &str, author: &Author) -> Result<RecordId> {
 ///
 /// [`KernelError::Db`] for engine errors.
 pub async fn name_of(db: &Db, anchor: &RecordId) -> Result<Option<String>> {
-    Ok(attribute::of(db, anchor, false)
-        .await?
-        .into_iter()
-        .find(|a| a.name == NAME)
-        .and_then(|a| match a.content {
-            Some(Value::String(s)) => Some(s),
-            _ => None,
-        }))
+    Ok(name_in(&attribute::of(db, anchor, false).await?))
+}
+
+/// The same answer from attributes a caller ALREADY has.
+///
+/// Every read of a name used to cost its own query, and a listing asked
+/// four separate times for the same entity's attributes — its name, its
+/// labels, whether it was archived, and its fields. One read, four
+/// answers.
+#[must_use]
+pub fn name_in(attributes: &[attribute::Attribute]) -> Option<String> {
+    attributes.iter().find(|a| a.name == NAME).and_then(|a| match &a.content {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    })
+}
+
+/// What a thing IS, from attributes already in hand.
+#[must_use]
+pub fn labels_in(attributes: &[attribute::Attribute]) -> Vec<RecordId> {
+    let mut out: Vec<RecordId> = Vec::new();
+    for a in attributes.iter().filter(|a| a.content.is_none()) {
+        for l in &a.labels {
+            if !out.contains(l) {
+                out.push(l.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Whether it is put away, from attributes already in hand.
+#[must_use]
+pub fn archived_in(attributes: &[attribute::Attribute]) -> bool {
+    attributes
+        .iter()
+        .find(|a| a.name == ARCHIVED)
+        .is_some_and(|a| matches!(a.content, Some(Value::Bool(true))))
 }
 
 /// Rename: a new version of the name attribute. The identity does not
@@ -141,18 +171,7 @@ pub async fn rename(db: &Db, anchor: &RecordId, name: &str, author: &Author) -> 
 ///
 /// [`KernelError::Db`] for engine errors.
 pub async fn labels_of(db: &Db, anchor: &RecordId) -> Result<Vec<RecordId>> {
-    let mut out: Vec<RecordId> = Vec::new();
-    for a in attribute::of(db, anchor, false).await? {
-        if a.content.is_some() {
-            continue;
-        }
-        for l in a.labels {
-            if !out.contains(&l) {
-                out.push(l);
-            }
-        }
-    }
-    Ok(out)
+    Ok(labels_in(&attribute::of(db, anchor, false).await?))
 }
 
 /// Say what an entity IS: one attribute, labels, no content.
@@ -207,11 +226,7 @@ pub async fn unarchive(db: &Db, anchor: &RecordId, author: &Author) -> Result<bo
 ///
 /// [`KernelError::Db`] for engine errors.
 pub async fn is_archived(db: &Db, anchor: &RecordId) -> Result<bool> {
-    Ok(attribute::of(db, anchor, false)
-        .await?
-        .into_iter()
-        .find(|a| a.name == ARCHIVED)
-        .is_some_and(|a| matches!(a.content, Some(Value::Bool(true)))))
+    Ok(archived_in(&attribute::of(db, anchor, false).await?))
 }
 
 async fn set_archived(
@@ -284,13 +299,13 @@ pub async fn list(db: &Db, include_archived: bool) -> Result<Vec<RecordId>> {
     if include_archived {
         return Ok(all);
     }
-    let mut out = Vec::new();
-    for id in all {
-        if !is_archived(db, &id).await? {
-            out.push(id);
-        }
-    }
-    Ok(out)
+    // ONE read for the whole set, not one per entity. Asking
+    // `is_archived` in a loop turned a listing into a query per row.
+    let held = attribute::of_many(db, &all, false).await?;
+    Ok(all
+        .into_iter()
+        .filter(|id| !archived_in(held.get(&record_uuid(id)).map_or(&[][..], Vec::as_slice)))
+        .collect())
 }
 
 /// Find one entity by any unique fragment of its uuid.

@@ -543,3 +543,174 @@ async fn a_role_is_built_from_entities_attributes_and_edges() {
         Some("Database Administrator")
     );
 }
+
+/// A CUT CONNECTION MUST NOT BE FOLLOWED. `walk` filters the traversal
+/// with a row-level `active = true`, but unlinking APPENDS a row and
+/// leaves the original in place — so the old `active = true` row still
+/// matches and the walk keeps reaching a node nothing connects to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_walk_does_not_follow_an_unlinked_edge() {
+    use superx_mod_entities::edge;
+
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let a = entity::create(&db, "A", &op).await.expect("a");
+    let b = entity::create(&db, "B", &op).await.expect("b");
+    let uid = edge::link(&db, &a, &b, "tmp", &[], &op).await.expect("link");
+
+    let before = edge::walk(&db, &a, None, 4).await.expect("walk");
+    assert_eq!(before.nodes.len(), 2, "linked: A reaches B");
+
+    edge::unlink(&db, &uid, &op).await.expect("cut");
+    let after = edge::walk(&db, &a, None, 4).await.expect("walk");
+    assert_eq!(after.edges.len(), 0, "the edge is gone");
+    assert_eq!(
+        after.nodes.len(),
+        1,
+        "and so is the node it reached — a cut connection leaves no orphan: {:?}",
+        after.nodes
+    );
+}
+
+/// A DECIMAL SURVIVES BEING READ. `Number::to_int()` answers `Some` for
+/// a Float too, so asking it first turned 19.99 into 19 on the way to
+/// the browser — and the next write put 19 back. A price destroyed by
+/// being looked at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_decimal_is_not_truncated_on_the_way_out() {
+    use superx_mod_entities::api;
+
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let e = entity::create(&db, "Thing", &op).await.expect("e");
+    attribute::add(
+        &db,
+        &e,
+        Write {
+            name: "ratio",
+            datatype: "number",
+            content: Some(Value::Number(19.99.into())),
+            labels: &[],
+            options: None,
+        },
+        &op,
+    )
+    .await
+    .expect("set");
+
+    let view = api::detail(&db, &superx_ops::record_uuid(&e)).await.expect("detail");
+    let ratio = view.attributes.iter().find(|a| a.name == "ratio").expect("there");
+    assert_eq!(ratio.content, serde_json::json!(19.99), "the value the operator typed");
+}
+
+/// EVERY ADVERTISED DATATYPE CAN ACTUALLY BE WRITTEN, through the only
+/// write path there is. `datetime` could not: JSON has no instant
+/// literal, so it arrived as a string and the gate refused it — one of
+/// the five was unusable, and the test table that should have caught it
+/// omitted the very type that was broken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_datatype_can_be_written_through_the_api() {
+    use superx_mod_entities::api;
+
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let e = entity::create(&db, "Thing", &op).await.expect("e");
+    let frag = superx_ops::record_uuid(&e);
+
+    for (name, datatype, content) in [
+        ("a", "text", serde_json::json!("prose")),
+        ("b", "number", serde_json::json!(19.99)),
+        ("c", "boolean", serde_json::json!(true)),
+        ("d", "datetime", serde_json::json!("2026-08-28T12:34:00Z")),
+        ("e", "json", serde_json::json!({ "k": [1, 2] })),
+    ] {
+        api::put_attribute(
+            &db,
+            &frag,
+            &serde_json::from_value(serde_json::json!({
+                "name": name, "datatype": datatype, "content": content
+            }))
+            .expect("req"),
+            &op,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{datatype} could not be written: {err}"));
+    }
+
+    let view = api::detail(&db, &frag).await.expect("detail");
+    assert_eq!(view.attributes.len(), 6, "the name plus all five datatypes");
+
+    // And a datetime that is not an instant still says so.
+    assert!(
+        api::put_attribute(
+            &db,
+            &frag,
+            &serde_json::from_value(serde_json::json!({
+                "name": "bad", "datatype": "datetime", "content": "yesterday"
+            }))
+            .expect("req"),
+            &op,
+        )
+        .await
+        .is_err(),
+        "'yesterday' is not an instant"
+    );
+}
+
+/// AN ATTRIBUTE BELONGS TO ONE ENTITY. The amend path took a uid from
+/// the body and never checked it against the entity in the URL, so a
+/// request addressed to one thing could rewrite another's — including
+/// renaming an attribute to `archived` to hide it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_entity_cannot_rewrite_another_entitys_attribute() {
+    use superx_mod_entities::api;
+
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let a = entity::create(&db, "A", &op).await.expect("a");
+    let b = entity::create(&db, "B", &op).await.expect("b");
+    let b_name = attribute::of(&db, &b, false)
+        .await
+        .expect("attrs")
+        .into_iter()
+        .find(|x| x.name == "name")
+        .expect("b has a name");
+
+    let err = api::put_attribute(
+        &db,
+        &superx_ops::record_uuid(&a),
+        &serde_json::from_value(serde_json::json!({
+            "uid": b_name.uid, "name": "name", "datatype": "text", "content": "HIJACKED"
+        }))
+        .expect("req"),
+        &op,
+    )
+    .await
+    .expect_err("A must not be able to rewrite B");
+    assert!(err.to_string().contains("does not belong"), "{err}");
+    assert_eq!(entity::name_of(&db, &b).await.expect("n").as_deref(), Some("B"));
+}
+
+/// Depth is the SHORTEST way there. A depth-first walk recorded
+/// whichever branch arrived first, so a direct neighbour reachable the
+/// long way round was painted as though it were far away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn depth_is_the_shortest_path_not_the_first_one_found() {
+    use superx_mod_entities::edge;
+
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let root = entity::create(&db, "root", &op).await.expect("r");
+    let mid = entity::create(&db, "mid", &op).await.expect("m");
+    let leaf = entity::create(&db, "leaf", &op).await.expect("l");
+    edge::link(&db, &root, &mid, "a", &[], &op).await.expect("1");
+    edge::link(&db, &mid, &leaf, "b", &[], &op).await.expect("2");
+    edge::link(&db, &root, &leaf, "direct", &[], &op).await.expect("3");
+
+    let sub = edge::walk(&db, &root, None, 4).await.expect("walk");
+    let depth_of = |e: &superx_kernel::types::RecordId| {
+        sub.nodes.iter().find(|n| &n.entity == e).map(|n| n.depth)
+    };
+    assert_eq!(depth_of(&leaf), Some(1), "leaf is a direct child of root");
+    assert_eq!(depth_of(&mid), Some(1));
+}

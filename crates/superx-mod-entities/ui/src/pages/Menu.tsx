@@ -51,11 +51,26 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
   })
 
   // Mantine hands back the node that was expanded and expects the data
-  // to be spliced in — `mergeAsyncChildren` does the splice, and the
-  // one query it needs is the one level below that node.
+  // to be spliced in — `mergeAsyncChildren` does the splice, and the one
+  // query it needs is the level below that node.
+  //
+  // MERGE, NEVER REPLACE. Adding an entity invalidates `roots`, and a
+  // window-focus refetch does the same with no user action at all —
+  // replacing `data` threw away every expanded subtree while `useTree`
+  // still believed those nodes were open. Because it only calls
+  // `onLoadChildren` on the FIRST expand, the branches rendered empty
+  // and could not be reloaded without collapsing each one by hand. So a
+  // refetch adds and removes roots and leaves loaded children alone.
   const [data, setData] = useState<TreeNodeData[]>([])
   useEffect(() => {
-    setData((roots.data ?? []).map(toNode))
+    const fresh = (roots.data ?? []).map(toNode)
+    setData((current) => {
+      const held = new Map(current.map((n) => [n.value, n]))
+      return fresh.map((n) => {
+        const already = held.get(n.value)
+        return already?.children ? { ...n, children: already.children } : n
+      })
+    })
   }, [roots.data])
 
   const tree = useTree({

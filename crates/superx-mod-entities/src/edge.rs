@@ -17,6 +17,8 @@
 //! so a connection that was cut is still on the record, with who cut it
 //! and when.
 
+use std::collections::HashSet;
+
 use superx_kernel::types::{Object, RecordId, Value};
 use superx_kernel::{Db, KernelError, Result};
 use superx_ops::record_uuid;
@@ -148,17 +150,29 @@ pub async fn of(db: &Db, anchor: &RecordId, dir: Direction) -> Result<Vec<Edge>>
         .await?;
     let rows: Vec<Value> = resp.take(0)?;
 
+    Ok(live(rows))
+}
+
+/// The current edges of a set of rows: newest row per uid, active only.
+///
+/// ONE PLACE. This was written out three times, and the copy inside the
+/// traversal drifted — it filtered `active = true` at the ROW level,
+/// which is wrong in an append-only store because unlinking appends a
+/// new row and leaves the old one exactly as it was. The stale
+/// `active = true` row kept matching, so a walk went on reaching the
+/// other end of a connection that had been cut.
+fn live(rows: Vec<Value>) -> Vec<Edge> {
     let mut chains: std::collections::BTreeMap<String, Vec<Value>> =
         std::collections::BTreeMap::new();
     for row in rows {
         let Some(uid) = obj_str(&row, "uid") else { continue };
         chains.entry(uid).or_default().push(row);
     }
-    Ok(chains
+    chains
         .into_values()
         .filter_map(|c| newest_by_valid_from(&c).and_then(parse))
         .filter(|e| e.active)
-        .collect())
+        .collect()
 }
 
 /// Which way to look.
@@ -286,79 +300,54 @@ pub async fn walk(
     label: Option<&RecordId>,
     depth: usize,
 ) -> Result<Subgraph> {
-    let filter = if label.is_some() {
-        "entity_edge WHERE active = true AND labels CONTAINS $label"
-    } else {
-        "entity_edge WHERE active = true"
-    };
-    let q = format!("SELECT @.{{..{depth}}}.{{ id, out: ->({filter})->entity.@ }} FROM $root");
-    let mut query = db.query(q).bind(("root", root.clone()));
-    if let Some(l) = label {
-        query = query.bind(("label", l.clone()));
-    }
-    let mut resp = query.await?;
-    let rows: Vec<Value> = resp.take(0)?;
-
-    let mut nodes: Vec<Reached> = Vec::new();
-    for row in &rows {
-        // The projection is keyed by the empty string — the shape the
-        // recursive form returns.
-        let tree = match row {
-            Value::Object(o) => o.values().next().cloned(),
-            other => Some(other.clone()),
-        };
-        if let Some(t) = tree {
-            collect(&t, 0, &mut nodes);
-        }
-    }
-    if nodes.is_empty() {
-        nodes.push(Reached { entity: root.clone(), depth: 0 });
-    }
-
-    let ids: Vec<RecordId> = nodes.iter().map(|n| n.entity.clone()).collect();
-    let mut resp = db
-        .query("SELECT *, in, out FROM entity_edge WHERE in IN $ids AND out IN $ids")
-        .bind(("ids", ids))
-        .await?;
-    let rows: Vec<Value> = resp.take(0)?;
-    let mut chains: std::collections::BTreeMap<String, Vec<Value>> =
-        std::collections::BTreeMap::new();
-    for row in rows {
-        let Some(uid) = obj_str(&row, "uid") else { continue };
-        chains.entry(uid).or_default().push(row);
-    }
-    let edges: Vec<Edge> = chains
-        .into_values()
-        .filter_map(|c| newest_by_valid_from(&c).and_then(parse))
-        .filter(|e| e.active)
+    // ONE READ FOR THE LIVE EDGES, then the walk over them.
+    //
+    // The traversal used to run in the engine, which reads better and is
+    // what a relation is for — but SurrealQL filters ROWS, and "is this
+    // edge still connected" is a question about a CHAIN: unlinking
+    // appends `active = false` and leaves the earlier row untouched, so
+    // a row-level filter followed connections that had been cut and the
+    // graph grew orphans. Resolving the chains first and walking those
+    // is correct, and it is still one round trip for any depth.
+    let mut resp = db.query("SELECT *, in, out FROM entity_edge").await?;
+    let all = live(resp.take(0)?);
+    let edges: Vec<Edge> = all
+        .into_iter()
         .filter(|e| label.is_none_or(|l| e.labels.contains(l)))
         .collect();
 
-    Ok(Subgraph { nodes, edges })
-}
+    let mut nodes = vec![Reached { entity: root.clone(), depth: 0 }];
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(record_uuid(root));
+    let mut frontier = vec![root.clone()];
 
-/// Flatten the nested shape the recursive traversal returns. The first
-/// depth at which an entity appears is the one kept — a cycle or a
-/// diamond is reached again, and the shortest way there is the honest
-/// answer.
-fn collect(node: &Value, depth: usize, out: &mut Vec<Reached>) {
-    let Value::Object(o) = node else { return };
-    if let Some(Value::RecordId(id)) = o.get("id") {
-        if !out.iter().any(|r| &r.entity == id) {
-            out.push(Reached { entity: id.clone(), depth });
-        }
-    }
-    if let Some(Value::Array(kids)) = o.get("out") {
-        for kid in kids.iter() {
-            match kid {
-                Value::Object(_) => collect(kid, depth + 1, out),
-                // A terminal comes back as a bare id once the depth
-                // budget is spent.
-                Value::RecordId(id) if !out.iter().any(|r| &r.entity == id) => {
-                    out.push(Reached { entity: id.clone(), depth: depth + 1 });
+    // BREADTH FIRST, so the depth recorded is the SHORTEST way there. A
+    // depth-first walk records whichever branch happened to arrive
+    // first, which paints a direct neighbour as though it were far away.
+    for d in 1..=depth {
+        let mut next: Vec<RecordId> = Vec::new();
+        for from in &frontier {
+            for e in edges.iter().filter(|e| record_uuid(&e.from) == record_uuid(from)) {
+                if seen.insert(record_uuid(&e.to)) {
+                    nodes.push(Reached { entity: e.to.clone(), depth: d });
+                    next.push(e.to.clone());
                 }
-                _ => {}
             }
         }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
     }
+
+    // Only the connections BETWEEN things actually reached.
+    let reached: HashSet<String> = nodes.iter().map(|n| record_uuid(&n.entity)).collect();
+    let edges = edges
+        .into_iter()
+        .filter(|e| {
+            reached.contains(&record_uuid(&e.from)) && reached.contains(&record_uuid(&e.to))
+        })
+        .collect();
+
+    Ok(Subgraph { nodes, edges })
 }

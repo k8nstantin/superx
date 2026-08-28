@@ -35,7 +35,11 @@ export default function App() {
         </Group>
       </AppShell.Header>
       <AppShell.Main>
-        <Tabs value={tab} onChange={setTab} keepMounted={false}>
+        {/* keepMounted, deliberately. The header above promises the menu
+            keeps its place; MenuTab holds that place in local state, so
+            unmounting it collapsed every expanded branch and refetched
+            each level from scratch — exactly inverting the property. */}
+        <Tabs value={tab} onChange={setTab}>
           <Tabs.List mb="md">
             <Tabs.Tab value="menu">Menu</Tabs.Tab>
             <Tabs.Tab value="entity" disabled={!open}>

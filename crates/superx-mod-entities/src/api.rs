@@ -10,8 +10,8 @@
 //! that drifts the first time either side changes.
 
 use serde::{Deserialize, Serialize};
-use superx_kernel::types::{RecordId, Value};
-use superx_kernel::{Db, Result};
+use superx_kernel::types::{Number, RecordId, Value};
+use superx_kernel::{Db, KernelError, Result};
 use superx_ops::record_uuid;
 use ts_rs::TS;
 
@@ -161,11 +161,12 @@ pub struct LinkReq {
 /// Verb errors pass through.
 pub async fn detail(db: &Db, fragment: &str) -> Result<EntityView> {
     let id = entity::resolve(db, fragment).await?;
+    // ONE read, four answers: the fields, the name, what it IS, and
+    // whether it is archived. This used to ask the same question of the
+    // same entity four times.
     let attributes = attribute::of(db, &id, false).await?;
-    let mut labels = Vec::new();
-    for l in entity::labels_of(db, &id).await? {
-        labels.push(label_view(db, &l).await?);
-    }
+    let mut names = NameCache::default();
+    let labels = names.views(db, &entity::labels_in(&attributes)).await?;
     let mut links = Vec::new();
     for e in edge::of(db, &id, Direction::Both).await? {
         let outbound = record_uuid(&e.from) == record_uuid(&id);
@@ -176,18 +177,17 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityView> {
             other_name: entity::name_of(db, &other).await?.unwrap_or_default(),
             other: record_uuid(&other),
             outbound,
-            labels: label_views(db, &e.labels).await?,
+            labels: names.views(db, &e.labels).await?,
         });
     }
-    let mut views = Vec::new();
-    for a in attributes {
-        views.push(attribute_view(a));
-    }
+    let name = entity::name_in(&attributes).unwrap_or_default();
+    let archived = entity::archived_in(&attributes);
+    let views: Vec<AttributeView> = attributes.into_iter().map(attribute_view).collect();
     Ok(EntityView {
         uuid: record_uuid(&id),
-        name: entity::name_of(db, &id).await?.unwrap_or_default(),
+        name,
         labels,
-        archived: entity::is_archived(db, &id).await?,
+        archived,
         attributes: views,
         links,
     })
@@ -242,18 +242,50 @@ pub async fn children(
 ///
 /// Verb errors pass through.
 pub async fn roots(db: &Db, include_archived: bool) -> Result<Vec<TreeNodeView>> {
+    // ONE read of every entity's attributes, and one name lookup per
+    // DISTINCT label. Asking per row turned the first screen into
+    // thousands of round trips.
+    let ids = entity::list(db, include_archived).await?;
+    let held = attribute::of_many(db, &ids, false).await?;
+    let mut names = NameCache::default();
     let mut out = Vec::new();
-    for id in entity::list(db, include_archived).await? {
-        let has_children = !edge::of(db, &id, Direction::Out).await?.is_empty();
+    for id in &ids {
+        let mine = held.get(&record_uuid(id)).map_or(&[][..], Vec::as_slice);
+        let labels = entity::labels_in(mine);
         out.push(TreeNodeView {
-            name: entity::name_of(db, &id).await?.unwrap_or_default(),
-            labels: label_views(db, &entity::labels_of(db, &id).await?).await?,
-            has_children,
+            name: entity::name_in(mine).unwrap_or_default(),
+            labels: names.views(db, &labels).await?,
+            has_children: !edge::of(db, id, Direction::Out).await?.is_empty(),
             via: None,
-            uuid: record_uuid(&id),
+            uuid: record_uuid(id),
         });
     }
     Ok(out)
+}
+
+/// One name lookup per distinct entity, however often it is referenced.
+/// A label appears on nearly every row, and asking for its name each
+/// time is the difference between one query and hundreds.
+#[derive(Default)]
+struct NameCache(std::collections::HashMap<String, String>);
+
+impl NameCache {
+    async fn views(&mut self, db: &Db, ids: &[RecordId]) -> Result<Vec<LabelView>> {
+        let mut out = Vec::new();
+        for id in ids {
+            let key = record_uuid(id);
+            let name = match self.0.get(&key) {
+                Some(n) => n.clone(),
+                None => {
+                    let n = entity::name_of(db, id).await?.unwrap_or_default();
+                    self.0.insert(key.clone(), n.clone());
+                    n
+                }
+            };
+            out.push(LabelView { uuid: key, name });
+        }
+        Ok(out)
+    }
 }
 
 /// The subgraph around one entity, for the graph tab.
@@ -324,7 +356,8 @@ pub async fn put_attribute(
         .content
         .as_ref()
         .filter(|c| !c.is_null())
-        .map(superx_kernel::message::value_from_json);
+        .map(|c| from_json(&req.datatype, c))
+        .transpose()?;
     let options = req
         .options
         .as_ref()
@@ -339,6 +372,18 @@ pub async fn put_attribute(
     };
     match &req.uid {
         Some(uid) => {
+            // THE URL SAYS WHOSE ATTRIBUTE THIS IS. Without this check a
+            // request addressed to one entity could amend a chain
+            // belonging to another — renaming it, or turning it into
+            // `archived`/`boolean` to hide something.
+            let existing = attribute::current(db, uid).await?.ok_or_else(|| {
+                KernelError::Module(format!("no attribute '{uid}'"))
+            })?;
+            if record_uuid(&existing.entity) != record_uuid(&id) {
+                return Err(KernelError::Module(format!(
+                    "attribute '{uid}' does not belong to this entity"
+                )));
+            }
             attribute::amend(db, uid, w, author).await?;
             Ok(uid.clone())
         }
@@ -364,6 +409,28 @@ pub async fn link(
         labels.push(entity::resolve(db, l).await?);
     }
     edge::link(db, &from, &to, &req.name, &labels, author).await
+}
+
+/// JSON in, a typed value out.
+///
+/// `value_from_json` has no datetime — JSON has no such literal — so an
+/// instant arrives as a string and the datatype gate refused it, which
+/// made `datetime` unwritable through the only write path there is. The
+/// conversion belongs here, at the boundary where the declared datatype
+/// is known.
+fn from_json(datatype: &str, c: &serde_json::Value) -> Result<Value> {
+    if datatype != "datetime" {
+        return Ok(superx_kernel::message::value_from_json(c));
+    }
+    let s = c.as_str().ok_or_else(|| {
+        KernelError::Module(
+            "a datetime is sent as an RFC 3339 string, e.g. 2026-08-28T12:34:00Z".to_string(),
+        )
+    })?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(s).map_err(|e| {
+        KernelError::Module(format!("'{s}' is not an RFC 3339 instant: {e}"))
+    })?;
+    Ok(Value::Datetime(parsed.with_timezone(&chrono::Utc).into()))
 }
 
 async fn label_view(db: &Db, id: &RecordId) -> Result<LabelView> {
@@ -399,17 +466,17 @@ fn to_json(v: &Value) -> serde_json::Value {
     match v {
         Value::String(s) => serde_json::Value::String(s.clone()),
         Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Number(n) => n
-            .to_int()
-            .map(|i| serde_json::Value::Number(i.into()))
-            .or_else(|| {
-                (*n)
-                    .into_float()
-                    .ok()
-                    .and_then(serde_json::Number::from_f64)
-                    .map(serde_json::Value::Number)
-            })
-            .unwrap_or(serde_json::Value::Null),
+        // MATCH THE VARIANT, do not ask `to_int`. It answers `Some` for a
+        // Float too — `Some(v as i64)` — so 19.99 came back as 19, the
+        // form rendered 19, and the next blur wrote 19 over the stored
+        // value. A price or a ratio was destroyed by being looked at.
+        Value::Number(Number::Int(i)) => serde_json::Value::Number((*i).into()),
+        Value::Number(Number::Float(f)) => serde_json::Number::from_f64(*f)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Value::Number(Number::Decimal(d)) => d
+            .to_string()
+            .parse::<serde_json::Number>()
+            .map_or_else(|_| serde_json::Value::String(d.to_string()), serde_json::Value::Number),
         Value::Datetime(d) => serde_json::Value::String(d.to_string()),
         Value::Array(items) => {
             serde_json::Value::Array(items.iter().map(to_json).collect())

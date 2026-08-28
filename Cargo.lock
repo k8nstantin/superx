@@ -3742,7 +3742,6 @@ dependencies = [
  "superx-kernel",
  "superx-mod-entities",
  "superx-mod-hello",
- "superx-mod-runner",
  "superx-mod-ui",
  "superx-ops",
  "surrealdb",
@@ -3803,23 +3802,6 @@ dependencies = [
  "surrealdb",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "superx-mod-runner"
-version = "1.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "linkme",
- "serde",
- "serde_json",
- "superx-kernel",
- "superx-ops",
- "surrealdb",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]

@@ -184,6 +184,49 @@ pub async fn of(db: &Db, entity: &RecordId, include_retired: bool) -> Result<Vec
         .collect())
 }
 
+/// Everything held by a SET of entities, keyed by entity uuid, in ONE
+/// request.
+///
+/// A listing needs this: asking per entity turned one screen into a
+/// query per row, and callers wanting a name, a label set and an
+/// archived flag each asked separately for the same rows.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn of_many(
+    db: &Db,
+    entities: &[RecordId],
+    include_retired: bool,
+) -> Result<std::collections::HashMap<String, Vec<Attribute>>> {
+    if entities.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut resp = db
+        .query("SELECT * FROM entity_attribute WHERE entity IN $ids")
+        .bind(("ids", entities.to_vec()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+
+    let mut chains: std::collections::BTreeMap<(String, String), Vec<Value>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let (Some(e), Some(uid)) = (obj_record(&row, "entity"), obj_str(&row, "uid")) else {
+            continue;
+        };
+        chains.entry((record_uuid(&e), uid)).or_default().push(row);
+    }
+    let mut out: std::collections::HashMap<String, Vec<Attribute>> =
+        std::collections::HashMap::new();
+    for ((entity_uuid, _), chain) in chains {
+        let Some(head) = newest_by_valid_from(&chain).and_then(parse) else { continue };
+        if head.active || include_retired {
+            out.entry(entity_uuid).or_default().push(head);
+        }
+    }
+    Ok(out)
+}
+
 /// Every version of one attribute, oldest first.
 ///
 /// # Errors

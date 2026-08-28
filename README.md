@@ -33,44 +33,27 @@ superx actions --live          # the action stream as it happens
 
 ### 2. Models the work as a graph
 
-The entities module is the product substrate: typed nodes joined by native SurrealDB edges, extensible at runtime.
+The entities module is the substrate a product or a role is designed in. Three tables, and one idea.
 
-- **18 kinds seeded, and kinds are data** — `product`, `task`, `rag`, `model`, `document`, `text`, `repo`, `credential`, joined by `contains`, `depends_on`, `consults`, `describes`, `instructs`, `produced`, `attached`. Adding a kind is a command, not a release.
-- **Text is a node.** Descriptions, instructions and comments are `text` entities linked by role edges, so each carries its own version chain and one text can serve several entities.
-- **Files attach as document nodes**, stored under the module's own directory.
-- **Traversal follows record pointers**, so expanding a node costs its degree — not the size of the edge history.
+- **An entity is a uuid7.** Like a social security number: you can change your name and you are still you. So the row holds nothing that can change, and every edge and every label anchors to it — a rename cannot ripple through the graph, because the name was never in the graph.
+- **Everything else is an attribute** — its name included. Any number, of five datatypes: `text`, `number`, `boolean`, `datetime`, `json`. Each has its own history, its own author and its own labels.
+- **A label is an entity.** `role` is a row, and what `role` MEANS is an attribute on it. There is no label table and no type registry: a new label or a new kind of connection is data, never a migration.
+- **An edge is an attribute the engine can walk** — a native relation, so following a deep graph costs a node's degree rather than a round trip per level.
+- **Nothing here interprets anything.** The module enforces two things: a label must exist, and a value must be what its datatype says. What a role does, whether a mandate binds, which links are worth following — the reader's judgement. A test pins it: a label called `role` behaves exactly like one called `zzz`.
 
 ![A product graph](superx-mod-website/img/graph.png)
 
-```bash
-superx entities create --type product --describe "what it is" Widget X
-superx entities create --type task Build the frame
-superx entities link <product> <task> --rel contains
-superx entities instruct <task> Read the description, then build it.
-superx entities tree <product>          # the whole product, one view
-superx entities graph <product> --json  # nodes + edges, for anything else
-```
+**The database is the interface.** There is no `superx entities` command: a person uses the dashboard, and another module reads the tables. A third surface saying the same things in a third shape is how the last one drifted.
 
 Each entity carries its real ancestor path, and the module ships its own dashboard on its own port:
 
 ![An entity, with its ancestor path](superx-mod-website/img/entity.png)
 
-### 3. Schedules that graph, and agents execute it
+### 3. Runs it (being rebuilt)
 
-A schedule row carries a time, an entity reference and a recurrence. Nothing else — the plan is already in the graph.
+The scheduler is being rebuilt. The previous one reached into the entities module's internals, which the module contract forbids — modules depend on the kernel, never on each other — and it has been removed rather than patched around.
 
-- **Waves.** Firing resolves the target's subgraph and layers its task nodes over `depends_on` with a topological sort; cycles are refused with the offending path named. Independent tasks dispatch in parallel up to a bounded parameter; dependants wait for a successful run **in this firing**, so a re-run is not blocked by last week's completion.
-- **Prompt assembly.** Each task spawns the configured agent command with its instructions, the product's description, and the attributes of everything it links to one hop out.
-- **Write-back.** Output becomes a `produced` text node linked to the task, so the next agent reads it as context.
-- **Steerable mid-run.** Every run pins the `valid_from` of the instruction text it dispatched with, and the subgraph is re-read at every wave — editing the graph while it runs steers whatever has not dispatched yet.
-- **No default executor.** `attr_runner_agent_cmd` is unset until you set it, and dispatch refuses loudly rather than spawning something you did not ask for.
-
-```bash
-superx runner plan <product>                 # dry run: the waves the graph implies
-superx runner config agent_cmd claude -p     # nothing spawns until this is set
-superx runner schedule <product> --in 10s --every 1d
-superx runner runs                           # firing history per task
-```
+What replaces it reads the substrate: an ordered list of entities in its own parameters, and a walk of each one's graph. Entities does not know it exists, and will not.
 
 ### 4. Everything above capture is a module
 
@@ -81,8 +64,7 @@ The kernel owns boot, capture, the telemetry stream, the substrate verbs and the
 | `kernel` | substrate, boot, module registry | `superx status · logs` |
 | `capture` | the capture loop over every discovered agent | `superx agents · sessions · read` |
 | `ui` | the core dashboard — status, live feed, sessions, console | `superx ui url` |
-| `entities` | the product graph + its own dashboard | `superx entities …` |
-| `runner` | schedules, waves, dispatch, write-back | `superx runner …` |
+| `entities` | entities, attributes, edges + its own dashboard | its own port; no CLI |
 | `hello` | the contribution template | `superx hello greet` |
 
 ![The entity list](superx-mod-website/img/entities.png)
@@ -106,14 +88,13 @@ Upgrades are `git pull`, `cargo build`, `superx restart` — the schema self-upg
 | crate | lines | what it is |
 |---|---:|---|
 | `superx-kernel` | 7.5k | substrate verbs, boot, capture engine, adapters, telemetry, module registry |
-| `superx-mod-entities` | 4.8k | the product graph, its HTTP API and its own React dashboard |
+| `superx-mod-entities` | 1.5k | entities, attributes and edges, its HTTP API and its own React dashboard |
 | `superx-mod-ui` | 3.1k | the core dashboard: typed API, SSE, four pages |
-| `superx-mod-runner` | 2.0k | schedules, wave planning, dispatch, recurrence |
 | `superx` | 1.6k | the CLI and the initialize/lifecycle flow |
 | `superx-ops` | 0.7k | shared runners and renderers |
 | `superx-mod-hello` | 0.2k | the module template |
 
-185 tests, all on an in-memory engine, no fixtures to maintain.
+176 tests, all on an in-memory engine, no fixtures to maintain.
 
 ## Contributing
 

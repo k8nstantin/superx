@@ -243,7 +243,13 @@ function Field({
           <NumberInput
             value={typeof field.content === 'number' ? field.content : undefined}
             onBlur={(ev) => {
-              const n = Number(ev.currentTarget.value)
+              // BLANK IS NOT ZERO. `Number('')` is 0 and passes a NaN
+              // check, so clicking into an empty field and out again
+              // used to write an explicit 0 onto the permanent record
+              // with the operator's name on it.
+              const raw = ev.currentTarget.value.trim()
+              if (raw === '') return
+              const n = Number(raw)
               if (!Number.isNaN(n)) write.mutate(n)
             }}
           />
@@ -256,11 +262,18 @@ function Field({
           />
         )
       case 'datetime':
+        // `datetime-local` speaks LOCAL time; the store speaks UTC.
+        // Slicing the stored instant into the widget and parsing it back
+        // as local shifted the value by the browser's offset on every
+        // open-and-blur, compounding each time.
         return (
           <TextInput
             type="datetime-local"
-            defaultValue={typeof field.content === 'string' ? field.content.slice(0, 16) : ''}
-            onBlur={(ev) => ev.currentTarget.value && write.mutate(new Date(ev.currentTarget.value).toISOString())}
+            defaultValue={toLocalInput(field.content)}
+            onBlur={(ev) =>
+              ev.currentTarget.value &&
+              write.mutate(new Date(ev.currentTarget.value).toISOString())
+            }
           />
         )
       default:
@@ -293,6 +306,15 @@ function Field({
       )}
     </Card>
   )
+}
+
+/// A stored UTC instant, as the local wall-clock the widget expects.
+function toLocalInput(content: unknown): string {
+  if (typeof content !== 'string') return ''
+  const d = new Date(content)
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
 function preview(f: AttributeView): string {

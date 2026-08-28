@@ -194,11 +194,18 @@ async fn archive(
 async fn assets(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let file = if path.is_empty() { "index.html" } else { path };
-    match Assets::get(file).or_else(|| Assets::get("index.html")) {
-        Some(content) => {
-            let mime = mime_guess::from_path(file).first_or_octet_stream();
-            ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
-        }
-        None => (StatusCode::NOT_FOUND, "no ui built").into_response(),
-    }
+    // GUESS FROM WHAT IS ACTUALLY SERVED, not from what was asked for.
+    // Falling back to index.html while labelling it from the URL sent
+    // HTML as `application/octet-stream` for `/entity/abc` — the browser
+    // downloaded a file instead of rendering the app, which is the exact
+    // case this fallback exists for.
+    let (served, content) = match Assets::get(file) {
+        Some(c) => (file, c),
+        None => match Assets::get("index.html") {
+            Some(c) => ("index.html", c),
+            None => return (StatusCode::NOT_FOUND, "no ui built").into_response(),
+        },
+    };
+    let mime = mime_guess::from_path(served).first_or_octet_stream();
+    ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
 }

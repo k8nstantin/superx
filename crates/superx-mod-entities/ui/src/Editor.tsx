@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button, Group, Text, Textarea } from '@mantine/core'
 import { useCreateBlockNote } from '@blocknote/react'
 import { BlockNoteView } from '@blocknote/mantine'
@@ -70,9 +70,22 @@ function ProseEditor({ value, onSave }: { value: string; onSave: (v: string) => 
 }
 
 function JsonEditor({ value, onSave }: { value: unknown; onSave: (v: unknown) => void }) {
-  const [draft, setDraft] = useState(() => JSON.stringify(value ?? {}, null, 2))
+  const serialised = JSON.stringify(value ?? {}, null, 2)
+  const [draft, setDraft] = useState(serialised)
   const [error, setError] = useState<string | null>(null)
-  useEffect(() => setDraft(JSON.stringify(value ?? {}, null, 2)), [value])
+
+  // RESET ONLY WHEN THE STORED VALUE ACTUALLY CHANGED. `value` is a
+  // parsed object, so React Query hands back a new identity on every
+  // refetch even when the bytes are identical — and refetches happen on
+  // window focus and whenever any other field on this entity is saved.
+  // Keying on the serialised form means an in-progress edit survives all
+  // of them; the same trap the grid layout fell into next door.
+  const loaded = useRef(serialised)
+  useEffect(() => {
+    if (loaded.current === serialised) return
+    loaded.current = serialised
+    setDraft(serialised)
+  }, [serialised])
   return (
     <>
       <Textarea
