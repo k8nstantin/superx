@@ -15,7 +15,6 @@ pub mod initialize;
 // reference per module crate keeps its linkme registration alive.
 use superx_mod_entities as _;
 use superx_mod_hello as _;
-use superx_mod_runner as _;
 use superx_mod_ui as _;
 
 pub use clap::Parser;

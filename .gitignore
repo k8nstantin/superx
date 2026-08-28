@@ -44,3 +44,7 @@ node_modules/
 
 # Parallel-session git worktrees (Claude Code) — never stage or audit.
 .claude/worktrees/
+
+# Python bytecode from tools/
+__pycache__/
+*.pyc

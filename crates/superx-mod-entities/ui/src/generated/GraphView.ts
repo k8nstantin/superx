@@ -3,11 +3,6 @@ import type { GraphEdgeView } from "./GraphEdgeView";
 import type { GraphNodeView } from "./GraphNodeView";
 
 /**
- * The subgraph reachable from one entity — the graph is PER ENTITY
- * (operator model): rooted where you opened it, never a global map.
+ * A subgraph, rooted where it was opened.
  */
-export type GraphView = { root: string, nodes: Array<GraphNodeView>, edges: Array<GraphEdgeView>, 
-/**
- * The walk stopped at the depth limit — there is more out there.
- */
-truncated: boolean, depth: bigint, };
+export type GraphView = { nodes: Array<GraphNodeView>, edges: Array<GraphEdgeView>, };

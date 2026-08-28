@@ -1,0 +1,333 @@
+//! The operator's second example, built end to end (epic #353).
+//!
+//! > "I can have a role that checks the Microsoft Teams UI and sends me
+//! >  a WhatsApp text when I get a new message, and all I do is set the
+//! >  frequency. Another example of a graph role with various labelled
+//! >  entities — I can have an entity labelled `credential` and store
+//! >  WhatsApp and Teams credentials."
+//!
+//! Nothing in the module knows what Teams is, what a credential is, or
+//! what a frequency means. It stores entities, attributes and edges; the
+//! labels carry the meaning and a reader acts on it. If this shape can
+//! be written and read back whole, the substrate is doing its job.
+
+use superx_kernel::types::Value;
+use superx_mod_entities::attribute::{self, Write};
+use superx_mod_entities::author::Author;
+use superx_mod_entities::edge::{self, Direction};
+use superx_mod_entities::{entity, SCHEMA_DDL};
+
+async fn fresh_db() -> superx_kernel::Db {
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("entities").await.expect("nsdb");
+    let ddl = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "test-password");
+    db.query(ddl).await.expect("ddl").check().expect("schema applies clean");
+    db
+}
+
+fn text(s: &str) -> Option<Value> {
+    Some(Value::String(s.to_string()))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_role_that_watches_teams_and_texts_whatsapp() {
+    let db = fresh_db().await;
+    let op = Author::operator();
+
+    // ── the vocabulary ────────────────────────────────────────────────
+    // Every one of these is an entity. Nothing is a type.
+    let label = entity::create(&db, "label", &op).await.expect("label");
+    let mut vocab = std::collections::HashMap::new();
+    for word in ["role", "credential", "task", "schedule", "instructions", "uses", "then"] {
+        let e = entity::create(&db, word, &op).await.expect("word");
+        entity::declare(&db, &e, "is", std::slice::from_ref(&label), &op).await.expect("a label");
+        vocab.insert(word, e);
+    }
+    let (role, credential, task, schedule, instructions, uses, then) = (
+        vocab["role"].clone(),
+        vocab["credential"].clone(),
+        vocab["task"].clone(),
+        vocab["schedule"].clone(),
+        vocab["instructions"].clone(),
+        vocab["uses"].clone(),
+        vocab["then"].clone(),
+    );
+
+    // What each label MEANS is a field on the label itself. This is the
+    // only interpretation layer, and a reader is the only thing that
+    // reads it.
+    for (l, meaning) in [
+        (&role, "This is who you are. Act within it and nothing beyond it."),
+        (&credential, "A REFERENCE to a secret, never the secret. Fetch it, use it, never log it."),
+        (&task, "Do what the instructions say, and nothing else."),
+        (&schedule, "How often to run. Read by whatever does the running."),
+    ] {
+        attribute::add(
+            &db,
+            l,
+            Write { name: "treatment", datatype: "text", content: text(meaning), labels: &[], options: None },
+            &op,
+        )
+        .await
+        .expect("what it means");
+    }
+
+    // ── the credentials ───────────────────────────────────────────────
+    // A REFERENCE, not the secret: where to fetch it from. The store has
+    // no opinion, but putting a live secret in a versioned, append-only
+    // row would mean it could never be removed.
+    let mut creds = Vec::new();
+    for (name, item) in [("Teams login", "keychain:superx/teams"), ("WhatsApp API key", "env:WHATSAPP_TOKEN")] {
+        let c = entity::create(&db, name, &op).await.expect("cred");
+        entity::declare(&db, &c, "is", std::slice::from_ref(&credential), &op).await.expect("it is one");
+        attribute::add(
+            &db,
+            &c,
+            Write { name: "reference", datatype: "text", content: text(item), labels: &[], options: None },
+            &op,
+        )
+        .await
+        .expect("where to fetch it");
+        creds.push(c);
+    }
+
+    // ── the role, and the only thing the operator sets ────────────────
+    let watcher = entity::create(&db, "Teams watcher", &op).await.expect("role");
+    entity::declare(&db, &watcher, "is", std::slice::from_ref(&role), &op).await.expect("a role");
+    attribute::add(
+        &db,
+        &watcher,
+        Write {
+            name: "every",
+            datatype: "number",
+            content: Some(Value::Number(300.into())),
+            labels: std::slice::from_ref(&schedule),
+            options: None,
+        },
+        &op,
+    )
+    .await
+    .expect("the frequency — the one knob");
+
+    // ── the two tasks ─────────────────────────────────────────────────
+    let check = entity::create(&db, "Check Teams for new messages", &op).await.expect("t1");
+    let send = entity::create(&db, "Send a WhatsApp text", &op).await.expect("t2");
+    for (t, orders) in [
+        (&check, "Open the Teams UI and report any message newer than the last run."),
+        (&send, "Text the operator on WhatsApp with what the previous step found."),
+    ] {
+        entity::declare(&db, t, "is", std::slice::from_ref(&task), &op).await.expect("a task");
+        attribute::add(
+            &db,
+            t,
+            Write {
+                name: "orders",
+                datatype: "text",
+                content: text(orders),
+                labels: std::slice::from_ref(&instructions),
+                options: None,
+            },
+            &op,
+        )
+        .await
+        .expect("what to do");
+    }
+
+    // ── the graph ─────────────────────────────────────────────────────
+    let contains = entity::create(&db, "contains", &op).await.expect("c");
+    entity::declare(&db, &contains, "is", std::slice::from_ref(&label), &op).await.expect("l");
+    let c = std::slice::from_ref(&contains);
+    edge::link(&db, &watcher, &check, "first", c, &op).await.expect("1");
+    edge::link(&db, &watcher, &send, "second", c, &op).await.expect("2");
+    edge::link(&db, &check, &send, "then", std::slice::from_ref(&then), &op).await.expect("order");
+    edge::link(&db, &check, &creds[0], "signs in with", std::slice::from_ref(&uses), &op).await.expect("3");
+    edge::link(&db, &send, &creds[1], "sends with", std::slice::from_ref(&uses), &op).await.expect("4");
+
+    // ── READ IT BACK, the way something that had to run it would ──────
+
+    // What is this thing?
+    assert_eq!(entity::labels_of(&db, &watcher).await.expect("l"), vec![role.clone()]);
+
+    // The one knob, and what its label says to do about it.
+    let held = attribute::of(&db, &watcher, false).await.expect("held");
+    let every = held.iter().find(|a| a.name == "every").expect("frequency");
+    assert_eq!(every.labels, vec![schedule.clone()]);
+    assert!(matches!(every.content, Some(Value::Number(_))));
+
+    let meaning = attribute::of(&db, &schedule, false)
+        .await
+        .expect("on the label")
+        .into_iter()
+        .find(|a| a.name == "treatment")
+        .and_then(|a| a.content);
+    assert!(
+        format!("{meaning:?}").contains("How often to run"),
+        "the label tells a reader what the number is for"
+    );
+
+    // Everything the role reaches, from ONE walk.
+    let world = edge::walk(&db, &watcher, None, 6).await.expect("walk");
+    let mut names = Vec::new();
+    for n in &world.nodes {
+        names.push(entity::name_of(&db, &n.entity).await.expect("n").unwrap_or_default());
+    }
+    for expected in [
+        "Teams watcher",
+        "Check Teams for new messages",
+        "Send a WhatsApp text",
+        "Teams login",
+        "WhatsApp API key",
+    ] {
+        assert!(names.contains(&expected.to_string()), "{expected} missing from {names:?}");
+    }
+
+    // The credentials it can reach, found by label rather than by name.
+    let mut reachable_creds = Vec::new();
+    for n in &world.nodes {
+        if entity::labels_of(&db, &n.entity).await.expect("l").contains(&credential) {
+            reachable_creds.push(entity::name_of(&db, &n.entity).await.expect("n").unwrap_or_default());
+        }
+    }
+    reachable_creds.sort();
+    assert_eq!(reachable_creds, vec!["Teams login", "WhatsApp API key"]);
+
+    // NEVER THE SECRET ITSELF — a reference to where it lives.
+    let teams_cred = attribute::of(&db, &creds[0], false).await.expect("attrs");
+    let reference = teams_cred.iter().find(|a| a.name == "reference").expect("ref");
+    assert!(
+        format!("{:?}", reference.content).contains("keychain:"),
+        "a pointer to the secret, not the secret"
+    );
+
+    // The order of work: which task comes after which.
+    let after_check = edge::of(&db, &check, Direction::Out)
+        .await
+        .expect("out")
+        .into_iter()
+        .filter(|e| e.labels.contains(&then))
+        .count();
+    assert_eq!(after_check, 1, "check, then send");
+
+    // Changing the frequency is one amend, and nothing else moves.
+    attribute::amend(
+        &db,
+        &every.uid,
+        Write {
+            name: "every",
+            datatype: "number",
+            content: Some(Value::Number(60.into())),
+            labels: std::slice::from_ref(&schedule),
+            options: None,
+        },
+        &op,
+    )
+    .await
+    .expect("set the frequency");
+    let again = edge::walk(&db, &watcher, None, 6).await.expect("walk again");
+    assert_eq!(again.nodes.len(), world.nodes.len(), "the graph did not notice");
+    assert_eq!(
+        attribute::history(&db, &every.uid).await.expect("history").len(),
+        2,
+        "and both frequencies are on the record, with who set them"
+    );
+}
+
+/// THE MODULE NEVER INTERPRETS, and this is the test that keeps it true.
+///
+/// > "The entity does not give a shit about handling. It only has
+/// >  attributes, edges and labels. Whoever uses entities knows how to
+/// >  treat it. I can add another concept down the road besides labels
+/// >  and nothing changes for the entities — only the process that reads
+/// >  them knows what's up. Entities don't even know it's there."
+/// >  — operator, 2026-08-28
+///
+/// So a label called `role` must be worth exactly as much to this module
+/// as a label called `zzz`: no branch, no special case, no meaning. The
+/// day someone writes `if name == "role"`, that property is gone and
+/// this fails.
+///
+/// Two names ARE known here, and only two — `name` and `archived` — and
+/// both are store concerns: what appears in a list, and what is hidden
+/// from one. Neither says what a thing IS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_word_in_the_vocabulary_means_anything_to_the_module() {
+    let db = fresh_db().await;
+    let op = Author::operator();
+
+    // Two entities, identical but for the words used. If the module has
+    // an opinion about any of these names, the two stop matching.
+    let loaded = ["role", "credential", "task", "label", "mandate", "contains", "schedule"];
+    let neutral = ["zzz1", "zzz2", "zzz3", "zzz4", "zzz5", "zzz6", "zzz7"];
+
+    let mut shapes = Vec::new();
+    for words in [loaded, neutral] {
+        let subject = entity::create(&db, words[0], &op).await.expect("e");
+        let marker = entity::create(&db, words[1], &op).await.expect("m");
+        let target = entity::create(&db, words[2], &op).await.expect("t");
+
+        entity::declare(&db, &subject, words[3], std::slice::from_ref(&marker), &op)
+            .await
+            .expect("declare");
+        attribute::add(
+            &db,
+            &subject,
+            Write {
+                name: words[4],
+                datatype: "text",
+                content: text("some prose"),
+                labels: std::slice::from_ref(&marker),
+                options: None,
+            },
+            &op,
+        )
+        .await
+        .expect("attribute");
+        edge::link(&db, &subject, &target, words[5], std::slice::from_ref(&marker), &op)
+            .await
+            .expect("edge");
+
+        let held = attribute::of(&db, &subject, false).await.expect("held");
+        let walked = edge::walk(&db, &subject, None, 4).await.expect("walk");
+        shapes.push((
+            held.len(),
+            held.iter().map(|a| a.labels.len()).collect::<Vec<_>>(),
+            entity::labels_of(&db, &subject).await.expect("l").len(),
+            entity::is_archived(&db, &subject).await.expect("a"),
+            walked.nodes.len(),
+            walked.edges.len(),
+        ));
+    }
+    assert_eq!(
+        shapes[0], shapes[1],
+        "a label called `role` is worth exactly what a label called `zzz2` is worth"
+    );
+
+    // And the two names that ARE known are known for storage reasons
+    // only: one decides what a thing is called, the other whether it is
+    // listed. Neither is asked what the thing IS.
+    let thing = entity::create(&db, "Thing", &op).await.expect("e");
+    assert_eq!(entity::name_of(&db, &thing).await.expect("n").as_deref(), Some("Thing"));
+    assert!(!entity::is_archived(&db, &thing).await.expect("a"));
+
+    // Any other name is inert, however meaningful it looks.
+    for inert in ["type", "kind", "class", "status", "state", "parent", "owner"] {
+        attribute::add(
+            &db,
+            &thing,
+            Write {
+                name: inert,
+                datatype: "text",
+                content: text("looks important, means nothing here"),
+                labels: &[],
+                options: None,
+            },
+            &op,
+        )
+        .await
+        .expect("stored like any other");
+    }
+    assert_eq!(entity::name_of(&db, &thing).await.expect("n").as_deref(), Some("Thing"));
+    assert!(!entity::is_archived(&db, &thing).await.expect("a"), "`state` is not `archived`");
+    // three entities per pass, twice over, plus the one above.
+    assert_eq!(entity::list(&db, false).await.expect("list").len(), 3 + 3 + 1);
+}

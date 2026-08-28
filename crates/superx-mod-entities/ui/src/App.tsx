@@ -1,88 +1,65 @@
-import { useEffect, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { Anchor, AppShell, Box, Group, NavLink, Text } from '@mantine/core'
-import { fetchPing } from './api'
-import EntitiesPage from './pages/Entities'
-import TypesPage from './pages/Types'
-import DictionaryPage from './pages/Dictionary'
-import GraphFull, { graphRouteId } from './pages/GraphFull'
-import { BreadcrumbProvider, BreadcrumbTrail } from './Breadcrumbs'
+import { useState } from 'react'
+import { AppShell, Group, Tabs, Text, Title } from '@mantine/core'
+import MenuTab from './pages/Menu'
+import EntityTab from './pages/Entity'
+import GraphTab from './pages/Graph'
 
-// The entities module's OWN dashboard (epic #216, approved design):
-// logo + wordmark, back link to the core dashboard (discovered from
-// the substrate), Entities and Types — the graph is per entity, so
-// there is no Graph menu.
-
-// types -> labels -> entities is a dependency, not a convention, so the
-// tabs read in that order (#292).
-const PAGES = ['Types', 'Dictionary', 'Entities'] as const
-type Page = (typeof PAGES)[number]
-
-/// One route, so one `pathname` check rather than a router dependency
-/// (issue #250): `/graph/<id>` is the graph in its own window, and the
-/// module's static handler already serves index.html for it.
-function useRoute(): string {
-  const [path, setPath] = useState(() => window.location.pathname)
-  useEffect(() => {
-    const onNav = () => setPath(window.location.pathname)
-    window.addEventListener('popstate', onNav)
-    return () => window.removeEventListener('popstate', onNav)
-  }, [])
-  return path
-}
+// The entities module's own dashboard, on its own port.
+//
+// THREE TABS (operator, 2026-08-28): the menu is where entities are
+// added and traversed, the entity is where one is designed, and the
+// graph is where its shape is seen. The graph DESIGNER is deliberately
+// not here — it is the next PR.
+//
+// Opening an entity does not navigate away from the menu: the tab
+// switches and the menu keeps its place, because traversing a deep graph
+// and losing where you were is the thing that makes it unusable.
 
 export default function App() {
-  return (
-    <BreadcrumbProvider>
-      <Shell />
-    </BreadcrumbProvider>
-  )
-}
+  const [open, setOpen] = useState<string | null>(null)
+  const [tab, setTab] = useState<string | null>('menu')
 
-function Shell() {
-  const [page, setPage] = useState<Page>('Entities')
-  const ping = useQuery({ queryKey: ['ping'], queryFn: fetchPing })
-  const graphId = graphRouteId(useRoute())
-  if (graphId) return <GraphFull frag={graphId} />
+  const openEntity = (uuid: string) => {
+    setOpen(uuid)
+    setTab('entity')
+  }
+
   return (
-    <AppShell header={{ height: 52 }} navbar={{ width: 180, breakpoint: 'xs' }} padding="md">
+    <AppShell header={{ height: 52 }} padding="md">
       <AppShell.Header>
-        <Group h="100%" px="md" gap="lg" wrap="nowrap">
-          <Group gap={10} wrap="nowrap">
-            <img src="/logo.svg" alt="" width={26} height={26} style={{ borderRadius: 6 }} />
-            <Text
-              component="span"
-              fw={700}
-              fz={18}
-              c="#EDE4F4"
-              style={{ fontFamily: "'Space Grotesk', system-ui, sans-serif" }}
-            >
-              superx
-            </Text>
-            <Text c="dimmed" fz={15} style={{ whiteSpace: 'nowrap' }}>
-              · entities{ping.data ? ` · v${ping.data.version}` : ''}
-            </Text>
-          </Group>
-          {/* Where you are in the graph, not just which page (#253). */}
-          <Box style={{ flex: 1, minWidth: 0 }}>
-            <BreadcrumbTrail onHome={() => setPage('Entities')} />
-          </Box>
-          {ping.data?.core_url && (
-            <Anchor href={ping.data.core_url} size="sm" style={{ whiteSpace: 'nowrap' }}>
-              ← core dashboard
-            </Anchor>
-          )}
+        <Group h="100%" px="md" gap="sm" wrap="nowrap">
+          <Title order={4}>entities</Title>
+          <Text size="xs" c="dimmed" ff="monospace">
+            uuid7 · attributes · edges
+          </Text>
         </Group>
       </AppShell.Header>
-      <AppShell.Navbar p="xs">
-        {PAGES.map((p) => (
-          <NavLink key={p} label={p} active={page === p} onClick={() => setPage(p)} />
-        ))}
-      </AppShell.Navbar>
       <AppShell.Main>
-        {page === 'Entities' && <EntitiesPage />}
-        {page === 'Types' && <TypesPage />}
-        {page === 'Dictionary' && <DictionaryPage />}
+        {/* keepMounted, deliberately. The header above promises the menu
+            keeps its place; MenuTab holds that place in local state, so
+            unmounting it collapsed every expanded branch and refetched
+            each level from scratch — exactly inverting the property. */}
+        <Tabs value={tab} onChange={setTab}>
+          <Tabs.List mb="md">
+            <Tabs.Tab value="menu">Menu</Tabs.Tab>
+            <Tabs.Tab value="entity" disabled={!open}>
+              Entity
+            </Tabs.Tab>
+            <Tabs.Tab value="graph" disabled={!open}>
+              Graph
+            </Tabs.Tab>
+          </Tabs.List>
+
+          <Tabs.Panel value="menu">
+            <MenuTab onOpen={openEntity} />
+          </Tabs.Panel>
+          <Tabs.Panel value="entity">
+            {open && <EntityTab frag={open} onOpen={openEntity} />}
+          </Tabs.Panel>
+          <Tabs.Panel value="graph">
+            {open && <GraphTab frag={open} onOpen={openEntity} />}
+          </Tabs.Panel>
+        </Tabs>
       </AppShell.Main>
     </AppShell>
   )

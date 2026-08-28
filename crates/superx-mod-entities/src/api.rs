@@ -1,1385 +1,503 @@
-//! The entities UI's typed API layer (issue #231) — thin wiring over
-//! the module's existing verbs, with every struct exported to
-//! `ui/src/generated/` via ts-rs so the frontend type-checks against
-//! the module. All functions here are pure translations: validation,
-//! versioning, and telemetry semantics live in the verbs they call.
+//! The HTTP surface, as typed views.
 //!
-//! Operator model (approved design): TYPES ARE ENTITY TYPES — the
-//! registry's relation kinds are never surfaced as "types"; they
-//! exist only for the link dialog's relation picker.
+//! Everything here is a thin adapter over [`crate::entity`],
+//! [`crate::attribute`] and [`crate::edge`]: it renames nothing,
+//! interprets nothing, and decides nothing. Its whole job is to turn
+//! record ids into strings a browser can hold and back again.
+//!
+//! The view types are exported to TypeScript by ts-rs, so the UI reads
+//! the contract from the module rather than from a hand-written copy
+//! that drifts the first time either side changes.
 
 use serde::{Deserialize, Serialize};
-use superx_kernel::message::value_from_json;
-use std::collections::HashSet;
-
-use superx_kernel::types::{RecordId, Value};
+use superx_kernel::types::{Number, RecordId, Value};
 use superx_kernel::{Db, KernelError, Result};
 use superx_ops::record_uuid;
 use ts_rs::TS;
 
-use crate::{
-    attachments, dictionary, documents, edges, fields, graph, nodes, notes, registry, target,
-    texts,
-};
+use crate::attribute::{self, Write};
+use crate::author::Author;
+use crate::edge::{self, Direction};
+use crate::entity;
 
-/// Depth ceiling for the breadcrumb walk (#253): deep enough for any
-/// real product hierarchy, shallow enough that a pathological graph
-/// cannot stall a detail render.
-const ANCESTOR_MAX_DEPTH: usize = 12; // skill-allow: §9-const — render-layer bound, not a policy tunable
-
+/// An attribute, as the browser sees it.
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
-pub struct TypeView {
+pub struct AttributeView {
+    /// Identity across versions — what a saved layout points at.
+    pub uid: String,
     pub name: String,
-    pub description: Option<String>,
-    /// The module creates these itself (the `text` carrier) — the
-    /// create form must not offer them.
-    pub system: bool,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct EntityListItem {
-    pub id: String,
-    pub entity_type: String,
-    pub name: String,
-    /// Hidden from the default list, still on the record.
-    pub archived: bool,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct AnnotationView {
-    /// The dictionary slot this prose sits in — `description`, `spec`,
-    /// `comments`. Not an edge's rel_type: the carrier is the LABEL now.
-    pub label: String,
-    /// The note's chain id, stable across every version of it.
-    pub note_uid: String,
-    pub content: String,
-    /// The note this one answers, for a threaded comment.
-    pub parent_uid: Option<String>,
-    /// `operator` | `role` | `agent` | `system`, and the role it acted as.
-    pub author_kind: Option<String>,
-    pub via_uid: Option<String>,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct EdgeView {
-    pub edge_uid: String,
-    pub rel_type: String,
-    /// The entity on the far side of the edge.
-    pub other_id: String,
-    pub other_name: String,
-    pub other_type: String,
-    /// true = this entity → other; false = other → this entity.
-    pub outbound: bool,
-}
-
-/// One step of the ancestor path (issue #253) — the breadcrumb the
-/// dashboards render above an entity. Root first.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct AncestorView {
-    pub id: String,
-    pub name: String,
-    pub entity_type: String,
-    /// The edge linking this step to the one below it.
-    pub rel_type: String,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct EntityDetail {
-    pub id: String,
-    pub entity_type: String,
-    pub name: String,
-    /// Markdown (BlockNote round-trip, D-UI5) — structured for
-    /// agents, readable everywhere.
-    pub content: Option<String>,
-    /// Pretty-printed attributes JSON, absent when empty.
-    pub attributes_json: Option<String>,
-    /// valid_from of the current state row — the version stamp. Send
-    /// it back as `based_on` to make a write compare-and-append (§6).
-    pub version: String,
-    /// Hidden from the lists, still on the record (§14).
-    pub archived: bool,
-    /// The labels this entity carries beyond what it IS, each resolved
-    /// to what an agent should do about it.
+    pub datatype: String,
+    /// The value, as JSON. `null` when the attribute carries only
+    /// labels, which is how it says what the entity IS.
+    #[ts(type = "unknown")]
+    pub content: serde_json::Value,
+    /// Label uuids. What they MEAN is on the label entity itself.
     pub labels: Vec<String>,
-    pub label_actions: Vec<LabelAction>,
-    pub annotations: Vec<AnnotationView>,
-    /// Active NON-TEXT edges, both directions (text-role edges show
-    /// as annotations instead).
-    pub edges: Vec<EdgeView>,
-    /// Files attached to this entity (EU4) — the `attached` edges,
-    /// resolved to their document nodes' metadata.
-    pub attachments: Vec<AttachmentView>,
-    /// The ancestor path, ROOT FIRST, excluding this entity (#253).
-    pub ancestors: Vec<AncestorView>,
+    /// Per-field overrides — a width, a placeholder.
+    #[ts(type = "unknown")]
+    pub options: serde_json::Value,
+    pub active: bool,
+    pub version: String,
 }
 
-/// One attached file. `size` is bytes as recorded at attach time; the
-/// bytes themselves live under the module's own dir and are served
-/// only through the download route.
+/// An entity opened on its own page.
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
-pub struct AttachmentView {
-    pub id: String,
+pub struct EntityView {
+    pub uuid: String,
     pub name: String,
-    pub mime: String,
-    pub size: i64,
+    /// What it IS: the labels on attributes that hold nothing.
+    pub labels: Vec<LabelView>,
+    pub archived: bool,
+    /// In the order they were added — uuid7 is time-ordered, so this is
+    /// creation order and nothing stored it.
+    pub attributes: Vec<AttributeView>,
+    pub links: Vec<LinkView>,
 }
 
-/// One node of a per-entity subgraph (EU5).
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct GraphNodeView {
-    pub id: String,
-    pub entity_type: String,
-    pub name: String,
-    /// Hops from the root — 0 is the entity the graph is rooted at.
-    pub depth: i64,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct GraphEdgeView {
-    pub from: String,
-    pub to: String,
-    pub rel_type: String,
-}
-
-/// The subgraph reachable from one entity — the graph is PER ENTITY
-/// (operator model): rooted where you opened it, never a global map.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct GraphView {
-    pub root: String,
-    pub nodes: Vec<GraphNodeView>,
-    pub edges: Vec<GraphEdgeView>,
-    /// The walk stopped at the depth limit — there is more out there.
-    pub truncated: bool,
-    pub depth: i64,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct VersionView {
-    pub name: String,
-    pub content: Option<String>,
-    pub attributes_json: Option<String>,
-    pub valid_from: String,
-}
-
-#[derive(Debug, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct CreateReq {
-    pub entity_type: String,
-    pub name: String,
-    /// Optional description — becomes a text node linked describes→.
-    pub description: Option<String>,
-    pub content: Option<String>,
-    pub attributes_json: Option<String>,
-}
-
-#[derive(Debug, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct UpdateReq {
-    pub name: Option<String>,
-    pub content: Option<String>,
-    /// REPLACES the whole attributes object when present (the
-    /// module's update semantics); omit to keep it.
-    pub attributes_json: Option<String>,
-    /// The version this edit was based on (§6). Send it and a write
-    /// that would silently clobber somebody else's is refused, with
-    /// their version named so you can re-read and merge. Omit it and
-    /// the old latest-wins behaviour applies — the guarantee is
-    /// offered, never imposed.
-    pub based_on: Option<String>,
-}
-
-#[derive(Debug, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct TextReq {
-    /// Who is writing. Absent means the operator, which is what a person
-    /// typing into the page is.
-    pub author_kind: Option<String>,
-    pub author_uid: Option<String>,
-    pub via_uid: Option<String>,
-    /// Markdown from the standard editor.
-    pub text: String,
-}
-
-#[derive(Debug, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct LinkReq {
-    /// Target entity: uuid or unique fragment.
-    pub to: String,
-    pub rel: String,
-}
-
-#[derive(Debug, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct TypeReq {
-    pub name: String,
-    pub description: Option<String>,
-}
-
-fn attrs_from_json(s: &Option<String>) -> Result<Option<superx_kernel::types::Value>> {
-    match s {
-        None => Ok(None),
-        Some(raw) if raw.trim().is_empty() => Ok(None),
-        Some(raw) => {
-            let v: serde_json::Value = serde_json::from_str(raw)
-                .map_err(|e| KernelError::Module(format!("attributes is not valid JSON: {e}")))?;
-            Ok(Some(value_from_json(&v)))
-        }
-    }
-}
-
-fn attrs_to_json(v: &Option<superx_kernel::types::Value>) -> Option<String> {
-    let v = v.as_ref()?;
-    let json = nodes::value_to_json(v);
-    if json.as_object().is_some_and(|o| o.is_empty()) {
-        return None;
-    }
-    serde_json::to_string_pretty(&json).ok()
-}
-
-/// ENTITY types only — relation kinds are not "types" (operator
-/// model); they surface solely through [`rel_types`]. The carrier type
-/// is flagged, not hidden: the registry stays honest and the create
-/// form drops it.
-pub async fn types_list(db: &Db) -> Result<Vec<TypeView>> {
-    Ok(registry::list_types(db)
-        .await?
-        .into_iter()
-        .filter(|t| t.category == "entity")
-        .map(|t| TypeView {
-            // Nothing is a "system" type any more: prose and files
-            // stopped being entities, so no kind has to be hidden from
-            // the create form to keep the operator out of trouble.
-            system: false,
-            name: t.name,
-            description: t.description,
-        })
-        .collect())
-}
-
-/// One term in the dictionary, as the design surface shows it.
+/// A label, named. Enough to render a chip without a second request.
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct LabelView {
-    /// What the runner is to DO with it. A label with none says what it
-    /// means to a human and nothing to a machine.
-    pub agent_note: Option<String>,
-    pub key: String,
-    /// `slot` (what an entity carries) or `link` (how entities connect).
-    pub label_kind: String,
-    pub display: String,
-    /// How a reader must TREAT it — the closed vocabulary.
-    pub semantics: String,
-    pub description: Option<String>,
-    /// Decides storage: prose kinds become note chains, value kinds live
-    /// in the attributes bag.
-    pub value_kind: Option<String>,
-    pub cardinality: Option<String>,
-    pub archived: bool,
-    /// Link labels: what this edge will accept at each end, how it reads
-    /// the other way, and whether it may close a loop.
-    pub source_types: Vec<String>,
-    pub target_types: Vec<String>,
-    pub inverse: Option<String>,
-    pub acyclic: bool,
+    pub uuid: String,
+    pub name: String,
 }
 
-/// A slot a type carries, resolved against the label it names.
+/// One connection, from the point of view of the entity you are on.
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
-pub struct SlotView {
-    pub label: String,
-    pub required: bool,
-    pub display_order: i64,
-    pub active: bool,
-    /// The label's own semantics, or this type's override of them.
-    pub semantics: String,
-    pub semantics_override: Option<String>,
-    pub value_kind: Option<String>,
-    pub cardinality: Option<String>,
+pub struct LinkView {
+    pub uid: String,
+    pub name: String,
+    /// Where it points, whichever end that is.
+    pub other: String,
+    pub other_name: String,
+    /// True when this entity is the one doing the pointing.
+    pub outbound: bool,
+    pub labels: Vec<LabelView>,
 }
 
-/// What the design surface needs to choose from: every closed vocabulary
-/// in one read, so the UI never hardcodes a list the substrate owns.
+/// A node of the graph view.
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
-pub struct VocabularyView {
-    pub slot_semantics: Vec<String>,
-    pub link_semantics: Vec<String>,
-    pub value_kinds: Vec<String>,
-    pub prose_kinds: Vec<String>,
-    pub cardinalities: Vec<String>,
-    pub revision: i64,
+pub struct GraphNodeView {
+    pub uuid: String,
+    pub name: String,
+    pub depth: usize,
+    pub labels: Vec<LabelView>,
 }
 
-/// Define or redefine a label.
+/// An edge of the graph view.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct GraphEdgeView {
+    pub uid: String,
+    pub name: String,
+    pub from: String,
+    pub to: String,
+    pub labels: Vec<LabelView>,
+}
+
+/// A subgraph, rooted where it was opened.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct GraphView {
+    pub nodes: Vec<GraphNodeView>,
+    pub edges: Vec<GraphEdgeView>,
+}
+
+/// One row of the menu tree. `has_children` is what lets the tree load
+/// a level at a time instead of the whole graph.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct TreeNodeView {
+    pub uuid: String,
+    pub name: String,
+    pub labels: Vec<LabelView>,
+    pub has_children: bool,
+    /// The edge that got us here, so the tree can show what the
+    /// relationship is rather than just the child.
+    pub via: Option<String>,
+}
+
+/// What the browser sends to create an entity.
 #[derive(Debug, Deserialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
-pub struct LabelReq {
-    pub key: String,
-    pub label_kind: String,
-    pub display: Option<String>,
-    pub semantics: String,
-    pub description: Option<String>,
-    pub cardinality: Option<String>,
-    pub value_kind: Option<String>,
-    /// Link labels only: which types may sit at each end. Absent leaves
-    /// what is there; an empty list clears it back to permissive.
-    pub source_types: Option<Vec<String>>,
-    pub target_types: Option<Vec<String>>,
-    pub inverse: Option<String>,
-    pub acyclic: Option<bool>,
-    /// WHAT THE RUNNER IS TO DO WITH IT — "this is the spec to build
-    /// from", "this is your mandate; you may not change it". The column
-    /// has existed since #266 and nothing could write it, so a label
-    /// could say what it MEANT to a human and nothing to a machine.
-    ///
-    /// This is the half of a label that makes it actionable: an agent
-    /// reads the labels first, and this is what it reads.
-    pub agent_note: Option<String>,
+pub struct CreateReq {
+    pub name: String,
 }
 
-/// Give a type a slot, or change the one it has.
+/// What the browser sends to add or amend an attribute.
 #[derive(Debug, Deserialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
-pub struct SlotReq {
-    pub label: String,
-    pub required: Option<bool>,
-    pub semantics_override: Option<String>,
-    /// Absent leaves the slot where it is; present moves it.
-    pub display_order: Option<i64>,
-    /// Absent leaves it as it is; `false` retires it.
-    pub active: Option<bool>,
-    /// Say so explicitly to remove a semantics override. Absent means
-    /// "leave it alone" — omitting a field must never be how something
-    /// gets cleared, because a form that mentions one thing would erase
-    /// the others.
-    pub clear_semantics_override: Option<bool>,
-}
-
-/// A declared field of an entity, with what it holds.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct LabelAction {
-    pub label: String,
-    /// What an agent is to do with a value carrying this label. Absent
-    /// means the label says what it MEANS to a human and nothing to a
-    /// machine — visible as a gap rather than silently doing nothing.
-    pub action: Option<String>,
-    /// How it must be TREATED (§5.2) — `binding` obeys, `directive` may
-    /// be refused, `secret` never prints.
-    pub semantics: String,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct FieldOffer {
-    pub key: String,
-    pub value_kind: String,
-    pub semantics: String,
-    pub description: String,
-    /// Already on the type — adding it here just fills it in. False
-    /// means adding it is an AD HOC field on this entity alone.
-    pub on_the_type: bool,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct FieldView {
-    pub key: String,
-    /// Empty when the entity holds a key its type no longer declares.
-    pub value_kind: String,
-    pub required: bool,
-    pub value: Option<String>,
-    /// True when nothing declares this key any more. Reads never fail,
-    /// so it surfaces rather than disappearing.
-    pub undeclared: bool,
-    /// The dictionary defines this label but the entity's TYPE does not
-    /// carry it — a field the operator added to this one thing.
-    ///
-    /// Kept as a FACT the page can use, not as a state to act on:
-    /// promotion is gone, so this is no longer "a field waiting to
-    /// become part of the type", it is just where the field came from.
-    pub ad_hoc: bool,
-    /// The dictionary terms attached to this field. Empty means the
-    /// field is theirs alone — named, typed, and nothing an agent acts
-    /// on. Each one an agent resolves to an ACTION at read time.
+pub struct AttributeReq {
+    /// Absent to add; present to amend that chain.
+    pub uid: Option<String>,
+    pub name: String,
+    pub datatype: String,
+    #[ts(type = "unknown | null")]
+    pub content: Option<serde_json::Value>,
+    #[serde(default)]
     pub labels: Vec<String>,
-    /// Those labels resolved: the name and what an agent is to DO with
-    /// it. Resolved at READ time, never frozen onto the field — a label
-    /// rewritten today changes what every field carrying it means, which
-    /// is the whole reason the action lives on the label.
-    pub actions: Vec<LabelAction>,
-    /// How this type treats it — the override where there is one.
-    pub semantics: String,
-    /// What `enum` allows, empty for every other kind.
-    pub options: Vec<String>,
+    #[ts(type = "unknown | null")]
+    pub options: Option<serde_json::Value>,
 }
 
-/// Every field of an entity: declared, typed, and what it holds.
+/// What the browser sends to link two entities.
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct LinkReq {
+    pub to: String,
+    pub name: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+/// Everything about one entity, for its page.
 ///
 /// # Errors
 ///
 /// Verb errors pass through.
-pub async fn entity_fields(db: &Db, fragment: &str) -> Result<Vec<FieldView>> {
-    let id = nodes::resolve_entity(db, fragment).await?;
-    let (entity_type, _) = nodes::anchor_info(db, &id).await?;
-    let slots = dictionary::slots_for(db, &entity_type, false).await?;
-
-    let mut out = Vec::new();
-    for f in fields::of(db, &id).await? {
-        let slot = slots.iter().find(|s| s.label == f.key);
-        let defined = dictionary::find(db, &f.key).await?;
-        out.push(FieldView {
-            semantics: slot
-                .and_then(|s| s.semantics_override.clone())
-                .or_else(|| defined.as_ref().map(|d| d.semantics.clone()))
-                .unwrap_or_default(),
-            options: defined
-                .as_ref()
-                .and_then(|d| d.attributes.as_ref())
-                .and_then(|a| a.get("options"))
-                .map(|v| match v {
-                    superx_kernel::types::Value::Array(items) => items
-                        .iter()
-                        .filter_map(|i| match i {
-                            superx_kernel::types::Value::String(s) => Some(s.clone()),
-                            _ => None,
-                        })
-                        .collect(),
-                    _ => Vec::new(),
-                })
-                .unwrap_or_default(),
-            ad_hoc: f.ad_hoc,
-            labels: defined
-                .as_ref()
-                .and_then(|d| d.attributes.as_ref())
-                .and_then(|a| a.get("labels"))
-                .map(|v| match v {
-                    superx_kernel::types::Value::Array(items) => items
-                        .iter()
-                        .filter_map(|i| match i {
-                            superx_kernel::types::Value::String(s) => Some(s.clone()),
-                            _ => None,
-                        })
-                        .collect(),
-                    _ => Vec::new(),
-                })
-                .unwrap_or_default(),
-            actions: Vec::new(), // filled below, once the labels are known
-            key: f.key,
-            value_kind: f.value_kind,
-            required: f.required,
-            value: f.value,
-            undeclared: f.undeclared,
+pub async fn detail(db: &Db, fragment: &str) -> Result<EntityView> {
+    let id = entity::resolve(db, fragment).await?;
+    // ONE read, four answers: the fields, the name, what it IS, and
+    // whether it is archived. This used to ask the same question of the
+    // same entity four times.
+    let attributes = attribute::of(db, &id, false).await?;
+    let mut names = NameCache::default();
+    let labels = names.views(db, &entity::labels_in(&attributes)).await?;
+    let mut links = Vec::new();
+    for e in edge::of(db, &id, Direction::Both).await? {
+        let outbound = record_uuid(&e.from) == record_uuid(&id);
+        let other = if outbound { e.to.clone() } else { e.from.clone() };
+        links.push(LinkView {
+            uid: e.uid,
+            name: e.name,
+            other_name: entity::name_of(db, &other).await?.unwrap_or_default(),
+            other: record_uuid(&other),
+            outbound,
+            labels: names.views(db, &e.labels).await?,
         });
     }
+    let name = entity::name_in(&attributes).unwrap_or_default();
+    let archived = entity::archived_in(&attributes);
+    let views: Vec<AttributeView> = attributes.into_iter().map(attribute_view).collect();
+    Ok(EntityView {
+        uuid: record_uuid(&id),
+        name,
+        labels,
+        archived,
+        attributes: views,
+        links,
+    })
+}
 
-    // RESOLVE THE LABELS TO THEIR ACTIONS, once, at read time.
-    //
-    // Not frozen onto the field when it was created: a label
-    // rewritten today must change what every field carrying it means,
-    // which is the whole reason the action lives on the label and not
-    // on the value. An agent reads the labels first and does what they
-    // say — so this is what it reads.
-    for view in &mut out {
-        for term in &view.labels {
-            let Some(l) = dictionary::find(db, term).await? else {
-                // Declared once, gone now. Reads never fail (§7), so it
-                // surfaces as a label with no action rather than
-                // vanishing and taking its meaning with it.
-                view.actions.push(LabelAction {
-                    label: term.clone(),
-                    action: None,
-                    semantics: String::new(),
-                });
-                continue;
-            };
-            view.actions.push(LabelAction {
-                label: term.clone(),
-                action: l.agent_note,
-                semantics: l.semantics,
-            });
+/// The children of one entity in the menu tree: one level, on expand.
+///
+/// `label` narrows which connections are followed, which is what makes a
+/// tree out of a graph — "show me what this contains" is a hierarchy,
+/// "show me everything" is a web.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn children(
+    db: &Db,
+    fragment: &str,
+    label: Option<&str>,
+) -> Result<Vec<TreeNodeView>> {
+    let id = entity::resolve(db, fragment).await?;
+    let filter = match label {
+        Some(l) => Some(entity::resolve(db, l).await?),
+        None => None,
+    };
+    let mine = edge::of(db, &id, Direction::Out).await?;
+    let kids: Vec<(RecordId, String)> = mine
+        .into_iter()
+        .filter(|e| filter.as_ref().is_none_or(|f| e.labels.contains(f)))
+        .map(|e| (e.to, e.name))
+        .collect();
+    let ids: Vec<RecordId> = kids.iter().map(|(id, _)| id.clone()).collect();
+    let held = attribute::of_many(db, &ids, false).await?;
+    let parents = edge::sources(db).await?;
+    let mut names = NameCache::default();
+    let mut out = Vec::new();
+    for (child, via) in kids {
+        let attrs = held.get(&record_uuid(&child)).map_or(&[][..], Vec::as_slice);
+        // ARCHIVED IS ARCHIVED EVERYWHERE. The root list hid it and the
+        // tree did not, so a thing put away vanished from the top of the
+        // menu and stayed visible one level down.
+        if entity::archived_in(attrs) {
+            continue;
         }
+        let labels = entity::labels_in(attrs);
+        out.push(TreeNodeView {
+            name: entity::name_in(attrs).unwrap_or_default(),
+            labels: names.views(db, &labels).await?,
+            has_children: parents.contains(&record_uuid(&child)),
+            via: Some(via),
+            uuid: record_uuid(&child),
+        });
     }
     Ok(out)
 }
 
-/// The slot labels this entity could take that it does not already
-/// hold — the dictionary's offer, so a field is PICKED, never invented
-/// inline (§6).
-///
-/// Prose kinds are excluded: they are notes, not values in the bag, and
-/// offering them here would put a description into the attributes.
+/// Every entity, for the top of the menu.
 ///
 /// # Errors
 ///
 /// Verb errors pass through.
-pub async fn addable_fields(db: &Db, fragment: &str) -> Result<Vec<FieldOffer>> {
-    let id = nodes::resolve_entity(db, fragment).await?;
-    let held: std::collections::HashSet<String> =
-        fields::of(db, &id).await?.into_iter().map(|f| f.key).collect();
-    let (entity_type, _) = nodes::anchor_info(db, &id).await?;
-    let slots = dictionary::slots_for(db, &entity_type, false).await?;
-
-    Ok(dictionary::list(db, false)
-        .await?
-        .into_iter()
-        .filter(|l| l.label_kind == dictionary::SLOT)
-        .filter(|l| l.value_kind.as_deref().is_some_and(fields::is_value_kind))
-        .filter(|l| !held.contains(&l.key))
-        .map(|l| FieldOffer {
-            on_the_type: slots.iter().any(|s| s.label == l.key),
-            value_kind: l.value_kind.unwrap_or_default(),
-            description: l.description.unwrap_or_default(),
-            semantics: l.semantics,
-            key: l.key,
-        })
-        .collect())
+pub async fn roots(db: &Db, include_archived: bool) -> Result<Vec<TreeNodeView>> {
+    // ONE read of every entity's attributes, and one name lookup per
+    // DISTINCT label. Asking per row turned the first screen into
+    // thousands of round trips.
+    let ids = entity::list(db, include_archived).await?;
+    let held = attribute::of_many(db, &ids, false).await?;
+    // AND ONE READ FOR "DOES THIS OPEN". Asking `edge::of` per row was
+    // the same N+1 the comment above claims to have removed — 500
+    // entities meant 500 scans of the edge table.
+    let parents = edge::sources(db).await?;
+    let mut names = NameCache::default();
+    let mut out = Vec::new();
+    for id in &ids {
+        let mine = held.get(&record_uuid(id)).map_or(&[][..], Vec::as_slice);
+        let labels = entity::labels_in(mine);
+        out.push(TreeNodeView {
+            name: entity::name_in(mine).unwrap_or_default(),
+            labels: names.views(db, &labels).await?,
+            has_children: parents.contains(&record_uuid(id)),
+            via: None,
+            uuid: record_uuid(id),
+        });
+    }
+    Ok(out)
 }
 
-/// Set one declared field, checked against what its label declares.
+/// One name lookup per distinct entity, however often it is referenced.
+/// A label appears on nearly every row, and asking for its name each
+/// time is the difference between one query and hundreds.
+#[derive(Default)]
+struct NameCache(std::collections::HashMap<String, String>);
+
+impl NameCache {
+    async fn views(&mut self, db: &Db, ids: &[RecordId]) -> Result<Vec<LabelView>> {
+        let mut out = Vec::new();
+        for id in ids {
+            let key = record_uuid(id);
+            let name = match self.0.get(&key) {
+                Some(n) => n.clone(),
+                None => {
+                    let n = entity::name_of(db, id).await?.unwrap_or_default();
+                    self.0.insert(key.clone(), n.clone());
+                    n
+                }
+            };
+            out.push(LabelView { uuid: key, name });
+        }
+        Ok(out)
+    }
+}
+
+/// The subgraph around one entity, for the graph tab.
 ///
 /// # Errors
 ///
 /// Verb errors pass through.
-pub async fn set_field(db: &Db, fragment: &str, key: &str, value: &str) -> Result<()> {
-    let id = nodes::resolve_entity(db, fragment).await?;
-    fields::set(db, &id, key, value).await
+pub async fn graph(
+    db: &Db,
+    fragment: &str,
+    label: Option<&str>,
+    depth: usize,
+) -> Result<GraphView> {
+    let id = entity::resolve(db, fragment).await?;
+    let filter = match label {
+        Some(l) => Some(entity::resolve(db, l).await?),
+        None => None,
+    };
+    let sub = edge::walk(db, &id, filter.as_ref(), depth).await?;
+    // ONE attribute read for every node at once, and one name lookup per
+    // DISTINCT label however often it recurs. Asking per node meant the
+    // same handful of label entities were fetched hundreds of times.
+    let reached: Vec<RecordId> = sub.nodes.iter().map(|n| n.entity.clone()).collect();
+    let held = attribute::of_many(db, &reached, false).await?;
+    let mut names = NameCache::default();
+    let mut nodes = Vec::new();
+    for n in &sub.nodes {
+        let mine = held.get(&record_uuid(&n.entity)).map_or(&[][..], Vec::as_slice);
+        // Something put away is not part of the picture.
+        if entity::archived_in(mine) {
+            continue;
+        }
+        let labels = entity::labels_in(mine);
+        nodes.push(GraphNodeView {
+            uuid: record_uuid(&n.entity),
+            name: entity::name_in(mine).unwrap_or_default(),
+            depth: n.depth,
+            labels: names.views(db, &labels).await?,
+        });
+    }
+    let shown: std::collections::HashSet<&str> =
+        nodes.iter().map(|n| n.uuid.as_str()).collect();
+    let mut edges = Vec::new();
+    for e in &sub.edges {
+        let (from, to) = (record_uuid(&e.from), record_uuid(&e.to));
+        if !shown.contains(from.as_str()) || !shown.contains(to.as_str()) {
+            continue;
+        }
+        edges.push(GraphEdgeView {
+            uid: e.uid.clone(),
+            name: e.name.clone(),
+            from,
+            to,
+            labels: names.views(db, &e.labels).await?,
+        });
+    }
+    Ok(GraphView { nodes, edges })
 }
 
-/// Name a field, give it a datatype, put a value in it.
-///
-/// If the dictionary does not define `key` yet, this defines it — §6:
-/// "you pick one from the dictionary, OR YOU ADD IT TO THE
-/// DICTIONARY". Semantics start at `data`, which is what a field for
-/// your own reference is; changing them to `binding`, `directive` or
-/// `secret` is what makes an agent treat it specially, and that is a
-/// separate, deliberate act on the Dictionary page.
+/// Create an entity.
 ///
 /// # Errors
 ///
-/// Verb errors pass through; an unknown kind is refused by name.
-pub async fn add_field(db: &Db, fragment: &str, req: &FieldReq) -> Result<()> {
-    if let Some(kind) = req.value_kind.as_deref() {
-        if dictionary::find(db, &req.key).await?.is_none() {
-            if !fields::is_value_kind(kind) {
+/// Verb errors pass through.
+pub async fn create(db: &Db, req: &CreateReq, author: &Author) -> Result<String> {
+    Ok(record_uuid(&entity::create(db, &req.name, author).await?))
+}
+
+/// Add or amend an attribute.
+///
+/// # Errors
+///
+/// Verb errors pass through, including the datatype gate.
+pub async fn put_attribute(
+    db: &Db,
+    fragment: &str,
+    req: &AttributeReq,
+    author: &Author,
+) -> Result<String> {
+    let id = entity::resolve(db, fragment).await?;
+    let mut labels = Vec::new();
+    for l in &req.labels {
+        labels.push(entity::resolve(db, l).await?);
+    }
+    let content = req
+        .content
+        .as_ref()
+        .filter(|c| !c.is_null())
+        .map(|c| from_json(&req.datatype, c))
+        .transpose()?;
+    let options = req
+        .options
+        .as_ref()
+        .filter(|o| !o.is_null())
+        .map(superx_kernel::message::value_from_json);
+    let w = Write {
+        name: &req.name,
+        datatype: &req.datatype,
+        content,
+        labels: &labels,
+        options,
+    };
+    match &req.uid {
+        Some(uid) => {
+            // THE URL SAYS WHOSE ATTRIBUTE THIS IS. Without this check a
+            // request addressed to one entity could amend a chain
+            // belonging to another — renaming it, or turning it into
+            // `archived`/`boolean` to hide something.
+            let existing = attribute::current(db, uid).await?.ok_or_else(|| {
+                KernelError::Module(format!("no attribute '{uid}'"))
+            })?;
+            if record_uuid(&existing.entity) != record_uuid(&id) {
                 return Err(KernelError::Module(format!(
-                    "'{kind}' is not a datatype this understands — pick one of: {}",
-                    fields::VALUE_KINDS.join(", ")
+                    "attribute '{uid}' does not belong to this entity"
                 )));
             }
-
-            // THE THIRD THING, optional and MANY. Every label named
-            // must already be defined — a term nobody declared cannot
-            // make anything actionable, and a typo would silently
-            // produce a field the operator believed an agent would act
-            // on while it never would.
-            let mut carried = Vec::new();
-            for term in req.labels.iter().flatten() {
-                dictionary::find(db, term).await?.ok_or_else(|| {
-                    KernelError::Module(format!(
-                        "the dictionary defines no label '{term}' — labels are created \
-                         before they are attached. Define it first, or leave the labels \
-                         empty and the field is yours alone"
-                    ))
-                })?;
-                if !carried.contains(term) {
-                    carried.push(term.clone());
-                }
-            }
-
-            // The labels are recorded ON the field, and the ACTIONS
-            // stay on the labels themselves. That is the whole point:
-            // you cannot predict every action a field needs, so an
-            // agent resolves them at read time rather than the field
-            // freezing a copy that goes stale the moment a label is
-            // rewritten.
-            let mut attrs = superx_kernel::types::Object::new();
-            if !carried.is_empty() {
-                attrs.insert(
-                    "labels".to_string(),
-                    superx_kernel::types::Value::Array(
-                        carried
-                            .iter()
-                            .map(|t| superx_kernel::types::Value::String(t.clone()))
-                            .collect::<Vec<_>>()
-                            .into(),
-                    ),
-                );
-            }
-
-            dictionary::define(db, dictionary::Definition {
-                key: &req.key,
-                kind: dictionary::SLOT,
-                display: &req.key,
-                // The FIELD's own semantics stay `data`. With many
-                // labels there is no single meaning to borrow, and
-                // picking one would be arbitrary — an agent reads the
-                // labels, and each label carries its own action.
-                semantics: "data",
-                value_kind: Some(kind),
-                cardinality: Some("one"),
-                attributes: (!attrs.is_empty()).then_some(attrs),
-                ..Default::default()
-            })
-            .await?;
+            attribute::amend(db, uid, w, author).await?;
+            Ok(uid.clone())
         }
-    }
-    set_field(db, fragment, &req.key, &req.value).await
-}
-
-/// One typed value, from the entity page.
-#[derive(Debug, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct FieldReq {
-    pub key: String,
-    pub value: String,
-    /// Naming a field the dictionary does not know yet ADDS IT to the
-    /// dictionary with this kind — §6's sentence has two halves and
-    /// only the first was built: "you pick one from the dictionary, OR
-    /// YOU ADD IT TO THE DICTIONARY".
-    ///
-    /// Absent means pick-an-existing, and an unknown key is refused as
-    /// before. So a typo is still a typo; a deliberate new field is a
-    /// new field, and the difference is whether a kind came with it.
-    pub value_kind: Option<String>,
-    /// OPTIONAL, MANY, and this is the third thing a field has
-    /// (operator, 2026-08-25): "a custom field may or may not have the
-    /// label … an item can have many labels".
-    ///
-    /// A field with a name and a datatype and no labels is yours, for
-    /// your own reference, and no agent does anything with it. Each
-    /// label it carries is an ACTION an agent takes on it — "this is
-    /// the spec to build from" — so a field named `description`
-    /// labelled `spec` is the spec the runner builds from.
-    ///
-    /// You cannot predict every attribute a thing needs or every action
-    /// to take on it; this is what lets both be added without code.
-    pub labels: Option<Vec<String>>,
-}
-
-/// A file attached to something, as the page shows it.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct AttachedView {
-    pub uid: String,
-    /// What the file MEANS — a PDF labelled `mandate` IS the mandate.
-    pub label: String,
-    pub filename: String,
-    pub mime: String,
-    pub size: i64,
-    pub active: bool,
-    pub author_kind: Option<String>,
-    pub valid_from: Option<String>,
-}
-
-/// Everything that belongs to one target — an entity, a type or a label.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ContentView {
-    pub target_kind: String,
-    pub target_uid: String,
-    pub notes: Vec<AnnotationView>,
-    pub files: Vec<AttachedView>,
-}
-
-/// Prose written on a target.
-#[derive(Debug, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ContentNoteReq {
-    pub label: String,
-    pub body: String,
-}
-
-/// The content of an entity, a type or a label (#296).
-///
-/// A type is exactly the thing people argue about, and this is where the
-/// argument lives.
-///
-/// # Errors
-///
-/// Verb errors pass through.
-pub async fn content(db: &Db, kind: &str, uid: &str) -> Result<ContentView> {
-    let target = target::Target::resolve(db, kind, uid).await?;
-    Ok(ContentView {
-        notes: notes::for_target(db, &target, false)
-            .await?
-            .into_iter()
-            .map(|n| AnnotationView {
-                label: n.label,
-                note_uid: n.uid,
-                content: n.body,
-                parent_uid: n.parent_uid,
-                author_kind: n.author_kind,
-                via_uid: n.via_uid,
-            })
-            .collect(),
-        files: attachments::for_target(db, &target, false)
-            .await?
-            .into_iter()
-            .map(|a| AttachedView {
-                uid: a.uid,
-                label: a.label,
-                filename: a.filename,
-                mime: a.mime,
-                size: a.size,
-                active: a.active,
-                author_kind: a.author_kind,
-                valid_from: a.valid_from.map(|t| t.to_rfc3339()),
-            })
-            .collect(),
-        target_kind: target.kind().to_string(),
-        target_uid: target.uid(),
-    })
-}
-
-/// Write prose on any target.
-///
-/// # Errors
-///
-/// Verb errors pass through.
-pub async fn write_content_note(
-    db: &Db,
-    kind: &str,
-    uid: &str,
-    req: &ContentNoteReq,
-) -> Result<String> {
-    let target = target::Target::resolve(db, kind, uid).await?;
-    let (note_uid, _) =
-        notes::write_to_target(db, &target, &req.label, &req.body, &notes::Author::operator())
-            .await?;
-    Ok(note_uid)
-}
-
-/// The whole dictionary, for the design surface.
-///
-/// # Errors
-///
-/// Verb errors pass through.
-/// Label an entity (#324) — what it is, beyond its identity.
-///
-/// # Errors
-///
-/// Verb errors pass through.
-pub async fn set_entity_labels(db: &Db, fragment: &str, labels: &[String]) -> Result<()> {
-    let id = nodes::resolve_entity(db, fragment).await?;
-    nodes::set_labels(db, &id, labels).await
-}
-
-/// Archive or restore an entity (§14). Returns whether anything
-/// changed — archiving what is already archived is a no-op, not an
-/// error.
-///
-/// # Errors
-///
-/// Verb errors pass through.
-pub async fn set_archived(db: &Db, fragment: &str, archived: bool) -> Result<bool> {
-    let id = nodes::resolve_entity(db, fragment).await?;
-    nodes::set_archived(db, &id, archived).await
-}
-
-/// Archive or restore a label (§14): a term superseded by a better one
-/// stops being offered without the dictionary losing what it meant.
-///
-/// # Errors
-///
-/// Verb errors pass through.
-pub async fn set_label_archived(
-    db: &Db,
-    key: &str,
-    kind: &str,
-    archived: bool,
-) -> Result<()> {
-    dictionary::archive(db, key, kind, archived).await
-}
-
-pub async fn labels(db: &Db, include_archived: bool) -> Result<Vec<LabelView>> {
-    Ok(dictionary::list(db, include_archived)
-        .await?
-        .into_iter()
-        .map(|l| LabelView {
-            key: l.key,
-            label_kind: l.label_kind,
-            display: l.display,
-            semantics: l.semantics,
-            description: l.description,
-            value_kind: l.value_kind,
-            cardinality: l.cardinality,
-            agent_note: l.agent_note,
-            archived: l.archived,
-            source_types: l.source_types,
-            target_types: l.target_types,
-            inverse: l.inverse,
-            acyclic: l.acyclic,
-        })
-        .collect())
-}
-
-/// Every closed vocabulary the design surface offers.
-///
-/// # Errors
-///
-/// Verb errors pass through.
-pub async fn vocabulary(db: &Db) -> Result<VocabularyView> {
-    Ok(VocabularyView {
-        slot_semantics: dictionary::SLOT_SEMANTICS.iter().map(ToString::to_string).collect(),
-        link_semantics: dictionary::LINK_SEMANTICS.iter().map(ToString::to_string).collect(),
-        value_kinds: fields::VALUE_KINDS
-            .iter()
-            .chain(std::iter::once(&fields::SECRET_KIND))
-            .map(ToString::to_string)
-            .collect(),
-        prose_kinds: fields::PROSE_KINDS.iter().map(ToString::to_string).collect(),
-        cardinalities: vec!["one".to_string(), "many".to_string()],
-        revision: dictionary::revision(db).await?,
-    })
-}
-
-/// Define or redefine a label.
-///
-/// # Errors
-///
-/// Verb errors pass through.
-pub async fn define_label(db: &Db, req: &LabelReq) -> Result<()> {
-    dictionary::define(
-        db,
-        dictionary::Definition {
-            key: &req.key,
-            kind: &req.label_kind,
-            display: req.display.as_deref().unwrap_or(&req.key),
-            semantics: &req.semantics,
-            description: req.description.as_deref(),
-            cardinality: req.cardinality.as_deref(),
-            value_kind: req.value_kind.as_deref(),
-            source_types: req.source_types.as_deref(),
-            target_types: req.target_types.as_deref(),
-            inverse: req.inverse.as_deref(),
-            acyclic: req.acyclic,
-            agent_note: req.agent_note.as_deref(),
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// The slots a type carries, resolved against the dictionary.
-///
-/// # Errors
-///
-/// Verb errors pass through.
-pub async fn slots(db: &Db, entity_type: &str, include_retired: bool) -> Result<Vec<SlotView>> {
-    let mut out = Vec::new();
-    for slot in dictionary::slots_for(db, entity_type, include_retired).await? {
-        let defined = dictionary::find(db, &slot.label).await?;
-        out.push(SlotView {
-            semantics: slot
-                .semantics_override
-                .clone()
-                .or_else(|| defined.as_ref().map(|d| d.semantics.clone()))
-                .unwrap_or_default(),
-            value_kind: defined.as_ref().and_then(|d| d.value_kind.clone()),
-            cardinality: defined.and_then(|d| d.cardinality),
-            label: slot.label,
-            required: slot.required,
-            display_order: slot.display_order,
-            active: slot.active,
-            semantics_override: slot.semantics_override,
-        });
-    }
-    Ok(out)
-}
-
-/// Give a type a slot, move it, or retire it.
-///
-/// # Errors
-///
-/// Verb errors pass through.
-pub async fn bind_slot(db: &Db, entity_type: &str, req: &SlotReq) -> Result<()> {
-    let author = notes::Author::operator();
-    let existing = dictionary::slots_for(db, entity_type, true)
-        .await?
-        .into_iter()
-        .find(|s| s.label == req.label);
-
-    match existing {
-        // Already there: this is an edit, and each part is optional so a
-        // form that only changes the order does not also reset the rest.
-        Some(prior) => {
-            // ABSENT MEANS UNCHANGED. Treating a missing field as "clear
-            // it" meant a request that only set `required` also wiped the
-            // §5.2 semantics override — the value that decides how an
-            // agent treats the slot — with nothing in the request saying
-            // so and nothing in the response admitting it.
-            let clearing = req.clear_semantics_override.unwrap_or(false);
-            let semantics_override = if clearing {
-                None
-            } else {
-                req.semantics_override.clone().or_else(|| prior.semantics_override.clone())
-            };
-            let required = req.required.unwrap_or(prior.required);
-
-            if required != prior.required || semantics_override != prior.semantics_override {
-                dictionary::bind_slot(
-                    db,
-                    entity_type,
-                    &req.label,
-                    required,
-                    semantics_override.as_deref(),
-                    &author,
-                )
-                .await?;
-            }
-            if let Some(order) = req.display_order {
-                dictionary::order_slot(db, entity_type, &req.label, order, &author).await?;
-            }
-            if let Some(active) = req.active {
-                dictionary::retire_slot(db, entity_type, &req.label, active, &author).await?;
-            }
-            Ok(())
-        }
-        None => {
-            dictionary::bind_slot(
-                db,
-                entity_type,
-                &req.label,
-                req.required.unwrap_or(false),
-                req.semantics_override.as_deref(),
-                &author,
-            )
-            .await
-        }
+        None => attribute::add(db, &id, w, author).await,
     }
 }
 
-/// Create a new ENTITY type (the UI never creates relation kinds).
-pub async fn types_add(db: &Db, req: &TypeReq) -> Result<()> {
-    registry::add_type(db, &req.name, "entity", req.description.as_deref()).await
-}
-
-/// Relation kinds, for the link dialog's picker only.
-pub async fn rel_types(db: &Db) -> Result<Vec<String>> {
-    Ok(registry::list_types(db)
-        .await?
-        .into_iter()
-        .filter(|t| t.category == "relation")
-        .map(|t| t.name)
-        .collect())
-}
-
-/// The entity list. Text nodes are annotations of the entity they hang
-/// off — every comment and description would otherwise land here as a
-/// row of its own — so the unfiltered list omits them; asking for the
-/// carrier type by name still returns them.
-pub async fn list(
-    db: &Db,
-    type_filter: Option<&str>,
-    include_archived: bool,
-) -> Result<Vec<EntityListItem>> {
-    Ok(nodes::list_entities(db, type_filter)
-        .await?
-        .into_iter()
-        // No type filter. The carriers that used to need hiding are
-        // ARCHIVED by B4, and archived is the one question the list
-        // asks — "should this still be shown by default?" (§14).
-        .filter(|e| include_archived || !e.archived)
-        .map(|e| EntityListItem {
-            id: record_uuid(&e.id),
-            entity_type: e.entity_type,
-            name: e.name,
-            archived: e.archived,
-        })
-        .collect())
-}
-
-pub async fn detail(db: &Db, fragment: &str) -> Result<EntityDetail> {
-    detail_at(db, fragment, None).await
-}
-
-/// THE WHOLE ENTITY AS IT STOOD AT AN INSTANT (§14).
-///
-/// A field-by-field picker answers "how did this text change". This
-/// answers **"what did the agent see when it did that"** — the question
-/// after a bad run — and it cannot be assembled from separate pickers,
-/// because each one moves independently.
-///
-/// One instant reaches every chain: state, notes, attachments and
-/// edges, all resolved at the same moment. `valid_from <= as_of`,
-/// latest wins per chain, edges as they were ACTIVE then.
+/// Link two entities.
 ///
 /// # Errors
 ///
-/// [`KernelError::Module`] when the instant is unreadable or the entity
-/// did not exist yet; verb errors pass through.
-pub async fn detail_at(
+/// Verb errors pass through.
+pub async fn link(
     db: &Db,
     fragment: &str,
-    as_of: crate::asof::AsOf,
-) -> Result<EntityDetail> {
-    let id = nodes::resolve_entity(db, fragment).await?;
-    let (entity_type, _created) = nodes::anchor_info(db, &id).await?;
-    let state = nodes::state_at(db, &id, as_of).await?.ok_or_else(|| {
-        // Distinguishing the two is the difference between a broken
-        // substrate and a question about a time before this existed.
-        if as_of.is_some() {
-            KernelError::Module(format!(
-                "entity {} had no version at that instant — it was created later",
-                record_uuid(&id)
-            ))
-        } else {
-            KernelError::Module(format!("entity {} has no state chain", record_uuid(&id)))
-        }
+    req: &LinkReq,
+    author: &Author,
+) -> Result<String> {
+    let from = entity::resolve(db, fragment).await?;
+    let to = entity::resolve(db, &req.to).await?;
+    let mut labels = Vec::new();
+    for l in &req.labels {
+        labels.push(entity::resolve(db, l).await?);
+    }
+    edge::link(db, &from, &to, &req.name, &labels, author).await
+}
+
+/// JSON in, a typed value out.
+///
+/// `value_from_json` has no datetime — JSON has no such literal — so an
+/// instant arrives as a string and the datatype gate refused it, which
+/// made `datetime` unwritable through the only write path there is. The
+/// conversion belongs here, at the boundary where the declared datatype
+/// is known.
+fn from_json(datatype: &str, c: &serde_json::Value) -> Result<Value> {
+    if datatype != "datetime" {
+        return Ok(superx_kernel::message::value_from_json(c));
+    }
+    let s = c.as_str().ok_or_else(|| {
+        KernelError::Module(
+            "a datetime is sent as an RFC 3339 string, e.g. 2026-08-28T12:34:00Z".to_string(),
+        )
     })?;
-    // Prose comes from the note store (#278). The text carriers still
-    // exist and are still written, but nothing reads them for display any
-    // more — which is what had to become true before they can go.
-    let annotations = notes::for_entity_at(db, &id, false, as_of)
-        .await?
-        .into_iter()
-        .map(|n| AnnotationView {
-            label: n.label,
-            note_uid: n.uid,
-            content: n.body,
-            parent_uid: n.parent_uid,
-            author_kind: n.author_kind,
-            via_uid: n.via_uid,
-        })
-        .collect();
+    let parsed = chrono::DateTime::parse_from_rfc3339(s).map_err(|e| {
+        KernelError::Module(format!("'{s}' is not an RFC 3339 instant: {e}"))
+    })?;
+    Ok(Value::Datetime(parsed.with_timezone(&chrono::Utc).into()))
+}
 
-    // Active NON-TEXT edges, both directions, with the far side named.
-    let mut views: Vec<(RecordId, EdgeView)> = Vec::new();
-    for (rows, outbound) in [
-        (edges::expand_at(db, std::slice::from_ref(&id), false, as_of).await?, true),
-        (edges::expand_at(db, std::slice::from_ref(&id), true, as_of).await?, false),
-    ] {
-        for e in rows {
-            if !e.active || texts::TEXT_ROLES.contains(&e.rel_type.as_str()) {
-                continue;
-            }
-            let other = if outbound { e.to.clone() } else { e.from.clone() };
-            views.push((
-                other.clone(),
-                EdgeView {
-                    edge_uid: e.edge_uid,
-                    rel_type: e.rel_type,
-                    other_id: record_uuid(&other),
-                    other_name: String::new(),
-                    other_type: String::new(),
-                    outbound,
-                },
-            ));
+fn attribute_view(a: attribute::Attribute) -> AttributeView {
+    AttributeView {
+        uid: a.uid,
+        name: a.name,
+        datatype: a.datatype,
+        content: a.content.as_ref().map_or(serde_json::Value::Null, to_json),
+        labels: a.labels.iter().map(record_uuid).collect(),
+        options: a.options.as_ref().map_or(serde_json::Value::Null, to_json),
+        active: a.active,
+        version: a.version,
+    }
+}
+
+/// Render a dynamic value as JSON for the browser.
+fn to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        // MATCH THE VARIANT, do not ask `to_int`. It answers `Some` for a
+        // Float too — `Some(v as i64)` — so 19.99 came back as 19, the
+        // form rendered 19, and the next blur wrote 19 over the stored
+        // value. A price or a ratio was destroyed by being looked at.
+        Value::Number(Number::Int(i)) => serde_json::Value::Number((*i).into()),
+        Value::Number(Number::Float(f)) => serde_json::Number::from_f64(*f)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Value::Number(Number::Decimal(d)) => d
+            .to_string()
+            .parse::<serde_json::Number>()
+            .map_or_else(|_| serde_json::Value::String(d.to_string()), serde_json::Value::Number),
+        Value::Datetime(d) => serde_json::Value::String(d.to_string()),
+        Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(to_json).collect())
         }
-    }
-    let others: Vec<RecordId> = views.iter().map(|(o, _)| o.clone()).collect();
-    let meta = nodes::current_meta(db, &others).await?;
-    let edges: Vec<EdgeView> = views
-        .into_iter()
-        .map(|(other, mut v)| {
-            if let Some(m) = meta.get(&record_uuid(&other)) {
-                v.other_name = m.name.clone();
-                v.other_type = m.entity_type.clone();
-            }
-            v
-        })
-        .collect();
-
-    let attachments = attachments_of(db, &id, as_of).await?;
-    let ancestors = graph::ancestors(db, &id, ANCESTOR_MAX_DEPTH)
-        .await?
-        .into_iter()
-        .map(|a| AncestorView {
-            id: record_uuid(&a.id),
-            name: a.name,
-            entity_type: a.entity_type,
-            rel_type: a.rel_type,
-        })
-        .collect();
-
-    Ok(EntityDetail {
-        id: record_uuid(&id),
-        entity_type,
-        name: state.name,
-        content: state.content,
-        attributes_json: attrs_to_json(&state.attributes),
-        archived: state.archived,
-        label_actions: {
-            // Resolved at READ time, like a field's — a label rewritten
-            // today changes what every entity carrying it means.
-            let mut out = Vec::new();
-            for term in &state.labels {
-                let found = dictionary::find(db, term).await?;
-                out.push(LabelAction {
-                    label: term.clone(),
-                    action: found.as_ref().and_then(|l| l.agent_note.clone()),
-                    semantics: found.map(|l| l.semantics).unwrap_or_default(),
-                });
-            }
-            out
-        },
-        labels: state.labels.clone(),
-        version: state.valid_from,
-        annotations,
-        edges,
-        attachments,
-        ancestors,
-    })
-}
-
-/// The files on an entity, read from the `attachment` rows.
-///
-/// It used to walk the `attached` edge to a `document` node and read
-/// its attributes. B4 retracted those edges and B6 stopped creating the
-/// nodes, so that walk now finds nothing — the rows are the one place
-/// files live (§3, §6).
-async fn attachments_of(
-    db: &Db,
-    id: &RecordId,
-    as_of: crate::asof::AsOf,
-) -> Result<Vec<AttachmentView>> {
-    Ok(attachments::for_target_at(db, &target::Target::Entity(id.clone()), false, as_of)
-        .await?
-        .into_iter()
-        .map(|a| AttachmentView { id: a.uid, name: a.filename, mime: a.mime, size: a.size })
-        .collect())
-}
-
-/// A string out of an attributes bag, for the legacy document rows the
-/// download route still resolves.
-fn attr_str(attrs: Option<&Value>, key: &str) -> Option<String> {
-    match attrs {
-        Some(Value::Object(o)) => match o.get(key) {
-            Some(Value::String(v)) => Some(v.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// The subgraph rooted at one entity (EU5). `both` unions the forward
-/// and reverse walks: an entity's neighbourhood is what it points at
-/// AND what points at it — a root-level entity should show its whole
-/// world, which is the operator's model for this view.
-pub async fn graph_view(
-    db: &Db,
-    fragment: &str,
-    depth: usize,
-    direction: &str,
-) -> Result<GraphView> {
-    let id = nodes::resolve_entity(db, fragment).await?;
-    let root_uuid = record_uuid(&id);
-    let walks: &[bool] = match direction {
-        "out" => &[false],
-        "in" => &[true],
-        _ => &[false, true],
-    };
-    let mut nodes_out: Vec<GraphNodeView> = Vec::new();
-    let mut edges_out: Vec<GraphEdgeView> = Vec::new();
-    let mut truncated = false;
-    let mut seen_nodes: HashSet<String> = HashSet::new();
-    let mut seen_edges: HashSet<String> = HashSet::new();
-    for &reverse in walks {
-        let sub = graph::subgraph(db, &id, depth, reverse).await?;
-        truncated |= sub.truncated_at_depth;
-        for n in sub.nodes {
-            // The type check that used to live here is gone. Prose is
-            // not a member of the product graph (operator, issue #246)
-            // — and the walk now knows that from the dictionary, so it
-            // never arrives to be filtered. The rule held HERE and
-            // nowhere in the CLI path is exactly why the operator's
-            // graph showed 1 node where the runner's showed 4 (#300).
-            let uuid = record_uuid(&n.id);
-            // A node reached by both walks keeps its SHALLOWEST depth.
-            if let Some(prev) = nodes_out.iter_mut().find(|p| p.id == uuid) {
-                prev.depth = prev.depth.min(n.depth as i64);
-                continue;
-            }
-            if !seen_nodes.insert(uuid.clone()) {
-                continue;
-            }
-            nodes_out.push(GraphNodeView {
-                id: uuid,
-                entity_type: n.entity_type,
-                name: n.name,
-                depth: n.depth as i64,
-            });
-        }
-        for e in sub.edges {
-            if !seen_edges.insert(e.edge_uid.clone()) {
-                continue;
-            }
-            edges_out.push(GraphEdgeView {
-                from: e.from,
-                to: e.to,
-                rel_type: e.rel_type,
-            });
-        }
-    }
-    // An edge whose far end was never reached would render as a stub.
-    edges_out.retain(|e| seen_nodes.contains(&e.from) && seen_nodes.contains(&e.to));
-    Ok(GraphView {
-        root: root_uuid,
-        nodes: nodes_out,
-        edges: edges_out,
-        truncated,
-        depth: depth as i64,
-    })
-}
-
-/// Where an attachment's bytes live, and what to call them on the way
-/// out. Path resolution stays in the module: the stored path is a
-/// substrate fact written by the attach path, never client input.
-pub async fn attachment_file(db: &Db, uid: &str) -> Result<(String, String, String)> {
-    // An attachment ROW, by uid. It used to resolve a `document` entity
-    // and read its attributes; B4 migrated those into rows and B6
-    // stopped creating them, so the row is where the path is.
-    if let Some(a) = attachments::current(db, uid).await? {
-        if !a.active {
-            return Err(KernelError::Module(
-                "that attachment was retracted — it is on the record, not on the way out".into(),
-            ));
-        }
-        return Ok((a.path, a.filename, a.mime));
-    }
-
-    // A LEGACY document node, for an instance that has not migrated yet.
-    // Reading it keeps every existing download link working across the
-    // upgrade instead of breaking until the operator runs the migration.
-    let id = nodes::resolve_entity(db, uid).await?;
-    let state = nodes::current_state(db, &id)
-        .await?
-        .ok_or_else(|| KernelError::Module("attachment has no state".into()))?;
-    let attrs = state.attributes.as_ref();
-    let path = attrs
-        .and_then(documents::stored_path)
-        .ok_or_else(|| KernelError::Module("not an attachment: no stored file".into()))?;
-    Ok((
-        path,
-        attr_str(attrs, "original_name").unwrap_or(state.name),
-        attr_str(attrs, "mime").unwrap_or_else(|| "application/octet-stream".into()),
-    ))
-}
-
-/// Version history, for an entity OR for a note.
-///
-/// #262 shipped version viewing and the UI reaches it with the id from
-/// the detail payload. That id is now a note uid, so an endpoint that
-/// only resolved entities would 404 on every description in the system.
-/// Notes are tried first: a note uid is a full uuid and cannot collide
-/// with the fragment-matching an entity lookup does.
-pub async fn history(db: &Db, fragment: &str) -> Result<Vec<VersionView>> {
-    let versions = notes::history(db, fragment).await?;
-    if !versions.is_empty() {
-        return Ok(versions
-            .into_iter()
-            .map(|n| VersionView {
-                name: n.label,
-                content: Some(n.body),
-                attributes_json: None,
-                valid_from: n
-                    .valid_from
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_default(),
-            })
-            .collect());
-    }
-
-    let id = nodes::resolve_entity(db, fragment).await?;
-    Ok(nodes::state_history(db, &id)
-        .await?
-        .into_iter()
-        .map(|s| VersionView {
-            name: s.name,
-            content: s.content,
-            attributes_json: attrs_to_json(&s.attributes),
-            valid_from: s.valid_from,
-        })
-        .collect())
-}
-
-pub async fn create(db: &Db, req: &CreateReq) -> Result<String> {
-    let attrs = attrs_from_json(&req.attributes_json)?;
-    let id = nodes::create_entity(db, &req.entity_type, &req.name, req.content.clone(), attrs)
-        .await?;
-    if let Some(desc) = req.description.as_deref() {
-        if !desc.trim().is_empty() {
-            texts::set_role_text(db, &id, "describes", desc).await?;
-        }
-    }
-    Ok(record_uuid(&id))
-}
-
-pub async fn update(db: &Db, fragment: &str, req: &UpdateReq) -> Result<String> {
-    let id = nodes::resolve_entity(db, fragment).await?;
-    // Before anything is validated or written: did the thing move under
-    // the writer's feet? Refusing here means no half-applied edit.
-    nodes::check_fresh(db, &id, req.based_on.as_deref()).await?;
-    let attrs = attrs_from_json(&req.attributes_json)?;
-
-    // Every declared key goes through the same check whichever door it
-    // came in by (#294). Without this the attributes box was a way round
-    // every rule `fields::set` enforces — including the one that keeps a
-    // raw credential out of the graph.
-    let attrs = match attrs {
-        Some(superx_kernel::types::Value::Object(bag)) => Some(
-            superx_kernel::types::Value::Object(fields::validate_bag(db, &id, &bag).await?),
+        Value::Object(o) => serde_json::Value::Object(
+            o.iter().map(|(k, val)| (k.clone(), to_json(val))).collect(),
         ),
-        other => other,
-    };
-
-    nodes::update_entity(db, &id, req.name.clone(), req.content.clone(), attrs).await?;
-    Ok(record_uuid(&id))
-}
-
-pub async fn describe(db: &Db, fragment: &str, text: &str) -> Result<String> {
-    let id = nodes::resolve_entity(db, fragment).await?;
-    // The note's uid, not a carrier's. Prose stopped being an entity
-    // in #302; returning a node id here would name something that is
-    // no longer created.
-    let (note_uid, _new) = texts::set_role_text(db, &id, "describes", text).await?;
-    Ok(note_uid)
-}
-
-/// Add a comment, optionally as someone other than the operator.
-///
-/// The default stays the operator, so every caller that does not say who
-/// it is keeps behaving as it did. What changes is that a caller which
-/// KNOWS who it is can now say so — an agent's output recorded as the
-/// operator's would be a lie in the column that exists to be trusted.
-pub async fn comment(
-    db: &Db,
-    fragment: &str,
-    text: &str,
-    author: &notes::Author,
-) -> Result<String> {
-    let id = nodes::resolve_entity(db, fragment).await?;
-    let note_uid = texts::add_comment(db, &id, text, author).await?;
-    Ok(note_uid)
-}
-
-pub async fn link(db: &Db, fragment: &str, req: &LinkReq) -> Result<String> {
-    let from = nodes::resolve_entity(db, fragment).await?;
-    let to = nodes::resolve_entity(db, &req.to).await?;
-    edges::link(db, &from, &to, &req.rel).await
-}
-
-pub async fn unlink(db: &Db, fragment: &str, req: &LinkReq) -> Result<String> {
-    let from = nodes::resolve_entity(db, fragment).await?;
-    let to = nodes::resolve_entity(db, &req.to).await?;
-    edges::unlink(db, &from, &to, &req.rel).await
-}
-
-/// Keep the graph module linked for EU5 (the Graph button's phase).
-#[allow(dead_code)] // skill-allow: allow — EU5 lands the graph endpoint over this
-fn _eu5_uses_graph() {
-    let _ = graph::render_tree;
+        _ => serde_json::Value::Null,
+    }
 }
