@@ -8,9 +8,14 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ts-rs.workspace = true
 linkme.workspace = true
 superx-kernel = { path = "../superx-kernel" }
 superx-ops = { path = "../superx-ops" }
+tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 uuid.workspace = true
 
