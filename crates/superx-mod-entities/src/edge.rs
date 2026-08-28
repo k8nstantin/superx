@@ -1,0 +1,364 @@
+//! Edges — what an entity points at.
+//!
+//! An edge is built like an attribute: a uid, a name, labels, and a
+//! history. The difference is where it is stored. A native relation lets
+//! the ENGINE walk the graph — both directions, many levels, one query —
+//! and a link kept in a column cannot be walked at all: following it
+//! means looking up the next entity's rows, which is a round trip per
+//! level. Roles and products get deep enough that this decides whether
+//! the graph is readable.
+//!
+//! MANY EDGES MAY JOIN THE SAME PAIR. A role can both contain a task and
+//! consult it, and those are two edges with two names and two histories,
+//! not one edge with two meanings.
+//!
+//! Linking appends a row with a fresh uid. Unlinking appends another on
+//! the same uid with `active = false`, and relinking appends a third —
+//! so a connection that was cut is still on the record, with who cut it
+//! and when.
+
+use superx_kernel::types::{Object, RecordId, Value};
+use superx_kernel::{Db, KernelError, Result};
+use superx_ops::record_uuid;
+
+use crate::author::Author;
+use crate::{new_id, newest_by_valid_from, obj_bool, obj_display, obj_record, obj_records, obj_str};
+
+/// One edge as it currently reads.
+#[derive(Debug, Clone)]
+pub struct Edge {
+    /// Identity across versions — what an unlink and a relink share.
+    pub uid: String,
+    pub from: RecordId,
+    pub to: RecordId,
+    pub name: String,
+    /// What the connection MEANS. Resolved by the reader.
+    pub labels: Vec<RecordId>,
+    pub active: bool,
+    pub version: String,
+}
+
+/// Link two entities. Returns the edge's `uid`.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] for an empty name or a self-link;
+/// [`KernelError::Db`] for engine errors — including an endpoint that
+/// does not exist, which the schema refuses, and a label that does not
+/// exist.
+pub async fn link(
+    db: &Db,
+    from: &RecordId,
+    to: &RecordId,
+    name: &str,
+    labels: &[RecordId],
+    author: &Author,
+) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(KernelError::Module(
+            "a connection needs a name — an unnamed edge cannot be read".to_string(),
+        ));
+    }
+    if record_uuid(from) == record_uuid(to) {
+        return Err(KernelError::Module(
+            "an entity cannot point at itself — that says nothing".to_string(),
+        ));
+    }
+    let uid = record_uuid(&new_id("edge"));
+    relate(db, Row { from, to, uid: &uid, name, labels, active: true }, author).await?;
+    Ok(uid)
+}
+
+/// Cut a link: the same uid, `active = false`. Idempotent — returns
+/// whether a row was written.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] when the uid has no chain; [`KernelError::Db`]
+/// for engine errors.
+pub async fn unlink(db: &Db, uid: &str, author: &Author) -> Result<bool> {
+    set_active(db, uid, false, author).await
+}
+
+/// Put a cut link back.
+///
+/// # Errors
+///
+/// As [`unlink`].
+pub async fn relink(db: &Db, uid: &str, author: &Author) -> Result<bool> {
+    set_active(db, uid, true, author).await
+}
+
+async fn set_active(db: &Db, uid: &str, active: bool, author: &Author) -> Result<bool> {
+    let now = current(db, uid)
+        .await?
+        .ok_or_else(|| KernelError::Module(format!("no edge '{uid}'")))?;
+    if now.active == active {
+        return Ok(false);
+    }
+    relate(
+        db,
+        Row {
+            from: &now.from,
+            to: &now.to,
+            uid,
+            name: &now.name,
+            labels: &now.labels,
+            active,
+        },
+        author,
+    )
+    .await?;
+    Ok(true)
+}
+
+/// The current version of one edge.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn current(db: &Db, uid: &str) -> Result<Option<Edge>> {
+    let mut resp = db
+        .query("SELECT *, in, out FROM entity_edge WHERE uid = $uid")
+        .bind(("uid", uid.to_string()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    Ok(newest_by_valid_from(&rows).and_then(parse))
+}
+
+/// The live edges of one entity: outward, inward, or both.
+///
+/// This is the read the tree makes on every expand — "what hangs off
+/// this one" — so it is one query bounded by the entity's degree, never
+/// the table.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn of(db: &Db, anchor: &RecordId, dir: Direction) -> Result<Vec<Edge>> {
+    let clause = match dir {
+        Direction::Out => "in = $e",
+        Direction::In => "out = $e",
+        Direction::Both => "in = $e OR out = $e",
+    };
+    let mut resp = db
+        .query(format!("SELECT *, in, out FROM entity_edge WHERE {clause}"))
+        .bind(("e", anchor.clone()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+
+    let mut chains: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let Some(uid) = obj_str(&row, "uid") else { continue };
+        chains.entry(uid).or_default().push(row);
+    }
+    Ok(chains
+        .into_values()
+        .filter_map(|c| newest_by_valid_from(&c).and_then(parse))
+        .filter(|e| e.active)
+        .collect())
+}
+
+/// Which way to look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// What this entity points at.
+    Out,
+    /// What points at this entity — free, because the engine holds the
+    /// pointers both ways.
+    In,
+    Both,
+}
+
+/// Every version of one edge, oldest first — including every time it was
+/// cut and put back.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn history(db: &Db, uid: &str) -> Result<Vec<Edge>> {
+    let mut resp = db
+        .query(
+            "SELECT *, in, out FROM entity_edge WHERE uid = $uid \
+             ORDER BY valid_from ASC, id ASC",
+        )
+        .bind(("uid", uid.to_string()))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    Ok(rows.iter().filter_map(parse).collect())
+}
+
+fn parse(row: &Value) -> Option<Edge> {
+    Some(Edge {
+        uid: obj_str(row, "uid")?,
+        from: obj_record(row, "in")?,
+        to: obj_record(row, "out")?,
+        name: obj_str(row, "name")?,
+        labels: obj_records(row, "labels"),
+        active: obj_bool(row, "active"),
+        version: obj_display(row, "valid_from").unwrap_or_default(),
+    })
+}
+
+/// One edge row, about to be written. A struct rather than a row of
+/// positional arguments, because two `&RecordId` and two `&str` next to
+/// each other is a swap nothing catches.
+struct Row<'a> {
+    from: &'a RecordId,
+    to: &'a RecordId,
+    uid: &'a str,
+    name: &'a str,
+    labels: &'a [RecordId],
+    active: bool,
+}
+
+/// The one place an edge row is written.
+async fn relate(db: &Db, r: Row<'_>, author: &Author) -> Result<()> {
+    let (from, to, uid, name, labels, active) =
+        (r.from, r.to, r.uid, r.name, r.labels, r.active);
+    let mut row = Object::new();
+    row.insert("uid".to_string(), Value::String(uid.to_string()));
+    row.insert("name".to_string(), Value::String(name.to_string()));
+    row.insert("active".to_string(), Value::Bool(active));
+    let mut wanted: Vec<Value> = Vec::new();
+    for l in labels {
+        let v = Value::RecordId(l.clone());
+        if !wanted.contains(&v) {
+            wanted.push(v);
+        }
+    }
+    if !wanted.is_empty() {
+        row.insert("labels".to_string(), Value::Array(wanted.into()));
+    }
+    row.insert("valid_from".to_string(), Value::Datetime(chrono::Utc::now().into()));
+    author.stamp(&mut row);
+
+    db.query("RELATE $from->entity_edge->$to CONTENT $row")
+        .bind(("from", from.clone()))
+        .bind(("to", to.clone()))
+        .bind(("row", Value::Object(row)))
+        .await?
+        .check()?;
+    Ok(())
+}
+
+/// One entity reached by a walk, and how far out it was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reached {
+    pub entity: RecordId,
+    /// 0 is the root.
+    pub depth: usize,
+}
+
+/// The subgraph around one entity: what was reached, and the live edges
+/// among them.
+#[derive(Debug, Clone)]
+pub struct Subgraph {
+    pub nodes: Vec<Reached>,
+    pub edges: Vec<Edge>,
+}
+
+/// WALK THE GRAPH FROM ONE ENTITY, to a depth, following only the edges
+/// you care about.
+///
+/// This is the read the graph tab makes, and the reason edges are a
+/// native relation rather than a column: the engine follows record
+/// pointers, so the whole subtree comes back from ONE traversal instead
+/// of a round trip per level. A four-deep role graph is one query, and
+/// so is a ten-deep one.
+///
+/// Two requests in total, whatever the depth: the traversal, then the
+/// live edges among everything it reached. The second is what a drawing
+/// needs — names and labels on the connections, not just the shape.
+///
+/// `label` narrows it to one kind of connection, which is what makes a
+/// tree out of a graph: "follow `contains` from here" is a hierarchy,
+/// while following everything is a web.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn walk(
+    db: &Db,
+    root: &RecordId,
+    label: Option<&RecordId>,
+    depth: usize,
+) -> Result<Subgraph> {
+    let filter = if label.is_some() {
+        "entity_edge WHERE active = true AND labels CONTAINS $label"
+    } else {
+        "entity_edge WHERE active = true"
+    };
+    let q = format!("SELECT @.{{..{depth}}}.{{ id, out: ->({filter})->entity.@ }} FROM $root");
+    let mut query = db.query(q).bind(("root", root.clone()));
+    if let Some(l) = label {
+        query = query.bind(("label", l.clone()));
+    }
+    let mut resp = query.await?;
+    let rows: Vec<Value> = resp.take(0)?;
+
+    let mut nodes: Vec<Reached> = Vec::new();
+    for row in &rows {
+        // The projection is keyed by the empty string — the shape the
+        // recursive form returns.
+        let tree = match row {
+            Value::Object(o) => o.values().next().cloned(),
+            other => Some(other.clone()),
+        };
+        if let Some(t) = tree {
+            collect(&t, 0, &mut nodes);
+        }
+    }
+    if nodes.is_empty() {
+        nodes.push(Reached { entity: root.clone(), depth: 0 });
+    }
+
+    let ids: Vec<RecordId> = nodes.iter().map(|n| n.entity.clone()).collect();
+    let mut resp = db
+        .query("SELECT *, in, out FROM entity_edge WHERE in IN $ids AND out IN $ids")
+        .bind(("ids", ids))
+        .await?;
+    let rows: Vec<Value> = resp.take(0)?;
+    let mut chains: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let Some(uid) = obj_str(&row, "uid") else { continue };
+        chains.entry(uid).or_default().push(row);
+    }
+    let edges: Vec<Edge> = chains
+        .into_values()
+        .filter_map(|c| newest_by_valid_from(&c).and_then(parse))
+        .filter(|e| e.active)
+        .filter(|e| label.is_none_or(|l| e.labels.contains(l)))
+        .collect();
+
+    Ok(Subgraph { nodes, edges })
+}
+
+/// Flatten the nested shape the recursive traversal returns. The first
+/// depth at which an entity appears is the one kept — a cycle or a
+/// diamond is reached again, and the shortest way there is the honest
+/// answer.
+fn collect(node: &Value, depth: usize, out: &mut Vec<Reached>) {
+    let Value::Object(o) = node else { return };
+    if let Some(Value::RecordId(id)) = o.get("id") {
+        if !out.iter().any(|r| &r.entity == id) {
+            out.push(Reached { entity: id.clone(), depth });
+        }
+    }
+    if let Some(Value::Array(kids)) = o.get("out") {
+        for kid in kids.iter() {
+            match kid {
+                Value::Object(_) => collect(kid, depth + 1, out),
+                // A terminal comes back as a bare id once the depth
+                // budget is spent.
+                Value::RecordId(id) if !out.iter().any(|r| &r.entity == id) => {
+                    out.push(Reached { entity: id.clone(), depth: depth + 1 });
+                }
+                _ => {}
+            }
+        }
+    }
+}

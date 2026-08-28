@@ -47,6 +47,7 @@
 
 pub mod attribute;
 pub mod author;
+pub mod edge;
 pub mod entity;
 
 use async_trait::async_trait;
