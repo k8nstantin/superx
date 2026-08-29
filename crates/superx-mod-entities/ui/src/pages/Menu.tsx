@@ -1,84 +1,90 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ActionIcon,
   Alert,
-  Anchor,
   Badge,
+  Box,
+  Card,
   Group,
   Loader,
-  mergeAsyncChildren,
+  NavLink,
   Switch,
   Text,
   TextInput,
-  Tree,
-  useTree,
-  type TreeNodeData,
 } from '@mantine/core'
-import {
-  createEntity,
-  fetchChildren,
-  fetchRoots,
-  searchEntities,
-  type TreeNodeView,
-} from '../api'
+import { createEntity, fetchChildren, fetchRoots, searchEntities, type TreeNodeView } from '../api'
 
-// THE MENU: add entities, and traverse them.
+// THE MENU TAB: add entities, search them, and walk the graph.
 //
 // The data is a GRAPH, not a tree — an entity can have many parents and
 // the graph can contain cycles — so there is no global hierarchy to
-// draw. What there is, is a view ROOTED WHERE YOU ARE: expand a row and
-// it asks for exactly one level. Depth stops mattering because the whole
+// draw. What there is, is a view ROOTED WHERE YOU ARE: open a row and it
+// asks for exactly one level. Depth stops mattering because the whole
 // thing is never requested, and a cycle is just a row you can open
 // again.
 //
-// Mantine's Tree does the lazy half natively: `hasChildren` with no
-// children triggers `onLoadChildren` on first expand.
+// IT IS BUILT ON NavLink, the same menu component the core dashboard's
+// navigation uses, nested. The previous cut rendered rows by hand
+// through Mantine's Tree, which draws bare text: no hover, no active
+// state, nothing that looks like a control. A menu should look like the
+// product's menu.
 
-/// A node's key is its PATH, not its uuid.
+/// A row's key is its PATH, not its uuid.
 ///
-/// The data is a graph: an entity can hang under two parents at once,
-/// and both rows would then share one key — one arrow would open both,
-/// `mergeAsyncChildren` would splice the fetched level into whichever it
-/// found first, and React would see duplicate keys among siblings. The
-/// uuid rides in `nodeProps` for opening the entity; the path is what
-/// makes a DAG renderable as a tree.
-///
-/// `hasChildren` with NO `children` key is what marks a node as lazy —
-/// an empty `children` array means "expanded, and there is nothing
-/// here", so `onLoadChildren` never fires.
-/// THE PATH IS ALREADY IN THE TREE. A node's `value` is the chain of
-/// uuids that reached it, so the breadcrumb trail is that chain with
-/// each step's label looked up — nothing has to be fetched, and the
-/// trail always agrees with the branch that is actually open.
-export function trailFrom(
-  data: TreeNodeData[],
-  path: string,
-): { uuid: string; name: string }[] {
-  const steps = path.split('/')
+/// The data is a graph: an entity can hang under two parents at once and
+/// both rows would then share one key — opening one would open the
+/// other, and the fetched level would be spliced into whichever was
+/// found first. The uuid rides alongside for opening the entity; the
+/// path is what makes a DAG renderable as a menu.
+type Node = {
+  path: string
+  uuid: string
+  name: string
+  via: string | null
+  labels: { uuid: string; name: string }[]
+  hasChildren: boolean
+  children?: Node[]
+}
+
+const toNode = (v: TreeNodeView, parent = ''): Node => ({
+  path: parent ? `${parent}/${v.uuid}` : v.uuid,
+  uuid: v.uuid,
+  name: v.name || '(unnamed)',
+  via: v.via,
+  labels: v.labels,
+  hasChildren: v.has_children,
+})
+
+/// The trail to a row, read off the path it already carries — nothing is
+/// fetched, so the breadcrumbs cannot disagree with the branch that is
+/// open.
+function trailTo(nodes: Node[], path: string): { uuid: string; name: string }[] {
   const out: { uuid: string; name: string }[] = []
-  let level = data
+  let level = nodes
   let key = ''
-  for (const uuid of steps) {
+  for (const uuid of path.split('/')) {
     key = key ? `${key}/${uuid}` : uuid
-    const node = level.find((n) => n.value === key)
-    if (!node) break
-    out.push({ uuid, name: String(node.label) })
-    level = node.children ?? []
+    const found = level.find((n) => n.path === key)
+    if (!found) break
+    out.push({ uuid: found.uuid, name: found.name })
+    level = found.children ?? []
   }
   return out
 }
 
-function toNode(v: TreeNodeView, parentKey = ''): TreeNodeData {
-  return {
-    value: parentKey ? `${parentKey}/${v.uuid}` : v.uuid,
-    label: v.name || '(unnamed)',
-    nodeProps: { labels: v.labels, via: v.via, uuid: v.uuid },
-    hasChildren: v.has_children,
-  }
+/// Splice a fetched level in, leaving every other branch alone.
+function withChildren(nodes: Node[], path: string, kids: Node[]): Node[] {
+  return nodes.map((n) => {
+    if (n.path === path) return { ...n, children: kids }
+    if (n.children && path.startsWith(`${n.path}/`)) {
+      return { ...n, children: withChildren(n.children, path, kids) }
+    }
+    return n
+  })
 }
 
-export default function MenuTree({
+export default function MenuTab({
   onOpen,
   opened,
 }: {
@@ -88,18 +94,17 @@ export default function MenuTree({
   const qc = useQueryClient()
   const [archived, setArchived] = useState(false)
   const [name, setName] = useState('')
-
-  const roots = useQuery({
-    queryKey: ['roots', archived],
-    queryFn: () => fetchRoots(archived),
-  })
-
-  // SEARCH REACHES PAST THE TREE. The tree loads one level at a time, so
-  // filtering what is already on screen would only ever find what the
-  // operator had already navigated to — which is not what a search box
-  // is for. The match runs server-side over every entity and comes back
-  // flat, because a hit was not reached through a parent.
   const [term, setTerm] = useState('')
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [nodes, setNodes] = useState<Node[]>([])
+
+  const roots = useQuery({ queryKey: ['roots', archived], queryFn: () => fetchRoots(archived) })
+
+  // SEARCH REACHES PAST THE MENU. It loads one level at a time, so
+  // filtering what is on screen would only ever find what you had
+  // already navigated to — the opposite of what a search box is for. The
+  // match runs server-side over every entity and comes back flat,
+  // because a hit was not reached through a parent.
   const searching = term.trim().length > 0
   const hits = useQuery({
     queryKey: ['search', term.trim(), archived],
@@ -107,37 +112,39 @@ export default function MenuTree({
     enabled: searching,
   })
 
-  // Mantine hands back the node that was expanded and expects the data
-  // to be spliced in — `mergeAsyncChildren` does the splice, and the one
-  // query it needs is the level below that node.
-  //
   // MERGE, NEVER REPLACE. Adding an entity invalidates `roots`, and a
   // window-focus refetch does the same with no user action at all —
-  // replacing `data` threw away every expanded subtree while `useTree`
-  // still believed those nodes were open. Because it only calls
-  // `onLoadChildren` on the FIRST expand, the branches rendered empty
-  // and could not be reloaded without collapsing each one by hand. So a
-  // refetch adds and removes roots and leaves loaded children alone.
-  const [data, setData] = useState<TreeNodeData[]>([])
+  // replacing the list threw away every branch that was open.
   useEffect(() => {
     const fresh = (roots.data ?? []).map((n) => toNode(n))
-    setData((current) => {
-      const held = new Map(current.map((n) => [n.value, n]))
+    setNodes((current) => {
+      const held = new Map(current.map((n) => [n.path, n]))
       return fresh.map((n) => {
-        const already = held.get(n.value)
+        const already = held.get(n.path)
         return already?.children ? { ...n, children: already.children } : n
       })
     })
   }, [roots.data])
 
-  const tree = useTree({
-    onLoadChildren: async (value) => {
-      // The key is a path; the entity to ask about is its last segment.
-      const uuid = value.split('/').pop() ?? value
-      const kids = await fetchChildren(uuid)
-      setData((current) => mergeAsyncChildren(current, value, kids.map((k) => toNode(k, value))))
+  const toggle = useCallback(
+    async (node: Node) => {
+      const next = new Set(expanded)
+      if (next.has(node.path)) {
+        next.delete(node.path)
+        setExpanded(next)
+        return
+      }
+      next.add(node.path)
+      setExpanded(next)
+      // One level, on first open. Asking again on every re-open would
+      // re-fetch a branch that has not changed.
+      if (!node.children) {
+        const kids = await fetchChildren(node.uuid)
+        setNodes((cur) => withChildren(cur, node.path, kids.map((k) => toNode(k, node.path))))
+      }
     },
-  })
+    [expanded],
+  )
 
   const add = useMutation({
     mutationFn: (n: string) => createEntity(n),
@@ -151,21 +158,93 @@ export default function MenuTree({
     },
   })
 
+  // A ROW IS A NavLink; THE BRANCH UNDER IT IS OURS.
+  //
+  // NavLink will collapse its own children, and that collapse would not
+  // open: it measures the content it is given, and the content arrives
+  // one fetch later — so the chevron flipped and nothing appeared.
+  // Rendering the branch here instead means what is on screen is
+  // exactly what the expanded set says, with no animation state in
+  // between to disagree with it.
+  const row = (n: Node) => (
+    <Box key={n.path}>
+      <NavLink
+        active={n.uuid === opened}
+        // THE CHEVRON IS ITS OWN TARGET. Opening an entity switches to
+        // the Entity tab; expanding a branch must not. Two things a row
+        // can do, two places to click, each looking like what it does.
+        leftSection={
+          n.hasChildren ? (
+            <ActionIcon
+              component="div"
+              variant="subtle"
+              size="sm"
+              aria-label={expanded.has(n.path) ? 'Collapse' : 'Expand'}
+              onClick={(ev) => {
+                ev.stopPropagation()
+                void toggle(n)
+              }}
+            >
+              <Text size="xs" c="dimmed">
+                {expanded.has(n.path) ? '▾' : '▸'}
+              </Text>
+            </ActionIcon>
+          ) : (
+            <Box w={22} />
+          )
+        }
+        onClick={() => onOpen(n.uuid, trailTo(nodes, n.path))}
+        label={
+          <Group gap={7} wrap="nowrap">
+            {n.via && (
+              <Text size="xs" c="dimmed" ff="monospace" style={{ whiteSpace: 'nowrap' }}>
+                {n.via} →
+              </Text>
+            )}
+            <Text size="sm" truncate>
+              {n.name}
+            </Text>
+            {n.labels.map((l) => (
+              <Badge key={l.uuid} size="xs" variant="light">
+                {l.name}
+              </Badge>
+            ))}
+          </Group>
+        }
+      />
+      {expanded.has(n.path) && (
+        <Box pl={20}>
+          {n.children ? n.children.map(row) : <Loader size="xs" ml="sm" my={6} />}
+        </Box>
+      )}
+    </Box>
+  )
+
   return (
     <>
-      {/* THE TREE LIVES IN THE SIDEBAR, so the controls stack instead
-          of spreading: a row of label-beside-field made sense across a
-          page and does not in a 300px column. */}
-      <TextInput
-        placeholder="New entity"
-        value={name}
-        onChange={(e) => setName(e.currentTarget.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && name.trim()) add.mutate(name.trim())
-        }}
-        rightSection={
+      <Card withBorder padding="md" mb="md">
+        <Group align="flex-end" gap="sm" wrap="wrap">
+          <TextInput
+            label="New entity"
+            description="a name is all it needs — everything else is an attribute"
+            placeholder="DBA"
+            value={name}
+            onChange={(e) => setName(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && name.trim()) add.mutate(name.trim())
+            }}
+            style={{ flex: 1, minWidth: 220 }}
+          />
+          {/* A REAL BUTTON, BESIDE THE FIELD. It used to sit inside the
+              input as a right section, where Mantine sets
+              `pointer-events: none` by default — it looked live and
+              swallowed every click, and nothing caught it because the
+              tests posted to the endpoint and dispatched synthetic
+              clicks straight at the element, both of which walk past the
+              CSS that was the whole problem. */}
           <ActionIcon
-            variant="subtle"
+            size={36}
+            variant="filled"
             onClick={() => name.trim() && add.mutate(name.trim())}
             loading={add.isPending}
             disabled={!name.trim()}
@@ -173,155 +252,83 @@ export default function MenuTree({
           >
             +
           </ActionIcon>
-        }
-        mb="xs"
-      />
-      {add.error && (
-        <Text c="red" size="xs" mb="xs">
-          {String(add.error)}
-        </Text>
-      )}
-      <TextInput
-        placeholder="Search entities"
-        value={term}
-        onChange={(e) => setTerm(e.currentTarget.value)}
-        rightSection={
-          term ? (
-            <ActionIcon variant="subtle" onClick={() => setTerm('')} aria-label="Clear search">
-              ×
-            </ActionIcon>
-          ) : null
-        }
-        mb="xs"
-      />
-      <Switch
-        label="show archived"
-        size="xs"
-        checked={archived}
-        onChange={(e) => setArchived(e.currentTarget.checked)}
-        mb="sm"
-      />
+          <TextInput
+            label="Search"
+            description="every entity, not just the ones on screen"
+            placeholder="jira"
+            value={term}
+            onChange={(e) => setTerm(e.currentTarget.value)}
+            style={{ flex: 1, minWidth: 200 }}
+          />
+          <Switch
+            label="show archived"
+            checked={archived}
+            onChange={(e) => setArchived(e.currentTarget.checked)}
+            mb={8}
+          />
+        </Group>
+        {add.error && (
+          <Text c="red" size="sm" mt="xs">
+            {String(add.error)}
+          </Text>
+        )}
+      </Card>
 
-      {/* A HIT IS NOT A BRANCH. Search results are shown as a flat
-          list, not spliced into the tree, because they were not reached
-          through a parent and pretending otherwise would put an entity
-          somewhere it does not live. */}
-      {searching && (
-        <>
-          {hits.isLoading && <Loader size="sm" />}
-          {hits.data?.length === 0 && (
-            <Text c="dimmed" size="xs" px={6}>
-              Nothing matches “{term.trim()}”.
-            </Text>
-          )}
-          {(hits.data ?? []).map((h) => (
-            <Group key={h.uuid} gap="xs" wrap="nowrap" py={2} px={6}>
-              <Anchor
-                component="button"
-                type="button"
-                size="sm"
-                underline="hover"
-                fw={h.uuid === opened ? 700 : undefined}
-                onClick={() => onOpen(h.uuid, [{ uuid: h.uuid, name: h.name }])}
-              >
-                {h.name || '(unnamed)'}
-              </Anchor>
-              {h.labels.map((l) => (
-                <Badge key={l.uuid} size="xs" variant="light">
-                  {l.name}
-                </Badge>
-              ))}
-            </Group>
-          ))}
-        </>
-      )}
-
-      {!searching && roots.isLoading && <Loader size="sm" />}
+      <Card withBorder padding="xs">
         {/* SAY WHAT WENT WRONG. This rendered an empty box when the read
-            failed, so an unprovisioned instance looked like a blank page
-            with no explanation — the reader cannot tell "nothing here"
-            from "this is broken". */}
-        {!searching && roots.error && (
-          <Alert color="red" title="Cannot read entities">
+            failed, so an unprovisioned instance looked like a page that
+            had not loaded rather than one with something to report. */}
+        {roots.error && (
+          <Alert color="red" title="Cannot read entities" m="xs">
             <Text size="sm">{String(roots.error)}</Text>
             <Text size="xs" c="dimmed" mt="xs">
-              If this says a table does not exist, the module's database has not been
-              provisioned into this shape yet: retire the old one with
-              run superx modules provision entities.
+              If this says a table does not exist, this module's database has not been
+              provisioned yet: run superx modules provision entities.
             </Text>
           </Alert>
         )}
-        {!searching && !roots.error && roots.data?.length === 0 && (
-          <Text c="dimmed" size="sm">
-            Nothing yet. Add an entity above.
-          </Text>
+
+        {searching ? (
+          <Box>
+            {hits.isLoading && <Loader size="sm" m="sm" />}
+            {hits.data?.length === 0 && (
+              <Text c="dimmed" size="sm" m="sm">
+                Nothing matches “{term.trim()}”.
+              </Text>
+            )}
+            {/* A HIT IS NOT A BRANCH. Results are flat because they were
+                not reached through a parent, and splicing them into the
+                menu would put an entity somewhere it does not live. */}
+            {(hits.data ?? []).map((h) => (
+              <NavLink
+                key={h.uuid}
+                active={h.uuid === opened}
+                onClick={() => onOpen(h.uuid, [{ uuid: h.uuid, name: h.name }])}
+                label={
+                  <Group gap={7} wrap="nowrap">
+                    <Text size="sm">{h.name || '(unnamed)'}</Text>
+                    {h.labels.map((l) => (
+                      <Badge key={l.uuid} size="xs" variant="light">
+                        {l.name}
+                      </Badge>
+                    ))}
+                  </Group>
+                }
+              />
+            ))}
+          </Box>
+        ) : (
+          <Box>
+            {roots.isLoading && <Loader size="sm" m="sm" />}
+            {!roots.error && roots.data?.length === 0 && (
+              <Text c="dimmed" size="sm" m="sm">
+                Nothing yet. Add an entity above.
+              </Text>
+            )}
+            {nodes.map(row)}
+          </Box>
         )}
-        {!searching && (
-        <Tree
-          data={data}
-          tree={tree}
-          levelOffset={22}
-          renderNode={({ node, expanded, hasChildren, elementProps, tree: t }) => {
-            const props = (node.nodeProps ?? {}) as {
-              labels?: { uuid: string; name: string }[]
-              via?: string | null
-              uuid?: string
-            }
-            return (
-              <Group gap="xs" {...elementProps} wrap="nowrap" py={2}>
-                <Text
-                  size="sm"
-                  c="dimmed"
-                  w={14}
-                  style={{ cursor: hasChildren ? 'pointer' : 'default' }}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    if (hasChildren) t.toggleExpanded(node.value)
-                  }}
-                >
-                  {hasChildren ? (expanded ? '▾' : '▸') : ''}
-                </Text>
-                {props.via && (
-                  <Text size="xs" c="dimmed" ff="monospace">
-                    {props.via} →
-                  </Text>
-                )}
-                {/* A LINK, NOT A CLICKABLE WORD. Opening an entity was
-                    already wired to this text, but nothing said so —
-                    plain body copy with a cursor is not an affordance,
-                    and the click ALSO bubbled to the row, so the one
-                    guess an operator might make toggled the branch
-                    instead. An anchor looks like what it is, takes
-                    keyboard focus, and keeps the row's expander to
-                    itself. */}
-                <Anchor
-                  component="button"
-                  type="button"
-                  size="sm"
-                  underline="hover"
-                  // WHICH ONE AM I LOOKING AT. The tree stays put while
-                  // you work in the pane beside it, so without this the
-                  // sidebar gives no clue which branch the open entity
-                  // is.
-                  fw={props.uuid === opened ? 700 : undefined}
-                  c={props.uuid === opened ? undefined : 'var(--mantine-color-text)'}
-                  onClick={(ev) => {
-                    ev.stopPropagation()
-                    onOpen(props.uuid ?? node.value, trailFrom(data, node.value))
-                  }}
-                >
-                  {node.label}
-                </Anchor>
-                {(props.labels ?? []).map((l) => (
-                  <Badge key={l.uuid} size="xs" variant="light">
-                    {l.name}
-                  </Badge>
-                ))}
-              </Group>
-            )
-          }}
-        />
-        )}
+      </Card>
     </>
   )
 }
