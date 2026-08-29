@@ -66,11 +66,19 @@ export default function EntityTab({
   useEffect(() => {
     const box = gridBox.current
     if (!box) return
-    const ro = new ResizeObserver(([entry]) =>
-      setGridWidth(entry.contentRect.width),
-    )
+    // ROUND, AND BAIL WHEN IT HAS NOT MOVED. This observer feeds a
+    // width into the grid it is measuring, so a change of a fraction of
+    // a pixel re-lays-out the grid, which changes the width, which fires
+    // the observer again — and with enough content to summon a
+    // scrollbar the oscillation never settles and the tab locks up. Two
+    // rich-text fields on one entity was enough to hang the page.
+    // Writing the same number back is a no-op in React, which ends it.
+    const ro = new ResizeObserver(([entry]) => {
+      const w = Math.round(entry.contentRect.width)
+      setGridWidth((prev) => (Math.abs(prev - w) > 1 ? w : prev))
+    })
     ro.observe(box)
-    setGridWidth(box.clientWidth)
+    setGridWidth(Math.round(box.clientWidth))
     return () => ro.disconnect()
     // Re-observe when the fields first render: the box does not exist
     // while the entity is loading, so a mount-only effect would attach
@@ -411,20 +419,28 @@ function Field({
     if (readOnly) return <Text size="sm" c="dimmed">{preview(field)}</Text>
     switch (field.datatype) {
       case 'number':
-        // THE BLUR IS CAUGHT ON THE WRAPPER, NOT THE INPUT. Mantine's
-        // NumberInput binds its own onBlur to the underlying control and
-        // does not compose the one it is handed, so this commit never
-        // ran — a number typed into this field was simply lost, the one
-        // datatype in the set that could not be saved at all. focusout
-        // bubbles, so the wrapper sees it and the commit is ours again.
+        // THE ONE DATATYPE THAT COULD NOT BE SAVED. Mantine's
+        // NumberInput neither composes the onBlur it is handed nor lets
+        // the event bubble, so every commit hook this field had was
+        // dead and a typed number vanished without a word. It is caught
+        // on the wrapper in the CAPTURE phase instead.
         return (
           <div
-            onBlur={() => {
-              // BLANK IS NOT ZERO. `Number('')` is 0 and passes a NaN
-              // check, so clicking into an empty field and out again
-              // used to write an explicit 0 onto the permanent record
-              // with the operator's name on it.
-              const raw = String(draft ?? '').trim()
+            // CAPTURE, BECAUSE THE BUBBLE NEVER ARRIVES. Mantine's
+            // NumberInput stops the blur inside its own handler, so a
+            // listener on the wrapper waiting for it to bubble up is
+            // never called and the number is silently dropped —
+            // confirmed by invoking the handler by hand, which saved
+            // correctly. The capture phase runs root-to-target and
+            // cannot be cancelled by the target, so this always fires.
+            onBlurCapture={(ev) => {
+              // READ THE BOX, NOT OUR IDEA OF THE BOX. Mantine's
+              // NumberInput runs its own controlled pipeline, so the
+              // draft this component keeps is not reliably what the
+              // operator is looking at — and a save that disagrees with
+              // the screen is worse than no save. The input holds what
+              // they typed; take it from there.
+              const raw = (ev.currentTarget.querySelector('input')?.value ?? '').trim()
               if (raw === '') return
               const n = Number(raw)
               // AND ONLY WHEN IT CHANGED. Tabbing through a field used

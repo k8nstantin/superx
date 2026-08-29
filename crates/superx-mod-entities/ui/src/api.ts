@@ -26,6 +26,11 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
 export const fetchPing = () =>
   json<{ module: string; version: string; core_url: string | null }>('/api/ping')
 
+export const searchEntities = (q: string, archived = false) =>
+  json<TreeNodeView[]>(
+    `/api/entities/search?q=${encodeURIComponent(q)}&archived=${archived}`,
+  )
+
 export const fetchRoots = (archived = false) =>
   json<TreeNodeView[]>(`/api/entities?archived=${archived}`)
 

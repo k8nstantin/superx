@@ -265,6 +265,54 @@ pub async fn children(
 /// # Errors
 ///
 /// Verb errors pass through.
+/// Find entities by name, anywhere in the graph.
+///
+/// THE TREE CANNOT ANSWER THIS. It loads a level at a time, so anything
+/// the operator has not already expanded to is not on the client to
+/// filter — and the whole point of a search box is the thing you have
+/// not found yet. So the match happens here, over every entity, and
+/// comes back flat: a search result has no parent, because it was not
+/// reached through one.
+///
+/// Case-insensitive substring. Not a ranking, not a fuzzy match — a
+/// person typing three letters of a name they already know is the case
+/// this serves, and pretending to be cleverer would only make the
+/// result harder to predict.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn search(db: &Db, query: &str, include_archived: bool) -> Result<Vec<TreeNodeView>> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let all = entity::list(db, include_archived).await?;
+    let visible: std::collections::HashSet<String> = all.iter().map(record_uuid).collect();
+    let parents = edge::sources(db, &visible).await?;
+    let held = attribute::of_many(db, &all, false).await?;
+    let mut names = NameCache::default();
+    let mut out = Vec::new();
+    for id in &all {
+        let mine = held.get(&record_uuid(id)).map_or(&[][..], Vec::as_slice);
+        let name = entity::name_in(mine).unwrap_or_default();
+        if !name.to_lowercase().contains(&needle) {
+            continue;
+        }
+        out.push(TreeNodeView {
+            labels: names.views(db, &entity::labels_in(mine)).await?,
+            has_children: parents.contains(&record_uuid(id)),
+            via: None,
+            uuid: record_uuid(id),
+            name,
+        });
+    }
+    // Shortest first: a search for "back" should offer `Backups` above
+    // `Backups nightly verification sweep`.
+    out.sort_by_key(|n| (n.name.len(), n.name.clone()));
+    Ok(out)
+}
+
 pub async fn roots(db: &Db, include_archived: bool) -> Result<Vec<TreeNodeView>> {
     // ONE read of every entity's attributes, and one name lookup per
     // DISTINCT label. Asking per row turned the first screen into

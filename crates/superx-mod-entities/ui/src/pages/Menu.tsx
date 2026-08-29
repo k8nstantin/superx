@@ -1,11 +1,10 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  ActionIcon,
   Alert,
   Anchor,
   Badge,
-  Button,
-  Card,
   Group,
   Loader,
   mergeAsyncChildren,
@@ -16,7 +15,13 @@ import {
   useTree,
   type TreeNodeData,
 } from '@mantine/core'
-import { createEntity, fetchChildren, fetchRoots, type TreeNodeView } from '../api'
+import {
+  createEntity,
+  fetchChildren,
+  fetchRoots,
+  searchEntities,
+  type TreeNodeView,
+} from '../api'
 
 // THE MENU: add entities, and traverse them.
 //
@@ -42,6 +47,28 @@ import { createEntity, fetchChildren, fetchRoots, type TreeNodeView } from '../a
 /// `hasChildren` with NO `children` key is what marks a node as lazy —
 /// an empty `children` array means "expanded, and there is nothing
 /// here", so `onLoadChildren` never fires.
+/// THE PATH IS ALREADY IN THE TREE. A node's `value` is the chain of
+/// uuids that reached it, so the breadcrumb trail is that chain with
+/// each step's label looked up — nothing has to be fetched, and the
+/// trail always agrees with the branch that is actually open.
+export function trailFrom(
+  data: TreeNodeData[],
+  path: string,
+): { uuid: string; name: string }[] {
+  const steps = path.split('/')
+  const out: { uuid: string; name: string }[] = []
+  let level = data
+  let key = ''
+  for (const uuid of steps) {
+    key = key ? `${key}/${uuid}` : uuid
+    const node = level.find((n) => n.value === key)
+    if (!node) break
+    out.push({ uuid, name: String(node.label) })
+    level = node.children ?? []
+  }
+  return out
+}
+
 function toNode(v: TreeNodeView, parentKey = ''): TreeNodeData {
   return {
     value: parentKey ? `${parentKey}/${v.uuid}` : v.uuid,
@@ -51,7 +78,13 @@ function toNode(v: TreeNodeView, parentKey = ''): TreeNodeData {
   }
 }
 
-export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) {
+export default function MenuTree({
+  onOpen,
+  opened,
+}: {
+  onOpen: (uuid: string, trail: { uuid: string; name: string }[]) => void
+  opened: string | null
+}) {
   const qc = useQueryClient()
   const [archived, setArchived] = useState(false)
   const [name, setName] = useState('')
@@ -59,6 +92,19 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
   const roots = useQuery({
     queryKey: ['roots', archived],
     queryFn: () => fetchRoots(archived),
+  })
+
+  // SEARCH REACHES PAST THE TREE. The tree loads one level at a time, so
+  // filtering what is already on screen would only ever find what the
+  // operator had already navigated to — which is not what a search box
+  // is for. The match runs server-side over every entity and comes back
+  // flat, because a hit was not reached through a parent.
+  const [term, setTerm] = useState('')
+  const searching = term.trim().length > 0
+  const hits = useQuery({
+    queryKey: ['search', term.trim(), archived],
+    queryFn: () => searchEntities(term.trim(), archived),
+    enabled: searching,
   })
 
   // Mantine hands back the node that was expanded and expects the data
@@ -103,61 +149,110 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
 
   return (
     <>
-      <Card withBorder padding="md" mb="md">
-        <Group align="flex-end" gap="sm">
-          <TextInput
-            label="New entity"
-            description="a name is all it needs — everything else is an attribute"
-            placeholder="DBA"
-            value={name}
-            onChange={(e) => setName(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && name.trim()) add.mutate(name.trim())
-            }}
-            style={{ flex: 1 }}
-          />
-          <Button
+      {/* THE TREE LIVES IN THE SIDEBAR, so the controls stack instead
+          of spreading: a row of label-beside-field made sense across a
+          page and does not in a 300px column. */}
+      <TextInput
+        placeholder="New entity"
+        value={name}
+        onChange={(e) => setName(e.currentTarget.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && name.trim()) add.mutate(name.trim())
+        }}
+        rightSection={
+          <ActionIcon
+            variant="subtle"
             onClick={() => name.trim() && add.mutate(name.trim())}
             loading={add.isPending}
             disabled={!name.trim()}
+            aria-label="Add entity"
           >
-            Add
-          </Button>
-          <Switch
-            label="show archived"
-            checked={archived}
-            onChange={(e) => setArchived(e.currentTarget.checked)}
-            mb={6}
-          />
-        </Group>
-        {add.error && (
-          <Text c="red" size="sm" mt="xs">
-            {String(add.error)}
-          </Text>
-        )}
-      </Card>
+            +
+          </ActionIcon>
+        }
+        mb="xs"
+      />
+      {add.error && (
+        <Text c="red" size="xs" mb="xs">
+          {String(add.error)}
+        </Text>
+      )}
+      <TextInput
+        placeholder="Search entities"
+        value={term}
+        onChange={(e) => setTerm(e.currentTarget.value)}
+        rightSection={
+          term ? (
+            <ActionIcon variant="subtle" onClick={() => setTerm('')} aria-label="Clear search">
+              ×
+            </ActionIcon>
+          ) : null
+        }
+        mb="xs"
+      />
+      <Switch
+        label="show archived"
+        size="xs"
+        checked={archived}
+        onChange={(e) => setArchived(e.currentTarget.checked)}
+        mb="sm"
+      />
 
-      <Card withBorder padding="md">
-        {roots.isLoading && <Loader size="sm" />}
+      {/* A HIT IS NOT A BRANCH. Search results are shown as a flat
+          list, not spliced into the tree, because they were not reached
+          through a parent and pretending otherwise would put an entity
+          somewhere it does not live. */}
+      {searching && (
+        <>
+          {hits.isLoading && <Loader size="sm" />}
+          {hits.data?.length === 0 && (
+            <Text c="dimmed" size="xs" px={6}>
+              Nothing matches “{term.trim()}”.
+            </Text>
+          )}
+          {(hits.data ?? []).map((h) => (
+            <Group key={h.uuid} gap="xs" wrap="nowrap" py={2} px={6}>
+              <Anchor
+                component="button"
+                type="button"
+                size="sm"
+                underline="hover"
+                fw={h.uuid === opened ? 700 : undefined}
+                onClick={() => onOpen(h.uuid, [{ uuid: h.uuid, name: h.name }])}
+              >
+                {h.name || '(unnamed)'}
+              </Anchor>
+              {h.labels.map((l) => (
+                <Badge key={l.uuid} size="xs" variant="light">
+                  {l.name}
+                </Badge>
+              ))}
+            </Group>
+          ))}
+        </>
+      )}
+
+      {!searching && roots.isLoading && <Loader size="sm" />}
         {/* SAY WHAT WENT WRONG. This rendered an empty box when the read
             failed, so an unprovisioned instance looked like a blank page
             with no explanation — the reader cannot tell "nothing here"
             from "this is broken". */}
-        {roots.error && (
+        {!searching && roots.error && (
           <Alert color="red" title="Cannot read entities">
             <Text size="sm">{String(roots.error)}</Text>
             <Text size="xs" c="dimmed" mt="xs">
               If this says a table does not exist, the module's database has not been
               provisioned into this shape yet: retire the old one with
-              schema/retire-v1.surql, then run superx modules provision entities.
+              run superx modules provision entities.
             </Text>
           </Alert>
         )}
-        {!roots.error && roots.data?.length === 0 && (
+        {!searching && !roots.error && roots.data?.length === 0 && (
           <Text c="dimmed" size="sm">
             Nothing yet. Add an entity above.
           </Text>
         )}
+        {!searching && (
         <Tree
           data={data}
           tree={tree}
@@ -200,9 +295,15 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
                   type="button"
                   size="sm"
                   underline="hover"
+                  // WHICH ONE AM I LOOKING AT. The tree stays put while
+                  // you work in the pane beside it, so without this the
+                  // sidebar gives no clue which branch the open entity
+                  // is.
+                  fw={props.uuid === opened ? 700 : undefined}
+                  c={props.uuid === opened ? undefined : 'var(--mantine-color-text)'}
                   onClick={(ev) => {
                     ev.stopPropagation()
-                    onOpen(props.uuid ?? node.value)
+                    onOpen(props.uuid ?? node.value, trailFrom(data, node.value))
                   }}
                 >
                   {node.label}
@@ -216,7 +317,7 @@ export default function MenuTab({ onOpen }: { onOpen: (uuid: string) => void }) 
             )
           }}
         />
-      </Card>
+        )}
     </>
   )
 }

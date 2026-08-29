@@ -52,6 +52,7 @@ pub async fn spawn(kernel: &Kernel, db: superx_kernel::Db, port: u16) -> Result<
     let app = Router::new()
         .route("/api/ping", get(ping))
         .route("/api/entities", get(list).post(create))
+        .route("/api/entities/search", get(search))
         .route("/api/entities/{frag}", get(detail))
         .route("/api/entities/{frag}/attributes", post(put_attribute))
         .route("/api/entities/{frag}/children", get(children))
@@ -96,6 +97,21 @@ async fn ping(State(state): State<AppState>) -> Json<serde_json::Value> {
 struct ListQuery {
     #[serde(default)]
     archived: bool,
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    archived: bool,
+}
+
+async fn search(
+    State(state): State<AppState>,
+    Query(p): Query<SearchQuery>,
+) -> std::result::Result<Json<Vec<api::TreeNodeView>>, (StatusCode, String)> {
+    api::search(&state.db, &p.q, p.archived).await.map(Json).map_err(fail)
 }
 
 async fn list(
