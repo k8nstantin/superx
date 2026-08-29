@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Anchor, AppShell, Box, Breadcrumbs, Button, Group, Tabs, Text, Title } from '@mantine/core'
+import { AppShell, Box, Button, Container, Group, Tabs, Title } from '@mantine/core'
 import { fetchPing } from './api'
 import MenuTab from './pages/Menu'
 import EntityTab from './pages/Entity'
@@ -41,40 +41,7 @@ export default function App() {
             <img src="/logo.svg" alt="" width={26} height={26} style={{ borderRadius: 6 }} />
             <Title order={3}>Entities</Title>
           </Group>
-          {/* WHERE YOU ARE, in the header's dead middle — the same trail
-              the core dashboard puts there. In a graph you can descend
-              into, the branch you are standing on is the one thing the
-              pane never tells you. Each step walks back up. */}
-          <Box style={{ flex: 1, minWidth: 0 }}>
-            <Breadcrumbs
-              separator="›"
-              separatorMargin={8}
-              styles={{
-                root: { flexWrap: 'nowrap', overflow: 'hidden' },
-                separator: { color: 'var(--mantine-color-dimmed)' },
-              }}
-            >
-              {trail.map((c, i) =>
-                i === trail.length - 1 ? (
-                  <Text key={c.uuid} size="sm" fw={600} truncate style={{ maxWidth: 320 }}>
-                    {c.name}
-                  </Text>
-                ) : (
-                  <Anchor
-                    key={c.uuid}
-                    size="sm"
-                    c="dimmed"
-                    onClick={() => {
-                      setOpen(c.uuid)
-                      setTrail(trail.slice(0, i + 1))
-                    }}
-                  >
-                    {c.name}
-                  </Anchor>
-                ),
-              )}
-            </Breadcrumbs>
-          </Box>
+          <Box style={{ flex: 1, minWidth: 0 }} />
           {/* BACK TO SUPERX. This module runs on its own port, so
               without it the operator is stranded: the dashboard they
               came from is a different origin and the browser's back
@@ -91,6 +58,11 @@ export default function App() {
       </AppShell.Header>
 
       <AppShell.Main>
+        {/* A COLUMN, NOT THE WHOLE MONITOR. Form rows and short labels
+            stretched edge to edge on a wide screen are unreadable, and a
+            menu row highlighting across two thousand pixels looks
+            broken rather than selected. */}
+        <Container size="xl" px={0}>
         <Tabs value={tab} onChange={setTab} keepMounted={false}>
           <Tabs.List mb="md">
             <Tabs.Tab value="menu">Menu</Tabs.Tab>
@@ -108,7 +80,16 @@ export default function App() {
               switching tabs cannot unmount it and throw away every
               branch you expanded. */}
           <Box display={tab === 'menu' ? undefined : 'none'}>
-            <MenuTab onOpen={openEntity} opened={open} />
+            <MenuTab
+              onOpen={openEntity}
+              opened={open}
+              trail={trail}
+              onCrumb={(uuid, upto) => {
+                setOpen(uuid)
+                setTrail(trail.slice(0, upto + 1))
+                setTab('entity')
+              }}
+            />
           </Box>
           <Tabs.Panel value="entity">
             {open && (
@@ -136,6 +117,7 @@ export default function App() {
             )}
           </Tabs.Panel>
         </Tabs>
+        </Container>
       </AppShell.Main>
     </AppShell>
   )

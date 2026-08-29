@@ -3,12 +3,16 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ActionIcon,
   Alert,
+  Anchor,
   Badge,
   Box,
+  Breadcrumbs,
+  Button,
   Card,
   Group,
   Loader,
   NavLink,
+  Stack,
   Switch,
   Text,
   TextInput,
@@ -46,6 +50,12 @@ type Node = {
   hasChildren: boolean
   children?: Node[]
 }
+
+/// What a brand-new entity is called until you rename it. It has to be
+/// SOMETHING: the name is an attribute, a listing shows it, and a blank
+/// row is unreadable. Renaming it is the first field on the tab that
+/// opens.
+const NEW_NAME = 'Untitled' // skill-allow: §9-const — the module's own vocabulary, not a tunable
 
 const toNode = (v: TreeNodeView, parent = ''): Node => ({
   path: parent ? `${parent}/${v.uuid}` : v.uuid,
@@ -87,13 +97,16 @@ function withChildren(nodes: Node[], path: string, kids: Node[]): Node[] {
 export default function MenuTab({
   onOpen,
   opened,
+  trail,
+  onCrumb,
 }: {
   onOpen: (uuid: string, trail: { uuid: string; name: string }[]) => void
   opened: string | null
+  trail: { uuid: string; name: string }[]
+  onCrumb: (uuid: string, upto: number) => void
 }) {
   const qc = useQueryClient()
   const [archived, setArchived] = useState(false)
-  const [name, setName] = useState('')
   const [term, setTerm] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [nodes, setNodes] = useState<Node[]>([])
@@ -147,9 +160,14 @@ export default function MenuTab({
   )
 
   const add = useMutation({
-    mutationFn: (n: string) => createEntity(n),
-    onSuccess: () => {
-      setName('')
+    mutationFn: () => createEntity(NEW_NAME),
+    // CREATING OPENS IT. There is nowhere else to go afterwards: a new
+    // entity is a uuid and a placeholder name, and everything you would
+    // do next — name it, label it, give it fields — is on the Entity
+    // tab. Leaving you on the menu staring at a row called "Untitled"
+    // just adds a click.
+    onSuccess: (created) => {
+      onOpen(created.uuid, [{ uuid: created.uuid, name: NEW_NAME }])
       void qc.invalidateQueries({ queryKey: ['roots'] })
       // The pickers list every entity, so a new one belongs in them
       // immediately — otherwise you create a label and cannot use it
@@ -222,59 +240,59 @@ export default function MenuTab({
 
   return (
     <>
-      <Card withBorder padding="md" mb="md">
-        <Group align="flex-end" gap="sm" wrap="wrap">
-          <TextInput
-            label="New entity"
-            description="a name is all it needs — everything else is an attribute"
-            placeholder="DBA"
-            value={name}
-            onChange={(e) => setName(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && name.trim()) add.mutate(name.trim())
-            }}
-            style={{ flex: 1, minWidth: 220 }}
-          />
-          {/* A REAL BUTTON, BESIDE THE FIELD. It used to sit inside the
-              input as a right section, where Mantine sets
-              `pointer-events: none` by default — it looked live and
-              swallowed every click, and nothing caught it because the
-              tests posted to the endpoint and dispatched synthetic
-              clicks straight at the element, both of which walk past the
-              CSS that was the whole problem. */}
-          <ActionIcon
-            size={36}
-            variant="filled"
-            onClick={() => name.trim() && add.mutate(name.trim())}
-            loading={add.isPending}
-            disabled={!name.trim()}
-            aria-label="Add entity"
-          >
-            +
-          </ActionIcon>
-          <TextInput
-            label="Search"
-            description="every entity, not just the ones on screen"
-            placeholder="jira"
-            value={term}
-            onChange={(e) => setTerm(e.currentTarget.value)}
-            style={{ flex: 1, minWidth: 200 }}
-          />
+      {/* A COLUMN. A list of entities is read down, not across — the
+          controls that drive it belong at its own width, not spread to
+          the far edge of a monitor. Search sits directly above the list
+          it filters, which is the only place it means anything. */}
+      <Stack gap="xs" maw={640}>
+        <Group gap="sm" wrap="nowrap">
+          <Button onClick={() => add.mutate()} loading={add.isPending} leftSection="+" size="sm">
+            New entity
+          </Button>
+          <Box style={{ flex: 1, minWidth: 0 }}>
+            <Breadcrumbs
+              separator="›"
+              separatorMargin={6}
+              styles={{
+                root: { flexWrap: 'nowrap', overflow: 'hidden' },
+                separator: { color: 'var(--mantine-color-dimmed)' },
+              }}
+            >
+              {trail.map((c, i) =>
+                i === trail.length - 1 ? (
+                  <Text key={c.uuid} size="sm" fw={600} truncate>
+                    {c.name}
+                  </Text>
+                ) : (
+                  <Anchor key={c.uuid} size="sm" c="dimmed" onClick={() => onCrumb(c.uuid, i)}>
+                    {c.name}
+                  </Anchor>
+                ),
+              )}
+            </Breadcrumbs>
+          </Box>
           <Switch
-            label="show archived"
+            label="archived"
+            size="xs"
             checked={archived}
             onChange={(e) => setArchived(e.currentTarget.checked)}
-            mb={8}
           />
         </Group>
+
         {add.error && (
-          <Text c="red" size="sm" mt="xs">
+          <Text c="red" size="sm">
             {String(add.error)}
           </Text>
         )}
-      </Card>
 
-      <Card withBorder padding="xs">
+        <TextInput
+          placeholder="Search every entity"
+          value={term}
+          onChange={(e) => setTerm(e.currentTarget.value)}
+          size="sm"
+        />
+
+        <Card withBorder padding={4}>
         {/* SAY WHAT WENT WRONG. This rendered an empty box when the read
             failed, so an unprovisioned instance looked like a page that
             had not loaded rather than one with something to report. */}
@@ -328,7 +346,8 @@ export default function MenuTab({
             {nodes.map(row)}
           </Box>
         )}
-      </Card>
+        </Card>
+      </Stack>
     </>
   )
 }
