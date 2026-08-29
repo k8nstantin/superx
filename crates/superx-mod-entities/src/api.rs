@@ -265,6 +265,40 @@ pub async fn children(
 /// # Errors
 ///
 /// Verb errors pass through.
+/// EVERY entity, flat — for the pickers.
+///
+/// A LABEL IS AN ENTITY, and so is a link target: there is no separate
+/// kind of thing to choose from, which is the whole point of the model.
+/// Both pickers used to be fed by [`roots`], so the moment an entity was
+/// linked it acquired a parent, stopped being a root, and silently
+/// disappeared from both lists — the graph could never be built more
+/// than one level deep from the interface that exists to build it.
+///
+/// Flat and unsorted-by-hierarchy on purpose: this is a list to choose a
+/// uuid from, not a tree to navigate.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn all(db: &Db, include_archived: bool) -> Result<Vec<TreeNodeView>> {
+    let ids = entity::list(db, include_archived).await?;
+    let held = attribute::of_many(db, &ids, false).await?;
+    let mut names = NameCache::default();
+    let mut out = Vec::new();
+    for id in &ids {
+        let mine = held.get(&record_uuid(id)).map_or(&[][..], Vec::as_slice);
+        out.push(TreeNodeView {
+            name: entity::name_in(mine).unwrap_or_default(),
+            labels: names.views(db, &entity::labels_in(mine)).await?,
+            has_children: false,
+            via: None,
+            uuid: record_uuid(id),
+        });
+    }
+    out.sort_by_key(|n| n.name.to_lowercase());
+    Ok(out)
+}
+
 /// Find entities by name, anywhere in the graph.
 ///
 /// THE TREE CANNOT ANSWER THIS. It loads a level at a time, so anything

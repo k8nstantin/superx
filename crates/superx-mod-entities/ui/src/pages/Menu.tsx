@@ -144,6 +144,10 @@ export default function MenuTree({
     onSuccess: () => {
       setName('')
       void qc.invalidateQueries({ queryKey: ['roots'] })
+      // The pickers list every entity, so a new one belongs in them
+      // immediately — otherwise you create a label and cannot use it
+      // until the page is reloaded.
+      void qc.invalidateQueries({ queryKey: ['all-entities'] })
     },
   })
 

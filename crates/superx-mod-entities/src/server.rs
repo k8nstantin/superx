@@ -53,6 +53,7 @@ pub async fn spawn(kernel: &Kernel, db: superx_kernel::Db, port: u16) -> Result<
         .route("/api/ping", get(ping))
         .route("/api/entities", get(list).post(create))
         .route("/api/entities/search", get(search))
+        .route("/api/entities/all", get(all_entities))
         .route("/api/entities/{frag}", get(detail))
         .route("/api/entities/{frag}/attributes", post(put_attribute))
         .route("/api/entities/{frag}/children", get(children))
@@ -105,6 +106,13 @@ struct SearchQuery {
     q: String,
     #[serde(default)]
     archived: bool,
+}
+
+async fn all_entities(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> std::result::Result<Json<Vec<api::TreeNodeView>>, (StatusCode, String)> {
+    api::all(&state.db, q.archived).await.map(Json).map_err(fail)
 }
 
 async fn search(

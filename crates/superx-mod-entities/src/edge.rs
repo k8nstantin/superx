@@ -370,8 +370,15 @@ pub async fn walk(
         if frontier.is_empty() {
             break;
         }
+        // BOTH DIRECTIONS. A neighbourhood is what points at you as
+        // much as what you point at — the engine holds the pointers
+        // both ways, so the inbound half is free. Following only `in`
+        // meant every leaf drew as a lone dot with no connections,
+        // while the entity page listed its inbound links directly
+        // underneath: the same graph, described two different ways on
+        // one screen.
         let mut resp = db
-            .query("SELECT *, in, out FROM entity_edge WHERE in IN $ids")
+            .query("SELECT *, in, out FROM entity_edge WHERE in IN $ids OR out IN $ids")
             .bind(("ids", frontier.clone()))
             .await?;
         let level: Vec<Edge> = live(resp.take(0)?)
@@ -379,11 +386,14 @@ pub async fn walk(
             .filter(|e| label.is_none_or(|l| e.labels.contains(l)))
             .collect();
 
+        // The far end is whichever end is not the one we came from.
+        let here: HashSet<String> = frontier.iter().map(record_uuid).collect();
         let mut next: Vec<RecordId> = Vec::new();
         for e in &level {
-            if seen.insert(record_uuid(&e.to)) {
-                nodes.push(Reached { entity: e.to.clone(), depth: d });
-                next.push(e.to.clone());
+            let far = if here.contains(&record_uuid(&e.from)) { &e.to } else { &e.from };
+            if seen.insert(record_uuid(far)) {
+                nodes.push(Reached { entity: far.clone(), depth: d });
+                next.push(far.clone());
             }
         }
         edges.extend(level);

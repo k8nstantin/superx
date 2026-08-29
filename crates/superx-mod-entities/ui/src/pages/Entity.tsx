@@ -23,7 +23,7 @@ import {
   MACHINERY,
   NAME,
   NAME_HEIGHT,
-  fetchRoots,
+  fetchAllEntities,
   linkEntities,
   NATURAL_HEIGHT,
   NATURAL_WIDTH,
@@ -155,7 +155,12 @@ export default function EntityTab({
 
   const archive = useMutation({
     mutationFn: (a: boolean) => setArchived(frag, a),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ['entity', frag] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['entity', frag] })
+      // A rename changes what the pickers and the tree show.
+      void qc.invalidateQueries({ queryKey: ['all-entities'] })
+      void qc.invalidateQueries({ queryKey: ['roots'] })
+    },
   })
 
   if (e.isLoading) return <Loader size="sm" />
@@ -279,7 +284,13 @@ function EntityPicker({
   value: string | null
   onChange: (v: string | null) => void
 }) {
-  const all = useQuery({ queryKey: ['roots', true], queryFn: () => fetchRoots(true) })
+  // EVERY ENTITY, not the roots. Any entity can be a label — a label
+  // IS an entity carrying the label `label` — and any entity can be the
+  // far end of a link. Feeding these pickers from `roots` meant that
+  // linking something removed it from both lists, because it now had a
+  // parent: the graph could never be built deeper than one level from
+  // the screen whose job is building it.
+  const all = useQuery({ queryKey: ['all-entities'], queryFn: () => fetchAllEntities(true) })
   const data = (all.data ?? [])
     .filter((e) => e.uuid !== exclude)
     .map((e) => ({ value: e.uuid, label: e.name || e.uuid.slice(0, 8) }))
@@ -354,6 +365,11 @@ function Link({ frag }: { frag: string }) {
   const link = useMutation({
     mutationFn: () => linkEntities(frag, to ?? '', name.trim(), label ? [label] : []),
     onSuccess: () => {
+      // A LINK RESHAPES THE TREE. The far end gains a parent and stops
+      // being a root; this end gains children. Refreshing only this
+      // entity left the menu showing the shape from before the link.
+      void qc.invalidateQueries({ queryKey: ['roots'] })
+      void qc.invalidateQueries({ queryKey: ['all-entities'] })
       setTo(null)
       setName('')
       setLabel(null)
@@ -412,7 +428,12 @@ function Field({
         labels: field.labels,
         options: field.options,
       }),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ['entity', frag] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['entity', frag] })
+      // A rename changes what the pickers and the tree show.
+      void qc.invalidateQueries({ queryKey: ['all-entities'] })
+      void qc.invalidateQueries({ queryKey: ['roots'] })
+    },
   })
 
   const body = () => {

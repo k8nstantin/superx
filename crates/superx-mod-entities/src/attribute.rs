@@ -32,6 +32,11 @@ use crate::{new_id, newest_by_valid_from, obj_bool, obj_display, obj_get, obj_re
 pub const DATATYPES: [&str; 5] = // skill-allow: §9-const — the module's own data model, not a tunable
     ["text", "number", "boolean", "datetime", "json"];
 
+/// The attributes this module reads BY NAME, and therefore the only two
+/// an entity may not hold twice. Everything else may repeat.
+const SINGLETON: [&str; 2] = // skill-allow: §9-const — the module's own vocabulary, not a tunable
+    ["name", "archived"];
+
 /// One attribute as it currently reads.
 #[derive(Debug, Clone)]
 pub struct Attribute {
@@ -81,6 +86,28 @@ pub async fn add(
     w: Write<'_>,
     author: &Author,
 ) -> Result<String> {
+    // ONE NAME, ONE ARCHIVED FLAG — checked HERE, not in a form.
+    //
+    // Attributes are a list and repetition is usually the point: two
+    // declarations are two rows both called `is`, and two fields may
+    // share a name and differ by label. But these two are read BY NAME
+    // to answer "what is this called" and "is it put away", and the
+    // answer is the first match — so a second one makes identity depend
+    // on insertion order. The browser refused it; anything else went
+    // straight past.
+    if SINGLETON.contains(&w.name.trim()) {
+        let taken = of(db, entity, true)
+            .await?
+            .into_iter()
+            .any(|a| a.name == w.name.trim());
+        if taken {
+            return Err(KernelError::Module(format!(
+                "this entity already has '{}' — amend the one it has rather than \
+                 adding a second, which would leave the real one decided by order",
+                w.name.trim()
+            )));
+        }
+    }
     let uid = record_uuid(&new_id("attr"));
     append(db, entity, &uid, &w, true, author).await?;
     Ok(uid)

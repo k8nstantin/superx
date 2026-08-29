@@ -26,6 +26,12 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
 export const fetchPing = () =>
   json<{ module: string; version: string; core_url: string | null }>('/api/ping')
 
+/// EVERY entity, for the pickers. A label is an entity carrying the
+/// label `label`, and a link target is any entity at all — so what a
+/// picker must offer is the whole set, never a subset the module chose.
+export const fetchAllEntities = (archived = false) =>
+  json<TreeNodeView[]>(`/api/entities/all?archived=${archived}`)
+
 export const searchEntities = (q: string, archived = false) =>
   json<TreeNodeView[]>(
     `/api/entities/search?q=${encodeURIComponent(q)}&archived=${archived}`,

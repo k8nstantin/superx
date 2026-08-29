@@ -840,3 +840,83 @@ async fn provisioning_is_safe_to_repeat() {
         .await
         .expect("create after a second provision");
 }
+
+/// AN ATTRIBUTE CANNOT HANG OFF A UUID NOBODY ISSUED.
+///
+/// `record<entity>` is a TYPE, not a foreign key — the engine checks the
+/// shape of the value and never that the row exists. Without an ASSERT
+/// an attribute could be written against an invented uuid: absent from
+/// every listing, reachable by nothing, and permanent, because nothing
+/// here deletes. `labels` on the same table had always asserted
+/// existence and `entity_edge` is ENFORCED; this was the third
+/// reference, and the only one that was open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attribute_needs_an_entity_that_exists() {
+    let db = fresh_db().await;
+    let ghost = superx_mod_entities::new_id("entity");
+    assert!(
+        attribute::add(
+            &db,
+            &ghost,
+            Write {
+                name: "orphan",
+                datatype: "text",
+                content: text("nowhere"),
+                labels: &[],
+                options: None
+            },
+            &Author::operator(),
+        )
+        .await
+        .is_err(),
+        "an attribute on an entity that was never created is unreachable data"
+    );
+}
+
+/// ONE NAME, ONE ARCHIVED FLAG. The rest may repeat.
+///
+/// Most attributes are a list and repetition is the point — declaring
+/// two labels writes two rows both called `is`, and two fields may
+/// legitimately share a name and differ by label. But `name` and
+/// `archived` are the two this module reads BY NAME to answer "what is
+/// this called" and "is it put away", and it answers with the first
+/// match. A second one makes the answer depend on insertion order,
+/// which is an implementation detail standing in for a rule. The form
+/// refused this; the module did not, so anything talking to the
+/// database directly walked straight past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_name_and_the_archived_flag_cannot_be_duplicated() {
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let e = entity::create(&db, "Real", &op).await.expect("create");
+
+    let second_name = attribute::add(
+        &db,
+        &e,
+        Write { name: "name", datatype: "text", content: text("IMPOSTOR"), labels: &[], options: None },
+        &op,
+    )
+    .await;
+    assert!(second_name.is_err(), "a second name makes the real one a matter of ordering");
+
+    entity::archive(&db, &e, &op).await.expect("archive");
+    let second_flag = attribute::add(
+        &db,
+        &e,
+        Write { name: "archived", datatype: "boolean", content: Some(Value::Bool(false)), labels: &[], options: None },
+        &op,
+    )
+    .await;
+    assert!(second_flag.is_err(), "two archived flags disagree and one of them wins by accident");
+
+    // And the rename path still works, because it amends the chain it
+    // already has rather than adding a second row.
+    entity::rename(&db, &e, "Renamed", &op).await.expect("rename still works");
+    assert_eq!(entity::name_of(&db, &e).await.expect("read"), Some("Renamed".to_string()));
+
+    // Ordinary repetition is untouched: two labels, two `is` rows.
+    let role = entity::create(&db, "role", &op).await.expect("role");
+    let tag = entity::create(&db, "tag", &op).await.expect("tag");
+    entity::declare(&db, &e, "is", &[role], &op).await.expect("first declaration");
+    entity::declare(&db, &e, "is", &[tag], &op).await.expect("a second label is not a duplicate");
+}

@@ -176,7 +176,15 @@ DEFINE FIELD created_at  ON TABLE entity TYPE datetime;
 DEFINE TABLE entity_attribute SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
 
 DEFINE FIELD uid         ON TABLE entity_attribute TYPE string;
-DEFINE FIELD entity      ON TABLE entity_attribute TYPE record<entity>;
+-- ASSERT, BECAUSE record<entity> IS A TYPE AND NOT A FOREIGN KEY. The
+-- engine checks the shape of the value, never that the row is there, so
+-- without this an attribute could be hung on a uuid nothing had ever
+-- issued: invisible in every listing, unreachable, and — the store being
+-- append-only — permanent. `labels` on this same table has always
+-- asserted existence and `entity_edge` is ENFORCED; this was the one
+-- reference of the three left open.
+DEFINE FIELD entity      ON TABLE entity_attribute TYPE record<entity>
+    ASSERT record::exists($value);
 DEFINE FIELD name        ON TABLE entity_attribute TYPE string;
 DEFINE FIELD labels      ON TABLE entity_attribute TYPE option<array<record<entity>>>
     ASSERT $value == NONE OR array::all($value, |$l| record::exists($l));
