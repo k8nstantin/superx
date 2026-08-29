@@ -7,7 +7,7 @@
 use superx_kernel::types::Value;
 use superx_mod_entities::attribute::{self, Write};
 use superx_mod_entities::author::Author;
-use superx_mod_entities::{entity, SCHEMA_DDL};
+use superx_mod_entities::{api, edge, entity, SCHEMA_DDL};
 
 async fn fresh_db() -> superx_kernel::Db {
     let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
@@ -713,4 +713,210 @@ async fn depth_is_the_shortest_path_not_the_first_one_found() {
     };
     assert_eq!(depth_of(&leaf), Some(1), "leaf is a direct child of root");
     assert_eq!(depth_of(&mid), Some(1));
+}
+
+/// ARCHIVING A PARENT MUST NOT TAKE ITS CHILDREN WITH IT.
+///
+/// The menu's top level is "entities nothing points at", and archived
+/// entities are hidden from it. Those two rules together used to delete
+/// a thing from the interface without deleting it from the store: the
+/// child still had an inbound edge so it was no root, and the only row
+/// that led to it was the one just put away. It was in the database and
+/// on no screen, with nothing an operator could click to get it back.
+///
+/// A parent that cannot be seen is not a parent for this purpose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archiving_a_parent_gives_its_children_back_to_the_top_level() {
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let parent = entity::create(&db, "Parent", &op).await.expect("parent");
+    let child = entity::create(&db, "Child", &op).await.expect("child");
+    edge::link(&db, &parent, &child, "owns", &[], &op).await.expect("link");
+
+    let names = |rows: &[api::TreeNodeView]| {
+        rows.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+    };
+
+    // While the parent is visible the child hangs off it, not the top.
+    let top = api::roots(&db, false).await.expect("roots");
+    assert!(names(&top).contains(&"Parent".to_string()));
+    assert!(
+        !names(&top).contains(&"Child".to_string()),
+        "a child reachable by expanding must not also sit at the root"
+    );
+
+    entity::archive(&db, &parent, &op).await.expect("archive");
+
+    let top = api::roots(&db, false).await.expect("roots after archive");
+    assert!(
+        !names(&top).contains(&"Parent".to_string()),
+        "the archived parent is hidden"
+    );
+    assert!(
+        names(&top).contains(&"Child".to_string()),
+        "the child is reachable again — archiving the only way in must not \
+         leave it in the store and off every screen"
+    );
+}
+
+/// The mirror of the same rule: an expander must open on something.
+///
+/// `has_children` counted any live outbound edge, including ones landing
+/// on an entity the menu hides — so a row wore a chevron that expanded
+/// to an empty list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_only_opens_when_there_is_something_behind_it() {
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let parent = entity::create(&db, "Parent", &op).await.expect("parent");
+    let child = entity::create(&db, "Child", &op).await.expect("child");
+    edge::link(&db, &parent, &child, "owns", &[], &op).await.expect("link");
+
+    let opens = |rows: &[api::TreeNodeView], who: &str| {
+        rows.iter().find(|r| r.name == who).map(|r| r.has_children)
+    };
+
+    let top = api::roots(&db, false).await.expect("roots");
+    assert_eq!(opens(&top, "Parent"), Some(true), "it has a visible child");
+
+    entity::archive(&db, &child, &op).await.expect("archive child");
+
+    let top = api::roots(&db, false).await.expect("roots after archive");
+    assert_eq!(
+        opens(&top, "Parent"),
+        Some(false),
+        "its only child is hidden, so the chevron would open on nothing"
+    );
+}
+
+/// PROVISIONING REPLACES. IT DOES NOT ACCUMULATE.
+///
+/// This is the failure that cost a day. The first cut of this schema
+/// defined every table `IF NOT EXISTS`, which is not "define" — it is
+/// "define unless something is already sitting there". On an instance
+/// that had run the shape before it, `entity` kept v1's required
+/// `entity_type` column, and the new code's create, which writes only
+/// `created_at`, was refused every single time:
+///
+///     Found NONE for field `entity_type`, but expected a string
+///
+/// The database was provisioned, the module was running, and nothing
+/// could be created. Applying a new schema over an old one is not an
+/// upgrade; it is a half-open door. So the schema drops what it owns
+/// before it defines it, and this pins that: v1 first, the real thing
+/// second, and an entity must be creatable afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_schema_replaces_an_older_shape_instead_of_layering_over_it() {
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("entities").await.expect("nsdb");
+
+    // The shape that shipped before #353, exactly as it was.
+    let v1 = include_str!("fixtures/v1-entities.surql")
+        .replace("$SUPERX_MODULE_PASSWORD", "test-password");
+    db.query(v1).await.expect("v1 applies").check().expect("v1 is clean");
+
+    // And the current one, straight over the top of it.
+    let now = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "test-password");
+    db.query(now).await.expect("re-provision").check().expect("schema replaces cleanly");
+
+    // The proof is that the module can do its most basic act.
+    let id = entity::create(&db, "DBA", &Author::operator())
+        .await
+        .expect("an upgraded instance must be able to create an entity");
+    assert_eq!(
+        entity::name_of(&db, &id).await.expect("read"),
+        Some("DBA".to_string())
+    );
+}
+
+/// And provisioning twice is provisioning once — the operator may run it
+/// again without hunting for a reason it would be unsafe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provisioning_is_safe_to_repeat() {
+    let db = fresh_db().await;
+    let again = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "test-password");
+    db.query(again).await.expect("re-apply").check().expect("clean on a live database");
+    entity::create(&db, "Still works", &Author::operator())
+        .await
+        .expect("create after a second provision");
+}
+
+/// AN ATTRIBUTE CANNOT HANG OFF A UUID NOBODY ISSUED.
+///
+/// `record<entity>` is a TYPE, not a foreign key — the engine checks the
+/// shape of the value and never that the row exists. Without an ASSERT
+/// an attribute could be written against an invented uuid: absent from
+/// every listing, reachable by nothing, and permanent, because nothing
+/// here deletes. `labels` on the same table had always asserted
+/// existence and `entity_edge` is ENFORCED; this was the third
+/// reference, and the only one that was open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attribute_needs_an_entity_that_exists() {
+    let db = fresh_db().await;
+    let ghost = superx_mod_entities::new_id("entity");
+    assert!(
+        attribute::add(
+            &db,
+            &ghost,
+            Write {
+                name: "orphan",
+                datatype: "text",
+                content: text("nowhere"),
+                labels: &[],
+                options: None
+            },
+            &Author::operator(),
+        )
+        .await
+        .is_err(),
+        "an attribute on an entity that was never created is unreachable data"
+    );
+}
+
+/// ONE NAME, ONE ARCHIVED FLAG. The rest may repeat.
+///
+/// Most attributes are a list and repetition is the point — declaring
+/// two labels writes two rows both called `is`, and two fields may
+/// legitimately share a name and differ by label. But `name` and
+/// `archived` are the two this module reads BY NAME to answer "what is
+/// this called" and "is it put away", and it answers with the first
+/// match. A second one makes the answer depend on insertion order,
+/// which is an implementation detail standing in for a rule. The form
+/// refused this; the module did not, so anything talking to the
+/// database directly walked straight past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_name_and_the_archived_flag_cannot_be_duplicated() {
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let e = entity::create(&db, "Real", &op).await.expect("create");
+
+    let second_name = attribute::add(
+        &db,
+        &e,
+        Write { name: "name", datatype: "text", content: text("IMPOSTOR"), labels: &[], options: None },
+        &op,
+    )
+    .await;
+    assert!(second_name.is_err(), "a second name makes the real one a matter of ordering");
+
+    entity::archive(&db, &e, &op).await.expect("archive");
+    let second_flag = attribute::add(
+        &db,
+        &e,
+        Write { name: "archived", datatype: "boolean", content: Some(Value::Bool(false)), labels: &[], options: None },
+        &op,
+    )
+    .await;
+    assert!(second_flag.is_err(), "two archived flags disagree and one of them wins by accident");
+
+    // And the rename path still works, because it amends the chain it
+    // already has rather than adding a second row.
+    entity::rename(&db, &e, "Renamed", &op).await.expect("rename still works");
+    assert_eq!(entity::name_of(&db, &e).await.expect("read"), Some("Renamed".to_string()));
+
+    // Ordinary repetition is untouched: two labels, two `is` rows.
+    let role = entity::create(&db, "role", &op).await.expect("role");
+    let tag = entity::create(&db, "tag", &op).await.expect("tag");
+    entity::declare(&db, &e, "is", &[role], &op).await.expect("first declaration");
+    entity::declare(&db, &e, "is", &[tag], &op).await.expect("a second label is not a duplicate");
 }

@@ -123,6 +123,36 @@
 --     permissions are declarative intent; APPEND-ONLY IS HELD BY THE
 --     CODE, which never emits UPDATE or DELETE (§10).
 
+-- THE WHOLE DATABASE GOES FIRST ---------------------------------------
+--
+-- PROVISIONING MEANS: this database ends up in the shape this file
+-- describes, and NOTHING that was there survives. Not "add what is
+-- missing".
+--
+-- The second attempt defined its tables `IF NOT EXISTS`, which does not
+-- amend a table that already exists — so an instance that had run the
+-- first shape kept it, `entity` still demanded its old `entity_type`,
+-- and every create the module made was refused on a database that
+-- reported itself provisioned. Naming the tables to drop instead is the
+-- same bug one step removed: it is correct only while the list is
+-- complete, and the list is a thing a person maintains.
+--
+-- So the DATABASE is removed. There is no table to forget.
+--
+-- SAFE TO RE-RUN, AND DESTRUCTIVE EVERY TIME. This file is applied by
+-- exactly one thing — `superx modules provision entities`, invoked by
+-- the operator. Nothing runs it at boot, at restart or on upgrade.
+--
+-- AND IT IS VERIFIED, NOT ASSUMED. `provisioning_leaves_the_database
+-- _exactly_as_this_file_describes` reads the schema back out of the
+-- engine afterwards and diffs it against this file: every table, every
+-- field, and NOTHING ELSE. Applying DDL and trusting that it took is
+-- what let the last shape survive underneath a schema that thought it
+-- had replaced it.
+
+REMOVE DATABASE IF EXISTS entities;
+DEFINE DATABASE entities;
+
 DEFINE USER IF NOT EXISTS superx_mod_entities ON DATABASE
     PASSWORD '$SUPERX_MODULE_PASSWORD'
     ROLES EDITOR
@@ -133,9 +163,9 @@ DEFINE USER IF NOT EXISTS superx_mod_entities ON DATABASE
 -- Issued once, never altered. This is what every edge and every label
 -- points at, forever.
 
-DEFINE TABLE IF NOT EXISTS entity SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
+DEFINE TABLE entity SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
 
-DEFINE FIELD IF NOT EXISTS created_at  ON TABLE entity TYPE datetime;
+DEFINE FIELD created_at  ON TABLE entity TYPE datetime;
 
 
 -- 2 ─── entity_attribute ─────────────── everything said about it ───────
@@ -143,25 +173,33 @@ DEFINE FIELD IF NOT EXISTS created_at  ON TABLE entity TYPE datetime;
 -- Content may be absent: an attribute that only carries labels is how
 -- you say what a thing IS.
 
-DEFINE TABLE IF NOT EXISTS entity_attribute SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
+DEFINE TABLE entity_attribute SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
 
-DEFINE FIELD IF NOT EXISTS uid         ON TABLE entity_attribute TYPE string;
-DEFINE FIELD IF NOT EXISTS entity      ON TABLE entity_attribute TYPE record<entity>;
-DEFINE FIELD IF NOT EXISTS name        ON TABLE entity_attribute TYPE string;
-DEFINE FIELD IF NOT EXISTS labels      ON TABLE entity_attribute TYPE option<array<record<entity>>>
+DEFINE FIELD uid         ON TABLE entity_attribute TYPE string;
+-- ASSERT, BECAUSE record<entity> IS A TYPE AND NOT A FOREIGN KEY. The
+-- engine checks the shape of the value, never that the row is there, so
+-- without this an attribute could be hung on a uuid nothing had ever
+-- issued: invisible in every listing, unreachable, and — the store being
+-- append-only — permanent. `labels` on this same table has always
+-- asserted existence and `entity_edge` is ENFORCED; this was the one
+-- reference of the three left open.
+DEFINE FIELD entity      ON TABLE entity_attribute TYPE record<entity>
+    ASSERT record::exists($value);
+DEFINE FIELD name        ON TABLE entity_attribute TYPE string;
+DEFINE FIELD labels      ON TABLE entity_attribute TYPE option<array<record<entity>>>
     ASSERT $value == NONE OR array::all($value, |$l| record::exists($l));
-DEFINE FIELD IF NOT EXISTS datatype    ON TABLE entity_attribute TYPE string
+DEFINE FIELD datatype    ON TABLE entity_attribute TYPE string
     ASSERT $value INSIDE ['text', 'number', 'boolean', 'datetime', 'json'];
-DEFINE FIELD IF NOT EXISTS content     ON TABLE entity_attribute TYPE any;
-DEFINE FIELD IF NOT EXISTS options     ON TABLE entity_attribute TYPE option<object> FLEXIBLE;
-DEFINE FIELD IF NOT EXISTS active      ON TABLE entity_attribute TYPE bool;
-DEFINE FIELD IF NOT EXISTS valid_from  ON TABLE entity_attribute TYPE datetime;
-DEFINE FIELD IF NOT EXISTS author_kind ON TABLE entity_attribute TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS author_uid  ON TABLE entity_attribute TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE entity_attribute TYPE option<string>;
+DEFINE FIELD content     ON TABLE entity_attribute TYPE any;
+DEFINE FIELD options     ON TABLE entity_attribute TYPE option<object> FLEXIBLE;
+DEFINE FIELD active      ON TABLE entity_attribute TYPE bool;
+DEFINE FIELD valid_from  ON TABLE entity_attribute TYPE datetime;
+DEFINE FIELD author_kind ON TABLE entity_attribute TYPE option<string>;
+DEFINE FIELD author_uid  ON TABLE entity_attribute TYPE option<string>;
+DEFINE FIELD via_uid     ON TABLE entity_attribute TYPE option<string>;
 
-DEFINE INDEX IF NOT EXISTS idx_attribute_chain  ON TABLE entity_attribute FIELDS uid, valid_from;
-DEFINE INDEX IF NOT EXISTS idx_attribute_entity ON TABLE entity_attribute FIELDS entity, valid_from;
+DEFINE INDEX idx_attribute_chain  ON TABLE entity_attribute FIELDS uid, valid_from;
+DEFINE INDEX idx_attribute_entity ON TABLE entity_attribute FIELDS entity, valid_from;
 
 
 -- 3 ─── entity_edge ────────────────────── what the entity points at ────
@@ -170,16 +208,16 @@ DEFINE INDEX IF NOT EXISTS idx_attribute_entity ON TABLE entity_attribute FIELDS
 -- exist. Many edges may join the same pair, each with its own name,
 -- labels and history. Unlinking appends `active = false` on the same uid.
 
-DEFINE TABLE IF NOT EXISTS entity_edge SCHEMAFULL TYPE RELATION IN entity OUT entity ENFORCED PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
+DEFINE TABLE entity_edge SCHEMAFULL TYPE RELATION IN entity OUT entity ENFORCED PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
 
-DEFINE FIELD IF NOT EXISTS uid         ON TABLE entity_edge TYPE string;
-DEFINE FIELD IF NOT EXISTS name        ON TABLE entity_edge TYPE string;
-DEFINE FIELD IF NOT EXISTS labels      ON TABLE entity_edge TYPE option<array<record<entity>>>
+DEFINE FIELD uid         ON TABLE entity_edge TYPE string;
+DEFINE FIELD name        ON TABLE entity_edge TYPE string;
+DEFINE FIELD labels      ON TABLE entity_edge TYPE option<array<record<entity>>>
     ASSERT $value == NONE OR array::all($value, |$l| record::exists($l));
-DEFINE FIELD IF NOT EXISTS active      ON TABLE entity_edge TYPE bool;
-DEFINE FIELD IF NOT EXISTS valid_from  ON TABLE entity_edge TYPE datetime;
-DEFINE FIELD IF NOT EXISTS author_kind ON TABLE entity_edge TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS author_uid  ON TABLE entity_edge TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS via_uid     ON TABLE entity_edge TYPE option<string>;
+DEFINE FIELD active      ON TABLE entity_edge TYPE bool;
+DEFINE FIELD valid_from  ON TABLE entity_edge TYPE datetime;
+DEFINE FIELD author_kind ON TABLE entity_edge TYPE option<string>;
+DEFINE FIELD author_uid  ON TABLE entity_edge TYPE option<string>;
+DEFINE FIELD via_uid     ON TABLE entity_edge TYPE option<string>;
 
-DEFINE INDEX IF NOT EXISTS idx_edge_chain ON TABLE entity_edge FIELDS uid, valid_from;
+DEFINE INDEX idx_edge_chain ON TABLE entity_edge FIELDS uid, valid_from;

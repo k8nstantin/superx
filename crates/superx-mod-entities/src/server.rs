@@ -32,6 +32,9 @@ struct Assets;
 #[derive(Clone)]
 struct AppState {
     db: superx_kernel::Db,
+    /// The core dashboard, resolved from the substrate at startup so the
+    /// module's header can offer a way back to it.
+    core_url: Option<String>,
 }
 
 /// Bind and spawn the entities service.
@@ -45,9 +48,12 @@ pub async fn spawn(kernel: &Kernel, db: superx_kernel::Db, port: u16) -> Result<
     // it the socket stays bound after shutdown and a re-enable cannot
     // bind.
     let stop = kernel.module_token(MODULE_NAME);
+    let core_url = crate::core_dashboard_url(kernel).await;
     let app = Router::new()
         .route("/api/ping", get(ping))
         .route("/api/entities", get(list).post(create))
+        .route("/api/entities/search", get(search))
+        .route("/api/entities/all", get(all_entities))
         .route("/api/entities/{frag}", get(detail))
         .route("/api/entities/{frag}/attributes", post(put_attribute))
         .route("/api/entities/{frag}/children", get(children))
@@ -55,7 +61,7 @@ pub async fn spawn(kernel: &Kernel, db: superx_kernel::Db, port: u16) -> Result<
         .route("/api/entities/{frag}/link", post(link))
         .route("/api/entities/{frag}/archive", post(archive))
         .fallback(get(assets))
-        .with_state(AppState { db });
+        .with_state(AppState { db, core_url });
 
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -80,10 +86,11 @@ fn fail(e: KernelError) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, e.to_string())
 }
 
-async fn ping() -> Json<serde_json::Value> {
+async fn ping(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "module": MODULE_NAME,
         "version": env!("CARGO_PKG_VERSION"),
+        "core_url": state.core_url,
     }))
 }
 
@@ -91,6 +98,28 @@ async fn ping() -> Json<serde_json::Value> {
 struct ListQuery {
     #[serde(default)]
     archived: bool,
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    archived: bool,
+}
+
+async fn all_entities(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> std::result::Result<Json<Vec<api::TreeNodeView>>, (StatusCode, String)> {
+    api::all(&state.db, q.archived).await.map(Json).map_err(fail)
+}
+
+async fn search(
+    State(state): State<AppState>,
+    Query(p): Query<SearchQuery>,
+) -> std::result::Result<Json<Vec<api::TreeNodeView>>, (StatusCode, String)> {
+    api::search(&state.db, &p.q, p.archived).await.map(Json).map_err(fail)
 }
 
 async fn list(

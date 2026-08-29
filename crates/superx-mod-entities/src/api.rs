@@ -220,7 +220,14 @@ pub async fn children(
         .collect();
     let ids: Vec<RecordId> = kids.iter().map(|(id, _)| id.clone()).collect();
     let held = attribute::of_many(db, &ids, false).await?;
-    let parents = edge::sources(db).await?;
+    // The same visibility the menu uses one level up, so an expander
+    // here promises exactly what expanding it will show.
+    let visible: std::collections::HashSet<String> = entity::list(db, false)
+        .await?
+        .iter()
+        .map(record_uuid)
+        .collect();
+    let parents = edge::sources(db, &visible).await?;
     let mut names = NameCache::default();
     let mut out = Vec::new();
     for (child, via) in kids {
@@ -243,21 +250,127 @@ pub async fn children(
     Ok(out)
 }
 
-/// Every entity, for the top of the menu.
+/// The TOP of the menu: entities nothing points at.
+///
+/// A tree whose first level is every entity is a list, and a child shows
+/// up twice — once at the root and once under its parent. A root is
+/// something with no live edge pointing at it; everything else is
+/// reachable by expanding, which is what the tree is for.
+///
+/// An entity that only has edges pointing IN and none out is still
+/// reachable from its parent. One caught in a cycle with no way in from
+/// outside would not be — so anything unreachable is surfaced rather
+/// than hidden.
 ///
 /// # Errors
 ///
 /// Verb errors pass through.
+/// EVERY entity, flat — for the pickers.
+///
+/// A LABEL IS AN ENTITY, and so is a link target: there is no separate
+/// kind of thing to choose from, which is the whole point of the model.
+/// Both pickers used to be fed by [`roots`], so the moment an entity was
+/// linked it acquired a parent, stopped being a root, and silently
+/// disappeared from both lists — the graph could never be built more
+/// than one level deep from the interface that exists to build it.
+///
+/// Flat and unsorted-by-hierarchy on purpose: this is a list to choose a
+/// uuid from, not a tree to navigate.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn all(db: &Db, include_archived: bool) -> Result<Vec<TreeNodeView>> {
+    let ids = entity::list(db, include_archived).await?;
+    let held = attribute::of_many(db, &ids, false).await?;
+    let mut names = NameCache::default();
+    let mut out = Vec::new();
+    for id in &ids {
+        let mine = held.get(&record_uuid(id)).map_or(&[][..], Vec::as_slice);
+        out.push(TreeNodeView {
+            name: entity::name_in(mine).unwrap_or_default(),
+            labels: names.views(db, &entity::labels_in(mine)).await?,
+            has_children: false,
+            via: None,
+            uuid: record_uuid(id),
+        });
+    }
+    out.sort_by_key(|n| n.name.to_lowercase());
+    Ok(out)
+}
+
+/// Find entities by name, anywhere in the graph.
+///
+/// THE TREE CANNOT ANSWER THIS. It loads a level at a time, so anything
+/// the operator has not already expanded to is not on the client to
+/// filter — and the whole point of a search box is the thing you have
+/// not found yet. So the match happens here, over every entity, and
+/// comes back flat: a search result has no parent, because it was not
+/// reached through one.
+///
+/// Case-insensitive substring. Not a ranking, not a fuzzy match — a
+/// person typing three letters of a name they already know is the case
+/// this serves, and pretending to be cleverer would only make the
+/// result harder to predict.
+///
+/// # Errors
+///
+/// Verb errors pass through.
+pub async fn search(db: &Db, query: &str, include_archived: bool) -> Result<Vec<TreeNodeView>> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let all = entity::list(db, include_archived).await?;
+    let visible: std::collections::HashSet<String> = all.iter().map(record_uuid).collect();
+    let parents = edge::sources(db, &visible).await?;
+    let held = attribute::of_many(db, &all, false).await?;
+    let mut names = NameCache::default();
+    let mut out = Vec::new();
+    for id in &all {
+        let mine = held.get(&record_uuid(id)).map_or(&[][..], Vec::as_slice);
+        let name = entity::name_in(mine).unwrap_or_default();
+        if !name.to_lowercase().contains(&needle) {
+            continue;
+        }
+        out.push(TreeNodeView {
+            labels: names.views(db, &entity::labels_in(mine)).await?,
+            has_children: parents.contains(&record_uuid(id)),
+            via: None,
+            uuid: record_uuid(id),
+            name,
+        });
+    }
+    // Shortest first: a search for "back" should offer `Backups` above
+    // `Backups nightly verification sweep`.
+    out.sort_by_key(|n| (n.name.len(), n.name.clone()));
+    Ok(out)
+}
+
 pub async fn roots(db: &Db, include_archived: bool) -> Result<Vec<TreeNodeView>> {
     // ONE read of every entity's attributes, and one name lookup per
     // DISTINCT label. Asking per row turned the first screen into
     // thousands of round trips.
-    let ids = entity::list(db, include_archived).await?;
+    let all = entity::list(db, include_archived).await?;
+    // WHAT THE MENU CAN SEE, which is what both questions below are
+    // really about. Archiving an entity used to take everything it
+    // pointed at out of the tree with it: the target still had an
+    // inbound edge, so it was not a root, and the only row that led to
+    // it was hidden — leaving it in the store and nowhere on screen.
+    let visible: std::collections::HashSet<String> =
+        all.iter().map(record_uuid).collect();
+    // AND ONE READ EACH for "does this open" and "is this a root".
+    let parents = edge::sources(db, &visible).await?;
+    let children = edge::targets(db, &visible).await?;
+    let ids: Vec<RecordId> = all
+        .iter()
+        .filter(|id| !children.contains(&record_uuid(id)))
+        .cloned()
+        .collect();
+    // Nothing unreachable is hidden: an entity every path points into
+    // but none leads out of would otherwise vanish from the menu.
+    let ids = if ids.is_empty() { all } else { ids };
     let held = attribute::of_many(db, &ids, false).await?;
-    // AND ONE READ FOR "DOES THIS OPEN". Asking `edge::of` per row was
-    // the same N+1 the comment above claims to have removed — 500
-    // entities meant 500 scans of the edge table.
-    let parents = edge::sources(db).await?;
     let mut names = NameCache::default();
     let mut out = Vec::new();
     for id in &ids {

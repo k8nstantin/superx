@@ -23,7 +23,19 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
   return (await r.json()) as T
 }
 
-export const fetchPing = () => json<{ module: string; version: string }>('/api/ping')
+export const fetchPing = () =>
+  json<{ module: string; version: string; core_url: string | null }>('/api/ping')
+
+/// EVERY entity, for the pickers. A label is an entity carrying the
+/// label `label`, and a link target is any entity at all — so what a
+/// picker must offer is the whole set, never a subset the module chose.
+export const fetchAllEntities = (archived = false) =>
+  json<TreeNodeView[]>(`/api/entities/all?archived=${archived}`)
+
+export const searchEntities = (q: string, archived = false) =>
+  json<TreeNodeView[]>(
+    `/api/entities/search?q=${encodeURIComponent(q)}&archived=${archived}`,
+  )
 
 export const fetchRoots = (archived = false) =>
   json<TreeNodeView[]>(`/api/entities?archived=${archived}`)
@@ -93,6 +105,11 @@ export const NATURAL_HEIGHT: Record<Datatype, number> = {
   boolean: 3,
   datetime: 3,
 }
+
+/// The name's own height. It is `text`, but it is the one text field
+/// drawn as a single line, so it is sized against that control and not
+/// against the editor.
+export const NAME_HEIGHT = 3
 
 export const NATURAL_WIDTH: Record<Datatype, number> = {
   text: 12,

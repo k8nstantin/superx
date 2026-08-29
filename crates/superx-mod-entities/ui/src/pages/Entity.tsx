@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ActionIcon,
@@ -22,7 +22,8 @@ import {
   DATATYPES,
   MACHINERY,
   NAME,
-  fetchRoots,
+  NAME_HEIGHT,
+  fetchAllEntities,
   linkEntities,
   NATURAL_HEIGHT,
   NATURAL_WIDTH,
@@ -60,6 +61,29 @@ export default function EntityTab({
   const e = useQuery({ queryKey: ['entity', frag], queryFn: () => fetchEntity(frag) })
   const [design, setDesign] = useState(false)
   const [dragged, setDragged] = useState<LayoutItem[] | null>(null)
+  const gridBox = useRef<HTMLDivElement>(null)
+  const [gridWidth, setGridWidth] = useState(0)
+  useEffect(() => {
+    const box = gridBox.current
+    if (!box) return
+    // ROUND, AND BAIL WHEN IT HAS NOT MOVED. This observer feeds a
+    // width into the grid it is measuring, so a change of a fraction of
+    // a pixel re-lays-out the grid, which changes the width, which fires
+    // the observer again — and with enough content to summon a
+    // scrollbar the oscillation never settles and the tab locks up. Two
+    // rich-text fields on one entity was enough to hang the page.
+    // Writing the same number back is a no-op in React, which ends it.
+    const ro = new ResizeObserver(([entry]) => {
+      const w = Math.round(entry.contentRect.width)
+      setGridWidth((prev) => (Math.abs(prev - w) > 1 ? w : prev))
+    })
+    ro.observe(box)
+    setGridWidth(Math.round(box.clientWidth))
+    return () => ro.disconnect()
+    // Re-observe when the fields first render: the box does not exist
+    // while the entity is loading, so a mount-only effect would attach
+    // to nothing and leave the grid at zero forever.
+  }, [e.data?.uuid])
   const dirty = dragged !== null
 
   // A DECLARATION IS NOT A FIELD. An attribute carrying labels and no
@@ -99,7 +123,13 @@ export default function EntityTab({
         return found
       }
       const dt = (isDatatype(f.datatype) ? f.datatype : 'text') as Datatype
-      const item = { i: f.uid, x: 0, y, w: NATURAL_WIDTH[dt], h: NATURAL_HEIGHT[dt] }
+      // THE NAME IS SIZED LIKE WHAT IT IS. It is a text field, but it
+      // renders as a single line rather than the prose editor every
+      // other text field gets — so taking text's height gave a 36px
+      // input a 168px box, and the first thing anyone saw on opening an
+      // entity was a card that was five-sixths empty.
+      const h = f.name === NAME ? NAME_HEIGHT : NATURAL_HEIGHT[dt]
+      const item = { i: f.uid, x: 0, y, w: NATURAL_WIDTH[dt], h }
       y += item.h
       return item
     })
@@ -125,7 +155,12 @@ export default function EntityTab({
 
   const archive = useMutation({
     mutationFn: (a: boolean) => setArchived(frag, a),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ['entity', frag] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['entity', frag] })
+      // A rename changes what the pickers and the tree show.
+      void qc.invalidateQueries({ queryKey: ['all-entities'] })
+      void qc.invalidateQueries({ queryKey: ['roots'] })
+    },
   })
 
   if (e.isLoading) return <Loader size="sm" />
@@ -175,10 +210,15 @@ export default function EntityTab({
       <Link frag={frag} />
       <AddField frag={frag} />
 
+      {/* THE GRID NEEDS A NUMBER, THE PAGE HAS A WIDTH. react-grid-layout
+          computes column geometry in pixels, so a hardcoded width either
+          overflows a narrow window or leaves a gutter on a wide one.
+          Measure the column the fields actually sit in. */}
+      <div ref={gridBox}>
       <GridLayout
         className="layout"
         layout={layout}
-        width={1100}
+        width={gridWidth}
         gridConfig={{ cols: COLS, rowHeight: 28 }}
         // Dragging is OFF until you turn design on, and a click inside a
         // field must never start a drag — otherwise typing moves the box.
@@ -199,6 +239,7 @@ export default function EntityTab({
           </div>
         ))}
       </GridLayout>
+      </div>
 
       {e.data.links.length > 0 && (
         <Card withBorder padding="md" mt="md">
@@ -243,7 +284,13 @@ function EntityPicker({
   value: string | null
   onChange: (v: string | null) => void
 }) {
-  const all = useQuery({ queryKey: ['roots', true], queryFn: () => fetchRoots(true) })
+  // EVERY ENTITY, not the roots. Any entity can be a label — a label
+  // IS an entity carrying the label `label` — and any entity can be the
+  // far end of a link. Feeding these pickers from `roots` meant that
+  // linking something removed it from both lists, because it now had a
+  // parent: the graph could never be built deeper than one level from
+  // the screen whose job is building it.
+  const all = useQuery({ queryKey: ['all-entities'], queryFn: () => fetchAllEntities(true) })
   const data = (all.data ?? [])
     .filter((e) => e.uuid !== exclude)
     .map((e) => ({ value: e.uuid, label: e.name || e.uuid.slice(0, 8) }))
@@ -318,6 +365,11 @@ function Link({ frag }: { frag: string }) {
   const link = useMutation({
     mutationFn: () => linkEntities(frag, to ?? '', name.trim(), label ? [label] : []),
     onSuccess: () => {
+      // A LINK RESHAPES THE TREE. The far end gains a parent and stops
+      // being a root; this end gains children. Refreshing only this
+      // entity left the menu showing the shape from before the link.
+      void qc.invalidateQueries({ queryKey: ['roots'] })
+      void qc.invalidateQueries({ queryKey: ['all-entities'] })
       setTo(null)
       setName('')
       setLabel(null)
@@ -376,27 +428,40 @@ function Field({
         labels: field.labels,
         options: field.options,
       }),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ['entity', frag] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['entity', frag] })
+      // A rename changes what the pickers and the tree show.
+      void qc.invalidateQueries({ queryKey: ['all-entities'] })
+      void qc.invalidateQueries({ queryKey: ['roots'] })
+    },
   })
 
   const body = () => {
     if (readOnly) return <Text size="sm" c="dimmed">{preview(field)}</Text>
     switch (field.datatype) {
       case 'number':
+        // THE ONE DATATYPE THAT COULD NOT BE SAVED. Mantine's
+        // NumberInput neither composes the onBlur it is handed nor lets
+        // the event bubble, so every commit hook this field had was
+        // dead and a typed number vanished without a word. It is caught
+        // on the wrapper in the CAPTURE phase instead.
         return (
-          <NumberInput
-            // CONTROLLED NEEDS onChange. Mantine treats a defined
-            // `value` as controlled and defaults the setter to a no-op,
-            // so a field that already held a number could not be typed
-            // into at all — only empty ones appeared to work.
-            value={draft ?? (typeof field.content === 'number' ? field.content : '')}
-            onChange={setDraft}
-            onBlur={(ev) => {
-              // BLANK IS NOT ZERO. `Number('')` is 0 and passes a NaN
-              // check, so clicking into an empty field and out again
-              // used to write an explicit 0 onto the permanent record
-              // with the operator's name on it.
-              const raw = ev.currentTarget.value.trim()
+          <div
+            // CAPTURE, BECAUSE THE BUBBLE NEVER ARRIVES. Mantine's
+            // NumberInput stops the blur inside its own handler, so a
+            // listener on the wrapper waiting for it to bubble up is
+            // never called and the number is silently dropped —
+            // confirmed by invoking the handler by hand, which saved
+            // correctly. The capture phase runs root-to-target and
+            // cannot be cancelled by the target, so this always fires.
+            onBlurCapture={(ev) => {
+              // READ THE BOX, NOT OUR IDEA OF THE BOX. Mantine's
+              // NumberInput runs its own controlled pipeline, so the
+              // draft this component keeps is not reliably what the
+              // operator is looking at — and a save that disagrees with
+              // the screen is worse than no save. The input holds what
+              // they typed; take it from there.
+              const raw = (ev.currentTarget.querySelector('input')?.value ?? '').trim()
               if (raw === '') return
               const n = Number(raw)
               // AND ONLY WHEN IT CHANGED. Tabbing through a field used
@@ -404,7 +469,16 @@ function Field({
               // never be pruned.
               if (!Number.isNaN(n) && n !== field.content) write.mutate(n)
             }}
-          />
+          >
+            <NumberInput
+              // CONTROLLED NEEDS onChange. Mantine treats a defined
+              // `value` as controlled and defaults the setter to a no-op,
+              // so a field that already held a number could not be typed
+              // into at all — only empty ones appeared to work.
+              value={draft ?? (typeof field.content === 'number' ? field.content : '')}
+              onChange={setDraft}
+            />
+          </div>
         )
       case 'boolean':
         return (

@@ -186,18 +186,52 @@ pub enum Direction {
     Both,
 }
 
-/// Which entities have at least one live edge leaving them, in ONE read.
+/// Which entities have at least one live edge leaving them AND landing
+/// somewhere `visible`, in ONE read.
 ///
 /// A listing needs exactly this and nothing more: whether a row opens.
 /// Asking `of` per row turned one screen into a scan of the edge table
 /// per entity.
 ///
+/// THE FAR END HAS TO BE VISIBLE. The menu hides archived entities, so
+/// an edge into one is not a path anyone can walk there — counting it
+/// left rows wearing an expander that opened on nothing.
+///
 /// # Errors
 ///
 /// [`KernelError::Db`] for engine errors.
-pub async fn sources(db: &Db) -> Result<std::collections::HashSet<String>> {
+pub async fn sources(
+    db: &Db,
+    visible: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>> {
     let mut resp = db.query("SELECT *, in, out FROM entity_edge").await?;
-    Ok(live(resp.take(0)?).into_iter().map(|e| record_uuid(&e.from)).collect())
+    Ok(live(resp.take(0)?)
+        .into_iter()
+        .filter(|e| visible.contains(&record_uuid(&e.to)))
+        .map(|e| record_uuid(&e.from))
+        .collect())
+}
+
+/// Which entities have at least one live edge pointing AT them, in one
+/// read.
+///
+/// The menu needs it to know what a root is: a tree whose top level is
+/// every entity is not a tree, it is a list — and a child then appears
+/// twice, once at the root and once under its parent.
+///
+/// # Errors
+///
+/// [`KernelError::Db`] for engine errors.
+pub async fn targets(
+    db: &Db,
+    visible: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>> {
+    let mut resp = db.query("SELECT *, in, out FROM entity_edge").await?;
+    Ok(live(resp.take(0)?)
+        .into_iter()
+        .filter(|e| visible.contains(&record_uuid(&e.from)))
+        .map(|e| record_uuid(&e.to))
+        .collect())
 }
 
 /// Every version of one edge, oldest first — including every time it was
@@ -336,8 +370,15 @@ pub async fn walk(
         if frontier.is_empty() {
             break;
         }
+        // BOTH DIRECTIONS. A neighbourhood is what points at you as
+        // much as what you point at — the engine holds the pointers
+        // both ways, so the inbound half is free. Following only `in`
+        // meant every leaf drew as a lone dot with no connections,
+        // while the entity page listed its inbound links directly
+        // underneath: the same graph, described two different ways on
+        // one screen.
         let mut resp = db
-            .query("SELECT *, in, out FROM entity_edge WHERE in IN $ids")
+            .query("SELECT *, in, out FROM entity_edge WHERE in IN $ids OR out IN $ids")
             .bind(("ids", frontier.clone()))
             .await?;
         let level: Vec<Edge> = live(resp.take(0)?)
@@ -345,11 +386,14 @@ pub async fn walk(
             .filter(|e| label.is_none_or(|l| e.labels.contains(l)))
             .collect();
 
+        // The far end is whichever end is not the one we came from.
+        let here: HashSet<String> = frontier.iter().map(record_uuid).collect();
         let mut next: Vec<RecordId> = Vec::new();
         for e in &level {
-            if seen.insert(record_uuid(&e.to)) {
-                nodes.push(Reached { entity: e.to.clone(), depth: d });
-                next.push(e.to.clone());
+            let far = if here.contains(&record_uuid(&e.from)) { &e.to } else { &e.from };
+            if seen.insert(record_uuid(far)) {
+                nodes.push(Reached { entity: far.clone(), depth: d });
+                next.push(far.clone());
             }
         }
         edges.extend(level);
