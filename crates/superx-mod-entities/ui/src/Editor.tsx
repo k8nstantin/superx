@@ -1,9 +1,28 @@
 import { useEffect, useRef, useState } from 'react'
 import { Button, Group, Text, Textarea } from '@mantine/core'
-import { useCreateBlockNote } from '@blocknote/react'
-import { BlockNoteView } from '@blocknote/mantine'
+import { BlockNoteViewEditor, FormattingToolbar, useCreateBlockNote } from '@blocknote/react'
+import { BlockNoteView, type Theme } from '@blocknote/mantine'
 import '@blocknote/core/fonts/inter.css'
 import '@blocknote/mantine/style.css'
+import './editor.css'
+
+/// The project's palette, handed to the editor so it belongs to this
+/// product rather than arriving in the library's own colours.
+const SWINDEX: Theme = {
+  colors: {
+    editor: { text: '#EDE4F4', background: '#150420' },
+    menu: { text: '#CFC2DB', background: '#2A1235' },
+    tooltip: { text: '#CFC2DB', background: '#2A1235' },
+    hovered: { text: '#EDE4F4', background: '#3B2449' },
+    selected: { text: '#FFFFFF', background: '#9500BF' },
+    disabled: { text: '#5C4470', background: '#2A1235' },
+    shadow: '#0D0212',
+    border: '#3B2449',
+    sideMenu: '#8F7BA5',
+  },
+  borderRadius: 6,
+  fontFamily: 'system-ui, -apple-system, Segoe UI, Arial, sans-serif',
+}
 
 // `text` IS ALWAYS THIS EDITOR (operator, 2026-08-28). Two text fields
 // on one entity get the same control; what makes one a description and
@@ -52,7 +71,25 @@ function ProseEditor({ value, onSave }: { value: string; onSave: (v: string) => 
 
   return (
     <>
-      <BlockNoteView editor={editor} theme="dark" />
+      {/* THE TOOLBAR IS STATIC, and this was solved once already —
+          issue #233, "a real editor: static toolbar, room to write".
+          The rebuild dropped it and mounted BlockNote bare, which is
+          precisely what that issue was closed for: the library's own
+          toolbar only floats on selection, so a text field reads as no
+          editor at all. `renderEditor={false}` hands us the layout;
+          FormattingToolbar puts the controls above the writing area and
+          BlockNoteViewEditor puts the content back beneath them. */}
+      <div className="sx-editor" style={{ flex: 1, minHeight: 0 }}>
+        <BlockNoteView
+          editor={editor}
+          theme={SWINDEX}
+          renderEditor={false}
+          formattingToolbar={false}
+        >
+          <FormattingToolbar />
+          <BlockNoteViewEditor />
+        </BlockNoteView>
+      </div>
       <Group justify="flex-end" mt={4}>
         <Button
           size="compact-xs"
