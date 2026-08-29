@@ -58,11 +58,12 @@ export default function App() {
       </AppShell.Header>
 
       <AppShell.Main>
-        {/* A COLUMN, NOT THE WHOLE MONITOR. Form rows and short labels
-            stretched edge to edge on a wide screen are unreadable, and a
-            menu row highlighting across two thousand pixels looks
-            broken rather than selected. */}
-        <Container size="xl" px={0}>
+        {/* A COLUMN, LEFT, NOT A STRIPE DOWN THE MIDDLE. Content
+            stretched edge to edge on a wide screen is unreadable — but
+            Container centres by default, which parked the whole
+            interface in the middle of the monitor with equal voids on
+            both sides. It reads top-left, like every other page. */}
+        <Container size="xl" px={0} mx={0}>
         <Tabs value={tab} onChange={setTab} keepMounted={false}>
           <Tabs.List mb="md">
             <Tabs.Tab value="menu">Menu</Tabs.Tab>
