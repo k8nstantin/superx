@@ -22,6 +22,19 @@ export const CHART_COLORS = [
 export const INK = '#CFC2DB' // swindex dark[1]
 export const INK_MUTED = '#8F7BA5' // dark[3]
 export const GRID_LINE = '#3B2449' // dark[5]
+export const TRACK = '#2A1235' // dark[6] — the card surface; bar tracks sit on it
+
+// Outcome tones, validated on the card surface with the ramp above
+// (issue #228). One definition: the Status page used to carry its own
+// copy and a review found a panel drawn in Mantine's teal instead.
+export const OK = '#199e70'
+export const FAIL = '#e66767'
+export const CANCEL = '#c98500'
+export const UNKNOWN = '#5C4470'
+// Low→high magnitude ramp on the swindex surface, for heatmaps.
+export const HEAT = ['#241033', '#4C0063', '#8300A8', '#B833E8', '#DDA9FF']
+export const PELICAN = '#9500BF' // pelican[5], for canvases that cannot read a CSS variable
+export const MONO = "'JetBrains Mono', ui-monospace, Menlo, monospace"
 
 export const AXIS = {
   axisLine: { lineStyle: { color: GRID_LINE } },

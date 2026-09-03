@@ -3,8 +3,9 @@
 
 use superx_kernel::{Kernel, KernelModule, SCHEMA_DDL};
 use superx_mod_ui::{
-    resolved_context_window, resolved_port, resolved_url, UiModule, CONTEXT_WINDOW_PARAM,
-    DEFAULT_CONTEXT_WINDOW, DEFAULT_PORT, MODULE_NAME, PORT_PARAM,
+    resolved_context_window, resolved_default_range, resolved_port, resolved_url, UiModule,
+    CONTEXT_WINDOW_PARAM, DEFAULT_CONTEXT_WINDOW, DEFAULT_PORT, DEFAULT_RANGE,
+    DEFAULT_RANGE_PARAM, MODULE_NAME, PORT_PARAM,
 };
 
 const TEST_PASSWORD: &str = "test-kernel-password-for-mem-engine";
@@ -1143,7 +1144,7 @@ async fn churn_and_rework_signals() {
 
     // Struggle: the repeated command surfaces with its count.
     let repeat = s.top_repeat.expect("a command ran 3+ times");
-    assert_eq!(repeat.name, "cargo test");
+    assert_eq!(repeat.name, "cargo test --workspace", "the whole line, not the program (#367)");
     assert_eq!(repeat.value, 4);
 
     // Economics and shape.
@@ -1786,4 +1787,262 @@ async fn command_outcomes_reach_branch_agent_and_effort() {
     let e = s.efforts.iter().find(|e| e.name == "high").expect("effort row");
     assert_eq!(e.tests_passed, 7, "efforts carried these fields and nothing ever set them");
     assert_eq!(e.tests_failed, 2);
+}
+
+// ── the cockpit (#367) ──────────────────────────────────────────────
+
+/// The landing range is a substrate decision, not a literal in the
+/// page (#367, §9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_range_defaults_then_follows_the_parameter() {
+    let kernel = fresh_kernel().await;
+    assert_eq!(resolved_default_range(&kernel).await, DEFAULT_RANGE, "unregistered → default");
+    let entity = kernel
+        .register_module(&UiModule.descriptor())
+        .await
+        .expect("register");
+    assert_eq!(resolved_default_range(&kernel).await, DEFAULT_RANGE, "no param → default");
+    kernel
+        .set_parameter(
+            entity.clone(),
+            DEFAULT_RANGE_PARAM,
+            superx_kernel::types::Value::String("7d".into()),
+        )
+        .await
+        .expect("param");
+    assert_eq!(resolved_default_range(&kernel).await, "7d", "parameter wins");
+    kernel
+        .set_parameter(
+            entity,
+            DEFAULT_RANGE_PARAM,
+            superx_kernel::types::Value::String("fortnight".into()),
+        )
+        .await
+        .expect("param");
+    assert_eq!(
+        resolved_default_range(&kernel).await,
+        DEFAULT_RANGE,
+        "a range the API does not know falls back rather than 400ing every load"
+    );
+}
+
+/// One `LIMIT 20000` reset the connection on `30d` and `all`. The
+/// paged walk must return the same rows — newest first, none lost,
+/// none twice — including rows that share the boundary instant of a
+/// page, and it must honour the cap and the time bound (#367).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn range_walk_pages_without_losing_or_repeating_rows() {
+    use superx_mod_ui::stats::walk_messages;
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "walk").await;
+    for i in 0..7 {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({"seq": i, "message": {"content": []}}))
+            .await;
+    }
+    // Three rows at ONE instant, straddling a page boundary of two.
+    kernel
+        .db()
+        .query(
+            "LET $t = time::now() + 1h;
+             CREATE message SET session = $s, agent = $a, role = 'assistant', content = '', valid_from = $t;
+             CREATE message SET session = $s, agent = $a, role = 'assistant', content = '', valid_from = $t;
+             CREATE message SET session = $s, agent = $a, role = 'assistant', content = '', valid_from = $t;",
+        )
+        .bind(("s", session.clone()))
+        .bind(("a", agent.clone()))
+        .await
+        .expect("seed")
+        .check()
+        .expect("ok");
+
+    let all = walk_messages(&kernel, None, 100, 2).await.expect("walk");
+    assert_eq!(all.len(), 10, "seven logged + three at one instant, every one of them once");
+    let ids: std::collections::HashSet<String> =
+        all.iter().map(|m| superx_ops::record_uuid(&m.id)).collect();
+    assert_eq!(ids.len(), 10, "no row twice");
+    assert!(
+        all.windows(2).all(|w| w[0].valid_from >= w[1].valid_from),
+        "newest first across page joins"
+    );
+
+    let capped = walk_messages(&kernel, None, 5, 2).await.expect("walk");
+    assert_eq!(capped.len(), 5, "the cap holds across pages");
+    // The engine's order among rows at one instant is its own; what
+    // must hold is that the newest instant's three rows are all there.
+    let newest = all[0].valid_from;
+    assert_eq!(
+        capped.iter().filter(|m| m.valid_from == newest).count(),
+        3,
+        "the newest five begin with the three rows at the newest instant"
+    );
+    assert!(
+        capped.iter().all(|m| ids.contains(&superx_ops::record_uuid(&m.id))),
+        "and every one is a row of the full walk"
+    );
+
+    let future = chrono::Utc::now() + chrono::Duration::hours(2);
+    let none = walk_messages(&kernel, Some(future), 100, 2).await.expect("walk");
+    assert!(none.is_empty(), "the time bound applies to every page");
+
+    // The same walk through the public aggregation on a bounded range.
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.range, "24h");
+    assert!(!s.truncated);
+}
+
+/// An agent that reads through the shell is reading. `cat | head` is
+/// a read with a path; `sed -i` is not a read; `echo` is nothing; and a
+/// chain that ends in `cargo test` is a verification (#367).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_inspection_counts_as_reading() {
+    let kernel = fresh_kernel().await;
+    let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "reader").await;
+    let (a2, s2) = seed_agent_and_session(&kernel, "claude_code", "verifier").await;
+    let shell = |cmd: &str| {
+        serde_json::json!({"cwd": "/w/superx", "message": {"content": [
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": cmd}}]}})
+    };
+    log_tool_message(&kernel, &s1, &a1, shell("sed -i 's/a/b/' src/x.rs")).await;
+    log_tool_message(&kernel, &s1, &a1, shell("echo '--- doing ---'")).await;
+    log_tool_message(&kernel, &s1, &a1, shell("cat crates/foo.rs | head -20")).await;
+    log_tool_message(&kernel, &s2, &a2, shell("cat /other/repo/secret.txt")).await;
+    log_tool_message(&kernel, &s2, &a2, shell("cat README.md && cargo test --workspace")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    assert_eq!(s.reads_window, 2, "cat|head and the lone cat; not sed -i, not echo, not the test chain");
+    assert_eq!(s.tests_run, 1);
+    let e = &s.exposure;
+    assert_eq!(e.files_read, 2, "the two paths the reads named");
+    assert_eq!(e.outside_reads, 1, "/other/repo is not the directory the agent was working in");
+
+    let reader = s.live.iter().find(|l| l.identity == superx_ops::record_uuid(&s1)).expect("reader row");
+    assert_eq!(reader.doing, "reading");
+    assert_eq!(reader.files_now, vec!["/w/superx/crates/foo.rs".to_string()], "relative path, resolved against cwd");
+    let verifier = s.live.iter().find(|l| l.identity == superx_ops::record_uuid(&s2)).expect("verifier row");
+    assert_eq!(verifier.doing, "verifying", "the test run outranks the read");
+
+    // The sortie log names the repo each session flew in (#367).
+    assert_eq!(s.timeline.len(), 2);
+    assert!(
+        s.timeline.iter().all(|t| t.repo.as_deref() == Some("superx")),
+        "{:?}",
+        s.timeline.iter().map(|t| t.repo.clone()).collect::<Vec<_>>()
+    );
+}
+
+/// `<synthetic>` is the runtime writing a line itself. It is not a
+/// model, and must not top the live panel or the model table (#367).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_is_not_a_model() {
+    let kernel = fresh_kernel().await;
+    let (a, s1) = seed_agent_and_session(&kernel, "claude_code", "syn").await;
+    log_tool_message(&kernel, &s1, &a, serde_json::json!({
+        "message": {"model": "claude-opus-5", "usage": {"output_tokens": 30}, "content": []}})).await;
+    // Newest, so a first-sighting latch would take it.
+    log_tool_message(&kernel, &s1, &a, serde_json::json!({
+        "message": {"model": "<synthetic>", "usage": {"output_tokens": 0}, "content": []}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert!(s.models.iter().all(|m| m.name != "<synthetic>"), "{:?}", s.models);
+    assert_eq!(s.models.iter().find(|m| m.name == "claude-opus-5").map(|m| m.messages), Some(1));
+    assert_eq!(s.live.len(), 1);
+    assert_eq!(s.live[0].model.as_deref(), Some("claude-opus-5"), "the synthetic line does not mask the model");
+}
+
+/// The repeat signal reads the whole command line. `echo` a hundred
+/// times is scaffolding; the same `cargo test -p …` three times is the
+/// shape of fighting something (#367).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn top_repeat_reads_whole_command_lines() {
+    let kernel = fresh_kernel().await;
+    let (a, s1) = seed_agent_and_session(&kernel, "claude_code", "rep").await;
+    let shell = |cmd: &str| {
+        serde_json::json!({"message": {"content": [
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": cmd}}]}})
+    };
+    for _ in 0..5 {
+        log_tool_message(&kernel, &s1, &a, shell("echo '--- section ---'")).await;
+    }
+    log_tool_message(&kernel, &s1, &a, shell("git status")).await;
+    log_tool_message(&kernel, &s1, &a, shell("git status")).await;
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert!(s.top_repeat.is_none(), "five echoes and two git status are not a fight: {:?}", s.top_repeat);
+    assert_eq!(s.commands.iter().find(|c| c.name == "echo").map(|c| c.value), Some(5), "echo still counts in the mix");
+
+    for _ in 0..3 {
+        log_tool_message(&kernel, &s1, &a, shell("echo start;  cargo test -p superx-mod-ui   2>&1 | tail -3")).await;
+    }
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    let r = s.top_repeat.expect("three identical lines");
+    assert_eq!(r.name, "cargo test -p superx-mod-ui && tail -3", "noise dropped, redirection dropped, whitespace folded");
+    assert_eq!(r.value, 3);
+}
+
+/// Context pressure per live agent — the altitude gauge (#367).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_rows_carry_context_pressure() {
+    let kernel = fresh_kernel().await;
+    let (a, s1) = seed_agent_and_session(&kernel, "claude_code", "ctx").await;
+    log_tool_message(&kernel, &s1, &a, serde_json::json!({
+        "message": {"model": "claude-opus-5", "usage": {"input_tokens": 100_000,
+            "cache_read_input_tokens": 300_000, "cache_creation_input_tokens": 50_000,
+            "output_tokens": 10}, "content": []}})).await;
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.live.len(), 1);
+    assert_eq!(s.live[0].context_tokens, Some(450_000), "fresh + served + stored");
+    assert_eq!(s.live[0].context_pct, Some(45), "against the default 1M window");
+
+    let entity = kernel.register_module(&UiModule.descriptor()).await.expect("register");
+    kernel
+        .set_parameter(entity, CONTEXT_WINDOW_PARAM, superx_kernel::types::Value::Number(500_000.into()))
+        .await
+        .expect("param");
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.live[0].context_pct, Some(90), "the ceiling is the parameter");
+
+    // A session that never reported usage reads as unknown, not zero.
+    let (b, s2) = seed_agent_and_session(&kernel, "gemini_cli", "noctx").await;
+    log_tool_message(&kernel, &s2, &b, serde_json::json!({"message": {"content": []}})).await;
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    let row = s.live.iter().find(|l| l.identity == superx_ops::record_uuid(&s2)).expect("row");
+    assert_eq!(row.context_tokens, None);
+    assert_eq!(row.context_pct, None);
+}
+
+/// The substrate held every module failure and nothing read them.
+/// Per module: newest event and its age, failures recent and total,
+/// and what the newest failure said (#367).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_health_reads_failures_and_last_event() {
+    use superx_mod_ui::insights::insights_summary;
+    let kernel = fresh_kernel().await;
+    kernel
+        .db()
+        .query(
+            "CREATE telemetry_stream SET lifecycle_event = 'module_start_failed',
+                payload = { name: 'runner' }, valid_from = time::now() - 3d;
+             CREATE telemetry_stream SET lifecycle_event = 'module_failed',
+                payload = { name: 'runner', error: 'boom', failed_during: 'startup' },
+                valid_from = time::now() - 1h;
+             CREATE telemetry_stream SET lifecycle_event = 'module_active',
+                payload = { name: 'ui', startup_duration_ms: 12 }, valid_from = time::now();",
+        )
+        .await
+        .expect("seed")
+        .check()
+        .expect("ok");
+
+    let i = insights_summary(&kernel).await.expect("insights");
+    let runner = i.module_health.iter().find(|h| h.name == "runner").expect("runner");
+    assert_eq!(runner.last_event, "module_failed");
+    assert!((3000..4000).contains(&runner.last_event_secs), "about an hour: {}", runner.last_event_secs);
+    assert_eq!(runner.failures_recent, 1, "the three-day-old one is not recent");
+    assert_eq!(runner.failures_total, 2);
+    assert_eq!(runner.last_error.as_deref(), Some("boom"));
+    let ui = i.module_health.iter().find(|h| h.name == "ui").expect("ui");
+    assert_eq!(ui.last_event, "module_active");
+    assert_eq!(ui.failures_total, 0);
+    assert_eq!(ui.last_error, None);
+    assert_eq!(i.module_health[0].name, "runner", "the module with the most to fix sorts first");
 }

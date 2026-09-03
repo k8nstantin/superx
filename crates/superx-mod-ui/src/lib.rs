@@ -95,6 +95,35 @@ pub async fn resolved_stats_window(kernel: &Kernel) -> u32 {
     }
 }
 
+/// The range the cockpit lands on (#367) — a parameter on the ui
+/// module's registry entity. The newest-500 window is about two hours
+/// at a working instance's rate and lands every quality instrument on
+/// zero, so the landing view is a decision, and decisions live in the
+/// substrate.
+pub const DEFAULT_RANGE_PARAM: &str = "attr_ui_default_range";
+
+/// Fallback when the parameter is unset or names no known range.
+pub const DEFAULT_RANGE: &str = "24h";
+
+/// Every range the stats API accepts. `window` is the newest-N read;
+/// the rest are rolling time bounds; `all` is unbounded and row-capped.
+pub const RANGES: [&str; 7] = ["window", "1h", "6h", "24h", "7d", "30d", "all"];
+
+/// Resolve the landing range: parameter on the module entity when it
+/// names a known range, else the fallback.
+pub async fn resolved_default_range(kernel: &Kernel) -> String {
+    let Ok(Some(entity)) = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+    else {
+        return DEFAULT_RANGE.to_string();
+    };
+    match kernel.get_parameter(entity, DEFAULT_RANGE_PARAM).await {
+        Ok(Some(Value::String(r))) if RANGES.contains(&r.as_str()) => r,
+        _ => DEFAULT_RANGE.to_string(),
+    }
+}
+
 /// Resolve the context-window size: parameter on the module entity,
 /// else default.
 pub async fn resolved_context_window(kernel: &Kernel) -> i64 {
