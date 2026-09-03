@@ -603,7 +603,7 @@ async fn a_walk_does_not_follow_an_unlinked_edge() {
 /// being looked at.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_decimal_is_not_truncated_on_the_way_out() {
-    use superx_mod_entities::api;
+
 
     let db = fresh_db().await;
     let op = Author::operator();
@@ -635,7 +635,7 @@ async fn a_decimal_is_not_truncated_on_the_way_out() {
 /// omitted the very type that was broken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_datatype_can_be_written_through_the_api() {
-    use superx_mod_entities::api;
+
 
     let db = fresh_db().await;
     let op = Author::operator();
@@ -688,7 +688,7 @@ async fn every_datatype_can_be_written_through_the_api() {
 /// renaming an attribute to `archived` to hide it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_entity_cannot_rewrite_another_entitys_attribute() {
-    use superx_mod_entities::api;
+
 
     let db = fresh_db().await;
     let op = Author::operator();
@@ -944,4 +944,49 @@ async fn the_name_and_the_archived_flag_cannot_be_duplicated() {
     let tag = entity::create(&db, "tag", &op).await.expect("tag");
     entity::declare(&db, &e, "is", &[role], &op).await.expect("first declaration");
     entity::declare(&db, &e, "is", &[tag], &op).await.expect("a second label is not a duplicate");
+}
+
+/// A field is removed through the entity it belongs to, and only that
+/// one: the URL names the owner, and a request addressed to another
+/// entity may not reach in. A link, by contrast, touches two entities
+/// and either may cut it — a third may not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_field_is_retired_by_its_owner_and_a_link_by_either_end() {
+
+    let db = fresh_db().await;
+    let op = Author::operator();
+    let a = entity::create(&db, "A", &op).await.expect("a");
+    let b = entity::create(&db, "B", &op).await.expect("b");
+    let c = entity::create(&db, "C", &op).await.expect("c");
+    let field = attribute::add(
+        &db,
+        &a,
+        Write { name: "notes", datatype: "text", content: text("<p>x</p>"), labels: &[], options: None },
+        &op,
+    )
+    .await
+    .expect("field");
+    let frag = |id: &superx_kernel::types::RecordId| superx_ops::record_uuid(id);
+
+    assert!(
+        api::retire_attribute(&db, &frag(&b), &field, &op).await.is_err(),
+        "B may not retire A's field"
+    );
+    assert!(api::retire_attribute(&db, &frag(&a), &field, &op).await.expect("owner retires"));
+    assert!(
+        attribute::of(&db, &a, false).await.expect("live").iter().all(|x| x.uid != field),
+        "the field has left the screen"
+    );
+    assert!(
+        attribute::of(&db, &a, true).await.expect("all").iter().any(|x| x.uid == field),
+        "and the record still holds it"
+    );
+
+    let link = edge::link(&db, &a, &b, "depends on", &[], &op).await.expect("link");
+    assert!(api::unlink(&db, &frag(&c), &link, &op).await.is_err(), "C is not on this edge");
+    assert!(api::unlink(&db, &frag(&b), &link, &op).await.expect("the far end may cut it"));
+    assert!(
+        edge::of(&db, &a, superx_mod_entities::edge::Direction::Both).await.expect("edges").is_empty(),
+        "the link is cut for both ends"
+    );
 }

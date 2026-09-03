@@ -538,6 +538,51 @@ pub async fn put_attribute(
     }
 }
 
+/// Retire one attribute of THIS entity: the field leaves the screen and
+/// the record keeps every version of it (§10 — nothing is deleted).
+///
+/// # Errors
+///
+/// [`KernelError::Module`] when the uid is unknown or belongs to another
+/// entity — the URL says whose attribute this is, and a request addressed
+/// to one entity may not retire another's. Verb errors pass through.
+pub async fn retire_attribute(
+    db: &Db,
+    fragment: &str,
+    uid: &str,
+    author: &Author,
+) -> Result<bool> {
+    let id = entity::resolve(db, fragment).await?;
+    let existing = attribute::current(db, uid)
+        .await?
+        .ok_or_else(|| KernelError::Module(format!("no attribute '{uid}'")))?;
+    if record_uuid(&existing.entity) != record_uuid(&id) {
+        return Err(KernelError::Module(format!(
+            "attribute '{uid}' does not belong to this entity"
+        )));
+    }
+    attribute::retire(db, uid, author).await
+}
+
+/// Cut a link that touches THIS entity, from either end. The edge's
+/// history stays; a relink is the same act in reverse.
+///
+/// # Errors
+///
+/// [`KernelError::Module`] when the uid is unknown or the edge does not
+/// touch this entity. Verb errors pass through.
+pub async fn unlink(db: &Db, fragment: &str, uid: &str, author: &Author) -> Result<bool> {
+    let id = entity::resolve(db, fragment).await?;
+    let e = edge::current(db, uid)
+        .await?
+        .ok_or_else(|| KernelError::Module(format!("no edge '{uid}'")))?;
+    let me = record_uuid(&id);
+    if record_uuid(&e.from) != me && record_uuid(&e.to) != me {
+        return Err(KernelError::Module(format!("edge '{uid}' does not touch this entity")));
+    }
+    edge::unlink(db, uid, author).await
+}
+
 /// Link two entities.
 ///
 /// # Errors

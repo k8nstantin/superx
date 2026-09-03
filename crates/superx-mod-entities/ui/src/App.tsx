@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { AppShell, Box, Button, Container, Group, Tabs, Title } from '@mantine/core'
+import { Alert, AppShell, Box, Button, Container, Group, Tabs, Title } from '@mantine/core'
 import { fetchPing } from './api'
 import MenuTab from './pages/Menu'
 import EntityTab from './pages/Entity'
@@ -58,6 +58,12 @@ export default function App() {
       </AppShell.Header>
 
       <AppShell.Main>
+        {ping.isError && (
+          <Alert color="red" title="The entities module is not answering" mb="md" maw={640}>
+            Nothing here can be read or written until it is back. Check that the instance is
+            running and the module is provisioned, then reload.
+          </Alert>
+        )}
         {/* A COLUMN, LEFT, NOT A STRIPE DOWN THE MIDDLE. Content
             stretched edge to edge on a wide screen is unreadable — but
             Container centres by default, which parked the whole

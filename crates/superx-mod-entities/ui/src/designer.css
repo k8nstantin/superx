@@ -1,14 +1,30 @@
-/* THE RESIZE GRIP, VISIBLE. react-grid-layout keeps the handle at
-   opacity 0 until the card is hovered and draws it as two 5px lines in
-   40% black — on a midnight surface that is nothing at all, so the
-   designer read as drag-only ("no resize capability", operator,
-   2026-09-03). In design mode every card shows its grip, in the accent
-   colour; with resizing off the library does not render the handle. */
-.layout .react-grid-item > .react-resizable-handle {
+/* THE DESIGNER'S GUIDES. Design mode draws the twelve columns and the
+   rows the cards snap to, so a drag reads against something rather than
+   against a void; the drop placeholder is a dashed accent outline where
+   the card will land; and the grip is always visible in the accent
+   colour — react-grid-layout kept it at opacity 0 until hover and drew it
+   in 40% black, invisible on a midnight surface ("no resize capability",
+   operator, 2026-09-03). */
+.designer.designing .react-grid-layout {
+  background-image:
+    linear-gradient(to right, rgba(184, 51, 232, 0.14) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(184, 51, 232, 0.08) 1px, transparent 1px);
+  background-size: var(--sx-col) 100%, 100% var(--sx-row);
+  background-position: var(--sx-pad) 0, 0 var(--sx-pad);
+  border-radius: 8px;
+  outline: 1px dashed rgba(184, 51, 232, 0.25);
+}
+.designer .react-grid-placeholder {
+  background: rgba(184, 51, 232, 0.16) !important;
+  border: 1px dashed #b833e8;
+  border-radius: 8px;
+  opacity: 1 !important;
+}
+.designer .react-grid-item > .react-resizable-handle {
   opacity: 1;
   background-image: none;
 }
-.layout .react-grid-item > .react-resizable-handle::after {
+.designer .react-grid-item > .react-resizable-handle::after {
   width: 9px;
   height: 9px;
   right: 4px;
@@ -16,4 +32,50 @@
   border-right: 2px solid #b833e8;
   border-bottom: 2px solid #b833e8;
   border-radius: 0 0 3px 0;
+}
+.designer .react-grid-item > .react-resizable-handle-e::after,
+.designer .react-grid-item > .react-resizable-handle-s::after {
+  border-radius: 0;
+}
+.designer.designing .react-grid-item {
+  cursor: grab;
+}
+.designer.designing .react-grid-item.react-draggable-dragging {
+  cursor: grabbing;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  z-index: 3;
+}
+/* The size badge while a card is being dragged or resized. */
+.sx-live {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  font: 600 11px var(--mantine-font-family-monospace);
+  color: #ede4f4;
+  background: #9500bf;
+  border-radius: 6px;
+  padding: 2px 6px;
+  pointer-events: none;
+  z-index: 4;
+}
+/* A palette item: something you can pick up. */
+.sx-palette-item {
+  cursor: grab;
+  user-select: none;
+}
+.sx-palette-item:active {
+  cursor: grabbing;
+}
+/* Prose preview, before the editor is asked for. */
+.sx-prose-preview {
+  cursor: text;
+  white-space: pre-wrap;
+  overflow: hidden;
+  border-radius: 6px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+}
+.sx-prose-preview:hover {
+  border-color: #3b2449;
+  background: rgba(255, 255, 255, 0.02);
 }
