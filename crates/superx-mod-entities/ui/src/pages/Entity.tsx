@@ -92,19 +92,14 @@ export default function EntityTab({
   const [dragged, setDragged] = useState<LayoutItem[] | null>(null)
   const dirty = dragged !== null
 
-  // A DECLARATION IS NOT A FIELD. An attribute carrying labels and no
-  // content is how the model says what a thing IS — rendering it as a
-  // prose editor meant one click on Save wrote `<p></p>` into it, and
-  // because `labels_in` counts only content-less attributes, the entity
-  // silently stopped being a role. Declarations show as chips in the
-  // header instead, where they can be removed on purpose.
+  // THE DECLARATION IS NOT A FIELD, and it is the `is` row and nothing
+  // else. Machinery — `screen`, `archived`, `is` — is left off the grid;
+  // the entity's labels show as chips in the header. Filtering out
+  // "content-less with labels" instead hid a freshly added field that had
+  // a label and no value yet (operator, 2026-09-03: "entities have
+  // labels, fields have labels").
   const fields = useMemo(
-    () =>
-      (e.data?.attributes ?? []).filter(
-        (a) =>
-          !MACHINERY.includes(a.name) &&
-          !(a.content === null && a.labels.length > 0),
-      ),
+    () => (e.data?.attributes ?? []).filter((a) => !MACHINERY.includes(a.name)),
     [e.data],
   )
   const saved = useMemo(() => {

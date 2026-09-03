@@ -31,6 +31,18 @@ pub const NAME: &str = "name"; // skill-allow: §9-const — the module's own vo
 /// and a time — you can see who put a thing away and when, and undo it.
 pub const ARCHIVED: &str = "archived"; // skill-allow: §9-const — the module's own vocabulary, not a tunable
 
+/// The attribute that says what an entity IS. Its labels are the
+/// ENTITY's labels; every other attribute's labels are that FIELD's own
+/// (operator, 2026-09-03: "entities have labels, fields have labels").
+///
+/// Reading every content-less labelled attribute as a declaration was
+/// wrong the moment a field could be born with a label and no value: add
+/// `notes` labelled `mandate` to an entity and, until something was
+/// typed into it, the ENTITY read as a mandate. A third name the module
+/// knows, and like the other two a storage concern — which row to read
+/// for what — not a meaning.
+pub const IS: &str = "is"; // skill-allow: §9-const — the module's own vocabulary, not a tunable
+
 /// Mint an entity and give it a name.
 ///
 /// Two rows, one act: the identity, then the name that identity is known
@@ -96,11 +108,12 @@ pub fn name_in(attributes: &[attribute::Attribute]) -> Option<String> {
     })
 }
 
-/// What a thing IS, from attributes already in hand.
+/// What a thing IS, from attributes already in hand: the labels on its
+/// [`IS`] rows, and nothing a field carries for itself.
 #[must_use]
 pub fn labels_in(attributes: &[attribute::Attribute]) -> Vec<RecordId> {
     let mut out: Vec<RecordId> = Vec::new();
-    for a in attributes.iter().filter(|a| a.content.is_none()) {
+    for a in attributes.iter().filter(|a| a.name == IS) {
         for l in &a.labels {
             if !out.contains(l) {
                 out.push(l.clone());
@@ -174,7 +187,10 @@ pub async fn labels_of(db: &Db, anchor: &RecordId) -> Result<Vec<RecordId>> {
     Ok(labels_in(&attribute::of(db, anchor, false).await?))
 }
 
-/// Say what an entity IS: one attribute, labels, no content.
+/// Say what an entity IS: one attribute, labels, no content. Only a row
+/// named [`IS`] is read back as the entity's labels; `name` is a
+/// parameter so a caller can still write a labelled, content-less row
+/// under any other name and have it mean nothing to the entity.
 ///
 /// # Errors
 ///
