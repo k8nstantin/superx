@@ -20,9 +20,9 @@ import 'react-grid-layout/css/styles.css'
 import 'react-resizable/css/styles.css'
 import {
   DATATYPES,
+  IS,
   MACHINERY,
   NAME,
-  fetchRoots,
   linkEntities,
   NATURAL_HEIGHT,
   NATURAL_WIDTH,
@@ -35,6 +35,7 @@ import {
   type Datatype,
 } from '../api'
 import { Editor } from '../Editor'
+import { EntityPicker } from '../EntityPicker'
 
 // THE ENTITY: add fields, and put them where you want them.
 //
@@ -240,41 +241,6 @@ export default function EntityTab({
   )
 }
 
-/// Pick another entity by name. Everything in this model points at
-/// something else — a label, the far end of a link — so choosing one is
-/// the single most repeated act on this page.
-function EntityPicker({
-  label,
-  description,
-  exclude,
-  value,
-  onChange,
-}: {
-  label: string
-  description?: string
-  exclude: string
-  value: string | null
-  onChange: (v: string | null) => void
-}) {
-  const all = useQuery({ queryKey: ['roots', true], queryFn: () => fetchRoots(true) })
-  const data = (all.data ?? [])
-    .filter((e) => e.uuid !== exclude)
-    .map((e) => ({ value: e.uuid, label: e.name || e.uuid.slice(0, 8) }))
-  return (
-    <Select
-      label={label}
-      description={description}
-      data={data}
-      value={value}
-      onChange={onChange}
-      searchable
-      clearable
-      nothingFoundMessage="no entity by that name"
-      style={{ flex: 1 }}
-    />
-  )
-}
-
 /// SAY WHAT A THING IS. An attribute carrying labels and no content is
 /// the whole mechanism — there is no separate "type" to set, and the
 /// label is just another entity.
@@ -284,7 +250,7 @@ function Declare({ frag, existing }: { frag: string; existing: string[] }) {
   const declare = useMutation({
     mutationFn: () =>
       putAttribute(frag, {
-        name: 'is',
+        name: IS,
         datatype: 'text',
         content: null,
         labels: [...existing, label ?? ''],
@@ -299,8 +265,9 @@ function Declare({ frag, existing }: { frag: string; existing: string[] }) {
       <Group align="flex-end" gap="sm">
         <EntityPicker
           label="This is a…"
-          description="a label is an entity; what it MEANS is a field on it"
-          exclude={frag}
+          description="a label is an entity carrying `label`; what it MEANS is a field on it"
+          kind="label"
+          exclude={[frag, ...existing]}
           value={label}
           onChange={setLabel}
         />
@@ -347,8 +314,8 @@ function Link({ frag }: { frag: string }) {
           onChange={(e) => setName(e.currentTarget.value)}
           style={{ flex: 1 }}
         />
-        <EntityPicker label="to" exclude={frag} value={to} onChange={setTo} />
-        <EntityPicker label="meaning" exclude={frag} value={label} onChange={setLabel} />
+        <EntityPicker label="to" kind="any" exclude={[frag]} value={to} onChange={setTo} />
+        <EntityPicker label="meaning" kind="label" exclude={[frag]} value={label} onChange={setLabel} />
         <Button
           onClick={() => to && name.trim() && link.mutate()}
           loading={link.isPending}
