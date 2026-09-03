@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, Result};
 
-use crate::api::{AgentSplit, HeatCell, InsightsSummary, NameCount, TimeCount, TokenTotals};
+use crate::api::{
+    AgentSplit, HeatCell, InsightsSummary, ModuleHealth, NameCount, TimeCount, TokenTotals,
+};
 
 /// Newest `module_active` events scanned for per-module startup cost —
 /// one row per module per boot, so this covers many boots.
@@ -20,6 +22,34 @@ const STARTUP_SCAN: u32 = 400; // skill-allow: §9-const — aggregation page bo
 
 /// The "is capture alive?" window.
 const RECENT_SECS: i64 = 3600; // skill-allow: §9-const — display window for the capture-lag tile
+
+/// Newest module lifecycle events scanned for per-module health (#367).
+/// A working instance emits a few hundred a day; this covers days.
+const HEALTH_SCAN: u32 = 3000; // skill-allow: §9-const — aggregation page bound
+
+/// What the module-health lamp calls recent.
+const HEALTH_RECENT_SECS: i64 = 86_400; // skill-allow: §9-const — display window for the module-health lamp
+
+/// The lifecycle events a module emits, newest first, with the error
+/// text a failure carries. `payload.error` is NONE on every other
+/// event, and NONE is simply not a string.
+const HEALTH_QUERY: &str = "SELECT payload.name AS name, lifecycle_event AS event,
+        payload.error AS error, valid_from
+     FROM telemetry_stream
+     WHERE lifecycle_event IN ['module_starting', 'module_started', 'module_active',
+        'module_stopped', 'module_failed', 'module_start_failed', 'module_start_abandoned',
+        'module_disabled', 'module_provisioned']
+     ORDER BY valid_from DESC LIMIT $limit";
+
+/// Every failure a module has ever logged, in the engine.
+const FAILURES_QUERY: &str = "SELECT payload.name AS name, count() AS value
+     FROM telemetry_stream
+     WHERE lifecycle_event IN ['module_failed', 'module_start_failed', 'module_start_abandoned']
+     GROUP BY name";
+
+fn is_failure(event: &str) -> bool {
+    matches!(event, "module_failed" | "module_start_failed" | "module_start_abandoned")
+}
 
 /// Gemini stores `input`/`output`/`cached`; Claude Code stores the four
 /// `*_input_tokens` counters. One query covers both — a missing field
@@ -230,6 +260,73 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
         .take(0)?;
     let events_last_hour = recent.first().and_then(obj).map_or(0, |o| get_int(o, "c"));
 
+    // ── module health: what happened to each module (#367) ──────────
+    let now = chrono::Utc::now();
+    let recent_cut = now - chrono::Duration::seconds(HEALTH_RECENT_SECS);
+    let mut health: Vec<ModuleHealth> = Vec::new();
+    let lifecycle: Vec<Value> = kernel
+        .db()
+        .query(HEALTH_QUERY)
+        .bind(("limit", HEALTH_SCAN))
+        .await?
+        .take(0)?;
+    for row in lifecycle.iter().filter_map(obj) {
+        let (Some(name), Some(event)) = (get_str(row, "name"), get_str(row, "event")) else {
+            continue;
+        };
+        let at = match row.get("valid_from") {
+            Some(Value::Datetime(d)) => **d,
+            _ => continue,
+        };
+        let idx = match health.iter().position(|h| h.name == name) {
+            Some(i) => i,
+            None => {
+                // Newest-first: the first sighting is the newest event.
+                health.push(ModuleHealth {
+                    name: name.to_string(),
+                    last_event: event.to_string(),
+                    last_event_secs: (now - at).num_seconds().max(0),
+                    failures_recent: 0,
+                    failures_total: 0,
+                    last_error: None,
+                });
+                health.len() - 1
+            }
+        };
+        if is_failure(event) {
+            if at > recent_cut {
+                health[idx].failures_recent += 1;
+            }
+            if health[idx].last_error.is_none() {
+                health[idx].last_error = get_str(row, "error").map(str::to_string);
+            }
+        }
+    }
+    for row in rows(kernel, FAILURES_QUERY).await?.iter().filter_map(obj) {
+        let Some(name) = get_str(row, "name") else { continue };
+        let total = get_int(row, "value");
+        match health.iter_mut().find(|h| h.name == name) {
+            Some(h) => h.failures_total = total,
+            // Failed beyond the scan and never seen since: still a
+            // module with a history worth showing.
+            None => health.push(ModuleHealth {
+                name: name.to_string(),
+                last_event: String::new(),
+                last_event_secs: -1,
+                failures_recent: 0,
+                failures_total: total,
+                last_error: None,
+            }),
+        }
+    }
+    health.sort_by(|a, b| {
+        b.failures_recent
+            .cmp(&a.failures_recent)
+            .then(b.failures_total.cmp(&a.failures_total))
+            .then(a.name.cmp(&b.name))
+    });
+    let module_health = health;
+
     Ok(InsightsSummary {
         events_per_day,
         hour_weekday,
@@ -240,5 +337,6 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
         module_startup,
         last_event_secs,
         events_last_hour,
+        module_health,
     })
 }

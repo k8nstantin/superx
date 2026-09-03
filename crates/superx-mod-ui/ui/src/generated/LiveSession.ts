@@ -26,6 +26,18 @@ lines_removed: bigint, out_tokens: bigint, tool_failures: bigint,
  */
 idle_secs: bigint, 
 /**
+ * Context in play at its newest usage-bearing message — fresh
+ * input plus what the cache served and stored (#367). The one
+ * reading a pilot needs before compaction hits; it lived on the
+ * Sessions page and not here.
+ */
+context_tokens: bigint | null, 
+/**
+ * `context_tokens` against `attr_ui_context_window_tokens`,
+ * clamped to 100 — the altitude gauge per aircraft.
+ */
+context_pct: bigint | null, 
+/**
  * The paths its newest calls touched, most recent first. An idle
  * row that names three files is legible; one that names none is
  * a number.
