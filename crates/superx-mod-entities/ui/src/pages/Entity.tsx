@@ -9,6 +9,8 @@ import {
   Group,
   Loader,
   NumberInput,
+  Pill,
+  Popover,
   Select,
   Switch,
   Text,
@@ -18,24 +20,27 @@ import {
 import GridLayout, { type LayoutItem } from 'react-grid-layout'
 import 'react-grid-layout/css/styles.css'
 import 'react-resizable/css/styles.css'
+import '../designer.css'
 import {
   DATATYPES,
-  IS,
   MACHINERY,
   NAME,
-  linkEntities,
+  NAME_HEIGHT,
   NATURAL_HEIGHT,
   NATURAL_WIDTH,
   SCREEN,
+  declareLabels,
   fetchEntity,
   isDatatype,
+  linkEntities,
   putAttribute,
   setArchived,
   type AttributeView,
   type Datatype,
+  type LabelView,
 } from '../api'
 import { Editor } from '../Editor'
-import { EntityPicker } from '../EntityPicker'
+import { EntityPicker, LabelsPicker } from '../EntityPicker'
 
 // THE ENTITY: add fields, and put them where you want them.
 //
@@ -50,6 +55,21 @@ import { EntityPicker } from '../EntityPicker'
 
 const COLS = 12
 
+/// EVERY WRITE ON THIS PAGE CHANGES WHAT THE LISTS SAY. A rename changes
+/// a menu row and every picker option; archiving removes a row; a link
+/// gives a row its expander; a label moves an entity between the
+/// vocabulary and the things. Refreshing only the entity left the menu
+/// showing an archived entity as live and a freshly linked one with no
+/// chevron until the window was refocused. So one refresh, for all of it.
+function useRefresh(frag: string) {
+  const qc = useQueryClient()
+  return () => {
+    void qc.invalidateQueries({ queryKey: ['entity', frag] })
+    void qc.invalidateQueries({ queryKey: ['roots'] })
+    void qc.invalidateQueries({ queryKey: ['all-entities'] })
+  }
+}
+
 export default function EntityTab({
   frag,
   onOpen,
@@ -57,7 +77,7 @@ export default function EntityTab({
   frag: string
   onOpen: (uuid: string) => void
 }) {
-  const qc = useQueryClient()
+  const refresh = useRefresh(frag)
   const e = useQuery({ queryKey: ['entity', frag], queryFn: () => fetchEntity(frag) })
   const [design, setDesign] = useState(false)
   const grid = useRef<HTMLDivElement>(null)
@@ -109,7 +129,10 @@ export default function EntityTab({
         return found
       }
       const dt = (isDatatype(f.datatype) ? f.datatype : 'text') as Datatype
-      const item = { i: f.uid, x: 0, y, w: NATURAL_WIDTH[dt], h: NATURAL_HEIGHT[dt] }
+      // The name is one line, and was drawn six rows tall because it is
+      // `text`: it gets its own height.
+      const h = f.name === NAME ? NAME_HEIGHT : NATURAL_HEIGHT[dt]
+      const item = { i: f.uid, x: 0, y, w: NATURAL_WIDTH[dt], h }
       y += item.h
       return item
     })
@@ -129,13 +152,35 @@ export default function EntityTab({
     },
     onSuccess: () => {
       setDragged(null)
-      void qc.invalidateQueries({ queryKey: ['entity', frag] })
+      refresh()
     },
   })
 
   const archive = useMutation({
     mutationFn: (a: boolean) => setArchived(frag, a),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ['entity', frag] }),
+    onSuccess: refresh,
+  })
+
+  // TAKE A LABEL OFF. Every content-less row carrying it is amended
+  // without it — older instances may have several declaration rows, and
+  // the entity IS whatever the union of them says.
+  const unlabel = useMutation({
+    mutationFn: async (uuid: string) => {
+      const rows = (e.data?.attributes ?? []).filter(
+        (a) => a.content === null && a.labels.some((l) => l.uuid === uuid),
+      )
+      for (const a of rows) {
+        await putAttribute(frag, {
+          uid: a.uid,
+          name: a.name,
+          datatype: a.datatype,
+          content: null,
+          labels: a.labels.filter((l) => l.uuid !== uuid).map((l) => l.uuid),
+          options: a.options,
+        })
+      }
+    },
+    onSuccess: refresh,
   })
 
   if (e.isLoading) return <Loader size="sm" />
@@ -148,10 +193,13 @@ export default function EntityTab({
         <Group justify="space-between" wrap="nowrap">
           <Group gap="xs" wrap="nowrap">
             <Title order={4}>{e.data.name || '(unnamed)'}</Title>
+            {/* A chip opens the label; its × takes the label off. */}
             {e.data.labels.map((l) => (
-              <Badge key={l.uuid} variant="light" style={{ cursor: 'pointer' }} onClick={() => onOpen(l.uuid)}>
-                {l.name}
-              </Badge>
+              <Pill key={l.uuid} withRemoveButton onRemove={() => unlabel.mutate(l.uuid)}>
+                <span style={{ cursor: 'pointer' }} onClick={() => onOpen(l.uuid)}>
+                  {l.name}
+                </span>
+              </Pill>
             ))}
             {e.data.archived && <Badge color="gray">archived</Badge>}
           </Group>
@@ -181,7 +229,7 @@ export default function EntityTab({
         </Text>
       </Card>
 
-      <Declare frag={frag} existing={e.data.labels.map((l) => l.uuid)} />
+      <Declare frag={frag} attributes={e.data.attributes} existing={e.data.labels.map((l) => l.uuid)} />
       <Link frag={frag} />
       <AddField frag={frag} />
 
@@ -244,20 +292,22 @@ export default function EntityTab({
 /// SAY WHAT A THING IS. An attribute carrying labels and no content is
 /// the whole mechanism — there is no separate "type" to set, and the
 /// label is just another entity.
-function Declare({ frag, existing }: { frag: string; existing: string[] }) {
-  const qc = useQueryClient()
+function Declare({
+  frag,
+  attributes,
+  existing,
+}: {
+  frag: string
+  attributes: AttributeView[]
+  existing: string[]
+}) {
+  const refresh = useRefresh(frag)
   const [label, setLabel] = useState<string | null>(null)
   const declare = useMutation({
-    mutationFn: () =>
-      putAttribute(frag, {
-        name: IS,
-        datatype: 'text',
-        content: null,
-        labels: [...existing, label ?? ''],
-      }),
+    mutationFn: () => declareLabels(frag, attributes, [...existing, label ?? '']),
     onSuccess: () => {
       setLabel(null)
-      void qc.invalidateQueries({ queryKey: ['entity', frag] })
+      refresh()
     },
   })
   return (
@@ -291,7 +341,7 @@ function Declare({ frag, existing }: { frag: string; existing: string[] }) {
 /// CONNECT IT TO SOMETHING. The connection carries a name and its own
 /// labels — what it MEANS is the label, not the name.
 function Link({ frag }: { frag: string }) {
-  const qc = useQueryClient()
+  const refresh = useRefresh(frag)
   const [to, setTo] = useState<string | null>(null)
   const [name, setName] = useState('')
   const [label, setLabel] = useState<string | null>(null)
@@ -301,7 +351,7 @@ function Link({ frag }: { frag: string }) {
       setTo(null)
       setName('')
       setLabel(null)
-      void qc.invalidateQueries({ queryKey: ['entity', frag] })
+      refresh()
     },
   })
   return (
@@ -344,7 +394,7 @@ function Field({
   field: AttributeView
   readOnly: boolean
 }) {
-  const qc = useQueryClient()
+  const refresh = useRefresh(frag)
   const [draft, setDraft] = useState<string | number | undefined>(undefined)
   const write = useMutation({
     mutationFn: (content: unknown) =>
@@ -353,10 +403,30 @@ function Field({
         name: field.name,
         datatype: field.datatype,
         content,
-        labels: field.labels,
+        labels: field.labels.map((l) => l.uuid),
         options: field.options,
       }),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ['entity', frag] }),
+    onSuccess: refresh,
+  })
+  // WHAT A FIELD IS. Labels apply to fields as much as to entities
+  // (operator, 2026-09-03), and the runner acts on them — so they are
+  // shown on the card, removable, and one more can be added in place.
+  // The value travels with the amend untouched: only the labels change.
+  const [adding, setAdding] = useState(false)
+  const relabel = useMutation({
+    mutationFn: (labels: LabelView[]) =>
+      putAttribute(frag, {
+        uid: field.uid,
+        name: field.name,
+        datatype: field.datatype,
+        content: field.content,
+        labels: labels.map((l) => l.uuid),
+        options: field.options,
+      }),
+    onSuccess: () => {
+      setAdding(false)
+      refresh()
+    },
   })
 
   const body = () => {
@@ -455,11 +525,46 @@ function Field({
         <Text size="xs" c="dimmed" ff="monospace">
           {field.datatype}
         </Text>
+        {field.labels.map((l) => (
+          <Pill
+            key={l.uuid}
+            size="xs"
+            withRemoveButton={!readOnly}
+            onRemove={() => relabel.mutate(field.labels.filter((x) => x.uuid !== l.uuid))}
+          >
+            {l.name}
+          </Pill>
+        ))}
+        {!readOnly && (
+          <Popover opened={adding} onChange={setAdding} trapFocus withArrow position="bottom-start" width={280}>
+            <Popover.Target>
+              <ActionIcon
+                size="xs"
+                variant="subtle"
+                aria-label="Add a label"
+                onClick={() => setAdding((o) => !o)}
+              >
+                +
+              </ActionIcon>
+            </Popover.Target>
+            <Popover.Dropdown>
+              <EntityPicker
+                label="Add a label"
+                placeholder="mandate"
+                size="xs"
+                kind="label"
+                exclude={[frag, ...field.labels.map((l) => l.uuid)]}
+                value={null}
+                onChange={(v) => v && relabel.mutate([...field.labels, { uuid: v, name: '' }])}
+              />
+            </Popover.Dropdown>
+          </Popover>
+        )}
       </Group>
       {body()}
-      {write.error && (
+      {(write.error ?? relabel.error) && (
         <Text c="red" size="xs" mt={4}>
-          {String(write.error)}
+          {String(write.error ?? relabel.error)}
         </Text>
       )}
     </Card>
@@ -481,17 +586,22 @@ function preview(f: AttributeView): string {
   return JSON.stringify(f.content).slice(0, 80)
 }
 
-/// Adding a field is a name and a datatype. Nothing else, ever.
+/// Adding a field is a name, a datatype, and the labels it carries —
+/// as many as it needs (operator, 2026-09-03: "fields can have many
+/// labels"). The labels are what a reader acts on; the datatype is only
+/// which control draws it.
 function AddField({ frag }: { frag: string }) {
-  const qc = useQueryClient()
+  const refresh = useRefresh(frag)
   const [name, setName] = useState('')
   const [datatype, setDatatype] = useState<string | null>('text')
+  const [labels, setLabels] = useState<string[]>([])
   const add = useMutation({
     mutationFn: () =>
-      putAttribute(frag, { name: name.trim(), datatype: datatype ?? 'text', content: null }),
+      putAttribute(frag, { name: name.trim(), datatype: datatype ?? 'text', content: null, labels }),
     onSuccess: () => {
       setName('')
-      void qc.invalidateQueries({ queryKey: ['entity', frag] })
+      setLabels([])
+      refresh()
     },
   })
   return (
@@ -516,6 +626,7 @@ function AddField({ frag }: { frag: string }) {
           allowDeselect={false}
           w={140}
         />
+        <LabelsPicker label="Labels" placeholder="mandate" exclude={[frag]} value={labels} onChange={setLabels} />
         <ActionIcon
           size="lg"
           onClick={() => name.trim() && add.mutate()}

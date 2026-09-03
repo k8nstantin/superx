@@ -1,6 +1,14 @@
 import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Badge, Group, Select, Text, type ComboboxData, type ComboboxItem } from '@mantine/core'
+import {
+  Badge,
+  Group,
+  MultiSelect,
+  Select,
+  Text,
+  type ComboboxData,
+  type ComboboxItem,
+} from '@mantine/core'
 import { LABEL, fetchAllEntities, isLabel, type TreeNodeView } from './api'
 
 // PICK AN ENTITY. Everything in this model points at something else — a
@@ -21,26 +29,13 @@ import { LABEL, fetchAllEntities, isLabel, type TreeNodeView } from './api'
 // wants anything, things first. Vocabulary and things are one table;
 // the picker is where they part.
 
-export function EntityPicker({
-  label,
-  description,
-  kind,
-  exclude,
-  value,
-  onChange,
-}: {
-  label: string
-  description?: string
-  /** `label`: only entities that are labels. `any`: everything, things first. */
-  kind: 'label' | 'any'
-  /** uuids to leave out — the entity itself, the labels it already carries. */
-  exclude: string[]
-  value: string | null
-  onChange: (v: string | null) => void
-}) {
-  const all = useQuery({ queryKey: ['all-entities'], queryFn: () => fetchAllEntities() })
+type Kind = 'label' | 'any'
 
-  const { data, byUuid } = useMemo(() => {
+/// The options every picker on the page draws from — one query, one
+/// shape, whether one entity is being chosen or several.
+function useEntityOptions(kind: Kind, exclude: string[]) {
+  const all = useQuery({ queryKey: ['all-entities'], queryFn: () => fetchAllEntities() })
+  return useMemo(() => {
     const offered = (all.data ?? []).filter((n) => !exclude.includes(n.uuid))
     const item = (n: TreeNodeView): ComboboxItem => ({
       value: n.uuid,
@@ -55,46 +50,111 @@ export function EntityPicker({
             ...(things.length > 0 ? [{ group: 'entities', items: things }] : []),
             ...(labels.length > 0 ? [{ group: 'labels', items: labels }] : []),
           ]
-    return { data, byUuid: new Map(offered.map((n) => [n.uuid, n])) }
+    // An empty label picker is a fresh instance, not a typo: say where
+    // the first word comes from.
+    const nothing =
+      kind === 'label'
+        ? data.length === 0
+          ? 'no labels yet — New label, on the Menu tab'
+          : 'no label by that name'
+        : 'no entity by that name'
+    return { data, nothing, byUuid: new Map(offered.map((n) => [n.uuid, n])) }
   }, [all.data, exclude, kind])
+}
 
-  // An empty label picker is a fresh instance, not a typo: say where the
-  // first word comes from.
-  const nothing =
-    kind === 'label'
-      ? byUuid.size > 0 && data.length === 0
-        ? 'no labels yet — New label, on the Menu tab'
-        : 'no label by that name'
-      : 'no entity by that name'
+/// The option shows what the entity IS beside its name, so `DBA role`
+/// and a task called DBA can be told apart before choosing. In a label
+/// picker every option carries `label`; that one chip says nothing and
+/// is left off.
+function optionRow(kind: Kind, byUuid: Map<string, TreeNodeView>) {
+  return ({ option }: { option: ComboboxItem }) => {
+    const node = byUuid.get(option.value)
+    const chips = (node?.labels ?? []).filter((l) => kind !== 'label' || l.name !== LABEL)
+    return (
+      <Group gap={6} wrap="nowrap">
+        <Text size="sm">{option.label}</Text>
+        {chips.map((l) => (
+          <Badge key={l.uuid} size="xs" variant="light">
+            {l.name}
+          </Badge>
+        ))}
+      </Group>
+    )
+  }
+}
 
+export function EntityPicker({
+  label,
+  description,
+  placeholder,
+  kind,
+  exclude,
+  value,
+  onChange,
+  size,
+}: {
+  label?: string
+  description?: string
+  placeholder?: string
+  /** `label`: only entities that are labels. `any`: everything, things first. */
+  kind: Kind
+  /** uuids to leave out — the entity itself, the labels it already carries. */
+  exclude: string[]
+  value: string | null
+  onChange: (v: string | null) => void
+  size?: 'xs' | 'sm'
+}) {
+  const { data, nothing, byUuid } = useEntityOptions(kind, exclude)
   return (
     <Select
       label={label}
       description={description}
+      placeholder={placeholder}
+      size={size}
       data={data}
       value={value}
       onChange={onChange}
       searchable
       clearable
       nothingFoundMessage={nothing}
-      // The option shows what the entity IS beside its name, so `DBA
-      // role` and a task called DBA can be told apart before choosing.
-      // In a label picker every option carries `label`; that one chip
-      // says nothing and is left off.
-      renderOption={({ option }) => {
-        const node = byUuid.get(option.value)
-        const chips = (node?.labels ?? []).filter((l) => kind !== 'label' || l.name !== LABEL)
-        return (
-          <Group gap={6} wrap="nowrap">
-            <Text size="sm">{option.label}</Text>
-            {chips.map((l) => (
-              <Badge key={l.uuid} size="xs" variant="light">
-                {l.name}
-              </Badge>
-            ))}
-          </Group>
-        )
-      }}
+      renderOption={optionRow(kind, byUuid)}
+      style={{ flex: 1 }}
+    />
+  )
+}
+
+/// Several labels at once — what a new field is born carrying. A field
+/// can hold as many as an entity can (operator, 2026-09-03), so the
+/// control that adds one takes a list, not a single choice.
+export function LabelsPicker({
+  label,
+  description,
+  placeholder,
+  exclude,
+  value,
+  onChange,
+}: {
+  label?: string
+  description?: string
+  placeholder?: string
+  exclude: string[]
+  value: string[]
+  onChange: (v: string[]) => void
+}) {
+  const { data, nothing, byUuid } = useEntityOptions('label', exclude)
+  return (
+    <MultiSelect
+      label={label}
+      description={description}
+      placeholder={placeholder}
+      data={data}
+      value={value}
+      onChange={onChange}
+      searchable
+      clearable
+      hidePickedOptions
+      nothingFoundMessage={nothing}
+      renderOption={optionRow('label', byUuid)}
       style={{ flex: 1 }}
     />
   )

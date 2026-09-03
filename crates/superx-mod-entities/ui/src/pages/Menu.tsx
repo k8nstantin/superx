@@ -19,13 +19,14 @@ import {
   TextInput,
 } from '@mantine/core'
 import {
-  IS,
   LABEL,
   createEntity,
+  declareLabels,
   fetchAllEntities,
   fetchChildren,
+  fetchEntity,
   fetchRoots,
-  putAttribute,
+  isLabel,
   searchEntities,
   type TreeNodeView,
 } from '../api'
@@ -203,11 +204,22 @@ export default function MenuTab({
       let meta = every.find((e) => e.name === LABEL)?.uuid
       if (!meta) {
         meta = (await createEntity(LABEL)).uuid
-        await putAttribute(meta, { name: IS, datatype: 'text', content: null, labels: [meta] })
+        await declareLabels(meta, [], [meta])
       }
       if (name.toLowerCase() === LABEL) return { uuid: meta, name: LABEL }
+      // ONE WORD, ONE ENTITY. Typing a name that already exists does not
+      // mint a second `role` beside the first — it makes THAT entity a
+      // label if it is not one yet, and opens it either way.
+      const same = every.find((e) => e.name === name)
+      if (same) {
+        if (!isLabel(same)) {
+          const detail = await fetchEntity(same.uuid)
+          await declareLabels(same.uuid, detail.attributes, [...same.labels.map((l) => l.uuid), meta])
+        }
+        return { uuid: same.uuid, name }
+      }
       const made = await createEntity(name)
-      await putAttribute(made.uuid, { name: IS, datatype: 'text', content: null, labels: [meta] })
+      await declareLabels(made.uuid, [], [meta])
       return { uuid: made.uuid, name }
     },
     onSuccess: (made) => {
@@ -314,7 +326,9 @@ export default function MenuTab({
                 value={labelName}
                 onChange={(e) => setLabelName(e.currentTarget.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && labelName.trim()) newLabel.mutate(labelName.trim())
+                  if (e.key === 'Enter' && labelName.trim() && !newLabel.isPending) {
+                    newLabel.mutate(labelName.trim())
+                  }
                 }}
               />
               <Group justify="flex-end" mt="xs">
