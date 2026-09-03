@@ -5,7 +5,14 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import '@mantine/core/styles.css'
 import App from './App'
 
-const queryClient = new QueryClient()
+// ONE RETRY, QUICKLY. With the library's default (three, backing off to
+// seven seconds) a module that had gone away showed an empty box for the
+// whole wait and, in practice, never reached the error state the page
+// knows how to draw. A second attempt half a second later is enough to
+// ride out a blip; after that, say what happened.
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { retry: 1, retryDelay: 400 } },
+})
 
 // The swindex design system — the same tokens as the core dashboard
 // (superx-mod-ui/ui/src/main.tsx): midnight surfaces, pelican-purple

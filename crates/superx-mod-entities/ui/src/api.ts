@@ -80,6 +80,17 @@ export const linkEntities = (frag: string, to: string, name: string, labels: str
     body: JSON.stringify({ to, name, labels }),
   })
 
+/// Take a field off the screen. The record keeps every version (§10).
+export const retireAttribute = (frag: string, uid: string) =>
+  json<{ changed: boolean }>(`/api/entities/${frag}/attributes/${uid}/retire`, { method: 'POST' })
+
+/// Cut a link from either end.
+export const unlinkEntities = (frag: string, uid: string) =>
+  json<{ changed: boolean }>(`/api/entities/${frag}/unlink`, {
+    method: 'POST',
+    body: JSON.stringify({ uid }),
+  })
+
 export const setArchived = (frag: string, archived: boolean) =>
   json<{ changed: boolean }>(`/api/entities/${frag}/archive`, {
     method: 'POST',
@@ -91,33 +102,32 @@ export const setArchived = (frag: string, archived: boolean) =>
 export const DATATYPES = ['text', 'number', 'boolean', 'datetime', 'json'] as const
 export type Datatype = (typeof DATATYPES)[number]
 
-/// How tall a field wants to be, in grid rows. A date needs a box; prose
-/// needs room. This is the default a new field lands with — the designer
-/// overrides it and the override is saved.
-/// In grid rows. Measured against what the card actually needs: a
-/// header line, padding, and the control. Two rows (66px) clipped a
-/// number and a date box at 77px — and a clipped field is one you cannot
-/// finish typing into.
-export const NATURAL_HEIGHT: Record<Datatype, number> = {
-  text: 6,
-  json: 6,
-  number: 3,
-  boolean: 3,
-  datetime: 3,
-}
+/// THE PALETTE. Everything on an entity's screen is one of these, added
+/// by hand (operator, 2026-09-03: "one field is required, name; the rest
+/// is added" · "connection is also a field you add" · "[labels are] just a
+/// field that you add"). Five datatypes, plus the entity's own labels,
+/// plus a link to another entity.
+///
+/// SIZES ARE COMPACT ON PURPOSE, in grid units of a 12-column row: prose
+/// half a row and five rows tall, a number a quarter row, a yes/no a
+/// sixth. Nothing spans the full width unless someone drags it there —
+/// full-width cards stacked one per row were the "long ugly fields".
+export type Kind = Datatype | 'labels' | 'link'
+export const PALETTE: { kind: Kind; title: string; hint: string; w: number; h: number }[] = [
+  { kind: 'text', title: 'Text', hint: 'prose, with formatting', w: 6, h: 5 },
+  { kind: 'number', title: 'Number', hint: 'a quantity', w: 3, h: 3 },
+  { kind: 'boolean', title: 'Yes / no', hint: 'a switch', w: 2, h: 3 },
+  { kind: 'datetime', title: 'Date', hint: 'an instant', w: 3, h: 3 },
+  { kind: 'json', title: 'JSON', hint: 'structure the database can query', w: 6, h: 5 },
+  { kind: 'labels', title: 'Labels', hint: 'what this entity IS', w: 6, h: 3 },
+  { kind: 'link', title: 'Link', hint: 'to another entity — links join entities only', w: 6, h: 3 },
+]
+export const SIZE: Record<Kind, { w: number; h: number }> = Object.fromEntries(
+  PALETTE.map((p) => [p.kind, { w: p.w, h: p.h }]),
+) as Record<Kind, { w: number; h: number }>
 
-/// The name's own height. It is `text`, but it is the one text field
-/// drawn as a single line, so it is sized against that control and not
-/// against the editor.
-export const NAME_HEIGHT = 3
-
-export const NATURAL_WIDTH: Record<Datatype, number> = {
-  text: 12,
-  json: 12,
-  number: 3,
-  boolean: 3,
-  datetime: 4,
-}
+/// The name is one line, drawn wide enough to read: two thirds of a row.
+export const NAME_SIZE = { w: 8, h: 3 }
 
 export function isDatatype(s: string): s is Datatype {
   return (DATATYPES as readonly string[]).includes(s)
