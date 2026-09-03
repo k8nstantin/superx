@@ -359,7 +359,7 @@ function Link({ frag }: { frag: string }) {
           onChange={(e) => setName(e.currentTarget.value)}
           style={{ flex: 1 }}
         />
-        <EntityPicker label="to" kind="any" exclude={[frag]} value={to} onChange={setTo} />
+        <EntityPicker label="to" kind="thing" exclude={[frag]} value={to} onChange={setTo} />
         <EntityPicker label="meaning" kind="label" exclude={[frag]} value={label} onChange={setLabel} />
         <Button
           onClick={() => to && name.trim() && link.mutate()}

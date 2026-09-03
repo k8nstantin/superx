@@ -26,10 +26,13 @@ import { LABEL, fetchAllEntities, isLabel, type TreeNodeView } from './api'
 // TWO KINDS OF QUESTION. "What is this?" and "what does this link mean?"
 // want a LABEL — an entity carrying `label` (operator, 2026-09-03: "an
 // entity that has label attached to it is a label"). "Link to what?"
-// wants anything, things first. Vocabulary and things are one table;
-// the picker is where they part.
+// wants a THING: links join entities to entities, in either direction
+// and any number, and a label is applied, never linked (operator,
+// 2026-09-03: "you cannot link fields nor labels, only entities to
+// entities"). Vocabulary and things are one table; the picker is where
+// they part.
 
-type Kind = 'label' | 'any'
+type Kind = 'label' | 'thing'
 
 /// The options every picker on the page draws from — one query, one
 /// shape, whether one entity is being chosen or several.
@@ -41,23 +44,17 @@ function useEntityOptions(kind: Kind, exclude: string[]) {
       value: n.uuid,
       label: n.name || n.uuid.slice(0, 8),
     })
-    const labels = offered.filter(isLabel).map(item)
-    const things = offered.filter((n) => !isLabel(n)).map(item)
-    const data: ComboboxData =
-      kind === 'label'
-        ? labels
-        : [
-            ...(things.length > 0 ? [{ group: 'entities', items: things }] : []),
-            ...(labels.length > 0 ? [{ group: 'labels', items: labels }] : []),
-          ]
-    // An empty label picker is a fresh instance, not a typo: say where
-    // the first word comes from.
+    const data: ComboboxData = offered.filter((n) => (kind === 'label') === isLabel(n)).map(item)
+    // An empty picker is a fresh instance, not a typo: say where the
+    // first word comes from.
     const nothing =
       kind === 'label'
         ? data.length === 0
           ? 'no labels yet — New label, on the Menu tab'
           : 'no label by that name'
-        : 'no entity by that name'
+        : data.length === 0
+          ? 'nothing to link to yet — New entity, on the Menu tab'
+          : 'no entity by that name'
     return { data, nothing, byUuid: new Map(offered.map((n) => [n.uuid, n])) }
   }, [all.data, exclude, kind])
 }
@@ -96,7 +93,7 @@ export function EntityPicker({
   label?: string
   description?: string
   placeholder?: string
-  /** `label`: only entities that are labels. `any`: everything, things first. */
+  /** `label`: only entities that are labels. `thing`: only entities that are not. */
   kind: Kind
   /** uuids to leave out — the entity itself, the labels it already carries. */
   exclude: string[]
