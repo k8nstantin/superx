@@ -56,6 +56,8 @@ pub async fn spawn(kernel: &Kernel, db: superx_kernel::Db, port: u16) -> Result<
         .route("/api/entities/all", get(all_entities))
         .route("/api/entities/{frag}", get(detail))
         .route("/api/entities/{frag}/attributes", post(put_attribute))
+        .route("/api/entities/{frag}/attributes/{uid}/retire", post(retire_attribute))
+        .route("/api/entities/{frag}/unlink", post(unlink))
         .route("/api/entities/{frag}/children", get(children))
         .route("/api/entities/{frag}/graph", get(graph))
         .route("/api/entities/{frag}/link", post(link))
@@ -195,6 +197,32 @@ async fn link(
     let db = &state.db;
     let uid = api::link(db, &frag, &req, &Author::operator()).await.map_err(fail)?;
     Ok(Json(serde_json::json!({ "uid": uid })))
+}
+
+async fn retire_attribute(
+    State(state): State<AppState>,
+    AxumPath((frag, uid)): AxumPath<(String, String)>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let changed = api::retire_attribute(&state.db, &frag, &uid, &Author::operator())
+        .await
+        .map_err(fail)?;
+    Ok(Json(serde_json::json!({ "changed": changed })))
+}
+
+#[derive(Deserialize)]
+struct UnlinkReq {
+    uid: String,
+}
+
+async fn unlink(
+    State(state): State<AppState>,
+    AxumPath(frag): AxumPath<String>,
+    Json(req): Json<UnlinkReq>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let changed = api::unlink(&state.db, &frag, &req.uid, &Author::operator())
+        .await
+        .map_err(fail)?;
+    Ok(Json(serde_json::json!({ "changed": changed })))
 }
 
 #[derive(Deserialize)]

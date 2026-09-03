@@ -274,11 +274,14 @@ export default function MenuTab({
                 {n.via} →
               </Text>
             )}
-            <Text size="sm" truncate>
+            {/* THE NAME GIVES WAY, THE CHIPS DO NOT. A long name used to
+                squash its own labels to `R…`, which is the one part of
+                the row that says what the thing is. */}
+            <Text size="sm" truncate style={{ minWidth: 0 }} title={n.name}>
               {n.name}
             </Text>
             {n.labels.map((l) => (
-              <Badge key={l.uuid} size="xs" variant="light">
+              <Badge key={l.uuid} size="xs" variant="light" style={{ flexShrink: 0 }}>
                 {l.name}
               </Badge>
             ))}
@@ -386,6 +389,7 @@ export default function MenuTab({
 
         <TextInput
           placeholder="Search every entity"
+          aria-label="Search every entity"
           value={term}
           onChange={(e) => setTerm(e.currentTarget.value)}
           size="sm"
@@ -395,7 +399,7 @@ export default function MenuTab({
         {/* SAY WHAT WENT WRONG. This rendered an empty box when the read
             failed, so an unprovisioned instance looked like a page that
             had not loaded rather than one with something to report. */}
-        {roots.error && (
+        {roots.isError && (
           <Alert color="red" title="Cannot read entities" m="xs">
             <Text size="sm">{String(roots.error)}</Text>
             <Text size="xs" c="dimmed" mt="xs">
@@ -436,8 +440,8 @@ export default function MenuTab({
           </Box>
         ) : (
           <Box>
-            {roots.isLoading && <Loader size="sm" m="sm" />}
-            {!roots.error && roots.data?.length === 0 && (
+            {roots.isFetching && !roots.data && <Loader size="sm" m="sm" />}
+            {!roots.isError && roots.data?.length === 0 && (
               <Text c="dimmed" size="sm" m="sm">
                 Nothing yet. Add an entity above.
               </Text>
