@@ -133,4 +133,44 @@ export function isDatatype(s: string): s is Datatype {
 export const SCREEN = 'screen'
 export const ARCHIVED = 'archived'
 export const NAME = 'name'
-export const MACHINERY: readonly string[] = [SCREEN, ARCHIVED]
+
+/// The name of the content-less attribute that says what an entity IS.
+export const IS = 'is' // skill-allow: §9-const — the module's own vocabulary, not a tunable
+
+/// THE ONE WORD THE INTERFACE KNOWS. A label is an entity carrying the
+/// label `label` (operator, 2026-09-03: "an entity that has label
+/// attached to it is a label"). This is how the pickers tell vocabulary
+/// from things and what *New label* attaches. The Rust side knows
+/// nothing of it — it stores and describes — so the word lives here,
+/// beside the other names the interface keeps for itself.
+export const LABEL = 'label' // skill-allow: §9-const — the module's own vocabulary, not a tunable
+
+export const isLabel = (n: { labels: { name: string }[] }) => n.labels.some((l) => l.name === LABEL)
+
+/// `is` is machinery too: the row that says what a thing IS is drawn as
+/// chips in the header, never as a field — and once its last label is
+/// removed it would otherwise surface as an empty text field called `is`.
+export const MACHINERY: readonly string[] = [SCREEN, ARCHIVED, IS]
+
+/// The declaration row: the newest content-less `is` attribute, if any.
+///
+/// ONE ROW, AMENDED. "Label it" used to append a fresh `is` row on every
+/// click, each repeating the labels before it — two clicks, two rows — and
+/// nothing could take a label off again. A declaration is one chain like
+/// any other attribute: add to it, remove from it, and its history is the
+/// history of what the thing has been.
+export const declarationOf = (attrs: AttributeView[]): AttributeView | undefined => {
+  const rows = attrs.filter((a) => a.name === IS && a.content === null)
+  return rows[rows.length - 1]
+}
+
+/// Set what an entity IS to exactly `labels`, amending its declaration
+/// row or starting one.
+export const declareLabels = (frag: string, attrs: AttributeView[], labels: string[]) =>
+  putAttribute(frag, {
+    uid: declarationOf(attrs)?.uid ?? null,
+    name: IS,
+    datatype: 'text',
+    content: null,
+    labels,
+  })

@@ -267,7 +267,7 @@ async fn an_attribute_can_be_retired_and_restored() {
 /// WHAT AN ENTITY IS: the labels on attributes that hold nothing. An
 /// attribute WITH content describes the value, not the thing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn what_a_thing_is_comes_from_attributes_that_hold_nothing() {
+async fn what_a_thing_is_comes_from_its_is_row_and_not_from_its_fields() {
     let db = fresh_db().await;
     let role = entity::create(&db, "role", &Author::operator()).await.expect("l1");
     let mandate = entity::create(&db, "mandate", &Author::operator()).await.expect("l2");
@@ -293,8 +293,33 @@ async fn what_a_thing_is_comes_from_attributes_that_hold_nothing() {
 
     assert_eq!(
         entity::labels_of(&db, &dba).await.expect("labels"),
-        vec![role],
+        vec![role.clone()],
         "it IS a role; `mandate` describes the rule, not the DBA"
+    );
+
+    // A FIELD BORN WITH A LABEL AND NO VALUE is still a field. Adding
+    // `notes` labelled `mandate` and typing nothing into it yet used to
+    // make the DBA itself a mandate, because "content-less and labelled"
+    // was read as a declaration (operator, 2026-09-03: "entities have
+    // labels, fields have labels").
+    attribute::add(
+        &db,
+        &dba,
+        Write {
+            name: "notes",
+            datatype: "text",
+            content: None,
+            labels: std::slice::from_ref(&mandate),
+            options: None,
+        },
+        &Author::operator(),
+    )
+    .await
+    .expect("an empty, labelled field");
+    assert_eq!(
+        entity::labels_of(&db, &dba).await.expect("labels"),
+        vec![role],
+        "an empty field's label is the field's, not the entity's"
     );
 }
 

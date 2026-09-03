@@ -1,0 +1,19 @@
+/* THE RESIZE GRIP, VISIBLE. react-grid-layout keeps the handle at
+   opacity 0 until the card is hovered and draws it as two 5px lines in
+   40% black — on a midnight surface that is nothing at all, so the
+   designer read as drag-only ("no resize capability", operator,
+   2026-09-03). In design mode every card shows its grip, in the accent
+   colour; with resizing off the library does not render the handle. */
+.layout .react-grid-item > .react-resizable-handle {
+  opacity: 1;
+  background-image: none;
+}
+.layout .react-grid-item > .react-resizable-handle::after {
+  width: 9px;
+  height: 9px;
+  right: 4px;
+  bottom: 4px;
+  border-right: 2px solid #b833e8;
+  border-bottom: 2px solid #b833e8;
+  border-radius: 0 0 3px 0;
+}
