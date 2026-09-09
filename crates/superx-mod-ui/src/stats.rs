@@ -52,6 +52,15 @@ fn get_int(o: &Object, key: &str) -> i64 {
     }
 }
 
+/// The file a tool call touched: `file_path` for the file tools,
+/// `notebook_path` for NotebookRead and NotebookEdit — which carried
+/// their path under a name nothing read, so notebook work never
+/// reached the files, languages, exposure or created/modified
+/// instruments (#346).
+fn touched_path(input: &Object) -> Option<&str> {
+    get_str(input, "file_path").or_else(|| get_str(input, "notebook_path"))
+}
+
 fn line_count(s: &str) -> i64 {
     if s.is_empty() {
         0
@@ -61,10 +70,18 @@ fn line_count(s: &str) -> i64 {
 }
 
 /// Lines of code a single tool_use block writes (Write/Edit content;
-/// MultiEdit sums its edits).
+/// MultiEdit sums its edits; NotebookEdit's `new_source`).
 fn block_lines(name: &str, input: &Object) -> i64 {
     if !WRITE_TOOLS.contains(&name) {
         return 0;
+    }
+    // A notebook edit carries the cell's text as `new_source`, and a
+    // `delete` writes nothing (#346).
+    if name == "NotebookEdit" {
+        if get_str(input, "edit_mode") == Some("delete") {
+            return 0;
+        }
+        return get_str(input, "new_source").map(line_count).unwrap_or(0);
     }
     if let Some(s) = get_str(input, "content").or_else(|| get_str(input, "new_string")) {
         return line_count(s);
@@ -548,8 +565,14 @@ struct CodeAgg {
 /// Lines a call REPLACED — an Edit's `old_string`, which the
 /// lines-written figure alone cannot see. A Write replaces nothing;
 /// it is counted entirely as added.
+///
+/// A NotebookEdit that replaces or deletes a cell takes out text the
+/// call never carried — the cell's prior source is not in the input —
+/// so it replaces an UNKNOWN number of lines. That is reported as
+/// none rather than invented: notebook rework reads as added lines
+/// only, and the churn ratio understates it by exactly that (#346).
 fn replaced_lines(name: &str, input: &Object) -> i64 {
-    if !WRITE_TOOLS.contains(&name) {
+    if !WRITE_TOOLS.contains(&name) || name == "NotebookEdit" {
         return 0;
     }
     if let Some(s) = get_str(input, "old_string") {
@@ -1453,7 +1476,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         // A tool_result message carries no model. Attributing it to
         // `unknown` put a meaningless row at the top of the model
         // comparison (review of #330) — so an absent model is simply
-        // not attributed.
+        // not attributed. That holds for every figure, not only the
+        // message count: lines, tokens, failures and reverts on a
+        // model-less message go to no row at all (#345).
         // `<synthetic>` is Claude Code's marker for a line the runtime
         // wrote itself; it sat in the model comparison and on the live
         // panel as if something had been prompted (#367). Not a model.
@@ -1463,15 +1488,14 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             .and_then(|m| get_str(m, "model"))
             .filter(|m| !m.is_empty() && !m.starts_with('<'))
             .map(str::to_string);
-        let model = model_opt.clone().unwrap_or_else(|| "unknown".to_string());
         if let Some(known) = &model_opt {
             code.models.entry(known.clone()).or_default().messages += 1;
         }
         {
             let sid = superx_ops::record_uuid(&m.session);
             let l = code.live.entry(sid).or_default();
-            if l.model.is_none() && model != "unknown" {
-                l.model = Some(model.clone());
+            if l.model.is_none() {
+                l.model = model_opt.clone();
             }
             // Effort is switched mid-session, and it rides different
             // messages than the model does — so it is picked up on its
@@ -1621,7 +1645,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                 if let Some(an) = &agent_name {
                     code.agents.entry(an.clone()).or_default().out_tokens += out;
                 }
-                code.models.entry(model.clone()).or_default().out_tokens += out;
+                if let Some(known) = &model_opt {
+                    code.models.entry(known.clone()).or_default().out_tokens += out;
+                }
                 if let Some(e) = &effort {
                     let ea = code.efforts.entry(e.clone()).or_default();
                     ea.out_tokens += out;
@@ -1706,7 +1732,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             .entry(hour_key.clone())
                                             .or_insert((0, 0, 0))
                                             .2 += 1;
-                                        code.models.entry(model.clone()).or_default().tool_failures += 1;
+                                        if let Some(known) = &model_opt {
+                                            code.models.entry(known.clone()).or_default().tool_failures += 1;
+                                        }
                                         if let Some(e) = &effort {
                                             code.efforts.entry(e.clone()).or_default().tool_failures += 1;
                                         }
@@ -1733,7 +1761,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             id.to_string(),
                                             (
                                                 name.clone(),
-                                                Some(model.clone()),
+                                                model_opt.clone(),
                                                 repo_key.clone(),
                                                 branch_pair.clone(),
                                             ),
@@ -1812,7 +1840,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                             // the directory the agent was working in
                             // is exposure nobody asked for.
                             if let Some(Value::Object(input)) = block.get("input") {
-                                if let Some(path) = get_str(input, "file_path") {
+                                if let Some(path) = touched_path(input) {
                                     if READ_TOOLS.contains(&name.as_str()) {
                                         code.files_read.insert(path.to_string());
                                         {
@@ -1905,7 +1933,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             b.churn_self += replaced;
                                         }
                                     }
-                                    if let Some(pth) = get_str(input, "file_path") {
+                                    if let Some(pth) = touched_path(input) {
                                         b.files.insert(pth.to_string());
                                         // Only a real write OWNS a path.
                                         // Unguarded, every Read mapped
@@ -1929,7 +1957,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             r.churn_self += replaced;
                                         }
                                     }
-                                    if let Some(pth) = get_str(input, "file_path") {
+                                    if let Some(pth) = touched_path(input) {
                                         r.files.insert(pth.to_string());
                                     }
                                 }
@@ -1951,7 +1979,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             .or_default();
                                         cell.added += n;
                                         cell.removed += replaced;
-                                        if let Some(pth) = get_str(input, "file_path") {
+                                        if let Some(pth) = touched_path(input) {
                                             cell.files.insert(pth.to_string());
                                         }
                                     }
@@ -1961,7 +1989,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 // walk is newest-first, so the last
                                 // value written wins — and that is the
                                 // oldest event for the path (#340).
-                                if let Some(pth) = get_str(input, "file_path") {
+                                if let Some(pth) = touched_path(input) {
                                     let creates = name == "Write"
                                         && get_str(input, "old_string").is_none();
                                     code.path_origin.insert(pth.to_string(), creates);
@@ -1997,7 +2025,7 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     // Which files, and how often each —
                                     // a path written three times is
                                     // rework of rework (#350).
-                                    if let Some(pth) = get_str(input, "file_path") {
+                                    if let Some(pth) = touched_path(input) {
                                         *l.path_hits.entry(pth.to_string()).or_insert(0) += 1;
                                         if l.files_now.len() < LIVE_FILES
                                             && !l.files_now.iter().any(|f| f == pth)
@@ -2007,12 +2035,12 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                     }
                                     claim_doing(l, "writing");
                                 }
-                                {
-                                    let mm = code.models.entry(model.clone()).or_default();
+                                if let Some(known) = &model_opt {
+                                    let mm = code.models.entry(known.clone()).or_default();
                                     mm.lines_added += n;
                                     mm.lines_removed += replaced;
                                 }
-                                if let Some(path) = get_str(input, "file_path") {
+                                if let Some(path) = touched_path(input) {
                                     let seen = code.removed_text.entry(path.to_string()).or_default();
                                     // How long did this text live?
                                     // `removed_at` holds when a LATER
@@ -2052,7 +2080,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                             if let Some(an) = &agent_name {
                                                 code.agents.entry(an.clone()).or_default().reverts += 1;
                                             }
-                                            code.models.entry(model.clone()).or_default().reverts += 1;
+                                            if let Some(known) = &model_opt {
+                                                code.models.entry(known.clone()).or_default().reverts += 1;
+                                            }
                                             if let Some(e) = &effort {
                                                 code.efforts.entry(e.clone()).or_default().reverts += 1;
                                             }
@@ -2081,12 +2111,11 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 lines_written += n;
                                 agg.lines += n;
                                 code.lines_added += n;
-                                code.lines_removed += replaced_lines(&name, input);
+                                code.lines_removed += replaced;
 
                                 // The file this call touched.
-                                if let Some(path) = get_str(input, "file_path")
+                                if let Some(path) = touched_path(input)
                                     .or_else(|| get_str(input, "path"))
-                                    .or_else(|| get_str(input, "notebook_path"))
                                 {
                                     *code.files.entry(path.to_string()).or_insert(0) += 1;
                                     if let Some(ext) = extension_of(path) {

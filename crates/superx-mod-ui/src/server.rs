@@ -135,8 +135,9 @@ async fn sse_poller(
     }
 }
 
-/// Serve the dashboard: exact asset when it exists, index.html as the
-/// SPA fallback for everything else.
+/// Serve the dashboard: the exact asset when it exists, index.html as
+/// the SPA fallback for route-shaped paths, and a 404 for a file that
+/// is not there (#352).
 async fn static_assets(uri: axum::http::Uri) -> axum::response::Response {
     use axum::response::IntoResponse as _;
     let path = uri.path().trim_start_matches('/');
@@ -164,11 +165,28 @@ async fn static_assets(uri: axum::http::Uri) -> axum::response::Response {
                 .into_response()
         })
     };
-    serve(path)
-        .or_else(|| serve("index.html"))
-        .unwrap_or_else(|| {
-            (StatusCode::NOT_FOUND, Html("dashboard not built — run npm run build in crates/superx-mod-ui/ui")).into_response()
-        })
+    if let Some(found) = serve(path) {
+        return found;
+    }
+    // The SPA fallback exists for client-side routes, which carry no
+    // extension. A FILE request that misses — the bundle an older
+    // index.html still names, in an open tab or a back/forward-cache
+    // entry — must say so. Served index.html in its place, the browser
+    // fails to parse HTML as a script and the tab keeps showing what
+    // it last rendered, which the operator read as "the UI reverted"
+    // when the truth was "the UI failed to load" (#352).
+    if names_a_file(path) {
+        return (StatusCode::NOT_FOUND, format!("no such asset: /{path}")).into_response();
+    }
+    serve("index.html").unwrap_or_else(|| {
+        (StatusCode::NOT_FOUND, Html("dashboard not built — run npm run build in crates/superx-mod-ui/ui")).into_response()
+    })
+}
+
+/// A request path that names a file rather than a route: anything
+/// under `assets/`, or whose last segment carries an extension.
+fn names_a_file(path: &str) -> bool {
+    path.starts_with("assets/") || path.rsplit('/').next().is_some_and(|last| last.contains('.'))
 }
 
 async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
@@ -701,5 +719,63 @@ impl<T: serde::Serialize> axum::response::IntoResponse for Response<T> {
             Self::Ok(json) => json.into_response(),
             Self::Err(err) => err.into_response(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn get(path: &str) -> axum::response::Response {
+        static_assets(path.parse::<axum::http::Uri>().expect("uri")).await
+    }
+
+    fn content_type(r: &axum::response::Response) -> &str {
+        r.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+    }
+
+    #[test]
+    fn a_route_has_no_extension_and_a_file_has_one() {
+        assert!(names_a_file("assets/index-Bca9TEJN.js"));
+        assert!(names_a_file("logo.svg"));
+        assert!(names_a_file("sessions/report.json"));
+        assert!(!names_a_file("status"));
+        assert!(!names_a_file("sessions/0199a1b2-7c3d-4e5f-8a9b-0c1d2e3f4a5b"));
+        assert!(!names_a_file(""));
+    }
+
+    /// The bundle an older index.html still names is gone: the answer
+    /// is a 404 that says so, not index.html wearing a script's name
+    /// (#352).
+    #[tokio::test]
+    async fn a_missing_file_is_a_404_not_the_index_page() {
+        let gone = get("/assets/index-Bca9TEJN.js").await;
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        assert!(content_type(&gone).starts_with("text/plain"), "{}", content_type(&gone));
+        let stray = get("/favicon.ico").await;
+        assert_eq!(stray.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Everything the fallback was for still works: the root, a
+    /// route-shaped path, and a real file with its own type and
+    /// cache policy.
+    #[tokio::test]
+    async fn the_root_routes_and_real_files_still_serve() {
+        for path in ["/", "/status", "/sessions/0199a1b2-7c3d-4e5f-8a9b-0c1d2e3f4a5b"] {
+            let r = get(path).await;
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert!(content_type(&r).starts_with("text/html"), "{path}: {}", content_type(&r));
+            assert_eq!(
+                r.headers().get(axum::http::header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{path}"
+            );
+        }
+        let logo = get("/logo.svg").await;
+        assert_eq!(logo.status(), StatusCode::OK);
+        assert!(content_type(&logo).starts_with("image/svg+xml"), "{}", content_type(&logo));
     }
 }
