@@ -2157,3 +2157,94 @@ async fn notebook_edits_count_their_lines_and_their_file() {
     assert_eq!(s.live[0].lines_added, 5);
     assert_eq!(s.live[0].files_now, vec![nb.to_string()]);
 }
+
+/// One captured message with an explicit agent-clock timestamp — the
+/// shape a backfill produces: `emitted_at` days ago, `valid_from` now.
+async fn log_tool_message_at(kernel: &Kernel, session: &superx_kernel::types::RecordId,
+                             agent: &superx_kernel::types::RecordId, raw: serde_json::Value,
+                             emitted: chrono::DateTime<chrono::Utc>) {
+    kernel
+        .log_message(superx_kernel::NewMessage {
+            session: session.clone(),
+            agent: agent.clone(),
+            role: "assistant".to_string(),
+            content: String::new(),
+            raw: Some(superx_kernel::message::json_to_object(&raw)),
+            seq: None,
+            emitted_at: Some(emitted),
+        })
+        .await
+        .expect("message");
+}
+
+/// Range membership follows the agent's clock. A restart that backfills
+/// six days of transcripts captures them within a minute; that work
+/// must not all land inside "last hour", and a failure at 17:00 agent
+/// time belongs in the 17:00 bucket, not the capture hour (#372).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn range_membership_follows_the_agents_clock_not_the_capture_run() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let now = chrono::Utc::now();
+    let edit = |id: &str, lines: &str| serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Edit",
+             "input": {"file_path": "/w/superx/src/a.rs", "old_string": "x", "new_string": lines}}]}
+    });
+
+    // Backfilled: the work happened three days ago, captured just now.
+    log_tool_message_at(&kernel, &session, &agent, edit("old", "a\nb\nc\nd\ne"),
+                        now - chrono::Duration::days(3)).await;
+    // Live: ten minutes ago.
+    log_tool_message_at(&kernel, &session, &agent, edit("new", "p\nq"),
+                        now - chrono::Duration::minutes(10)).await;
+    // A shell call that failed at 17:00 yesterday, agent time.
+    let seventeen = chrono::Timelike::with_hour(&(now - chrono::Duration::days(1)), 17).expect("17:00");
+    log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "f1", "name": "Bash", "input": {"command": "cargo test"}}]}
+    }), seventeen).await;
+    log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "f1", "is_error": true, "content": "boom"}]}
+    }), seventeen + chrono::Duration::seconds(5)).await;
+
+    let hour = superx_mod_ui::stats::stats_for_range(&kernel, 500, "1h").await.expect("1h");
+    assert_eq!(hour.lines_added, 2, "only the work that happened in the last hour");
+    assert!(!hour.truncated);
+    let week = superx_mod_ui::stats::stats_for_range(&kernel, 500, "7d").await.expect("7d");
+    assert_eq!(week.lines_added, 7, "both edits happened inside seven days");
+    let all = superx_mod_ui::stats::stats_for_range(&kernel, 500, "all").await.expect("all");
+    assert_eq!(all.lines_added, 7);
+
+    // The failure sits in the hour the agent saw it.
+    let bucket = week.fail_by_hour.iter().find(|h| h.failures > 0).expect("a failure bucket");
+    assert_eq!(bucket.hour, 17, "{:?}", week.fail_by_hour);
+    assert_eq!(week.fail_by_hour.iter().map(|h| h.failures).sum::<i64>(), 1);
+}
+
+/// The fixed window is by definition the newest N and never a sample.
+/// Every other range is one the moment the row cap cuts it short —
+/// `all` included, which has no cutoff but has the cap, and used to
+/// report "every row in range" over a 20,000-row sample of 39,000
+/// (#372).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_range_but_the_window_admits_its_row_cap() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    for _ in 0..3 {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "message": {"model": "claude-opus-5", "content": []}})).await;
+    }
+    let s = |range: &'static str, cap: u32| {
+        superx_mod_ui::stats::stats_for_range_capped(&kernel, 2, range, cap)
+    };
+    assert!(s("all", 2).await.expect("all").truncated, "three rows, cap two: a sample");
+    assert!(s("24h", 2).await.expect("24h").truncated);
+    assert!(!s("all", 20).await.expect("all").truncated, "room for every row");
+    assert!(!s("window", 2).await.expect("window").truncated, "the newest N is never a sample");
+}

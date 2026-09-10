@@ -26,6 +26,10 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
 
   const outcomes = s?.tool_outcomes ?? []
   const byHour = s?.fail_by_hour ?? []
+  // A zero here has never once been a measurement: the substrate holds
+  // no `durationMs` because the adapter does not capture the lines
+  // that carry it (#373). Unknown reads as unknown, not as 0s.
+  const waitsKnown = n(s?.wait_ms_total) > 0 || (s?.slowest?.length ?? 0) > 0
   const hours = Array.from({ length: 24 }, (_, h) => h)
   const hourRate = hours.map((h) => {
     const row = byHour.find((r) => n(r.hour) === h)
@@ -115,9 +119,18 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
               Waiting on operations
             </Text>
             <SimpleGrid cols={2} spacing="xs">
-              <Counter label="Total wait" value={fmtMs(s?.wait_ms_total)} tip="wall-clock the agents spent inside long operations, summed" />
-              <Counter label="Median / p95" value={`${fmtMs(s?.wait_ms_median)} / ${fmtMs(s?.wait_ms_p95)}`} />
+              <Counter
+                label="Total wait"
+                value={waitsKnown ? fmtMs(s?.wait_ms_total) : '—'}
+                tip="wall-clock the agents spent inside long operations, summed"
+              />
+              <Counter label="Median / p95" value={waitsKnown ? `${fmtMs(s?.wait_ms_median)} / ${fmtMs(s?.wait_ms_p95)}` : '—'} />
             </SimpleGrid>
+            {!waitsKnown && (
+              <Text size="xs" c="dimmed" mt={4}>
+                no operation timings in the substrate — the lines that carry them are not captured yet (#373)
+              </Text>
+            )}
             {(s?.slowest?.length ?? 0) > 0 && (
               <>
                 <Text size="xs" c="dimmed" tt="uppercase" mt="sm" mb={4} style={{ letterSpacing: 0.4 }}>
