@@ -20,7 +20,11 @@ last_tool: string | null, messages: bigint, lines_added: bigint,
  * Lines this session replaced. Added alone reads `0` for a
  * session deep in a rewrite (#343).
  */
-lines_removed: bigint, out_tokens: bigint, tool_failures: bigint, 
+lines_removed: bigint, 
+/**
+ * Its writes whose replaced half is unknown (#383).
+ */
+replaced_unknown: bigint, out_tokens: bigint, tool_failures: bigint, 
 /**
  * Seconds since its newest message.
  */

@@ -12,7 +12,10 @@ import { BANDS, CANCEL, FAIL, Gauge, HIGH_GOOD, LOW_GOOD, fmtCompact, n, pct } f
 export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: InsightsSummary | undefined; range: string | null }) {
   const added = n(s?.lines_added)
   const replaced = n(s?.lines_removed)
-  const churn = pct(replaced, added + replaced)
+  // Nothing replaced on the line but edits of unknown replaced size
+  // (#383): the needle has nothing true to point at.
+  const unknown = n(s?.replaced_unknown)
+  const churn = replaced === 0 && unknown > 0 ? null : pct(replaced, added + replaced)
 
   const directed = n(s?.churn_directed)
   const self = n(s?.churn_self)
@@ -41,14 +44,20 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
         label="Churn"
         value={s ? churn : null}
         bands={LOW_GOOD}
-        sub={s && churn != null ? `${fmtCompact(added)} added · ${fmtCompact(replaced)} replaced` : 'no code moved'}
+        sub={
+          s && churn != null
+            ? `${fmtCompact(added)} added · ${fmtCompact(replaced)} replaced${unknown > 0 ? ` · ${unknown} of unknown size` : ''}`
+            : unknown > 0
+              ? `${fmtCompact(added)} added · ${unknown} edits of unknown size`
+              : 'no code moved'
+        }
         tip={`replaced ÷ (added + replaced) over ${rangeNote}. 0% is all new code; past ${BANDS.churnBad}% the window spent itself rewriting.`}
       />
       <Gauge
         label="On course"
         value={s ? onCourse : null}
         bands={[[BANDS.directedBad / 100, FAIL], [BANDS.directedOk / 100, CANCEL], [1, OK]]}
-        sub={s && onCourse != null ? `${fmtCompact(directed)} directed · ${fmtCompact(self)} self` : 'nothing rewritten'}
+        sub={s && onCourse != null ? `${fmtCompact(directed)} directed · ${fmtCompact(self)} self` : unknown > 0 ? `${unknown} rewrites of unknown size` : 'nothing rewritten'}
         tip="share of replaced lines that followed a human instruction. Low means the agents are rewriting themselves with nobody steering."
       />
       <Gauge

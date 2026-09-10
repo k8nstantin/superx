@@ -59,6 +59,13 @@ lines_added: bigint,
  */
 lines_removed: bigint, 
 /**
+ * Writes whose replaced half is UNKNOWN — a shell edit or a
+ * notebook cell replaced text that is not on the line (#383).
+ * Every ratio built on `lines_removed` must say so rather than
+ * read these as zero.
+ */
+replaced_unknown: bigint, 
+/**
  * Distinct files the window touched.
  */
 files_touched: bigint, 

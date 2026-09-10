@@ -250,7 +250,7 @@ export function FlightDeck({
                       </Table.Td>
                       <Table.Td ta="right">{String(l.messages)}</Table.Td>
                       <Table.Td ta="right">
-                        <Churn added={l.lines_added} removed={l.lines_removed} />
+                        <Churn added={l.lines_added} removed={l.lines_removed} unknown={l.replaced_unknown} />
                       </Table.Td>
                       <Table.Td ta="right">{fmtCompact(l.out_tokens)}</Table.Td>
                       <Table.Td ta="right" c={n(l.tool_failures) > 0 ? 'red.4' : undefined}>
