@@ -27,10 +27,21 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
 
   const added = n(s?.lines_added)
   const replaced = n(s?.lines_removed)
-  const churnPct = pct(replaced, added + replaced)
+  // Shell edits and notebook cells replace text that is not on the line
+  // (#383): with nothing else replaced the ratio is unknown, not 0%.
+  const unknown = n(s?.replaced_unknown)
+  const churnPct = replaced === 0 && unknown > 0 ? null : pct(replaced, added + replaced)
   const churnTone = churnPct == null ? undefined : churnPct >= BANDS.churnBad ? FAIL : churnPct >= BANDS.churnOk ? CANCEL : OK
-  const churnRead =
+  const churnBand =
     churnPct == null ? '' : churnPct >= BANDS.churnBad ? 'mostly rewriting' : churnPct >= BANDS.churnOk ? 'revising as it goes' : 'mostly new code'
+  const churnRead =
+    churnPct == null
+      ? unknown > 0
+        ? `${unknown} edit${unknown === 1 ? '' : 's'} replaced an unknown number of lines`
+        : ''
+      : unknown > 0
+        ? `${churnBand} · ${unknown} more edit${unknown === 1 ? '' : 's'} of unknown size`
+        : churnBand
   const tokensPerLine = s && added > 0 ? Math.round(n(s.out_tokens_window) / added) : null
   const testsPer100 = s && added > 0 ? Math.round((n(s.tests_run) * 100 * 10) / added) / 10 : null
 
@@ -63,7 +74,7 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
                 <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
                   Added · replaced
                 </Text>
-                <Churn added={s?.lines_added} removed={s?.lines_removed} fz={30} />
+                <Churn added={s?.lines_added} removed={s?.lines_removed} unknown={s?.replaced_unknown} fz={30} />
               </div>
             </Group>
             <SimpleGrid cols={2} spacing="xs" mb="sm">

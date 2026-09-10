@@ -296,30 +296,51 @@ export function Counter({
 export function Churn({
   added,
   removed,
+  unknown,
   size = 'sm',
   fz,
 }: {
   added: number | bigint | null | undefined
   removed: number | bigint | null | undefined
+  /** Writes whose replaced half is unknown — shell edits, notebook
+   *  cells (#383). Rendered as `−?`, never as zero. */
+  unknown?: number | bigint | null
   size?: 'xs' | 'sm' | 'md'
   fz?: number
 }) {
   const a = n(added)
   const r = n(removed)
-  if (a === 0 && r === 0)
+  const u = n(unknown)
+  if (a === 0 && r === 0 && u === 0)
     return (
       <Text size={size} c="dimmed" span>
         —
       </Text>
     )
+  const unknownTip = `${u} edit${u === 1 ? '' : 's'} replaced an unknown number of lines — a shell edit or a notebook cell carries only what it wrote`
   return (
     <Group gap={6} wrap="nowrap" justify="flex-end" style={{ display: 'inline-flex' }}>
       <Text size={size} fz={fz} fw={fz ? 700 : undefined} ff={MONO} c={OK} span>
         +{fmtCompact(a)}
       </Text>
-      <Text size={size} fz={fz} fw={fz ? 700 : undefined} ff={MONO} c={FAIL} span>
-        −{fmtCompact(r)}
-      </Text>
+      {r === 0 && u > 0 ? (
+        <Tooltip label={unknownTip} withArrow multiline w={260}>
+          <Text size={size} fz={fz} fw={fz ? 700 : undefined} ff={MONO} c="dimmed" span>
+            −?
+          </Text>
+        </Tooltip>
+      ) : (
+        <Text size={size} fz={fz} fw={fz ? 700 : undefined} ff={MONO} c={FAIL} span>
+          −{fmtCompact(r)}
+          {u > 0 && (
+            <Tooltip label={unknownTip} withArrow multiline w={260}>
+              <Text span c="dimmed" fz={fz ? Math.round(fz * 0.6) : undefined}>
+                +?
+              </Text>
+            </Tooltip>
+          )}
+        </Text>
+      )}
     </Group>
   )
 }

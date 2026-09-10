@@ -147,6 +147,11 @@ pub struct StatsSummary {
     /// Lines they REPLACED — an Edit's `old_string`, which the
     /// previous `lines_written` figure could not see.
     pub lines_removed: i64,
+    /// Writes whose replaced half is UNKNOWN — a shell edit or a
+    /// notebook cell replaced text that is not on the line (#383).
+    /// Every ratio built on `lines_removed` must say so rather than
+    /// read these as zero.
+    pub replaced_unknown: i64,
     /// Distinct files the window touched.
     pub files_touched: i64,
     /// Write/Edit calls vs Read calls — the make/inspect ratio.
@@ -350,6 +355,8 @@ pub struct LiveSession {
     /// Lines this session replaced. Added alone reads `0` for a
     /// session deep in a rewrite (#343).
     pub lines_removed: i64,
+    /// Its writes whose replaced half is unknown (#383).
+    pub replaced_unknown: i64,
     pub out_tokens: i64,
     pub tool_failures: i64,
     /// Seconds since its newest message.

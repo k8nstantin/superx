@@ -2150,6 +2150,7 @@ async fn notebook_edits_count_their_lines_and_their_file() {
 
     assert_eq!(s.lines_added, 5, "3 replaced-in + 1 inserted + 0 deleted + 1 default-replace");
     assert_eq!(s.lines_removed, 0, "the prior cell text is not in the call — none invented");
+    assert_eq!(s.replaced_unknown, 3, "replace, delete and the default replace; not the insert (#383)");
     assert_eq!(s.writes_window, 4, "every NotebookEdit is a write, the delete included");
     assert_eq!(s.reads_window, 1);
 
@@ -2290,6 +2291,7 @@ async fn shell_edits_count_as_writing() {
     assert_eq!(s.writes_window, 3, "the heredoc, the script and sed -i");
     assert_eq!(s.lines_added, 3, "only the heredoc's lines are on the line");
     assert_eq!(s.lines_removed, 0, "what a shell edit replaced is unknown, not zero");
+    assert_eq!(s.replaced_unknown, 3, "and the page can say so: three edits of unknown replaced size (#383)");
     assert_eq!(s.reads_window, 1, "the piped grep is reading; a sink is not a file");
     assert_eq!(s.tests_run, 2, "both cargo test runs still count");
 
@@ -2305,6 +2307,7 @@ async fn shell_edits_count_as_writing() {
     assert_eq!(s.live.len(), 1);
     let row = &s.live[0];
     assert_eq!(row.lines_added, 3);
+    assert_eq!(row.replaced_unknown, 3);
     for f in ["/w/superx/src/gen.rs", "/w/superx/src/stats.rs", "/w/superx/src/lib.rs"] {
         assert!(row.files_now.iter().any(|x| x == f), "{f} not on the live row: {:?}", row.files_now);
     }

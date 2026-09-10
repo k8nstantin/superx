@@ -686,6 +686,9 @@ fn top_n(map: HashMap<String, i64>, n: usize) -> Vec<NameCount> {
 struct CodeAgg {
     lines_added: i64,
     lines_removed: i64,
+    /// Writes whose replaced half is unknown — shell edits, notebook
+    /// cells — so no ratio built on `lines_removed` reads them as zero (#383).
+    replaced_unknown: i64,
     writes: i64,
     reads: i64,
     tests: i64,
@@ -1105,6 +1108,7 @@ struct LiveAgg {
     messages: i64,
     lines_added: i64,
     lines_removed: i64,
+    replaced_unknown: i64,
     out_tokens: i64,
     tool_failures: i64,
     newest: Option<chrono::DateTime<chrono::Utc>>,
@@ -2141,6 +2145,16 @@ pub async fn stats_for_range_capped(
                             if let Some(Value::Object(input)) = block.get("input") {
                                 let n = block_lines(&name, input);
                                 let replaced = replaced_lines(&name, input);
+                                // A notebook cell replaced or deleted had a
+                                // prior text the call never carried — a write
+                                // of unknown replaced size (#346, #383).
+                                if name == "NotebookEdit" && get_str(input, "edit_mode") != Some("insert") {
+                                    code.replaced_unknown += 1;
+                                    code.live
+                                        .entry(superx_ops::record_uuid(&m.session))
+                                        .or_default()
+                                        .replaced_unknown += 1;
+                                }
                                 if n > 0 || replaced > 0 {
                                     let hour = when.format("%Y-%m-%dT%H").to_string();
                                     let slot = code.churn.entry(hour).or_insert((0, 0));
@@ -2406,6 +2420,7 @@ pub async fn stats_for_range_capped(
                                             // and stay unclaimed.
                                             let n = w.added;
                                             code.writes += 1;
+                                            code.replaced_unknown += 1;
                                             let sid = superx_ops::record_uuid(&m.session);
                                             if n > 0 {
                                                 let hour = when.format("%Y-%m-%dT%H").to_string();
@@ -2438,6 +2453,7 @@ pub async fn stats_for_range_capped(
                                             code.verify_events.entry(sid.clone()).or_default().push((when, true));
                                             let l = code.live.entry(sid).or_default();
                                             l.lines_added += n;
+                                            l.replaced_unknown += 1;
                                             claim_doing(l, "writing");
                                             for path in &w.paths {
                                                 *l.path_hits.entry(path.clone()).or_insert(0) += 1;
@@ -2881,6 +2897,7 @@ pub async fn stats_for_range_capped(
         top_sessions,
         lines_added: code.lines_added,
         lines_removed: code.lines_removed,
+        replaced_unknown: code.replaced_unknown,
         files_touched: code.files.len() as i64,
         writes_window: code.writes,
         reads_window: code.reads,
@@ -3155,6 +3172,7 @@ pub async fn stats_for_range_capped(
                         messages: l.messages,
                         lines_added: l.lines_added,
                         lines_removed: l.lines_removed,
+                        replaced_unknown: l.replaced_unknown,
                         out_tokens: l.out_tokens,
                         tool_failures: l.tool_failures,
                         idle_secs: idle,
