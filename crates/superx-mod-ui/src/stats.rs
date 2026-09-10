@@ -1224,6 +1224,23 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
 pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Result<StatsSummary> {
+    stats_for_range_capped(kernel, window, range, RANGE_ROW_CAP).await
+}
+
+/// [`stats_for_range`] with the time-bounded ranges' row cap as a
+/// parameter — the production cap is far more rows than a test wants
+/// to write, and the cap's one observable effect (`truncated`) is
+/// worth asserting (#372).
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn stats_for_range_capped(
+    kernel: &Kernel,
+    window: u32,
+    range: &str,
+    row_cap: u32,
+) -> Result<StatsSummary> {
     // ── cheap in-engine totals ──────────────────────────────────────
     let events_total =
         count_rows(kernel, "SELECT count() AS c FROM telemetry_stream GROUP ALL").await?;
@@ -1292,15 +1309,30 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
 
     // ── the raw-message window walk: what the agents actually did ──
     let cutoff = range_cutoff(range);
-    let cap = if range == "window" { window } else { RANGE_ROW_CAP };
+    let cap = if range == "window" { window } else { row_cap };
     let since = cutoff.map(|d| chrono::Utc::now() - d);
-    let msgs = walk_messages(kernel, since, cap, RANGE_PAGE).await?;
+    let mut msgs = walk_messages(kernel, since, cap, RANGE_PAGE).await?;
     // The altitude gauge's ceiling (#367), resolved once per request.
     let context_window = crate::resolved_context_window(kernel).await;
-    // Truncation is only meaningful for a time-bounded range: the
-    // fixed window is BY DEFINITION the newest N, so reporting it as
-    // "sampled" on the default view was just wrong (review of #330).
-    let truncated = cutoff.is_some() && msgs.len() as u32 >= cap;
+    // Truncation is judged on the walk itself, before the clock filter
+    // below: a capped walk is a sample whatever the filter keeps. The
+    // fixed window is BY DEFINITION the newest N and never a sample
+    // (review of #330); every other range — `all` included, which has
+    // no cutoff but has the cap — is one the moment the cap cut it
+    // short. `all` used to say "every row in range" over a 20,000-row
+    // sample of 39,000 (#372).
+    let truncated = range != "window" && msgs.len() as u32 >= cap;
+    // Range MEMBERSHIP follows the agent's clock, as every hour-graded
+    // figure has since #340. The walk's `valid_from > since` stays as
+    // the cheap bound — a row cannot be captured before it was emitted,
+    // so nothing in range lies outside it — and here the rows whose
+    // work happened before the range are dropped. Without this, a
+    // restart that backfills six days of transcripts puts all six
+    // inside "last hour": `1h` and `24h` returned byte-identical
+    // payloads while clock coverage said 1/24 (#372).
+    if let Some(s) = since {
+        msgs.retain(|m| m.emitted_at.unwrap_or(m.valid_from) > s);
+    }
 
     // Churn has two very different causes (operator insight, #337):
     // the agent rewriting its own work, or the design moving under it.
@@ -1388,12 +1420,11 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             code.efforts.entry(e.clone()).or_default().messages += 1;
         }
         let hour_key = when.format("%Y-%m-%dT%H").to_string();
-        let hour_of_day: i64 = m
-            .valid_from
-            .format("%H")
-            .to_string()
-            .parse()
-            .unwrap_or(0);
+        // On `when`, not `valid_from`: the failure-by-hour-of-day series
+        // (#328, first drawn in #369) put every backfilled call into the
+        // hour of the backfill — one bar at 09 for six days of work
+        // (#372).
+        let hour_of_day = i64::from(chrono::Timelike::hour(&when));
 
         // The 24×7 picture (#337): every session's span in the range.
         {
