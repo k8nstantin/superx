@@ -2,6 +2,7 @@ import { Grid, Group, SimpleGrid, Table, Text } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
 import { BANDS, CANCEL, Counter, FAIL, Meter, OK, Panel, Stat, UNKNOWN, fmtAge, fmtCompact, fmtMs, n, pct, rangeLabel } from './parts'
+import { openSession } from '../../route'
 
 // Did it hold (#367): what the commands reported, when it went wrong,
 // why the rewrites happened, and what the agents waited on.
@@ -239,7 +240,7 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
             </Table.Thead>
             <Table.Tbody>
               {(s?.compaction_sessions ?? []).slice(0, 8).map((c) => (
-                <Table.Tr key={c.identity}>
+                <Table.Tr key={c.session_id} onClick={() => openSession(c.session_id)} style={{ cursor: 'pointer' }} title="open this session's feed">
                   <Table.Td>
                     <Text size="xs" ff={MONO}>
                       {c.identity.slice(0, 20)}

@@ -12,6 +12,7 @@ import { Gauges } from './Gauges'
 import { HistorySection } from './HistorySection'
 import { QualitySection } from './QualitySection'
 import { Section, rangeLabel } from './parts'
+import { readHash, writeHash } from '../../route'
 import { SystemsSection } from './SystemsSection'
 
 // The cockpit (#367). One sticky bar carries the sections and the
@@ -44,8 +45,7 @@ const RANGES: [string, string][] = [
 /// The range lives in the URL hash so a reload — or a switch to another
 /// page and back — lands where you were.
 function hashRange(): string | null {
-  const m = /range=([a-z0-9]+)/.exec(window.location.hash)
-  const r = m?.[1] ?? null
+  const r = readHash().range ?? null
   return r && RANGES.some(([k]) => k === r) ? r : null
 }
 
@@ -64,7 +64,7 @@ export default function StatusPage() {
   const range = chosen ?? status.data?.default_range ?? null
   const setRange = useCallback((r: string) => {
     setChosen(r)
-    window.history.replaceState(null, '', `#range=${r}`)
+    writeHash({ ...readHash(), range: r })
   }, [])
   const stats = useQuery({
     queryKey: ['stats', range],

@@ -4,6 +4,7 @@ import type { StatsSummary } from '../../generated/StatsSummary'
 import { MONO } from '../../EChart'
 import { LivenessDot } from '../../LivenessDot'
 import { BANDS, Churn, CoverageStrip, FAIL, Panel, Stat, fmtAge, fmtCompact, n, type Tone } from './parts'
+import { openSession } from '../../route'
 
 // The flight deck (#367): one row per agent in the air, and the fleet
 // readings beside them. Everything here is a reading of right now and
@@ -103,7 +104,7 @@ export function FlightDeck({
         title="Running now"
         scope="live"
         range={null}
-        note="sessions with a message in the last five minutes · busiest first"
+        note="sessions with a message in the last five minutes · busiest first · click one to open its feed"
         mb="md"
       >
         {live.length === 0 ? (
@@ -155,7 +156,12 @@ export function FlightDeck({
                 {live.map((l) => {
                   const circling = n(l.self_churn_pct) >= BANDS.selfChurnBad || n(l.files_revisited) >= BANDS.revisitedBad
                   return (
-                    <Table.Tr key={l.identity}>
+                    <Table.Tr
+                      key={l.identity}
+                      onClick={() => openSession(l.identity)}
+                      style={{ cursor: 'pointer' }}
+                      title="open this session's feed"
+                    >
                       <Table.Td>
                         <Group gap={6} wrap="nowrap">
                           {/* Stated, not re-derived: the server already cut

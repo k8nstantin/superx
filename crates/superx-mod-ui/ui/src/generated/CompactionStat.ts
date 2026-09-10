@@ -6,7 +6,12 @@
  * records the trigger, how long it took and how much context was in
  * play when it fired.
  */
-export type CompactionStat = { identity: string, agent: string, repo: string | null, count: bigint, total_ms: bigint, median_ms: bigint, 
+export type CompactionStat = { identity: string, 
+/**
+ * The session's uuid — what a link to its feed needs (#378);
+ * `identity` is the display form.
+ */
+session_id: string, agent: string, repo: string | null, count: bigint, total_ms: bigint, median_ms: bigint, 
 /**
  * Largest context seen at a compaction — how close to the ceiling.
  */
