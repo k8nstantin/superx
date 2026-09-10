@@ -1,7 +1,7 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useDebouncedValue } from '@mantine/hooks'
-import { Badge, Button, Card, Group, Progress, ScrollArea, Table, Text, Title, Tooltip } from '@mantine/core'
+import { Alert, Badge, Button, Card, Group, Progress, ScrollArea, Table, Text, Title, Tooltip } from '@mantine/core'
 import { fetchAgents, fetchSessionActivity, fetchSessions } from '../api'
 import { useSse } from '../useSse'
 import { Feed, MAX_FEED_ROWS, matchesSearch, mergeFeed } from '../Feed'
@@ -10,18 +10,40 @@ import type { SseEvent } from '../generated/SseEvent'
 import type { SessionView } from '../generated/SessionView'
 import { useBreadcrumb } from '../Breadcrumbs'
 import { LivenessDot, liveness, type Liveness } from '../LivenessDot'
+import { openSession, readHash, sessionFromHash, writeHash } from '../route'
 
 export default function SessionsPage() {
-  const [selected, setSelected] = useState<SessionView | null>(null)
+  // Which session is open is the URL's to say (#378): the cockpit links
+  // here, a reload keeps the feed open, and Back returns to the list.
+  const sessions = useQuery({ queryKey: ['sessions'], queryFn: () => fetchSessions(), refetchInterval: 10000 })
+  const [wanted, setWanted] = useState<string | null>(sessionFromHash)
+  useEffect(() => {
+    const sync = () => setWanted(sessionFromHash())
+    window.addEventListener('hashchange', sync)
+    return () => window.removeEventListener('hashchange', sync)
+  }, [])
+  const selected = wanted ? ((sessions.data ?? []).find((s) => s.session_id === wanted) ?? null) : null
+  const back = useCallback(() => writeHash({ ...readHash(), session: undefined }, true), [])
   useBreadcrumb(
-    selected
-      ? [{ label: 'Sessions', onClick: () => setSelected(null) }, { label: selected.identity }]
-      : [{ label: 'Sessions' }],
+    selected ? [{ label: 'Sessions', onClick: back }, { label: selected.identity }] : [{ label: 'Sessions' }],
   )
-  return selected ? (
-    <SessionFeed session={selected} onBack={() => setSelected(null)} />
-  ) : (
-    <SessionList onOpen={setSelected} />
+  if (selected) {
+    return <SessionFeed session={selected} onBack={back} />
+  }
+  return (
+    <>
+      {wanted && sessions.isLoading && (
+        <Text size="sm" c="dimmed" mb="sm">
+          Reading the substrate for session {wanted}…
+        </Text>
+      )}
+      {wanted && !sessions.isLoading && (
+        <Alert color="orange" variant="light" mb="sm" title="No such session">
+          The substrate lists no session <Text span ff="monospace">{wanted}</Text>. Pick one below.
+        </Alert>
+      )}
+      <SessionList onOpen={(s) => openSession(s.session_id)} />
+    </>
   )
 }
 

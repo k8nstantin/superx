@@ -2495,7 +2495,8 @@ pub async fn stats_for_range_capped(
         .map(|(sid, mut c)| {
             let total: i64 = c.durations.iter().sum();
             CompactionStat {
-                identity: identity.get(&sid).cloned().unwrap_or(sid),
+                identity: identity.get(&sid).cloned().unwrap_or_else(|| sid.clone()),
+                session_id: sid,
                 agent: c.agent,
                 repo: c.repo,
                 count: c.durations.len() as i64,

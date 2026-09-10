@@ -3,6 +3,7 @@ import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
 import { sessionColor } from '../../Feed'
 import { BANDS, Churn, FAIL, OK, Panel, fmtAge, fmtCompact, fmtMs, n, pct } from './parts'
+import { openSession } from '../../route'
 
 // Who flew what (#367): agents, reasoning levels, models, branches and
 // repos compared on outcome rather than volume, the work cube, and the
@@ -365,7 +366,7 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                     const end = new Date(sp.end)
                     const mins = Math.max(0, Math.round((end.getTime() - start.getTime()) / 60_000))
                     return (
-                      <Table.Tr key={sp.identity}>
+                      <Table.Tr key={sp.identity} onClick={() => openSession(sp.identity)} style={{ cursor: 'pointer' }} title="open this session's feed">
                         <Table.Td>
                           <Group gap={6} wrap="nowrap">
                             <span style={{ width: 8, height: 8, borderRadius: 2, background: sessionColor(sp.identity), flexShrink: 0 }} />

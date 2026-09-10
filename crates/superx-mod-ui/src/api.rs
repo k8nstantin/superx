@@ -488,6 +488,9 @@ pub struct WorkCell {
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct CompactionStat {
     pub identity: String,
+    /// The session's uuid — what a link to its feed needs (#378);
+    /// `identity` is the display form.
+    pub session_id: String,
     pub agent: String,
     pub repo: Option<String>,
     pub count: i64,
