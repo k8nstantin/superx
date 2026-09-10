@@ -2046,3 +2046,114 @@ async fn module_health_reads_failures_and_last_event() {
     assert_eq!(ui.last_error, None);
     assert_eq!(i.module_health[0].name, "runner", "the module with the most to fix sorts first");
 }
+
+/// A message without a model — a tool_result, or an assistant turn
+/// whose model field is missing — attributes NOTHING to a model row.
+/// Half of #330's fix had landed: the message count skipped the
+/// sentinel while lines, tokens, failures and reverts still went to an
+/// `unknown` row with zero messages (#345).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_without_a_model_attributes_nothing_to_a_model_row() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+
+    // A model-less turn writes a line, spends tokens and runs a shell
+    // call that will fail…
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"usage": {"output_tokens": 500}, "content": [
+            {"type": "tool_use", "id": "n1", "name": "Edit",
+             "input": {"file_path": "/w/superx/src/b.rs",
+                       "old_string": "seed text that will be replaced later",
+                       "new_string": "keep this line here"}},
+            {"type": "tool_use", "id": "n2", "name": "Bash", "input": {"command": "cargo test"}}]}
+    })).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "n2", "is_error": true, "content": "boom"}]}
+    })).await;
+    // …and a real model then throws that line away — a revert that
+    // belongs to the model-less author, i.e. to nobody.
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "usage": {"output_tokens": 30}, "content": [
+            {"type": "tool_use", "id": "m1", "name": "Edit",
+             "input": {"file_path": "/w/superx/src/b.rs",
+                       "old_string": "keep this line here", "new_string": "a\nb\nc"}}]}
+    })).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // The work itself is all counted…
+    assert_eq!(s.lines_added, 4, "1 + 3");
+    assert_eq!(s.lines_removed, 2, "1 + 1");
+    assert_eq!(s.reverts, 1, "the model-less line was thrown away");
+
+    // …but only the model that exists has a row, carrying only its own.
+    let names: Vec<&str> = s.models.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["claude-opus-5"], "no sentinel row");
+    let opus = &s.models[0];
+    assert_eq!((opus.messages, opus.lines_added, opus.lines_removed), (1, 3, 1));
+    assert_eq!(opus.out_tokens, 30, "the 500 model-less tokens went to no row");
+    assert_eq!(opus.tool_failures, 0, "the model-less failure went to no row");
+    assert_eq!(opus.reverts, 0, "the model-less revert went to no row");
+
+    // The live row names the model that was seen, never the sentinel.
+    assert_eq!(s.live.len(), 1);
+    assert_eq!(s.live[0].model.as_deref(), Some("claude-opus-5"));
+}
+
+/// NotebookEdit was a write tool that wrote nothing: its text rides
+/// `new_source` and its file `notebook_path`, names neither counter
+/// nor path reader knew, so a session rewriting notebook cells read
+/// as idle (#346). Its replaced half is unknown by construction and
+/// is reported as none, not invented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notebook_edits_count_their_lines_and_their_file() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let nb = "/w/superx/nb/analysis.ipynb";
+
+    for input in [
+        serde_json::json!({"notebook_path": nb, "cell_id": "c1", "edit_mode": "replace",
+                           "new_source": "import x\ny = 1\nprint(y)"}),
+        serde_json::json!({"notebook_path": nb, "cell_id": "c1", "edit_mode": "insert",
+                           "cell_type": "markdown", "new_source": "# title"}),
+        serde_json::json!({"notebook_path": nb, "cell_id": "c2", "edit_mode": "delete",
+                           "new_source": ""}),
+        // The default edit_mode is replace.
+        serde_json::json!({"notebook_path": nb, "cell_id": "c3", "new_source": "z = 2"}),
+    ] {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "cwd": "/w/superx",
+            "message": {"model": "claude-opus-5", "content": [
+                {"type": "tool_use", "id": "e", "name": "NotebookEdit", "input": input}]}
+        })).await;
+    }
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "r", "name": "NotebookRead", "input": {"notebook_path": nb}}]}
+    })).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    assert_eq!(s.lines_added, 5, "3 replaced-in + 1 inserted + 0 deleted + 1 default-replace");
+    assert_eq!(s.lines_removed, 0, "the prior cell text is not in the call — none invented");
+    assert_eq!(s.writes_window, 4, "every NotebookEdit is a write, the delete included");
+    assert_eq!(s.reads_window, 1);
+
+    // The notebook is a file the agent touched, in its language, and
+    // it existed before the window — a cell edit is not a file created.
+    assert_eq!(s.files_touched, 1, "one notebook, however many cells");
+    // Languages count touches, as they do for every other extension.
+    assert_eq!(s.languages.iter().find(|l| l.name == "ipynb").map(|l| l.value), Some(5));
+    assert_eq!((s.files_created, s.files_modified), (0, 1));
+
+    // The live row shows the notebook under the agent's hands.
+    assert_eq!(s.live.len(), 1);
+    assert_eq!(s.live[0].lines_added, 5);
+    assert_eq!(s.live[0].files_now, vec![nb.to_string()]);
+}
