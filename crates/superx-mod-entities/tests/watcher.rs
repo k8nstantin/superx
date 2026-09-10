@@ -246,9 +246,10 @@ async fn a_role_that_watches_teams_and_texts_whatsapp() {
 /// day someone writes `if name == "role"`, that property is gone and
 /// this fails.
 ///
-/// Two names ARE known here, and only two — `name` and `archived` — and
-/// both are store concerns: what appears in a list, and what is hidden
-/// from one. Neither says what a thing IS.
+/// Three names ARE known here, and only three — `name`, `archived` and
+/// `is` — and all are store concerns: what appears in a list, what is
+/// hidden from one, and which row carries the entity's own labels.
+/// None of them says what a thing IS; the labels on the `is` row do.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_word_in_the_vocabulary_means_anything_to_the_module() {
     let db = fresh_db().await;
@@ -302,9 +303,9 @@ async fn no_word_in_the_vocabulary_means_anything_to_the_module() {
         "a label called `role` is worth exactly what a label called `zzz2` is worth"
     );
 
-    // And the two names that ARE known are known for storage reasons
-    // only: one decides what a thing is called, the other whether it is
-    // listed. Neither is asked what the thing IS.
+    // And the names that ARE known are known for storage reasons only:
+    // one decides what a thing is called, one whether it is listed, one
+    // which row to read its labels from. None is asked what the thing IS.
     let thing = entity::create(&db, "Thing", &op).await.expect("e");
     assert_eq!(entity::name_of(&db, &thing).await.expect("n").as_deref(), Some("Thing"));
     assert!(!entity::is_archived(&db, &thing).await.expect("a"));

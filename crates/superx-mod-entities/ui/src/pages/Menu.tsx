@@ -12,12 +12,24 @@ import {
   Group,
   Loader,
   NavLink,
+  Popover,
   Stack,
   Switch,
   Text,
   TextInput,
 } from '@mantine/core'
-import { createEntity, fetchChildren, fetchRoots, searchEntities, type TreeNodeView } from '../api'
+import {
+  LABEL,
+  createEntity,
+  declareLabels,
+  fetchAllEntities,
+  fetchChildren,
+  fetchEntity,
+  fetchRoots,
+  isLabel,
+  searchEntities,
+  type TreeNodeView,
+} from '../api'
 
 // THE MENU TAB: add entities, search them, and walk the graph.
 //
@@ -110,6 +122,8 @@ export default function MenuTab({
   const [term, setTerm] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [nodes, setNodes] = useState<Node[]>([])
+  const [naming, setNaming] = useState(false)
+  const [labelName, setLabelName] = useState('')
 
   const roots = useQuery({ queryKey: ['roots', archived], queryFn: () => fetchRoots(archived) })
 
@@ -172,6 +186,47 @@ export default function MenuTab({
       // The pickers list every entity, so a new one belongs in them
       // immediately — otherwise you create a label and cannot use it
       // until the page is reloaded.
+      void qc.invalidateQueries({ queryKey: ['all-entities'] })
+    },
+  })
+
+  // A LABEL IS AN ENTITY CARRYING `label` — and `label` is itself one,
+  // carrying itself. Nothing seeds it: a fresh instance has no
+  // vocabulary and, because a picker leaves out the entity itself, no
+  // way to mark the first word as a label. The live instance sat at
+  // four rows called Untitled for exactly this reason. So the first New
+  // label bootstraps the word `label`; every one after finds it there.
+  const newLabel = useMutation({
+    mutationFn: async (name: string) => {
+      // Archived included: a put-away `label` is still the word, and a
+      // second one would split the vocabulary in two.
+      const every = await fetchAllEntities(true)
+      let meta = every.find((e) => e.name === LABEL)?.uuid
+      if (!meta) {
+        meta = (await createEntity(LABEL)).uuid
+        await declareLabels(meta, [], [meta])
+      }
+      if (name.toLowerCase() === LABEL) return { uuid: meta, name: LABEL }
+      // ONE WORD, ONE ENTITY. Typing a name that already exists does not
+      // mint a second `role` beside the first — it makes THAT entity a
+      // label if it is not one yet, and opens it either way.
+      const same = every.find((e) => e.name === name)
+      if (same) {
+        if (!isLabel(same)) {
+          const detail = await fetchEntity(same.uuid)
+          await declareLabels(same.uuid, detail.attributes, [...same.labels.map((l) => l.uuid), meta])
+        }
+        return { uuid: same.uuid, name }
+      }
+      const made = await createEntity(name)
+      await declareLabels(made.uuid, [], [meta])
+      return { uuid: made.uuid, name }
+    },
+    onSuccess: (made) => {
+      setNaming(false)
+      setLabelName('')
+      onOpen(made.uuid, [{ uuid: made.uuid, name: made.name }])
+      void qc.invalidateQueries({ queryKey: ['roots'] })
       void qc.invalidateQueries({ queryKey: ['all-entities'] })
     },
   })
@@ -249,6 +304,50 @@ export default function MenuTab({
           <Button onClick={() => add.mutate()} loading={add.isPending} leftSection="+" size="sm">
             New entity
           </Button>
+          <Popover
+            opened={naming}
+            onChange={setNaming}
+            trapFocus
+            withArrow
+            position="bottom-start"
+            width={300}
+          >
+            <Popover.Target>
+              <Button variant="light" size="sm" onClick={() => setNaming((o) => !o)}>
+                New label
+              </Button>
+            </Popover.Target>
+            <Popover.Dropdown>
+              <TextInput
+                data-autofocus
+                label="New label"
+                description="what a thing IS — role, task, credential, resource"
+                placeholder="role"
+                value={labelName}
+                onChange={(e) => setLabelName(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && labelName.trim() && !newLabel.isPending) {
+                    newLabel.mutate(labelName.trim())
+                  }
+                }}
+              />
+              <Group justify="flex-end" mt="xs">
+                <Button
+                  size="xs"
+                  loading={newLabel.isPending}
+                  disabled={!labelName.trim()}
+                  onClick={() => newLabel.mutate(labelName.trim())}
+                >
+                  Create
+                </Button>
+              </Group>
+              {newLabel.error && (
+                <Text c="red" size="xs" mt="xs">
+                  {String(newLabel.error)}
+                </Text>
+              )}
+            </Popover.Dropdown>
+          </Popover>
           <Box style={{ flex: 1, minWidth: 0 }}>
             <Breadcrumbs
               separator="›"

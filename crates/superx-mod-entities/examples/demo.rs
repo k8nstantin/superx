@@ -2,11 +2,13 @@
 //! database, so the dashboard can be driven without a provisioned
 //! instance.
 //!
-//! `cargo run -p superx-mod-entities --example demo`
+//! `cargo run -p superx-mod-entities --example demo [port] [--empty]`
 //!
 //! It seeds the operator's own example — a DBA role with a vocabulary,
 //! fields and a four-deep graph — so there is something real to look at
-//! the moment the page loads.
+//! the moment the page loads. `--empty` skips the seed: a freshly
+//! provisioned instance has no vocabulary at all, and the way the UI
+//! bootstraps one is a thing that has to be seen working.
 
 use superx_mod_entities::attribute::{self, Write};
 use superx_mod_entities::author::Author;
@@ -24,15 +26,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.use_ns("superx").use_db("entities").await?;
     db.query(SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "demo")).await?.check()?;
 
-    seed(&db).await?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.iter().any(|a| a == "--empty") {
+        seed(&db).await?;
+    }
 
     let kernel = superx_kernel::Kernel::from_db(db.clone());
     // Never assume the module's real port is free: an instance may
     // already own it, and binding over a live service is not something a
     // demo should be able to attempt.
-    let port: u16 = std::env::args()
-        .nth(1)
-        .and_then(|p| p.parse().ok())
+    let port: u16 = args
+        .iter()
+        .find_map(|p| p.parse().ok())
         .unwrap_or(DEMO_PORT);
     superx_mod_entities::serve(&kernel, db, port).await?;
     println!("entities dashboard: http://127.0.0.1:{port}");
@@ -43,7 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn seed(db: &superx_kernel::Db) -> Result<(), Box<dyn std::error::Error>> {
     let op = Author::operator();
+    // `label` carries itself: an entity that has `label` attached is a
+    // label, and the word is no exception — which is also what the UI
+    // writes when it bootstraps the vocabulary on a fresh instance.
     let label = entity::create(db, "label", &op).await?;
+    entity::declare(db, &label, "is", std::slice::from_ref(&label), &op).await?;
     let make_label = |name: &'static str| {
         let db = db.clone();
         let label = label.clone();

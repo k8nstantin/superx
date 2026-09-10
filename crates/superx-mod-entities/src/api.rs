@@ -32,8 +32,10 @@ pub struct AttributeView {
     /// labels, which is how it says what the entity IS.
     #[ts(type = "unknown")]
     pub content: serde_json::Value,
-    /// Label uuids. What they MEAN is on the label entity itself.
-    pub labels: Vec<String>,
+    /// What this attribute IS — named, so the browser can draw the chip
+    /// and offer to remove it without a second request. What a label
+    /// MEANS is on the label entity itself.
+    pub labels: Vec<LabelView>,
     /// Per-field overrides — a width, a placeholder.
     #[ts(type = "unknown")]
     pub options: serde_json::Value,
@@ -182,7 +184,10 @@ pub async fn detail(db: &Db, fragment: &str) -> Result<EntityView> {
     }
     let name = entity::name_in(&attributes).unwrap_or_default();
     let archived = entity::archived_in(&attributes);
-    let views: Vec<AttributeView> = attributes.into_iter().map(attribute_view).collect();
+    let mut views = Vec::with_capacity(attributes.len());
+    for a in attributes {
+        views.push(attribute_view(db, &mut names, a).await?);
+    }
     Ok(EntityView {
         uuid: record_uuid(&id),
         name,
@@ -575,17 +580,21 @@ fn from_json(datatype: &str, c: &serde_json::Value) -> Result<Value> {
     Ok(Value::Datetime(parsed.with_timezone(&chrono::Utc).into()))
 }
 
-fn attribute_view(a: attribute::Attribute) -> AttributeView {
-    AttributeView {
+async fn attribute_view(
+    db: &Db,
+    names: &mut NameCache,
+    a: attribute::Attribute,
+) -> Result<AttributeView> {
+    Ok(AttributeView {
+        labels: names.views(db, &a.labels).await?,
         uid: a.uid,
         name: a.name,
         datatype: a.datatype,
         content: a.content.as_ref().map_or(serde_json::Value::Null, to_json),
-        labels: a.labels.iter().map(record_uuid).collect(),
         options: a.options.as_ref().map_or(serde_json::Value::Null, to_json),
         active: a.active,
         version: a.version,
-    }
+    })
 }
 
 /// Render a dynamic value as JSON for the browser.
