@@ -38,16 +38,43 @@ export function Editor({
   value,
   json,
   onSave,
+  onDone,
+  autoFocus,
 }: {
   value: unknown
   json: boolean
   onSave: (v: unknown) => void
+  /** Leave the editor without saving — the card goes back to its preview. */
+  onDone?: () => void
+  /** Put the caret in the text the moment the editor is ready. */
+  autoFocus?: boolean
 }) {
   if (json) return <JsonEditor value={value} onSave={onSave} />
-  return <ProseEditor value={typeof value === 'string' ? value : ''} onSave={onSave} />
+  return (
+    <ProseEditor
+      value={typeof value === 'string' ? value : ''}
+      onSave={onSave}
+      onDone={onDone}
+      autoFocus={autoFocus}
+    />
+  )
 }
 
-function ProseEditor({ value, onSave }: { value: string; onSave: (v: string) => void }) {
+// MOUNTED ON DEMAND. A card shows its prose as a preview and asks for this
+// editor when clicked; a screen of fifty text fields no longer boots fifty
+// editors (eleven of them cost over a second on the 43-field product), and
+// a card can be as short as its text rather than as tall as a toolbar.
+function ProseEditor({
+  value,
+  onSave,
+  onDone,
+  autoFocus,
+}: {
+  value: string
+  onSave: (v: string) => void
+  onDone?: () => void
+  autoFocus?: boolean
+}) {
   const editor = useCreateBlockNote()
   const [ready, setReady] = useState(false)
 
@@ -61,13 +88,14 @@ function ProseEditor({ value, onSave }: { value: string; onSave: (v: string) => 
       if (!cancelled) {
         editor.replaceBlocks(editor.document, blocks)
         setReady(true)
+        if (autoFocus) editor.focus()
       }
     })()
     return () => {
       cancelled = true
     }
     // Only on mount, and when the stored value changes underneath us.
-  }, [editor, value])
+  }, [editor, value, autoFocus])
 
   return (
     <>
@@ -90,10 +118,15 @@ function ProseEditor({ value, onSave }: { value: string; onSave: (v: string) => 
           <BlockNoteViewEditor />
         </BlockNoteView>
       </div>
-      <Group justify="flex-end" mt={4}>
+      <Group justify="flex-end" mt={4} gap={4}>
+        {onDone && (
+          <Button size="compact-xs" variant="subtle" color="gray" onClick={onDone}>
+            Done
+          </Button>
+        )}
         <Button
           size="compact-xs"
-          variant="subtle"
+          variant="light"
           disabled={!ready}
           onClick={() => {
             void Promise.resolve(editor.blocksToHTMLLossy(editor.document)).then(onSave)
