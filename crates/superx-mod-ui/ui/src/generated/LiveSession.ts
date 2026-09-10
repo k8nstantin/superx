@@ -48,6 +48,11 @@ context_pct: bigint | null,
  */
 files_now: Array<string>, 
 /**
+ * The newest thing this session shipped — `PR #384 merged`,
+ * `commit 5db4a18`, `pushed` — and when, RFC3339 (#381).
+ */
+shipped: string | null, shipped_at: string | null, 
+/**
  * A classified state rather than a raw tool name: `writing`,
  * `verifying`, `reading`, `thinking`, `waiting`. `Bash` alone
  * does not distinguish `cargo test` from `ls`.

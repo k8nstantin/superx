@@ -43,6 +43,9 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
         ? `${churnBand} · ${unknown} more edit${unknown === 1 ? '' : 's'} of unknown size`
         : churnBand
   const tokensPerLine = s && added > 0 ? Math.round(n(s.out_tokens_window) / added) : null
+  // The cost of a shipped unit (#381): what the range's output tokens
+  // bought in merged PRs.
+  const tokensPerPr = s && n(s.prs_merged) > 0 ? Math.round(n(s.out_tokens_window) / n(s.prs_merged)) : null
   const testsPer100 = s && added > 0 ? Math.round((n(s.tests_run) * 100 * 10) / added) / 10 : null
 
   const wr = n(s?.writes_window)
@@ -120,6 +123,38 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
               Commands
             </Text>
             <BarList rows={s?.commands ?? []} color="var(--mantine-color-pelican-6)" mono empty="no shell calls in this range" />
+          </Panel>
+        </Grid.Col>
+      </Grid>
+
+      {/* Outcomes beside the effort (#381): what the range SHIPPED, and
+          what the repository said those commits carried. */}
+      <Grid mb="md" gap="md">
+        <Grid.Col span={12}>
+          <Panel
+            title="Shipped"
+            scope="range"
+            range={range}
+            note="commits, pushes and PRs read from the shell · lines as git reported them at commit"
+            h="100%"
+          >
+            <SimpleGrid cols={{ base: 3, md: 6 }} spacing="xs">
+              <Counter label="Commits" value={s?.commits} tone={OK} tip="git commit calls in the range" />
+              <Counter label="Pushes" value={s?.pushes} tip="git push calls" />
+              <Counter label="PRs opened" value={s?.prs_opened} tip="gh pr create calls" />
+              <Counter label="PRs merged" value={s?.prs_merged} tone={OK} tip="gh pr merge calls" />
+              <div>
+                <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
+                  Committed
+                </Text>
+                <Tooltip label="insertions and deletions git printed after each commit — churn as the repository saw it, however the edits were made; a quiet commit reports none" withArrow multiline w={280}>
+                  <span>
+                    <Churn added={s?.committed_added} removed={s?.committed_removed} size="md" />
+                  </span>
+                </Tooltip>
+              </div>
+              <Counter label="Tokens / merged PR" value={tokensPerPr} tip="output tokens in the range ÷ PRs merged — the cost of a shipped unit" />
+            </SimpleGrid>
           </Panel>
         </Grid.Col>
       </Grid>

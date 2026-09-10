@@ -112,7 +112,7 @@ export function FlightDeck({
             {loading ? 'Reading the substrate…' : 'No agent has spoken in the last five minutes.'}
           </Text>
         ) : (
-          <Table.ScrollContainer minWidth={1180}>
+          <Table.ScrollContainer minWidth={1320}>
             <Table striped highlightOnHover>
               <Table.Thead>
                 <Table.Tr>
@@ -131,6 +131,11 @@ export function FlightDeck({
                     </Tooltip>
                   </Table.Th>
                   <Table.Th>Files now</Table.Th>
+                  <Table.Th>
+                    <Tooltip label="the newest thing this session shipped — a commit, a push, a PR opened or merged (#381)" withArrow multiline w={240}>
+                      <span>Shipped</span>
+                    </Tooltip>
+                  </Table.Th>
                   <Table.Th ta="right">
                     <Tooltip
                       label={`unasked share of its own rewrites, and files it has come back to ${s?.revisit_at ?? 3} or more times — the compounding signal`}
@@ -230,6 +235,23 @@ export function FlightDeck({
                               {(l.files_now ?? []).map((f) => f.split('/').slice(-1)[0]).join(' · ')}
                             </Text>
                           </Tooltip>
+                        )}
+                      </Table.Td>
+                      <Table.Td>
+                        {l.shipped ? (
+                          <Tooltip label={l.shipped_at ?? ''} withArrow>
+                            <Text size="xs" style={{ whiteSpace: 'nowrap' }}>
+                              {l.shipped}
+                              <Text span size="xs" c="dimmed">
+                                {' · '}
+                                {fmtAge(l.shipped_at ? Math.round((Date.now() - new Date(l.shipped_at).getTime()) / 1000) : null)}
+                              </Text>
+                            </Text>
+                          </Tooltip>
+                        ) : (
+                          <Text size="xs" c="dimmed">
+                            —
+                          </Text>
                         )}
                       </Table.Td>
                       <Table.Td ta="right">

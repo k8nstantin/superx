@@ -183,6 +183,21 @@ pub struct StatsSummary {
     pub builds_run: i64,
     /// Shell calls that drove git.
     pub git_ops: i64,
+
+    // ── what shipped (#381) — outcomes beside the effort ──────────
+    /// `git commit` calls.
+    pub commits: i64,
+    /// `git push` calls.
+    pub pushes: i64,
+    /// `gh pr create` calls.
+    pub prs_opened: i64,
+    /// `gh pr merge` calls.
+    pub prs_merged: i64,
+    /// Lines git reported committed — the `insertions(+)` and
+    /// `deletions(-)` a commit prints. Churn as the repository saw it,
+    /// however the edits were made; `0` when every commit ran quiet.
+    pub committed_added: i64,
+    pub committed_removed: i64,
     /// Calls into MCP servers (`mcp__*`).
     pub mcp_calls: i64,
     /// Web fetches and searches.
@@ -375,6 +390,10 @@ pub struct LiveSession {
     /// row that names three files is legible; one that names none is
     /// a number.
     pub files_now: Vec<String>,
+    /// The newest thing this session shipped — `PR #384 merged`,
+    /// `commit 5db4a18`, `pushed` — and when, RFC3339 (#381).
+    pub shipped: Option<String>,
+    pub shipped_at: Option<String>,
     /// A classified state rather than a raw tool name: `writing`,
     /// `verifying`, `reading`, `thinking`, `waiting`. `Bash` alone
     /// does not distinguish `cargo test` from `ls`.
