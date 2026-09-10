@@ -11,7 +11,18 @@ import type { InsightsSummary } from './generated/InsightsSummary'
 
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(path)
-  if (!r.ok) throw new Error(`${path}: ${r.status}`)
+  if (!r.ok) {
+    // The server's error body carries the engine's own words
+    // (`{ is_error, output }`); a bare status hides them (#367).
+    let detail = ''
+    try {
+      const body = (await r.json()) as { output?: unknown }
+      if (typeof body.output === 'string') detail = body.output
+    } catch {
+      /* not JSON — the status is all there is */
+    }
+    throw new Error(detail ? `${path}: ${r.status} — ${detail}` : `${path}: ${r.status}`)
+  }
   return r.json() as Promise<T>
 }
 
@@ -33,7 +44,7 @@ export const fetchActivity = (limit = 500, before?: string, q?: string) =>
 export const fetchActions = (limit = 50) => get<ActionView[]>(`/api/actions?limit=${limit}`)
 export const fetchCharts = () => get<ChartsSummary>('/api/charts/summary')
 export const fetchStats = (range = 'window') =>
-  get<StatsSummary>(`/api/stats?range=${range}`)
+  get<StatsSummary>(`/api/stats?range=${encodeURIComponent(range)}`)
 export const fetchInsights = () => get<InsightsSummary>('/api/insights')
 
 export async function runCommand(argv: string[]): Promise<{ output: string; is_error: boolean }> {

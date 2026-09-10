@@ -13,6 +13,11 @@ pub struct StatusResponse {
     pub ui_version: String,
     pub agents: usize,
     pub modules: Vec<ModuleView>,
+    /// The range the cockpit lands on (#367): `attr_ui_default_range`
+    /// on this module's registry entity, else the module's fallback.
+    /// The landing view is the operator's decision, not a literal in
+    /// the page.
+    pub default_range: String,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -349,6 +354,14 @@ pub struct LiveSession {
     pub tool_failures: i64,
     /// Seconds since its newest message.
     pub idle_secs: i64,
+    /// Context in play at its newest usage-bearing message — fresh
+    /// input plus what the cache served and stored (#367). The one
+    /// reading a pilot needs before compaction hits; it lived on the
+    /// Sessions page and not here.
+    pub context_tokens: Option<i64>,
+    /// `context_tokens` against `attr_ui_context_window_tokens`,
+    /// clamped to 100 — the altitude gauge per aircraft.
+    pub context_pct: Option<i64>,
 
     // ── what it is doing RIGHT NOW (#350) ────────────────────────
     /// The paths its newest calls touched, most recent first. An idle
@@ -656,6 +669,27 @@ pub struct InsightsSummary {
     /// Age of the newest captured event — the capture-alive signal.
     pub last_event_secs: Option<i64>,
     pub events_last_hour: i64,
+    /// Per-module health from the lifecycle stream (#367): the
+    /// substrate held every `module_failed` and nothing read them.
+    pub module_health: Vec<ModuleHealth>,
+}
+
+/// One module's health, read off its lifecycle events (#367). The
+/// registry says what state a module is IN; this says what happened
+/// to it — when it last did anything, how often it has failed, and
+/// what it said when it did.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ModuleHealth {
+    pub name: String,
+    /// The newest lifecycle event and its age.
+    pub last_event: String,
+    pub last_event_secs: i64,
+    /// `module_failed` + `module_start_failed` + `module_start_abandoned`.
+    pub failures_recent: i64,
+    pub failures_total: i64,
+    /// The error text carried by the newest failure, when it had one.
+    pub last_error: Option<String>,
 }
 
 /// One cell of the hour × weekday grid. `weekday` is SurrealDB's

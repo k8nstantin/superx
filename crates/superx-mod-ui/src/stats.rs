@@ -90,12 +90,135 @@ fn block_lines(name: &str, input: &Object) -> i64 {
 /// bar). So every stage is returned, with the pure-navigation ones
 /// dropped.
 fn command_labels(cmd: &str) -> Vec<String> {
+    labelled_stages(cmd).into_iter().map(|(label, _)| label).collect()
+}
+
+/// Every labelled stage of a chain, with the stage text it was read
+/// from — the text is what says whether `sed` was `-n` or `-i`.
+fn labelled_stages(cmd: &str) -> Vec<(String, String)> {
     split_stages(&strip_heredocs(cmd))
         .iter()
         .map(|stage| strip_redirections(stage))
-        .filter_map(|stage| stage_label(&stage))
+        .filter_map(|stage| stage_label(&stage).map(|label| (label, stage)))
         .collect()
 }
+
+/// Programs that inspect and change nothing. A shell call whose every
+/// stage is one of these is the agent READING — the same act as a
+/// `Read` tool call, which was all `reads` counted. An instance whose
+/// agents read through the shell showed *make ↔ inspect · 100%
+/// writing* under a Commands list led by `head`, `grep`, `cat` and
+/// `sed` (#367).
+const INSPECT_PROGRAMS: [&str; 22] = [
+    "cat", "head", "tail", "less", "more", "sed", "awk", "grep", "egrep", "fgrep", "rg", "ag",
+    "find", "fd", "ls", "tree", "wc", "stat", "file", "jq", "yq", "diff",
+];
+
+/// git's and gh's read-only verbs, as `stage_label` writes them.
+const INSPECT_VERBS: [&str; 15] = [
+    "git log", "git status", "git diff", "git show", "git blame", "git rev-parse",
+    "git ls-files", "git describe", "git shortlog", "gh pr view", "gh pr list", "gh pr diff",
+    "gh pr checks", "gh issue view", "gh issue list",
+];
+
+/// Stages that say nothing about the work: prompts, separators and
+/// shell bookkeeping. Ignored when deciding what a call IS, and left
+/// out of the repeat key — `echo ---` a hundred times a day is
+/// scaffolding, not a fight (#367).
+const NOISE_PROGRAMS: [&str; 8] = ["echo", "printf", "true", "false", "pwd", "env", "which", "type"];
+
+fn is_noise(label: &str) -> bool {
+    NOISE_PROGRAMS.contains(&label)
+}
+
+/// Does this stage only look? `sed -i` and `awk -i inplace` write, so
+/// the stage text decides for them.
+fn stage_inspects(label: &str, stage: &str) -> bool {
+    if INSPECT_VERBS.contains(&label) {
+        return true;
+    }
+    if !INSPECT_PROGRAMS.contains(&label) {
+        return false;
+    }
+    let in_place = stage
+        .split_whitespace()
+        .skip(1)
+        .any(|w| w == "-i" || w.starts_with("-i.") || w.starts_with("--in-place") || w == "inplace");
+    !in_place
+}
+
+/// A shell call that is all inspection, once the noise is set aside.
+/// `cat x && cargo test` is a test run; `echo; echo` is nothing.
+fn shell_inspects(cmd: &str) -> bool {
+    let real: Vec<_> = labelled_stages(cmd)
+        .into_iter()
+        .filter(|(label, _)| !is_noise(label))
+        .collect();
+    !real.is_empty() && real.iter().all(|(label, stage)| stage_inspects(label, stage))
+}
+
+/// Paths an inspecting call read, so a `cat` counts as exposure the
+/// way a `Read` does. Path-shaped tokens only — something with a slash
+/// that is not a flag or a URL — resolved against `cwd` when relative.
+fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (label, stage) in labelled_stages(cmd) {
+        if is_noise(&label) || !stage_inspects(&label, &stage) {
+            continue;
+        }
+        for w in stage.split_whitespace().skip(1) {
+            let w = w.trim_matches(|c| c == '\'' || c == '"' || c == ',' || c == ';');
+            if w.starts_with('-') || !w.contains('/') || w.contains("://") || w.contains('*') {
+                continue;
+            }
+            let path = if w.starts_with('/') || w.starts_with('~') {
+                w.to_string()
+            } else if let Some(c) = cwd {
+                format!("{}/{}", c.trim_end_matches('/'), w.trim_start_matches("./"))
+            } else {
+                continue;
+            };
+            if !out.contains(&path) {
+                out.push(path);
+            }
+            if out.len() >= INSPECT_PATHS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Paths taken from one inspecting call, at most.
+const INSPECT_PATHS: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// The key a call repeats under: the whole line, noise stages dropped,
+/// whitespace folded, bounded. Keyed on the PROGRAM, `echo` won the
+/// "fighting something" badge every day on a live instance (#367).
+fn repeat_key(cmd: &str) -> Option<String> {
+    let stripped = strip_heredocs(cmd);
+    let real: Vec<String> = split_stages(&stripped)
+        .iter()
+        .map(|stage| strip_redirections(stage))
+        .filter(|stage| stage_label(stage).is_some_and(|label| !is_noise(&label)))
+        .map(|stage| stage.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    if real.is_empty() {
+        return None;
+    }
+    let mut key = real.join(" && ");
+    if key.len() > REPEAT_KEY_CHARS {
+        let cut = key
+            .char_indices()
+            .nth(REPEAT_KEY_CHARS)
+            .map_or(key.len(), |(i, _)| i);
+        key.truncate(cut);
+    }
+    Some(key)
+}
+
+/// Characters a repeat key keeps.
+const REPEAT_KEY_CHARS: usize = 160; // skill-allow: §9-const — read-path bound, not a policy tunable
 
 /// Split a command line into stages at the separators that are
 /// really separators.
@@ -412,6 +535,8 @@ struct CodeAgg {
     live: HashMap<String, LiveAgg>,
     languages: HashMap<String, i64>,
     commands: HashMap<String, i64>,
+    /// Whole command lines, for the repeat signal (#367).
+    command_lines: HashMap<String, i64>,
     projects: HashMap<String, i64>,
     /// Newest branch seen per project — the walk is newest-first, so
     /// the first one wins. Kept apart from the counter so a project
@@ -736,6 +861,9 @@ struct LiveAgg {
     doing: Option<String>,
     thinking_tokens: i64,
     last_op_ms: i64,
+    /// Context at the newest usage-bearing message — first sighting
+    /// wins, the walk being newest-first (#367).
+    context_tokens: Option<i64>,
     churn_directed: i64,
     churn_self: i64,
     /// How many times each path was written in this session, for the
@@ -769,6 +897,8 @@ fn claim_doing(l: &mut LiveAgg, state: &str) {
 /// which a file counts as revisited (#350).
 const LIVE_FILES: usize = 4; // skill-allow: §9-const — render-layer cap
 const REVISIT_AT: i64 = 3; // skill-allow: §9-const — analysis threshold, render-layer
+/// Runs of one command line at which it reads as fighting something.
+const REPEAT_AT: i64 = 3; // skill-allow: §9-const — analysis threshold, render-layer
 
 #[derive(Default)]
 struct SessAgg {
@@ -824,6 +954,90 @@ const STEERING_MINUTES: i64 = 10; // skill-allow: §9-const — analysis window,
 /// is far more than a page needs; the payload says when it truncated
 /// rather than pretending the sample is the whole range.
 pub const RANGE_ROW_CAP: u32 = 20_000; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// Rows per page of the range walk (#367). One `LIMIT 20000` over
+/// `message` carried every raw payload in a single frame, and the
+/// engine reset the connection on `30d` and `all`. Pages keep each
+/// frame small; their union is the same walk.
+pub const RANGE_PAGE: u32 = 1_000; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+const WALK_FIRST: &str = "SELECT * FROM message ORDER BY valid_from DESC LIMIT $limit";
+const WALK_FIRST_SINCE: &str = "SELECT * FROM message WHERE valid_from > $since \
+     ORDER BY valid_from DESC LIMIT $limit";
+const WALK_NEXT: &str = "SELECT * FROM message WHERE valid_from <= $before \
+     ORDER BY valid_from DESC LIMIT $limit";
+const WALK_NEXT_SINCE: &str = "SELECT * FROM message WHERE valid_from <= $before \
+     AND valid_from > $since ORDER BY valid_from DESC LIMIT $limit";
+
+/// The newest rows of `message`, newest first, in pages. `since`
+/// bounds the range; `cap` bounds the rows. Each page continues from
+/// `valid_from <= cursor` and is deduplicated by id, so rows sharing
+/// the boundary instant are neither dropped nor counted twice; a page
+/// that adds nothing new ends the walk rather than spinning on it.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn walk_messages(
+    kernel: &Kernel,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    cap: u32,
+    page: u32,
+) -> Result<Vec<MessageRecord>> {
+    let page = page.max(1);
+    let mut out: Vec<MessageRecord> = Vec::new();
+    // Keyed by the row's uuid, as every session map in this file is:
+    // `RecordId` carries interior mutability clippy will not key on.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut before: Option<chrono::DateTime<chrono::Utc>> = None;
+    // Rows asked for this round. A full page even near the cap: the
+    // boundary rows the dedupe removes would otherwise eat the
+    // remainder. Widened only when an instant holds more rows than a
+    // page — the one case a `<=` cursor cannot step past on its own.
+    let mut want = page;
+    while (out.len() as u32) < cap {
+        let query = match (before, since) {
+            (None, None) => WALK_FIRST,
+            (None, Some(_)) => WALK_FIRST_SINCE,
+            (Some(_), None) => WALK_NEXT,
+            (Some(_), Some(_)) => WALK_NEXT_SINCE,
+        };
+        let mut q = kernel.db().query(query).bind(("limit", want));
+        if let Some(b) = before {
+            q = q.bind(("before", b));
+        }
+        if let Some(s) = since {
+            q = q.bind(("since", s));
+        }
+        let rows: Vec<MessageRecord> = q.await?.take(0)?;
+        let fetched = rows.len() as u32;
+        let mut added = 0u32;
+        for row in rows {
+            if (out.len() as u32) >= cap {
+                break;
+            }
+            if seen.insert(superx_ops::record_uuid(&row.id)) {
+                out.push(row);
+                added += 1;
+            }
+        }
+        if fetched < want {
+            break; // the engine ran out of rows
+        }
+        if added == 0 {
+            // Every row came back already held: the boundary instant
+            // is wider than the page. Ask for more of it, up to the cap.
+            if want >= cap {
+                break;
+            }
+            want = want.saturating_mul(2).min(cap.max(page));
+            continue;
+        }
+        want = page;
+        before = out.last().map(|m| m.valid_from);
+    }
+    Ok(out)
+}
 
 /// Tools whose output is a command's own report. Everything else —
 /// above all `Read`, whose payload is a FILE — must never be scored:
@@ -1056,27 +1270,10 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
     // ── the raw-message window walk: what the agents actually did ──
     let cutoff = range_cutoff(range);
     let cap = if range == "window" { window } else { RANGE_ROW_CAP };
-    let msgs: Vec<MessageRecord> = match cutoff {
-        Some(d) => {
-            let since = chrono::Utc::now() - d;
-            kernel
-                .db()
-                .query(
-                    "SELECT * FROM message WHERE valid_from > $since \
-                     ORDER BY valid_from DESC LIMIT $limit",
-                )
-                .bind(("since", since))
-                .bind(("limit", cap))
-                .await?
-                .take(0)?
-        }
-        None => kernel
-            .db()
-            .query("SELECT * FROM message ORDER BY valid_from DESC LIMIT $limit")
-            .bind(("limit", cap))
-            .await?
-            .take(0)?,
-    };
+    let since = cutoff.map(|d| chrono::Utc::now() - d);
+    let msgs = walk_messages(kernel, since, cap, RANGE_PAGE).await?;
+    // The altitude gauge's ceiling (#367), resolved once per request.
+    let context_window = crate::resolved_context_window(kernel).await;
     // Truncation is only meaningful for a time-bounded range: the
     // fixed window is BY DEFINITION the newest N, so reporting it as
     // "sampled" on the default view was just wrong (review of #330).
@@ -1257,10 +1454,14 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         // `unknown` put a meaningless row at the top of the model
         // comparison (review of #330) — so an absent model is simply
         // not attributed.
+        // `<synthetic>` is Claude Code's marker for a line the runtime
+        // wrote itself; it sat in the model comparison and on the live
+        // panel as if something had been prompted (#367). Not a model.
         let model_opt = raw
             .get("message")
             .and_then(obj)
             .and_then(|m| get_str(m, "model"))
+            .filter(|m| !m.is_empty() && !m.starts_with('<'))
             .map(str::to_string);
         let model = model_opt.clone().unwrap_or_else(|| "unknown".to_string());
         if let Some(known) = &model_opt {
@@ -1310,10 +1511,18 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
             .map(|(r, b)| (r.clone(), b.clone()));
         if let Some(rk) = &repo_key {
             let sid = superx_ops::record_uuid(&m.session);
-            let l = code.live.entry(sid).or_default();
+            let l = code.live.entry(sid.clone()).or_default();
             if l.repo.is_none() {
                 l.repo = Some(rk.clone());
                 l.branch = get_str(raw, "gitBranch").filter(|b| !b.is_empty()).map(str::to_string);
+            }
+            // The span's repo was declared and never filled, so the
+            // sortie log read a dash on every row (#367). Newest-first:
+            // the first sighting is where the session is now.
+            if let Some(span) = code.spans.get_mut(&sid) {
+                if span.3.is_none() {
+                    span.3 = Some(rk.clone());
+                }
             }
             if let Some(an) = &agent_name {
                 code.agents.entry(an.clone()).or_default().repos.insert(rk.clone());
@@ -1453,6 +1662,14 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                 code.in_tokens += inp;
                 code.cache_write += cw;
                 code.cache_read += cr;
+                // Context pressure (#367): the same sum the Sessions
+                // page reads off the newest usage-bearing message.
+                if inp + cw + cr > 0 {
+                    let l = code.live.entry(superx_ops::record_uuid(&m.session)).or_default();
+                    if l.context_tokens.is_none() {
+                        l.context_tokens = Some(inp + cw + cr);
+                    }
+                }
                 if let Some(an) = &agent_name {
                     code.agents.entry(an.clone()).or_default().in_tokens += inp + cw;
                 }
@@ -1881,6 +2098,42 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                                 }
                                 // The shell command it ran.
                                 if let Some(cmd) = get_str(input, "command") {
+                                    if SHELL_TOOLS.contains(&name.as_str()) {
+                                        // A call that only looks is the
+                                        // agent reading (#367): the same
+                                        // act as `Read`, through the shell.
+                                        if shell_inspects(cmd) {
+                                            code.reads += 1;
+                                            let cwd = get_str(raw, "cwd");
+                                            let paths = inspected_paths(cmd, cwd);
+                                            let l = code
+                                                .live
+                                                .entry(superx_ops::record_uuid(&m.session))
+                                                .or_default();
+                                            claim_doing(l, "reading");
+                                            for path in &paths {
+                                                if l.files_now.len() < LIVE_FILES
+                                                    && !l.files_now.iter().any(|x| x == path)
+                                                {
+                                                    l.files_now.push(path.clone());
+                                                }
+                                            }
+                                            for path in paths {
+                                                if let Some(rk) = &repo_key {
+                                                    code.repos_exposed.insert(rk.clone());
+                                                }
+                                                if cwd.is_some_and(|c| !path.starts_with(c))
+                                                    && !agent_scratch(&path)
+                                                {
+                                                    code.outside_reads += 1;
+                                                }
+                                                code.files_read.insert(path);
+                                            }
+                                        }
+                                        if let Some(key) = repeat_key(cmd) {
+                                            *code.command_lines.entry(key).or_insert(0) += 1;
+                                        }
+                                    }
                                     // Every stage of the chain counts —
                                     // `cd repo && cargo test` is a test run.
                                     for label in command_labels(cmd) {
@@ -1979,6 +2232,15 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         // Gemini-style: raw.tokens.output + raw.toolCalls[].
         if let Some(Value::Object(toks)) = raw.get("tokens") {
             agg.out_tokens += get_int(toks, "output");
+            // Gemini reports `total`, else input + cached (#367).
+            let total = get_int(toks, "total");
+            let ctx = if total > 0 { total } else { get_int(toks, "input") + get_int(toks, "cached") };
+            if ctx > 0 {
+                let l = code.live.entry(superx_ops::record_uuid(&m.session)).or_default();
+                if l.context_tokens.is_none() {
+                    l.context_tokens = Some(ctx);
+                }
+            }
         }
         if let Some(Value::Array(calls)) = raw.get("toolCalls") {
             for c in calls.iter() {
@@ -2294,9 +2556,9 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
         reverts: code.reverts,
         thrash_files: code.files.values().filter(|&&n| n >= 3).count() as i64,
         out_tokens_window: code.out_tokens,
-        top_repeat: top_n(code.commands.clone(), 1)
+        top_repeat: top_n(code.command_lines, 1)
             .into_iter()
-            .find(|c| c.value >= 3),
+            .find(|c| c.value >= REPEAT_AT),
         max_concurrent_sessions: code
             .concurrency
             .values()
@@ -2535,6 +2797,10 @@ pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Resul
                         out_tokens: l.out_tokens,
                         tool_failures: l.tool_failures,
                         idle_secs: idle,
+                        context_tokens: l.context_tokens,
+                        context_pct: l
+                            .context_tokens
+                            .map(|c| ((c * 100) / context_window.max(1)).clamp(0, 100)),
                         files_now: l.files_now.clone(),
                         // No classifiable call in the window: say what
                         // the silence IS rather than leaving it blank —

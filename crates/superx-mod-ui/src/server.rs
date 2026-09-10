@@ -214,11 +214,13 @@ async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
         .await
         .map(|a| a.len())
         .unwrap_or(0);
+    let default_range = crate::resolved_default_range(kernel).await;
     Json(StatusResponse {
         os: "running".into(),
         ui_version: env!("CARGO_PKG_VERSION").into(),
         agents,
         modules,
+        default_range,
     })
 }
 
@@ -445,9 +447,10 @@ async fn api_stats(
     // read. Unknown values fall back to the window rather than
     // erroring, so a stale bookmark still renders.
     let range = q.range.unwrap_or_else(|| "window".to_string());
-    let range = match range.as_str() {
-        "1h" | "6h" | "24h" | "7d" | "30d" | "all" | "window" => range,
-        _ => "window".to_string(),
+    let range = if crate::RANGES.contains(&range.as_str()) {
+        range
+    } else {
+        "window".to_string()
     };
     match crate::stats::stats_for_range(kernel, window, &range).await {
         Ok(s) => Response::ok(s),
