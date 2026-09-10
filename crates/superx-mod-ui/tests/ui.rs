@@ -1917,8 +1917,16 @@ async fn shell_inspection_counts_as_reading() {
     assert_eq!(e.outside_reads, 1, "/other/repo is not the directory the agent was working in");
 
     let reader = s.live.iter().find(|l| l.identity == superx_ops::record_uuid(&s1)).expect("reader row");
-    assert_eq!(reader.doing, "reading");
-    assert_eq!(reader.files_now, vec!["/w/superx/crates/foo.rs".to_string()], "relative path, resolved against cwd");
+    // The reader also ran `sed -i`, which is a write (#374), and a write
+    // outranks a read in the state ladder — the row says what the
+    // session changed, not only what it looked at.
+    assert_eq!(reader.doing, "writing");
+    assert_eq!(
+        reader.files_now,
+        vec!["/w/superx/crates/foo.rs".to_string(), "/w/superx/src/x.rs".to_string()],
+        "relative paths, resolved against cwd — the read first (newest), then the in-place edit"
+    );
+    assert_eq!(s.writes_window, 1, "sed -i is the one write");
     let verifier = s.live.iter().find(|l| l.identity == superx_ops::record_uuid(&s2)).expect("verifier row");
     assert_eq!(verifier.doing, "verifying", "the test run outranks the read");
 
@@ -2247,4 +2255,57 @@ async fn every_range_but_the_window_admits_its_row_cap() {
     assert!(s("24h", 2).await.expect("24h").truncated);
     assert!(!s("all", 20).await.expect("all").truncated, "room for every row");
     assert!(!s("window", 2).await.expect("window").truncated, "the newest N is never a sample");
+}
+
+/// Edits made through the shell are writes (#374). Under an operating
+/// mode that edits with `python3 - <<EOF`, `cat > file <<EOF` and
+/// `sed -i`, a session read `—` while it rewrote four files. The
+/// heredoc that goes straight into a file has its lines on the line;
+/// every other shell write is of unknown size and reports none — never
+/// zero by omission. Output capture, sinks and git are not writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_edits_count_as_writing() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let shell = |cmd: &str| serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": cmd}}]}
+    });
+    // A whole file through a heredoc: the lines are on the line.
+    log_tool_message(&kernel, &session, &agent,
+        shell("cat > src/gen.rs <<'EOF'\nfn a() {}\nfn b() {}\nfn c() {}\nEOF")).await;
+    // A script that rewrites a file: a write of unknown size, naming its file.
+    log_tool_message(&kernel, &session, &agent,
+        shell("python3 - <<'PYEOF'\nimport pathlib\np = pathlib.Path('/w/superx/src/stats.rs')\ns = p.read_text()\np.write_text(s.replace('a', 'b'))\nPYEOF")).await;
+    // In place, relative to cwd, chained with a verification.
+    log_tool_message(&kernel, &session, &agent, shell("sed -i 's/old/new/' src/lib.rs && cargo test -p x")).await;
+    // Not writes: an inspection with a sink, output captured to scratch, git.
+    log_tool_message(&kernel, &session, &agent, shell("cat src/lib.rs | grep foo > /dev/null")).await;
+    log_tool_message(&kernel, &session, &agent, shell("cargo test --workspace > /tmp/out.txt 2>&1")).await;
+    log_tool_message(&kernel, &session, &agent, shell("git commit -m x && git push")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.writes_window, 3, "the heredoc, the script and sed -i");
+    assert_eq!(s.lines_added, 3, "only the heredoc's lines are on the line");
+    assert_eq!(s.lines_removed, 0, "what a shell edit replaced is unknown, not zero");
+    assert_eq!(s.reads_window, 1, "the piped grep is reading; a sink is not a file");
+    assert_eq!(s.tests_run, 2, "both cargo test runs still count");
+
+    // The files under the agent's hands, absolute, scratch excluded.
+    let files: Vec<&str> = s.files.iter().map(|f| f.name.as_str()).collect();
+    for f in ["/w/superx/src/gen.rs", "/w/superx/src/stats.rs", "/w/superx/src/lib.rs"] {
+        assert!(files.contains(&f), "{f} missing from {files:?}");
+    }
+    assert!(!files.iter().any(|f| f.starts_with("/tmp") || f.starts_with("/dev")), "{files:?}");
+    assert_eq!(s.languages.iter().find(|l| l.name == "rs").map(|l| l.value), Some(3), "the three writes; a shell read feeds exposure, not languages");
+
+    // The live row shows the work.
+    assert_eq!(s.live.len(), 1);
+    let row = &s.live[0];
+    assert_eq!(row.lines_added, 3);
+    for f in ["/w/superx/src/gen.rs", "/w/superx/src/stats.rs", "/w/superx/src/lib.rs"] {
+        assert!(row.files_now.iter().any(|x| x == f), "{f} not on the live row: {:?}", row.files_now);
+    }
 }
