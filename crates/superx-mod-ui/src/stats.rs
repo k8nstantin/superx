@@ -209,6 +209,236 @@ fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
 /// Paths taken from one inspecting call, at most.
 const INSPECT_PATHS: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
 
+/// Programs whose path argument is a file they change.
+const WRITE_PROGRAMS: [&str; 5] = ["cp", "mv", "install", "touch", "tee"];
+/// Interpreters that take their program on stdin (`python3 -`): the
+/// heredoc is a script, and a script that writes is a write (#374).
+const STDIN_INTERPRETERS: [&str; 5] = ["python3", "python", "perl", "node", "ruby"];
+/// What a script looks like when it writes a file.
+const SCRIPT_WRITE_MARKERS: [&str; 8] = [
+    "write_text(", "write_bytes(", "writeFileSync(", "appendFileSync(", ".write(", ", 'w'",
+    ", \"w\"", ", 'a'",
+];
+/// Where a script names the file: the string literal right after one
+/// of these.
+const SCRIPT_PATH_OPENERS: [&str; 4] = ["Path(", "open(", "writeFileSync(", "appendFileSync("];
+/// Verbs that change files without naming them on the line.
+const WRITE_VERBS: [&str; 2] = ["git apply", "patch"];
+
+/// A shell call that changed files (#374): what it touched, and the
+/// lines it can be SEEN to have written — the body of a heredoc that
+/// went straight into a file. Everything else a shell writes is of
+/// unknown size and is reported as none, not as zero by omission.
+struct ShellWrite {
+    paths: Vec<String>,
+    added: i64,
+}
+
+/// The heredocs in a command: the line that opened each, with its body.
+fn heredocs(cmd: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut lines = cmd.lines();
+    while let Some(line) = lines.next() {
+        if let Some(pos) = line.find("<<") {
+            let raw = line[pos + 2..]
+                .trim_start_matches('-')
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            let delim = raw.trim_matches(|c| c == '\'' || c == '"');
+            if !delim.is_empty() && delim.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let mut body = String::new();
+                for b in lines.by_ref() {
+                    if b.trim() == delim {
+                        break;
+                    }
+                    body.push_str(b);
+                    body.push('\n');
+                }
+                out.push((line.to_string(), body));
+            }
+        }
+    }
+    out
+}
+
+/// A token that names a file the agent wrote, absolute against `cwd`.
+/// Scratch and device paths are not work; an unexpanded `$VAR` is not
+/// a path we can name.
+fn written_path(w: &str, cwd: Option<&str>) -> Option<String> {
+    let w = w.trim_matches(|c| c == '\'' || c == '"' || c == ',' || c == ';');
+    if w.is_empty()
+        || w.starts_with('-')
+        || w.starts_with('&')
+        || w.contains('$')
+        || w.contains('`')
+        || w.contains("://")
+        || w.contains('*')
+    {
+        return None;
+    }
+    let path = if w.starts_with('/') || w.starts_with('~') {
+        w.to_string()
+    } else if w.contains('/') || w.contains('.') {
+        format!("{}/{}", cwd?.trim_end_matches('/'), w.trim_start_matches("./"))
+    } else {
+        return None;
+    };
+    if path.starts_with("/dev/")
+        || path.starts_with("/tmp/")
+        || path.starts_with("/private/tmp/")
+        || path.starts_with("/var/")
+        || agent_scratch(&path)
+    {
+        return None;
+    }
+    Some(path)
+}
+
+/// The files a stage's `>` / `>>` / `&>` redirections write. `2>` is a
+/// log of the run, not work; `>&2` is plumbing.
+fn redirection_targets(stage: &str, cwd: Option<&str>) -> Vec<String> {
+    let words: Vec<&str> = stage.split_whitespace().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let core = words[i].trim_start_matches(['1', '&']);
+        if core.starts_with('>') {
+            let rest = core.trim_start_matches('>');
+            let target = if rest.is_empty() {
+                i += 1;
+                words.get(i).copied()
+            } else if rest.starts_with('&') {
+                None
+            } else {
+                Some(rest)
+            };
+            if let Some(p) = target.and_then(|t| written_path(t, cwd)) {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn script_writes(body: &str) -> bool {
+    SCRIPT_WRITE_MARKERS.iter().any(|m| body.contains(m))
+}
+
+/// The files a script names in its openers — `Path('…')`, `open("…"`.
+fn script_paths(body: &str, cwd: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for opener in SCRIPT_PATH_OPENERS {
+        let mut rest = body;
+        while let Some(i) = rest.find(opener) {
+            rest = &rest[i + opener.len()..];
+            let Some(q) = rest.chars().next() else { break };
+            if q == '\'' || q == '"' {
+                if let Some(end) = rest[1..].find(q) {
+                    if let Some(p) = written_path(&rest[1..1 + end], cwd) {
+                        if !out.contains(&p) {
+                            out.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn note_path(paths: &mut Vec<String>, p: String) {
+    if !paths.contains(&p) {
+        paths.push(p);
+    }
+}
+
+/// Did this shell call WRITE, and what? Under an operating mode that
+/// edits through `python3 - <<EOF`, `cat > file <<EOF` and `sed -i`,
+/// every edit of a working day was invisible: the session read `—`
+/// while it rewrote four files (#374). The heredoc bodies say what was
+/// written where; redirections, in-place editors and copying programs
+/// name their files; a script that writes names its files in its
+/// openers. Lines are counted only where the text is on the line —
+/// a heredoc into a file — and are otherwise unknown.
+fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut added = 0i64;
+    let mut wrote = false;
+    // Heredocs first: their bodies say what was written, and where.
+    for (line, body) in heredocs(cmd) {
+        for stage in split_stages(&line) {
+            if !stage.contains("<<") {
+                continue;
+            }
+            let stripped = strip_redirections(&stage);
+            let Some(label) = stage_label(&stripped) else { continue };
+            let targets = redirection_targets(&stage, cwd);
+            if label == "cat" && !targets.is_empty() {
+                // `cat > file <<EOF`: the file IS the body.
+                added += line_count(body.trim_end_matches('\n'));
+                wrote = true;
+                for t in targets {
+                    note_path(&mut paths, t);
+                }
+            } else if label == "tee" {
+                added += line_count(body.trim_end_matches('\n'));
+                wrote = true;
+                for w in stripped.split_whitespace().skip(1) {
+                    if let Some(p) = written_path(w, cwd) {
+                        note_path(&mut paths, p);
+                    }
+                }
+            } else if STDIN_INTERPRETERS.contains(&label.as_str())
+                && stripped.split_whitespace().any(|w| w == "-")
+                && script_writes(&body)
+            {
+                wrote = true;
+                for p in script_paths(&body, cwd) {
+                    note_path(&mut paths, p);
+                }
+            }
+        }
+    }
+    // Then every stage: redirections, in-place editors, copying programs.
+    for stage in split_stages(&strip_heredocs(cmd)) {
+        let stripped = strip_redirections(&stage);
+        let Some(label) = stage_label(&stripped) else { continue };
+        for t in redirection_targets(&stage, cwd) {
+            wrote = true;
+            note_path(&mut paths, t);
+        }
+        let words: Vec<&str> = stripped.split_whitespace().collect();
+        if INSPECT_PROGRAMS.contains(&label.as_str()) && !stage_inspects(&label, &stripped) {
+            // `sed -i`, `awk -i inplace`: the file is the last path.
+            wrote = true;
+            if let Some(p) = words.iter().rev().find_map(|w| written_path(w, cwd)) {
+                note_path(&mut paths, p);
+            }
+        } else if WRITE_PROGRAMS.contains(&label.as_str()) {
+            wrote = true;
+            if matches!(label.as_str(), "cp" | "mv" | "install") {
+                // The destination is the file changed.
+                if let Some(p) = words.iter().rev().find_map(|w| written_path(w, cwd)) {
+                    note_path(&mut paths, p);
+                }
+            } else {
+                for w in words.iter().skip(1) {
+                    if let Some(p) = written_path(w, cwd) {
+                        note_path(&mut paths, p);
+                    }
+                }
+            }
+        } else if WRITE_VERBS.contains(&label.as_str()) {
+            wrote = true;
+        }
+    }
+    wrote.then_some(ShellWrite { paths, added })
+}
+
 /// The key a call repeats under: the whole line, noise stages dropped,
 /// whitespace folded, bounded. Keyed on the PROGRAM, `echo` won the
 /// "fighting something" badge every day on a live instance (#367).
@@ -2162,7 +2392,77 @@ pub async fn stats_for_range_capped(
                                         // A call that only looks is the
                                         // agent reading (#367): the same
                                         // act as `Read`, through the shell.
-                                        if shell_inspects(cmd) {
+                                        // A write anywhere in the chain makes
+                                        // the call a write — `cat a > b` copies;
+                                        // only a chain that ONLY looks is reading.
+                                        if let Some(w) = shell_write(cmd, get_str(raw, "cwd")) {
+                                            // The agent WROTE through the shell
+                                            // (#374): the same act as `Edit`, so
+                                            // the same instruments move — the
+                                            // write count, the live row, the
+                                            // files under its hands, and the
+                                            // lines where the text is on the
+                                            // line. Replaced lines are unknown
+                                            // and stay unclaimed.
+                                            let n = w.added;
+                                            code.writes += 1;
+                                            let sid = superx_ops::record_uuid(&m.session);
+                                            if n > 0 {
+                                                let hour = when.format("%Y-%m-%dT%H").to_string();
+                                                code.churn.entry(hour).or_insert((0, 0)).0 += n;
+                                                if let Some(e) = &effort {
+                                                    code.efforts.entry(e.clone()).or_default().lines_added += n;
+                                                }
+                                                if let Some(key) = &branch_pair {
+                                                    code.branches.entry(key.clone()).or_default().lines_added += n;
+                                                }
+                                                if let Some(rk) = &repo_key {
+                                                    code.repos.entry(rk.clone()).or_default().lines_added += n;
+                                                }
+                                                if let Some(an) = &agent_name {
+                                                    code.agents.entry(an.clone()).or_default().lines_added += n;
+                                                    if let Some(rk) = &repo_key {
+                                                        code.cells
+                                                            .entry((an.clone(), rk.clone(), bucket.clone()))
+                                                            .or_default()
+                                                            .added += n;
+                                                    }
+                                                }
+                                                if let Some(known) = &model_opt {
+                                                    code.models.entry(known.clone()).or_default().lines_added += n;
+                                                }
+                                                lines_written += n;
+                                                agg.lines += n;
+                                                code.lines_added += n;
+                                            }
+                                            code.verify_events.entry(sid.clone()).or_default().push((when, true));
+                                            let l = code.live.entry(sid).or_default();
+                                            l.lines_added += n;
+                                            claim_doing(l, "writing");
+                                            for path in &w.paths {
+                                                *l.path_hits.entry(path.clone()).or_insert(0) += 1;
+                                                if l.files_now.len() < LIVE_FILES
+                                                    && !l.files_now.iter().any(|x| x == path)
+                                                {
+                                                    l.files_now.push(path.clone());
+                                                }
+                                            }
+                                            for path in &w.paths {
+                                                *code.files.entry(path.clone()).or_insert(0) += 1;
+                                                if let Some(ext) = extension_of(path) {
+                                                    *code.languages.entry(ext).or_insert(0) += 1;
+                                                }
+                                                if let Some(dir) = dir_of(path) {
+                                                    *code.dirs.entry(dir).or_insert(0) += 1;
+                                                }
+                                                if let Some(key) = &branch_pair {
+                                                    code.branches.entry(key.clone()).or_default().files.insert(path.clone());
+                                                }
+                                                if let Some(rk) = &repo_key {
+                                                    code.repos.entry(rk.clone()).or_default().files.insert(path.clone());
+                                                }
+                                            }
+                                                                                } else if shell_inspects(cmd) {
                                             code.reads += 1;
                                             let cwd = get_str(raw, "cwd");
                                             let paths = inspected_paths(cmd, cwd);
