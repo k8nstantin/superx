@@ -439,6 +439,96 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
     wrote.then_some(ShellWrite { paths, added })
 }
 
+/// What a shell stage SHIPPED (#381): outcomes, where every other
+/// instrument counts effort.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ship {
+    Commit,
+    Push,
+    PrOpened,
+    PrMerged,
+}
+
+/// The shipping events in a command, with the PR number when the line
+/// names one (`gh pr merge 384`). `git merge` is local and `gh pr view`
+/// only looks; neither ships.
+fn shipping(cmd: &str) -> Vec<(Ship, Option<String>)> {
+    let mut out = Vec::new();
+    for stage in split_stages(&strip_heredocs(cmd)) {
+        let stripped = strip_redirections(&stage);
+        let Some(label) = stage_label(&stripped) else { continue };
+        match label.as_str() {
+            "git commit" => out.push((Ship::Commit, None)),
+            "git push" => out.push((Ship::Push, None)),
+            "gh pr" => {
+                let words: Vec<&str> = stripped.split_whitespace().collect();
+                let Some(i) = words.iter().position(|w| *w == "pr") else { continue };
+                match words.get(i + 1).copied() {
+                    Some("create") => out.push((Ship::PrOpened, None)),
+                    Some("merge") => {
+                        let num = words[i + 2..]
+                            .iter()
+                            .find(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()))
+                            .map(|w| format!("#{w}"));
+                        out.push((Ship::PrMerged, num));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether the call commits — its output then carries the commit's
+/// shortstat, the one place the transcript states lines COMMITTED,
+/// however the edits were made.
+fn commits(cmd: &str) -> bool {
+    labelled_stages(cmd).iter().any(|(label, _)| label == "git commit")
+}
+
+/// `N files changed, X insertions(+), Y deletions(-)` as git prints it
+/// after a commit: insertions and deletions, either absent when zero.
+/// The last such line wins — a chain prints one per commit.
+fn shortstat(text: &str) -> Option<(i64, i64)> {
+    let mut found = None;
+    for line in text.lines() {
+        if !(line.contains(" changed") && (line.contains("insertion") || line.contains("deletion"))) {
+            continue;
+        }
+        let (mut ins, mut del) = (0i64, 0i64);
+        for part in line.split(',') {
+            let mut w = part.split_whitespace();
+            let (Some(n), Some(kind)) = (w.next(), w.next()) else { continue };
+            let Ok(v) = n.parse::<i64>() else { continue };
+            if kind.starts_with("insertion") {
+                ins = v;
+            } else if kind.starts_with("deletion") {
+                del = v;
+            }
+        }
+        found = Some((ins, del));
+    }
+    found
+}
+
+/// What a shipping call's output said, for the live row: the PR number
+/// `gh pr create` printed, else the commit's short hash from
+/// `[branch abc1234] message`.
+fn shipping_detail(text: &str) -> Option<String> {
+    if let Some(i) = text.find("/pull/") {
+        let num: String = text[i + 6..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !num.is_empty() {
+            return Some(format!("#{num}"));
+        }
+    }
+    let first = text.lines().find(|l| l.starts_with('['))?;
+    let close = first.find(']')?;
+    let hash = first[1..close].split_whitespace().last()?;
+    (hash.len() >= 7 && hash.chars().all(|c| c.is_ascii_hexdigit())).then(|| hash.to_string())
+}
+
 /// The key a call repeats under: the whole line, noise stages dropped,
 /// whitespace folded, bounded. Keyed on the PROGRAM, `echo` won the
 /// "fighting something" badge every day on a live instance (#367).
@@ -694,6 +784,14 @@ struct CodeAgg {
     tests: i64,
     builds: i64,
     git: i64,
+    /// What shipped (#381): commits, pushes, PRs opened and merged, and
+    /// the lines git reported committed.
+    commits: i64,
+    pushes: i64,
+    prs_opened: i64,
+    prs_merged: i64,
+    committed_added: i64,
+    committed_removed: i64,
     mcp: i64,
     web: i64,
     subagent: i64,
@@ -1109,6 +1207,9 @@ struct LiveAgg {
     lines_added: i64,
     lines_removed: i64,
     replaced_unknown: i64,
+    /// The newest thing this session shipped, and when (#381).
+    shipped: Option<String>,
+    shipped_at: Option<chrono::DateTime<chrono::Utc>>,
     out_tokens: i64,
     tool_failures: i64,
     newest: Option<chrono::DateTime<chrono::Utc>>,
@@ -1615,6 +1716,9 @@ pub async fn stats_for_range_capped(
     // happens with interleaved sidechains. Without this the text is
     // stashed forever and silently dropped.
     let mut shell_calls: HashSet<String> = HashSet::new();
+    // Commit calls whose output is still to come — it carries the
+    // shortstat (#381).
+    let mut commit_calls: HashSet<String> = HashSet::new();
     for m in &msgs {
         let sid = superx_ops::record_uuid(&m.session);
         let agg = per_session.entry(sid).or_default();
@@ -2036,6 +2140,10 @@ pub async fn stats_for_range_capped(
                             }
                             // Now the tool is known: score its output
                             // if — and only if — it was a shell call.
+                            let cmd_opt = block.get("input").and_then(obj).and_then(|i| get_str(i, "command"));
+                            // What the output said about shipping — a PR
+                            // number, a commit hash — for the live row (#381).
+                            let mut result_detail: Option<String> = None;
                             if let Some(id) = get_str(block, "id") {
                                 match pending_output.remove(id) {
                                     Some(text) if SHELL_TOOLS.contains(&name.as_str()) => {
@@ -2043,6 +2151,13 @@ pub async fn stats_for_range_capped(
                                         attribute_quality(
                                             &mut code, &branch_pair, &agent_name, &effort, d,
                                         );
+                                        if cmd_opt.is_some_and(commits) {
+                                            if let Some((ins, del)) = shortstat(&text) {
+                                                code.committed_added += ins;
+                                                code.committed_removed += del;
+                                            }
+                                        }
+                                        result_detail = shipping_detail(&text);
                                     }
                                     // Output already seen but the tool
                                     // was not a shell: drop it.
@@ -2051,6 +2166,9 @@ pub async fn stats_for_range_capped(
                                     // that this id is worth scoring.
                                     None if SHELL_TOOLS.contains(&name.as_str()) => {
                                         shell_calls.insert(id.to_string());
+                                        if cmd_opt.is_some_and(commits) {
+                                            commit_calls.insert(id.to_string());
+                                        }
                                     }
                                     None => {}
                                 }
@@ -2510,6 +2628,45 @@ pub async fn stats_for_range_capped(
                                             *code.command_lines.entry(key).or_insert(0) += 1;
                                         }
                                     }
+                                    // What the call SHIPPED (#381): the
+                                    // outcomes beside all this effort.
+                                    for (ship, num) in shipping(cmd) {
+                                        let detail = |wanted_pr: bool| {
+                                            result_detail
+                                                .as_deref()
+                                                .filter(|d| d.starts_with('#') == wanted_pr)
+                                                .map(|d| format!(" {d}"))
+                                                .unwrap_or_default()
+                                        };
+                                        let text = match ship {
+                                            Ship::Commit => {
+                                                code.commits += 1;
+                                                format!("commit{}", detail(false))
+                                            }
+                                            Ship::Push => {
+                                                code.pushes += 1;
+                                                "pushed".to_string()
+                                            }
+                                            Ship::PrOpened => {
+                                                code.prs_opened += 1;
+                                                format!("PR{} opened", detail(true))
+                                            }
+                                            Ship::PrMerged => {
+                                                code.prs_merged += 1;
+                                                format!(
+                                                    "PR{} merged",
+                                                    num.as_deref().map(|n| format!(" {n}")).unwrap_or_default()
+                                                )
+                                            }
+                                        };
+                                        // Newest-first: the first shipping
+                                        // event met is the session's latest.
+                                        let l = code.live.entry(superx_ops::record_uuid(&m.session)).or_default();
+                                        if l.shipped.is_none() {
+                                            l.shipped = Some(text);
+                                            l.shipped_at = Some(when);
+                                        }
+                                    }
                                     // Every stage of the chain counts —
                                     // `cd repo && cargo test` is a test run.
                                     for label in command_labels(cmd) {
@@ -2567,6 +2724,12 @@ pub async fn stats_for_range_capped(
                                     attribute_quality(&mut code, &branch_pair, &agent_name, &effort, d);
                                 } else {
                                     pending_output.insert(id.to_string(), text.to_string());
+                                }
+                                if commit_calls.remove(id) {
+                                    if let Some((ins, del)) = shortstat(text) {
+                                        code.committed_added += ins;
+                                        code.committed_removed += del;
+                                    }
                                 }
                             }
 
@@ -2917,6 +3080,12 @@ pub async fn stats_for_range_capped(
         tests_run: code.tests,
         builds_run: code.builds,
         git_ops: code.git,
+        commits: code.commits,
+        pushes: code.pushes,
+        prs_opened: code.prs_opened,
+        prs_merged: code.prs_merged,
+        committed_added: code.committed_added,
+        committed_removed: code.committed_removed,
         mcp_calls: code.mcp,
         web_calls: code.web,
         subagent_calls: code.subagent,
@@ -3181,6 +3350,8 @@ pub async fn stats_for_range_capped(
                             .context_tokens
                             .map(|c| ((c * 100) / context_window.max(1)).clamp(0, 100)),
                         files_now: l.files_now.clone(),
+                        shipped: l.shipped.clone(),
+                        shipped_at: l.shipped_at.map(|t| t.to_rfc3339()),
                         // No classifiable call in the window: say what
                         // the silence IS rather than leaving it blank —
                         // reasoning, blocked on a long call, or simply

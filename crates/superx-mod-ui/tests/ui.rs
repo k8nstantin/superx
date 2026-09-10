@@ -2312,3 +2312,53 @@ async fn shell_edits_count_as_writing() {
         assert!(row.files_now.iter().any(|x| x == f), "{f} not on the live row: {:?}", row.files_now);
     }
 }
+
+/// What shipped is read from the shell (#381): commits, pushes, PRs
+/// opened and merged, and the lines git said a commit carried — in
+/// either order of call and result, since sidechains interleave. A
+/// quiet commit is counted and carries no lines; looking at a PR and a
+/// local merge ship nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shipping_is_read_from_the_shell() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let call = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}
+    });
+    let result = |id: &str, body: &str| serde_json::json!({
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "is_error": false, "content": body}]}
+    });
+    // Real order: the call, then what it printed.
+    log_tool_message(&kernel, &session, &agent, call("c1", "git add crates/x.rs && git commit -m 'one'")).await;
+    log_tool_message(&kernel, &session, &agent,
+        result("c1", "[feat/x 5db4a18f] one\n 3 files changed, 138 insertions(+), 28 deletions(-)\n")).await;
+    // A quiet commit prints nothing: counted, no lines.
+    log_tool_message(&kernel, &session, &agent, call("c2", "git commit -q -m 'two'")).await;
+    log_tool_message(&kernel, &session, &agent, result("c2", "")).await;
+    // Reversed — the result before its call, as a sidechain lands it.
+    log_tool_message(&kernel, &session, &agent, result("c3", "[feat/x 9c4d6cc5] three\n 1 file changed, 12 insertions(+)\n")).await;
+    log_tool_message(&kernel, &session, &agent, call("c3", "git commit -m 'three'")).await;
+    log_tool_message(&kernel, &session, &agent, call("p1", "git push -u origin HEAD")).await;
+    log_tool_message(&kernel, &session, &agent, result("p1", "branch 'feat/x' set up to track 'origin/feat/x'.\n")).await;
+    log_tool_message(&kernel, &session, &agent, call("g1", "gh pr create --base main --title t --body b")).await;
+    log_tool_message(&kernel, &session, &agent, result("g1", "https://github.com/o/r/pull/379\n")).await;
+    log_tool_message(&kernel, &session, &agent, call("g2", "gh pr merge 379 --squash --admin")).await;
+    log_tool_message(&kernel, &session, &agent, result("g2", "✓ Squashed and merged pull request o/r#379\n")).await;
+    // Not shipping: looking at a PR, a local merge.
+    log_tool_message(&kernel, &session, &agent, call("v1", "gh pr view 379 --json state")).await;
+    log_tool_message(&kernel, &session, &agent, call("v2", "git merge --no-edit origin/main")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!((s.commits, s.pushes, s.prs_opened, s.prs_merged), (3, 1, 1, 1));
+    assert_eq!((s.committed_added, s.committed_removed), (150, 28), "138 + 12 in, 28 out; the quiet commit carried none");
+
+    // The live row names the newest thing shipped, not the newest command.
+    assert_eq!(s.live.len(), 1);
+    let row = &s.live[0];
+    assert_eq!(row.shipped.as_deref(), Some("PR #379 merged"));
+    assert!(row.shipped_at.is_some());
+}

@@ -116,6 +116,28 @@ builds_run: bigint,
  */
 git_ops: bigint, 
 /**
+ * `git commit` calls.
+ */
+commits: bigint, 
+/**
+ * `git push` calls.
+ */
+pushes: bigint, 
+/**
+ * `gh pr create` calls.
+ */
+prs_opened: bigint, 
+/**
+ * `gh pr merge` calls.
+ */
+prs_merged: bigint, 
+/**
+ * Lines git reported committed — the `insertions(+)` and
+ * `deletions(-)` a commit prints. Churn as the repository saw it,
+ * however the edits were made; `0` when every commit ran quiet.
+ */
+committed_added: bigint, committed_removed: bigint, 
+/**
  * Calls into MCP servers (`mcp__*`).
  */
 mcp_calls: bigint, 
