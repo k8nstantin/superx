@@ -198,6 +198,9 @@ pub struct StatsSummary {
     /// however the edits were made; `0` when every commit ran quiet.
     pub committed_added: i64,
     pub committed_removed: i64,
+    /// What landed on the repositories' main lines in the range, as the
+    /// repositories themselves report it (#386).
+    pub landed: Landed,
     /// Calls into MCP servers (`mcp__*`).
     pub mcp_calls: i64,
     /// Web fetches and searches.
@@ -658,6 +661,39 @@ pub struct SlowOp {
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct ChurnPoint {
     pub t: String,
+    pub added: i64,
+    pub removed: i64,
+}
+
+/// Churn as the repository saw it (#386): what LANDED on each repo's
+/// main line in the range, read with `git log --numstat` from the
+/// repositories the agents worked in. The transcript cannot see what a
+/// shell edit replaced; the repository can.
+#[derive(Debug, Default, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct Landed {
+    /// Commits on the main lines' first-parent history in the range.
+    pub commits: i64,
+    pub added: i64,
+    pub removed: i64,
+    /// Per repository, biggest movers first.
+    pub repos: Vec<LandedRepo>,
+    /// Hourly, keyed like `churn`, by commit time.
+    pub series: Vec<ChurnPoint>,
+    /// Working directories that could not be read as a repository —
+    /// gone, not git, or git too slow. Counted, never guessed at.
+    pub unreadable: i64,
+}
+
+/// One repository's landed lines.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct LandedRepo {
+    /// The directory holding `.git` — worktrees read as their repo.
+    pub name: String,
+    /// The main line read: `origin/main`, `main`, `master`, or `HEAD`.
+    pub branch: String,
+    pub commits: i64,
     pub added: i64,
     pub removed: i64,
 }

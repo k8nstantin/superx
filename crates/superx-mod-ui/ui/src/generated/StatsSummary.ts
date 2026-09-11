@@ -6,6 +6,7 @@ import type { CompactionStat } from "./CompactionStat";
 import type { EffortStat } from "./EffortStat";
 import type { Exposure } from "./Exposure";
 import type { HourRate } from "./HourRate";
+import type { Landed } from "./Landed";
 import type { LiveSession } from "./LiveSession";
 import type { ModelStat } from "./ModelStat";
 import type { NameCount } from "./NameCount";
@@ -137,6 +138,11 @@ prs_merged: bigint,
  * however the edits were made; `0` when every commit ran quiet.
  */
 committed_added: bigint, committed_removed: bigint, 
+/**
+ * What landed on the repositories' main lines in the range, as the
+ * repositories themselves report it (#386).
+ */
+landed: Landed, 
 /**
  * Calls into MCP servers (`mcp__*`).
  */

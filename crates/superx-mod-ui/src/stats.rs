@@ -774,6 +774,9 @@ fn top_n(map: HashMap<String, i64>, n: usize) -> Vec<NameCount> {
 /// Everything the walk learns about the code itself.
 #[derive(Default)]
 struct CodeAgg {
+    /// Every working directory the range's messages were sent from —
+    /// the repositories to ask what landed (#386).
+    cwds: HashSet<String>,
     lines_added: i64,
     lines_removed: i64,
     /// Writes whose replaced half is unknown — shell edits, notebook
@@ -1893,6 +1896,9 @@ pub async fn stats_for_range_capped(
         // Which repo the agent was standing in (#308, #325), and which
         // branch of it (#350).
         let repo_key = get_str(raw, "cwd").map(|c| c.rsplit('/').next().unwrap_or(c).to_string());
+        if let Some(c) = get_str(raw, "cwd") {
+            code.cwds.insert(c.to_string());
+        }
         let branch_key =
             get_str(raw, "gitBranch").filter(|b| !b.is_empty()).map(str::to_string);
         // The (repo, branch) pair, present only when both are known —
@@ -3033,7 +3039,17 @@ pub async fn stats_for_range_capped(
         secret_hits: code.secret_hits,
         secret_paths,
     };
+    // What the repositories say landed in this range (#386). The window
+    // has no cutoff of its own: its range is the oldest message it holds.
+    let landed_since = if range == "window" {
+        msgs.last().map(|m| m.emitted_at.unwrap_or(m.valid_from))
+    } else {
+        since
+    };
+    let landed = crate::landed::landed(&code.cwds, landed_since).await;
+
     Ok(StatsSummary {
+        landed,
         agents,
         sessions_total,
         sessions_active,

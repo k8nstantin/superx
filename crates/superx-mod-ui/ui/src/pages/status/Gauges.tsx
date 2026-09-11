@@ -15,7 +15,13 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
   // Nothing replaced on the line but edits of unknown replaced size
   // (#383): the needle has nothing true to point at.
   const unknown = n(s?.replaced_unknown)
-  const churn = replaced === 0 && unknown > 0 ? null : pct(replaced, added + replaced)
+  const transcriptChurn = replaced === 0 && unknown > 0 ? null : pct(replaced, added + replaced)
+  // When the transcript cannot say what was replaced, the repository
+  // can: what landed on main, read with git (#386).
+  const landedAdded = n(s?.landed?.added)
+  const landedRemoved = n(s?.landed?.removed)
+  const landedChurn = pct(landedRemoved, landedAdded + landedRemoved)
+  const churn = transcriptChurn ?? landedChurn
 
   const directed = n(s?.churn_directed)
   const self = n(s?.churn_self)
@@ -45,13 +51,15 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
         value={s ? churn : null}
         bands={LOW_GOOD}
         sub={
-          s && churn != null
+          s && transcriptChurn != null
             ? `${fmtCompact(added)} added · ${fmtCompact(replaced)} replaced${unknown > 0 ? ` · ${unknown} of unknown size` : ''}`
-            : unknown > 0
-              ? `${fmtCompact(added)} added · ${unknown} edits of unknown size`
-              : 'no code moved'
+            : s && landedChurn != null
+              ? `landed on main: ${fmtCompact(landedAdded)} added · ${fmtCompact(landedRemoved)} removed`
+              : unknown > 0
+                ? `${fmtCompact(added)} added · ${unknown} edits of unknown size`
+                : 'no code moved'
         }
-        tip={`replaced ÷ (added + replaced) over ${rangeNote}. 0% is all new code; past ${BANDS.churnBad}% the window spent itself rewriting.`}
+        tip={`replaced ÷ (added + replaced) over ${rangeNote}. 0% is all new code; past ${BANDS.churnBad}% the window spent itself rewriting. From the transcript when it can see what was replaced, else from what landed on main as git reports it.`}
       />
       <Gauge
         label="On course"

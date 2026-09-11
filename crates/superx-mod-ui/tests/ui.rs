@@ -2362,3 +2362,66 @@ async fn shipping_is_read_from_the_shell() {
     assert_eq!(row.shipped.as_deref(), Some("PR #379 merged"));
     assert!(row.shipped_at.is_some());
 }
+
+/// Churn as the repository saw it (#386): what landed on the main line
+/// of the repositories the agents worked in, read with git — however
+/// the edits were made. A side branch has not landed; a working
+/// directory that is not a repository is counted unreadable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn landed_lines_are_read_from_the_repositories() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+
+    let stamp = format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let dir = std::env::temp_dir().join(format!("superx-landed-{stamp}"));
+    let scratch = std::env::temp_dir().join(format!("superx-not-a-repo-{stamp}"));
+    std::fs::create_dir_all(dir.join("src")).expect("repo dir");
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C").arg(&dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("a.rs"), "one\ntwo\nthree\n").expect("write");
+    git(&["add", "a.rs"]);
+    git(&["commit", "-q", "-m", "first"]);
+    // Replace one line, add two: +3 −1 as the repository counts it.
+    std::fs::write(dir.join("a.rs"), "one\nTWO\nthree\nfour\nfive\n").expect("write");
+    git(&["add", "a.rs"]);
+    git(&["commit", "-q", "-m", "second"]);
+    // Work on a side branch has not landed.
+    git(&["checkout", "-q", "-b", "side"]);
+    std::fs::write(dir.join("b.rs"), "x\n".repeat(10)).expect("write");
+    git(&["add", "b.rs"]);
+    git(&["commit", "-q", "-m", "side work"]);
+    git(&["checkout", "-q", "main"]);
+
+    let shell = |cwd: &std::path::Path| serde_json::json!({
+        "cwd": cwd.to_string_lossy(),
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "ls"}}]}
+    });
+    // From a subdirectory of the repo, and from somewhere that is not one.
+    log_tool_message(&kernel, &session, &agent, shell(&dir.join("src"))).await;
+    log_tool_message(&kernel, &session, &agent, shell(&scratch)).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert_eq!(s.landed.commits, 2, "the two on main; the side branch has not landed");
+    assert_eq!((s.landed.added, s.landed.removed), (6, 1), "3 + 3 in, 1 out");
+    assert_eq!(s.landed.unreadable, 1, "the scratch directory is not a repository");
+    assert_eq!(s.landed.repos.len(), 1, "{:?}", s.landed.repos);
+    let repo = &s.landed.repos[0];
+    assert_eq!(repo.name, dir.file_name().expect("name").to_string_lossy());
+    assert_eq!(repo.branch, "main");
+    assert_eq!((repo.commits, repo.added, repo.removed), (2, 6, 1));
+    assert!(!s.landed.series.is_empty(), "an hourly point for the commit hour");
+}
