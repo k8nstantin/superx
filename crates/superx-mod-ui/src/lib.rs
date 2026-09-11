@@ -22,6 +22,7 @@ use superx_kernel::{
 pub mod activity;
 pub mod api;
 pub mod insights;
+pub mod landed;
 mod server;
 pub mod stats;
 
