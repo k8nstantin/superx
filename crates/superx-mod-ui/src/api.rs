@@ -866,6 +866,33 @@ pub struct InsightsSummary {
     /// Per-module health from the lifecycle stream (#367): the
     /// substrate held every `module_failed` and nothing read them.
     pub module_health: Vec<ModuleHealth>,
+    /// Every table in the substrate, biggest first (#398).
+    pub tables: Vec<TableStat>,
+    /// Rows across all of them, and what they weigh, estimated.
+    pub db_rows_total: i64,
+    pub db_bytes_est: i64,
+}
+
+/// One table in the substrate: how many rows it holds and roughly how
+/// much data that is (#398).
+///
+/// The engine reports no size, and the kernel does not tell a module
+/// where the datastore lives, so bytes are MEASURED rather than read:
+/// a sample of rows is serialised and averaged, and the average is
+/// multiplied by the count. That is the size of the DATA — what the
+/// rows would weigh written out — not the size of the files, which
+/// RocksDB compresses. Stated as an estimate, because it is one.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct TableStat {
+    pub name: String,
+    pub rows: i64,
+    /// Rows × the average serialised row, in bytes.
+    pub bytes_est: i64,
+    /// The average serialised row, in bytes.
+    pub avg_row_bytes: i64,
+    /// How many rows the estimate was measured from.
+    pub sampled: i64,
 }
 
 /// One module's health, read off its lifecycle events (#367). The

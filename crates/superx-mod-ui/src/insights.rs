@@ -13,7 +13,7 @@ use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, Result};
 
 use crate::api::{
-    AgentSplit, HeatCell, InsightsSummary, ModuleHealth, NameCount, TimeCount, TokenTotals,
+    AgentSplit, HeatCell, InsightsSummary, ModuleHealth, NameCount, TimeCount, TokenTotals, TableStat,
 };
 
 /// Newest `module_active` events scanned for per-module startup cost —
@@ -92,6 +92,74 @@ async fn rows(kernel: &Kernel, query: &'static str) -> Result<Vec<Value>> {
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
+/// Rows sampled per table to measure an average row (#398).
+const SIZE_SAMPLE: usize = 64; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// What the substrate holds, table by table (#398).
+///
+/// SurrealDB reports no storage size and the kernel does not hand a
+/// module the datastore path, so this measures the DATA instead of the
+/// files: every table is counted, a sample of its rows is serialised,
+/// and the average row is multiplied by the count. RocksDB compresses
+/// what it writes, so the on-disk figure will be smaller — this is
+/// what the rows weigh, which is the question a row count raises.
+async fn table_stats(kernel: &Kernel) -> Result<Vec<TableStat>> {
+    // The table list comes from the engine, so a module's own tables
+    // are counted without this knowing their names.
+    let info: Vec<Value> = kernel.db().query("INFO FOR DB").await?.take(0)?;
+    let mut names: Vec<String> = info
+        .first()
+        .and_then(obj)
+        .and_then(|o| o.get("tables"))
+        .and_then(obj)
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+
+    let mut out = Vec::new();
+    for name in names {
+        // The name comes from the engine's own catalogue, never from a
+        // request, so it cannot carry anything but a table name.
+        let count: Vec<Value> = kernel
+            .db()
+            .query(format!("SELECT count() AS c FROM {name} GROUP ALL"))
+            .await?
+            .take(0)?;
+        let rows = count
+            .first()
+            .and_then(obj)
+            .map(|o| get_int(o, "c"))
+            .unwrap_or(0);
+        if rows == 0 {
+            out.push(TableStat { name, rows: 0, bytes_est: 0, avg_row_bytes: 0, sampled: 0 });
+            continue;
+        }
+        let sample: Vec<Value> = kernel
+            .db()
+            .query(format!("SELECT * FROM {name} LIMIT {SIZE_SAMPLE}"))
+            .await?
+            .take(0)?;
+        let measured: Vec<usize> = sample
+            .iter()
+            .filter_map(|r| serde_json::to_string(r).ok().map(|s| s.len()))
+            .collect();
+        let avg = if measured.is_empty() {
+            0
+        } else {
+            (measured.iter().sum::<usize>() / measured.len()) as i64
+        };
+        out.push(TableStat {
+            name,
+            rows,
+            bytes_est: avg.saturating_mul(rows),
+            avg_row_bytes: avg,
+            sampled: measured.len() as i64,
+        });
+    }
+    out.sort_by_key(|t| std::cmp::Reverse(t.bytes_est));
+    Ok(out)
+}
+
 pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
     // ── the work calendar ───────────────────────────────────────────
     // By the AGENT'S clock, not ours: `emitted_at` is the source's own
@@ -327,6 +395,11 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
     });
     let module_health = health;
 
+    // What the substrate holds (#398).
+    let tables = table_stats(kernel).await?;
+    let db_rows_total = tables.iter().map(|t| t.rows).sum();
+    let db_bytes_est = tables.iter().map(|t| t.bytes_est).sum();
+
     Ok(InsightsSummary {
         events_per_day,
         hour_weekday,
@@ -338,5 +411,8 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
         last_event_secs,
         events_last_hour,
         module_health,
+        tables,
+        db_rows_total,
+        db_bytes_est,
     })
 }
