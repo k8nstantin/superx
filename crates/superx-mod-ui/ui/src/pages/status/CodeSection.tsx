@@ -265,9 +265,13 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
             <SimpleGrid cols={2} spacing="xs" mt="md">
               <Counter
                 label="Work undone"
-                value={s?.reverts}
+                value={n(s?.reverts) === 0 && unknown > 0 ? '—' : s?.reverts}
                 tone={n(s?.reverts) > 0 ? FAIL : undefined}
-                tip="edits whose work a later edit threw away — a flip-flop counts twice"
+                tip={
+                  n(s?.reverts) === 0 && unknown > 0
+                    ? `an undo is seen by comparing an edit's text with a later one's — ${unknown} edit${unknown === 1 ? '' : 's'} in this range carried no such text, so undone work is not visible here`
+                    : 'edits whose work a later edit threw away — a flip-flop counts twice'
+                }
               />
               <Counter label="Thrash files" value={s?.thrash_files} tip={`files touched ${s?.revisit_at ?? 3} or more times in this range`} />
               <Counter label="Tokens / line" value={tokensPerLine} tip="output tokens spent per line of code that survived" />

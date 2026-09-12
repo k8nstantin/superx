@@ -291,6 +291,12 @@ pub struct StatsSummary {
     /// Replaced lines with no instruction behind them — the agent
     /// rewriting its own work.
     pub churn_self: i64,
+    /// The same split counted in EDITS. A shell edit replaces an
+    /// unknown number of lines (#383), so the line-weighted split
+    /// reads zero for a session that edits through the shell — this
+    /// one still reads (#388).
+    pub edits_directed: i64,
+    pub edits_self: i64,
     /// Reasoning level against churn and productivity.
     pub efforts: Vec<EffortStat>,
     /// Productivity and token cost per agent.
@@ -343,6 +349,12 @@ pub struct RepoStat {
     /// that did not — design change vs agent confusion.
     pub churn_directed: i64,
     pub churn_self: i64,
+    /// The same split counted in EDITS. A shell edit replaces an
+    /// unknown number of lines (#383), so the line-weighted split
+    /// reads zero for a session that edits through the shell — this
+    /// one still reads (#388).
+    pub edits_directed: i64,
+    pub edits_self: i64,
     /// Edits whose work a later edit undid, in this repo.
     pub reverts: i64,
     /// Distinct agents that worked in it.
@@ -412,8 +424,9 @@ pub struct LiveSession {
     pub last_op_secs: i64,
 
     // ── is it spiralling? the leading indicators (#350) ──────────
-    /// Share of THIS session's replaced lines that nobody asked for.
-    /// Rising here is the agent starting to rewrite itself.
+    /// Share of this session's rewriting that nobody asked for —
+    /// replaced lines when the transcript can see them, else edits
+    /// (#388). Rising here is the agent starting to rewrite itself.
     pub self_churn_pct: i64,
     /// Files it has touched three or more times in the window.
     /// Rework of rework — the compounding signal, and the one worth
@@ -446,6 +459,12 @@ pub struct BranchStat {
     /// that did not — design change vs agent going in circles.
     pub churn_directed: i64,
     pub churn_self: i64,
+    /// The same split counted in EDITS. A shell edit replaces an
+    /// unknown number of lines (#383), so the line-weighted split
+    /// reads zero for a session that edits through the shell — this
+    /// one still reads (#388).
+    pub edits_directed: i64,
+    pub edits_self: i64,
     /// Test INVOCATIONS. With `test_pass_pct == -1`, this separates a
     /// branch that never ran a suite from one whose output the scanner
     /// could not parse — they are not the same thing (#354 review).
@@ -559,6 +578,12 @@ pub struct AgentStat {
     // ── outcome, so agents compare on more than volume (#350) ────
     pub churn_directed: i64,
     pub churn_self: i64,
+    /// The same split counted in EDITS. A shell edit replaces an
+    /// unknown number of lines (#383), so the line-weighted split
+    /// reads zero for a session that edits through the shell — this
+    /// one still reads (#388).
+    pub edits_directed: i64,
+    pub edits_self: i64,
     pub tests_passed: i64,
     pub tests_failed: i64,
     pub compile_errors: i64,

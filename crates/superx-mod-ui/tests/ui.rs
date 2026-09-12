@@ -751,6 +751,30 @@ async fn session_model_is_the_newest_one_the_session_used() {
         Some("claude-fable-5".to_string())
     );
 
+    // `<synthetic>` is the runtime writing a line itself, not a model
+    // (#367). The Status page filtered it; the Sessions page showed it
+    // as the session's model (#388). The newest REAL answer wins, even
+    // behind a run of runtime lines.
+    for _ in 0..3 {
+        kernel
+            .log_message(superx_kernel::NewMessage {
+                session: session.clone(),
+                agent: agent.clone(),
+                role: "assistant".to_string(),
+                content: String::new(),
+                raw: Some(json_to_object(&serde_json::json!({ "message": { "model": "<synthetic>" } }))),
+                seq: None,
+                emitted_at: None,
+            })
+            .await
+            .expect("synthetic message");
+    }
+    assert_eq!(
+        session_model(&kernel, session.clone()).await.expect("model"),
+        Some("claude-fable-5".to_string()),
+        "the sentinel is not a model"
+    );
+
     // Gemini names it at the root instead — same answer, one field over.
     let (agent2, session2) = seed_agent_and_session(&kernel, "gemini_cli", "src-model-2").await;
     kernel
@@ -2424,4 +2448,95 @@ async fn landed_lines_are_read_from_the_repositories() {
     assert_eq!(repo.branch, "main");
     assert_eq!((repo.commits, repo.added, repo.removed), (2, 6, 1));
     assert!(!s.landed.series.is_empty(), "an hourly point for the commit hour");
+}
+
+/// Steering is the half of churn a shell edit can still answer (#388).
+/// The lines it replaced are unknown, but whether anyone asked for it
+/// is not — so the split is counted in edits when it cannot be counted
+/// in lines, and On course, Why the churn and the Unasked columns keep
+/// reading under an operating mode that edits through the shell. A
+/// file written end to end is a creation, not a rewrite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steering_reads_in_edits_when_replaced_lines_are_unknown() {
+    let kernel = fresh_kernel().await;
+    // Steering is per session: one the operator redirected, one left
+    // to itself — the same shape as the line-counted test above.
+    let (agent, steered) = seed_agent_and_session(&kernel, "claude_code", "steered").await;
+    let (agent2, alone) = seed_agent_and_session(&kernel, "claude_code", "alone").await;
+    let shell = |cmd: &str| serde_json::json!({
+        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": cmd}}]}
+    });
+
+    // The operator says something, then the agent rewrites: directed.
+    kernel.log_message(superx_kernel::NewMessage {
+        session: steered.clone(), agent: agent.clone(), role: "user".into(),
+        content: "do it the other way".into(), raw: None, seq: None, emitted_at: None,
+    }).await.expect("human turn");
+    log_tool_message(&kernel, &steered, &agent, shell("sed -i 's/a/b/' src/a.rs")).await;
+
+    // The other session rewrites twice with nobody steering…
+    for f in ["src/b.rs", "src/c.rs"] {
+        log_tool_message(&kernel, &alone, &agent2, shell(
+            &format!("python3 - <<'PY'\nimport pathlib\np = pathlib.Path('/w/superx/{f}')\np.write_text(p.read_text() + 'x')\nPY"))).await;
+    }
+    // …and writes one file end to end: a creation, not a rewrite.
+    log_tool_message(&kernel, &alone, &agent2,
+        shell("cat > src/new.rs <<'EOF'\nfn fresh() {}\nEOF")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // The transcript still cannot say HOW MANY lines went…
+    assert_eq!(s.lines_removed, 0);
+    assert_eq!((s.churn_directed, s.churn_self), (0, 0));
+    // …but it can say how many rewrites there were, and who asked.
+    assert_eq!(s.edits_directed, 1, "the sed followed a human turn");
+    assert_eq!(s.edits_self, 2, "the two scripts had nobody steering");
+    assert_eq!(s.replaced_unknown, 4, "every shell write, the creation included");
+
+    // The created/modified split sees shell writes now.
+    assert_eq!(s.files_created, 1, "the heredoc wrote a whole file");
+    assert_eq!(s.files_modified, 3, "the three it edited in place");
+
+    // The circling signal falls back the same way, per session.
+    let row = |id: &superx_kernel::types::RecordId| {
+        let uuid = superx_ops::record_uuid(id);
+        s.live.iter().find(|l| l.identity == uuid).expect("live row")
+    };
+    assert_eq!(row(&steered).self_churn_pct, 0, "it was asked for");
+    assert_eq!(row(&alone).self_churn_pct, 100, "nobody asked");
+
+    // So do the branch and agent rows.
+    let b = s.branches.iter().find(|b| b.branch == "feat/x").expect("branch row");
+    assert_eq!((b.edits_directed, b.edits_self), (1, 2));
+    assert_eq!(b.self_churn_pct, 66, "two of three rewrites unasked");
+    assert_eq!(
+        (
+            s.agent_stats.iter().map(|a| a.edits_directed).sum::<i64>(),
+            s.agent_stats.iter().map(|a| a.edits_self).sum::<i64>(),
+        ),
+        (1, 2),
+        "the agent rows carry it too"
+    );
+}
+
+/// An extension is a language, not a version suffix. `superx.prev-5001959`
+/// ranked as a language on the live page beside `rs` and `py` (#388).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_version_suffix_is_not_a_language() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    for path in ["/w/superx/src/a.rs", "/w/bin/superx.prev-5001959", "/w/bin/superx", "/w/notes/plan.2026-09-11"] {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "cwd": "/w/superx",
+            "message": {"model": "claude-opus-5", "content": [
+                {"type": "tool_use", "id": "r", "name": "Read", "input": {"file_path": path}}]}
+        })).await;
+    }
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    let langs: Vec<&str> = s.languages.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(langs, vec!["rs"], "{langs:?}");
+    assert_eq!(s.files_touched, 4, "every file is still a file");
 }

@@ -18,6 +18,13 @@ export type BranchStat = { repo: string, branch: string, messages: bigint, sessi
  */
 churn_directed: bigint, churn_self: bigint, 
 /**
+ * The same split counted in EDITS. A shell edit replaces an
+ * unknown number of lines (#383), so the line-weighted split
+ * reads zero for a session that edits through the shell — this
+ * one still reads (#388).
+ */
+edits_directed: bigint, edits_self: bigint, 
+/**
  * Test INVOCATIONS. With `test_pass_pct == -1`, this separates a
  * branch that never ran a suite from one whose output the scanner
  * could not parse — they are not the same thing (#354 review).

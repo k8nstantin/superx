@@ -13,8 +13,12 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
   const failed = n(s?.tests_failed)
   const passPct = pct(passed, passed + failed)
 
-  const cd = n(s?.churn_directed)
-  const cs = n(s?.churn_self)
+  // Lines when the transcript can see what was replaced, else edits
+  // (#388) — the panel must not go dark on a day of shell edits.
+  const inLines = n(s?.churn_directed) + n(s?.churn_self) > 0
+  const cd = inLines ? n(s?.churn_directed) : n(s?.edits_directed)
+  const cs = inLines ? n(s?.churn_self) : n(s?.edits_self)
+  const unit = inLines ? 'replaced lines' : 'edits'
   const directedPct = pct(cd, cd + cs)
   const churnCause =
     directedPct == null
@@ -108,13 +112,13 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
             <Text size="sm" c="dimmed" mb="xs">
               {churnCause}
             </Text>
-            <Group gap={2} wrap="nowrap" mb="md" title="replaced lines that followed a human instruction, against those with nobody steering">
+            <Group gap={2} wrap="nowrap" mb="md" title={`${unit} that followed a human instruction, against those with nobody steering`}>
               <div style={{ width: `${directedPct ?? 0}%`, background: OK, height: 10, borderRadius: '3px 0 0 3px' }} />
               <div style={{ flex: 1, background: directedPct == null ? UNKNOWN : FAIL, height: 10, borderRadius: '0 3px 3px 0' }} />
             </Group>
             <SimpleGrid cols={2} spacing="xs">
-              <Counter label="Directed" value={s?.churn_directed} tone={OK} tip="replaced lines that followed a human turn within ten minutes" />
-              <Counter label="Self-inflicted" value={s?.churn_self} tone={FAIL} tip="replaced lines with nobody steering" />
+              <Counter label="Directed" value={cd} tone={OK} tip={`${unit} that followed a human turn within ten minutes`} />
+              <Counter label="Self-inflicted" value={cs} tone={FAIL} tip={`${unit} with nobody steering`} />
             </SimpleGrid>
             <Text size="sm" fw={600} mt="md" mb="xs">
               Waiting on operations

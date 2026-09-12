@@ -28,6 +28,13 @@ branch: string | null, messages: bigint, lines_added: bigint, lines_removed: big
  */
 churn_directed: bigint, churn_self: bigint, 
 /**
+ * The same split counted in EDITS. A shell edit replaces an
+ * unknown number of lines (#383), so the line-weighted split
+ * reads zero for a session that edits through the shell — this
+ * one still reads (#388).
+ */
+edits_directed: bigint, edits_self: bigint, 
+/**
  * Edits whose work a later edit undid, in this repo.
  */
 reverts: bigint, 

@@ -72,8 +72,9 @@ thinking_tokens: bigint,
  */
 last_op_secs: bigint, 
 /**
- * Share of THIS session's replaced lines that nobody asked for.
- * Rising here is the agent starting to rewrite itself.
+ * Share of this session's rewriting that nobody asked for —
+ * replaced lines when the transcript can see them, else edits
+ * (#388). Rising here is the agent starting to rewrite itself.
  */
 self_churn_pct: bigint, 
 /**

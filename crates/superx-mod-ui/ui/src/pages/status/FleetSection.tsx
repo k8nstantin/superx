@@ -77,7 +77,11 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                   const del = n(a.lines_removed)
                   const churn = pct(del, add + del)
                   const cost = add > 0 ? Math.round((n(a.in_tokens) + n(a.out_tokens)) / add) : null
-                  const unasked = pct(n(a.churn_self), n(a.churn_directed) + n(a.churn_self))
+                  // Lines, else edits (#388).
+                  const unasked =
+                    n(a.churn_directed) + n(a.churn_self) > 0
+                      ? pct(n(a.churn_self), n(a.churn_directed) + n(a.churn_self))
+                      : pct(n(a.edits_self), n(a.edits_directed) + n(a.edits_self))
                   const tests = n(a.tests_passed) + n(a.tests_failed)
                   const passPct = pct(n(a.tests_passed), tests)
                   return (
@@ -263,7 +267,11 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                         )}
                       </Table.Td>
                       <Table.Td ta="right">
-                        {n(b.churn_directed) + n(b.churn_self) === 0 ? <Text size="xs" c="dimmed">—</Text> : pctCell(unasked, BANDS.selfChurnBad, true)}
+                        {n(b.churn_directed) + n(b.churn_self) + n(b.edits_directed) + n(b.edits_self) === 0 ? (
+                          <Text size="xs" c="dimmed">—</Text>
+                        ) : (
+                          pctCell(unasked, BANDS.selfChurnBad, true)
+                        )}
                       </Table.Td>
                       <Table.Td ta="right"><Churn added={b.lines_added} removed={b.lines_removed} size="xs" /></Table.Td>
                       <Table.Td ta="right">{n(b.lines_added) === 0 ? '—' : `${n(b.rework_pct)}%`}</Table.Td>

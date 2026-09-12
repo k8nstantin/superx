@@ -24,4 +24,11 @@ edit_to_verify_p50_secs: bigint,
 /**
  * Compactions it sat through, and the time they took.
  */
-compactions: bigint, compaction_ms: bigint, churn_directed: bigint, churn_self: bigint, tests_passed: bigint, tests_failed: bigint, compile_errors: bigint, };
+compactions: bigint, compaction_ms: bigint, churn_directed: bigint, churn_self: bigint, 
+/**
+ * The same split counted in EDITS. A shell edit replaces an
+ * unknown number of lines (#383), so the line-weighted split
+ * reads zero for a session that edits through the shell — this
+ * one still reads (#388).
+ */
+edits_directed: bigint, edits_self: bigint, tests_passed: bigint, tests_failed: bigint, compile_errors: bigint, };

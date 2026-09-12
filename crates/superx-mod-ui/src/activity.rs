@@ -363,6 +363,10 @@ fn obj_of(row: &Value, key: &str) -> Option<superx_kernel::types::Object> {
     }
 }
 
+/// Rows read when looking for a session's newest real model or
+/// effort — enough to see past a run of runtime-written lines.
+const NEWEST_SCAN: u32 = 12; // skill-allow: §9-const — read-path bound, not a policy tunable
+
 /// A session's token telemetry, mined from the raw events adapters
 /// already preserve (issue #200): `(context, output_total)`.
 ///
@@ -400,17 +404,22 @@ pub async fn session_model_effort(
     kernel: &Kernel,
     session: RecordId,
 ) -> Result<(Option<String>, Option<String>)> {
+    // A few rows, not one: the newest line may name `<synthetic>`, the
+    // runtime's marker for a line it wrote itself. It is not a model
+    // (#367) — the Status page has filtered it since, the Sessions
+    // page showed it (#388). Skip the sentinels and take the newest
+    // real answer behind them.
     let newest = |field: &str, guard: &str| {
         format!(
             "SELECT {field} AS v, valid_from FROM message \
              WHERE session = $sess AND {guard} \
-             ORDER BY valid_from DESC LIMIT 1"
+             ORDER BY valid_from DESC LIMIT {NEWEST_SCAN}"
         )
     };
     let pick = |rows: Vec<Value>| {
-        rows.first().and_then(|row| match row {
+        rows.iter().find_map(|row| match row {
             Value::Object(o) => match o.get("v") {
-                Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                Some(Value::String(s)) if !s.is_empty() && !s.starts_with('<') => Some(s.clone()),
                 _ => None,
             },
             _ => None,
