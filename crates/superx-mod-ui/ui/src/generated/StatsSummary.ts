@@ -274,6 +274,13 @@ churn_directed: bigint,
  */
 churn_self: bigint, 
 /**
+ * The same split counted in EDITS. A shell edit replaces an
+ * unknown number of lines (#383), so the line-weighted split
+ * reads zero for a session that edits through the shell — this
+ * one still reads (#388).
+ */
+edits_directed: bigint, edits_self: bigint, 
+/**
  * Reasoning level against churn and productivity.
  */
 efforts: Array<EffortStat>, 

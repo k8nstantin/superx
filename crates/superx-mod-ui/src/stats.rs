@@ -232,6 +232,10 @@ const WRITE_VERBS: [&str; 2] = ["git apply", "patch"];
 struct ShellWrite {
     paths: Vec<String>,
     added: i64,
+    /// The call wrote a file end to end — a heredoc into it — rather
+    /// than editing it in place. The created/modified split reads this
+    /// the way it reads a whole-file `Write` (#388).
+    whole_file: bool,
 }
 
 /// The heredocs in a command: the line that opened each, with its body.
@@ -368,6 +372,7 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
     let mut paths: Vec<String> = Vec::new();
     let mut added = 0i64;
     let mut wrote = false;
+    let mut whole_file = false;
     // Heredocs first: their bodies say what was written, and where.
     for (line, body) in heredocs(cmd) {
         for stage in split_stages(&line) {
@@ -381,12 +386,14 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
                 // `cat > file <<EOF`: the file IS the body.
                 added += line_count(body.trim_end_matches('\n'));
                 wrote = true;
+                whole_file = true;
                 for t in targets {
                     note_path(&mut paths, t);
                 }
             } else if label == "tee" {
                 added += line_count(body.trim_end_matches('\n'));
                 wrote = true;
+                whole_file = true;
                 for w in stripped.split_whitespace().skip(1) {
                     if let Some(p) = written_path(w, cwd) {
                         note_path(&mut paths, p);
@@ -436,7 +443,7 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
             wrote = true;
         }
     }
-    wrote.then_some(ShellWrite { paths, added })
+    wrote.then_some(ShellWrite { paths, added, whole_file })
 }
 
 /// What a shell stage SHIPPED (#381): outcomes, where every other
@@ -743,7 +750,14 @@ fn extension_of(path: &str) -> Option<String> {
     // A dotfile has no extension: `.gitignore` is a name, not a
     // language (review of #311).
     let (stem, ext) = file.rsplit_once('.')?;
-    if stem.is_empty() || ext.is_empty() || ext.len() > 12 || ext.contains(' ') {
+    // A language suffix is letters and digits: `rs`, `py`, `ipynb`,
+    // `h`. `superx.prev-5001959` and `notes.2026-09-11` are versioned
+    // names, and they ranked as languages on the live page (#388).
+    if stem.is_empty()
+        || ext.len() > 10
+        || !ext.chars().all(|c| c.is_ascii_alphanumeric())
+        || !ext.chars().any(|c| c.is_ascii_alphabetic())
+    {
         return None;
     }
     Some(ext.to_ascii_lowercase())
@@ -828,6 +842,13 @@ struct CodeAgg {
     /// Replaced lines with and without a human instruction behind them.
     churn_directed: i64,
     churn_self: i64,
+    /// The same split counted in EDITS, not lines. A shell edit
+    /// replaces an unknown number of lines (#383), so a line-weighted
+    /// split reads zero for a whole day's work — an edit is one event
+    /// whatever its size, and whether anyone asked for it is knowable
+    /// either way (#388).
+    edits_directed: i64,
+    edits_self: i64,
     // ── quality, from what the commands printed (#327) ───────────
     tests_passed: i64,
     tests_failed: i64,
@@ -943,6 +964,13 @@ struct RepoAgg {
     branch: Option<String>,
     churn_directed: i64,
     churn_self: i64,
+    /// The same split counted in EDITS, not lines. A shell edit
+    /// replaces an unknown number of lines (#383), so a line-weighted
+    /// split reads zero for a whole day's work — an edit is one event
+    /// whatever its size, and whether anyone asked for it is knowable
+    /// either way (#388).
+    edits_directed: i64,
+    edits_self: i64,
     reverts: i64,
     messages: i64,
     lines_added: i64,
@@ -1006,6 +1034,13 @@ struct AgentAgg {
     /// them was asked to rewrite what it rewrote.
     churn_directed: i64,
     churn_self: i64,
+    /// The same split counted in EDITS, not lines. A shell edit
+    /// replaces an unknown number of lines (#383), so a line-weighted
+    /// split reads zero for a whole day's work — an edit is one event
+    /// whatever its size, and whether anyone asked for it is knowable
+    /// either way (#388).
+    edits_directed: i64,
+    edits_self: i64,
     tests_passed: i64,
     tests_failed: i64,
     compile_errors: i64,
@@ -1055,7 +1090,15 @@ struct BranchDerived {
 fn branch_derived(b: &BranchAgg) -> BranchDerived {
     let churn = b.churn_directed + b.churn_self;
     let tests = b.tests_passed + b.tests_failed;
-    let self_churn_pct = pct(b.churn_self, churn);
+    // Replaced lines where the transcript can see them, else edits: a
+    // branch worked entirely through shell edits scored a perfect
+    // steering component because its line-weighted churn was zero
+    // (#388).
+    let self_churn_pct = if churn > 0 {
+        pct(b.churn_self, churn)
+    } else {
+        pct(b.edits_self, b.edits_directed + b.edits_self)
+    };
     let rework_pct = pct(b.lines_removed, b.lines_added);
     // -1, not 0: a branch that ran no tests must not read like one
     // whose tests all failed.
@@ -1182,6 +1225,13 @@ struct BranchAgg {
     files: HashSet<String>,
     churn_directed: i64,
     churn_self: i64,
+    /// The same split counted in EDITS, not lines. A shell edit
+    /// replaces an unknown number of lines (#383), so a line-weighted
+    /// split reads zero for a whole day's work — an edit is one event
+    /// whatever its size, and whether anyone asked for it is knowable
+    /// either way (#388).
+    edits_directed: i64,
+    edits_self: i64,
     /// Test INVOCATIONS, so an unparsed run is distinguishable from a
     /// branch that never ran one (#354 review).
     tests_run: i64,
@@ -1227,6 +1277,13 @@ struct LiveAgg {
     context_tokens: Option<i64>,
     churn_directed: i64,
     churn_self: i64,
+    /// The same split counted in EDITS, not lines. A shell edit
+    /// replaces an unknown number of lines (#383), so a line-weighted
+    /// split reads zero for a whole day's work — an edit is one event
+    /// whatever its size, and whether anyone asked for it is knowable
+    /// either way (#388).
+    edits_directed: i64,
+    edits_self: i64,
     /// How many times each path was written in this session, for the
     /// rework-of-rework count.
     path_hits: HashMap<String, i64>,
@@ -2309,11 +2366,26 @@ pub async fn stats_for_range_capped(
                                             .take(1)
                                             .any(|h| *h >= cut)
                                     });
+                                // Did this call REWRITE something? The lines it
+                                // replaced may be unknown; the event is not
+                                // (#388). A whole new file is not a rewrite —
+                                // counting it as one made a branch that only
+                                // created files read as 100% self-inflicted.
+                                let rewrote = replaced > 0
+                                    || (name == "NotebookEdit"
+                                        && get_str(input, "edit_mode") != Some("insert"));
                                 if replaced > 0 {
                                     if steered {
                                         code.churn_directed += replaced;
                                     } else {
                                         code.churn_self += replaced;
+                                    }
+                                }
+                                if rewrote {
+                                    if steered {
+                                        code.edits_directed += 1;
+                                    } else {
+                                        code.edits_self += 1;
                                     }
                                 }
                                 if let Some(e) = &effort {
@@ -2330,6 +2402,13 @@ pub async fn stats_for_range_capped(
                                             b.churn_directed += replaced;
                                         } else {
                                             b.churn_self += replaced;
+                                        }
+                                    }
+                                    if rewrote {
+                                        if steered {
+                                            b.edits_directed += 1;
+                                        } else {
+                                            b.edits_self += 1;
                                         }
                                     }
                                     if let Some(pth) = touched_path(input) {
@@ -2356,6 +2435,13 @@ pub async fn stats_for_range_capped(
                                             r.churn_self += replaced;
                                         }
                                     }
+                                    if rewrote {
+                                        if steered {
+                                            r.edits_directed += 1;
+                                        } else {
+                                            r.edits_self += 1;
+                                        }
+                                    }
                                     if let Some(pth) = touched_path(input) {
                                         r.files.insert(pth.to_string());
                                     }
@@ -2369,6 +2455,13 @@ pub async fn stats_for_range_capped(
                                             a.churn_directed += replaced;
                                         } else {
                                             a.churn_self += replaced;
+                                        }
+                                    }
+                                    if rewrote {
+                                        if steered {
+                                            a.edits_directed += 1;
+                                        } else {
+                                            a.edits_self += 1;
                                         }
                                     }
                                     if let Some(rk) = &repo_key {
@@ -2419,6 +2512,13 @@ pub async fn stats_for_range_capped(
                                             l.churn_directed += replaced;
                                         } else {
                                             l.churn_self += replaced;
+                                        }
+                                    }
+                                    if rewrote {
+                                        if steered {
+                                            l.edits_directed += 1;
+                                        } else {
+                                            l.edits_self += 1;
                                         }
                                     }
                                     // Which files, and how often each —
@@ -2545,6 +2645,49 @@ pub async fn stats_for_range_capped(
                                             let n = w.added;
                                             code.writes += 1;
                                             code.replaced_unknown += 1;
+                                            // One rewrite, and whether anyone
+                                            // asked for it — the half of churn a
+                                            // shell edit can still answer (#388).
+                                            // A heredoc that writes a file end to
+                                            // end creates it, as `Write` does.
+                                            let rewrote = !w.whole_file;
+                                            if rewrote {
+                                                if steered {
+                                                    code.edits_directed += 1;
+                                                } else {
+                                                    code.edits_self += 1;
+                                                }
+                                            }
+                                            if let Some(key) = &branch_pair {
+                                                let b = code.branches.entry(key.clone()).or_default();
+                                                if rewrote {
+                                                    if steered {
+                                                        b.edits_directed += 1;
+                                                    } else {
+                                                        b.edits_self += 1;
+                                                    }
+                                                }
+                                            }
+                                            if let Some(rk) = &repo_key {
+                                                let r = code.repos.entry(rk.clone()).or_default();
+                                                if rewrote {
+                                                    if steered {
+                                                        r.edits_directed += 1;
+                                                    } else {
+                                                        r.edits_self += 1;
+                                                    }
+                                                }
+                                            }
+                                            if let Some(an) = &agent_name {
+                                                let a = code.agents.entry(an.clone()).or_default();
+                                                if rewrote {
+                                                    if steered {
+                                                        a.edits_directed += 1;
+                                                    } else {
+                                                        a.edits_self += 1;
+                                                    }
+                                                }
+                                            }
                                             let sid = superx_ops::record_uuid(&m.session);
                                             if n > 0 {
                                                 let hour = when.format("%Y-%m-%dT%H").to_string();
@@ -2578,6 +2721,13 @@ pub async fn stats_for_range_capped(
                                             let l = code.live.entry(sid).or_default();
                                             l.lines_added += n;
                                             l.replaced_unknown += 1;
+                                            if rewrote {
+                                                if steered {
+                                                    l.edits_directed += 1;
+                                                } else {
+                                                    l.edits_self += 1;
+                                                }
+                                            }
                                             claim_doing(l, "writing");
                                             for path in &w.paths {
                                                 *l.path_hits.entry(path.clone()).or_insert(0) += 1;
@@ -2588,6 +2738,16 @@ pub async fn stats_for_range_capped(
                                                 }
                                             }
                                             for path in &w.paths {
+                                                // Created here or already there?
+                                                // A whole-file write creates, as
+                                                // `Write` does; an in-place edit
+                                                // modifies. Without this the
+                                                // created/modified split saw none
+                                                // of the day's shell edits (#388).
+                                                code.path_origin.insert(path.clone(), w.whole_file);
+                                                if let Some(rk) = &repo_key {
+                                                    code.path_repo.insert(path.clone(), rk.clone());
+                                                }
                                                 *code.files.entry(path.clone()).or_insert(0) += 1;
                                                 if let Some(ext) = extension_of(path) {
                                                     *code.languages.entry(ext).or_insert(0) += 1;
@@ -3019,6 +3179,8 @@ pub async fn stats_for_range_capped(
             compaction_ms: a.compaction_ms,
             churn_directed: a.churn_directed,
             churn_self: a.churn_self,
+            edits_directed: a.edits_directed,
+            edits_self: a.edits_self,
             tests_passed: a.tests_passed,
             tests_failed: a.tests_failed,
             compile_errors: a.compile_errors,
@@ -3159,6 +3321,8 @@ pub async fn stats_for_range_capped(
                             .unwrap_or(0),
                         churn_directed: b.churn_directed,
                         churn_self: b.churn_self,
+                        edits_directed: b.edits_directed,
+                        edits_self: b.edits_self,
                         tests_run: b.tests_run,
                         tests_passed: b.tests_passed,
                         tests_failed: b.tests_failed,
@@ -3218,6 +3382,8 @@ pub async fn stats_for_range_capped(
                     out_tokens: r.out_tokens,
                     churn_directed: r.churn_directed,
                     churn_self: r.churn_self,
+                    edits_directed: r.edits_directed,
+                    edits_self: r.edits_self,
                     reverts: r.reverts,
                     agents: r.agents.len() as i64,
                     last_active: r.last_active.map(|t| t.to_rfc3339()).unwrap_or_default(),
@@ -3247,6 +3413,8 @@ pub async fn stats_for_range_capped(
         },
         churn_directed: code.churn_directed,
         churn_self: code.churn_self,
+        edits_directed: code.edits_directed,
+        edits_self: code.edits_self,
         efforts: {
             let mut v: Vec<EffortStat> = code
                 .efforts
@@ -3389,10 +3557,14 @@ pub async fn stats_for_range_capped(
                         }),
                         thinking_tokens: l.thinking_tokens,
                         last_op_secs: l.last_op_ms / 1000,
-                        self_churn_pct: pct(
-                            l.churn_self,
-                            l.churn_directed + l.churn_self,
-                        ),
+                        // Lines when the transcript can see them, else
+                        // edits — the signal must not go dark because
+                        // the session edits through the shell (#388).
+                        self_churn_pct: if l.churn_directed + l.churn_self > 0 {
+                            pct(l.churn_self, l.churn_directed + l.churn_self)
+                        } else {
+                            pct(l.edits_self, l.edits_directed + l.edits_self)
+                        },
                         files_revisited: l
                             .path_hits
                             .values()

@@ -23,8 +23,16 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
   const landedChurn = pct(landedRemoved, landedAdded + landedRemoved)
   const churn = transcriptChurn ?? landedChurn
 
-  const directed = n(s?.churn_directed)
-  const self = n(s?.churn_self)
+  // Steering: replaced lines when the transcript can see them, else
+  // edits — a shell edit's size is unknown but who asked for it is not
+  // (#388). Without the fallback this gauge went dark for a whole day.
+  const directedLines = n(s?.churn_directed)
+  const selfLines = n(s?.churn_self)
+  const directedEdits = n(s?.edits_directed)
+  const selfEdits = n(s?.edits_self)
+  const inLines = directedLines + selfLines > 0
+  const directed = inLines ? directedLines : directedEdits
+  const self = inLines ? selfLines : selfEdits
   const onCourse = pct(directed, directed + self)
 
   const passed = n(s?.tests_passed)
@@ -65,8 +73,12 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
         label="On course"
         value={s ? onCourse : null}
         bands={[[BANDS.directedBad / 100, FAIL], [BANDS.directedOk / 100, CANCEL], [1, OK]]}
-        sub={s && onCourse != null ? `${fmtCompact(directed)} directed · ${fmtCompact(self)} self` : unknown > 0 ? `${unknown} rewrites of unknown size` : 'nothing rewritten'}
-        tip="share of replaced lines that followed a human instruction. Low means the agents are rewriting themselves with nobody steering."
+        sub={
+          s && onCourse != null
+            ? `${fmtCompact(directed)} directed · ${fmtCompact(self)} self${inLines ? '' : ' · edits'}`
+            : 'nothing rewritten'
+        }
+        tip="share of the rewriting that followed a human instruction — replaced lines where the transcript can see them, else edits. Low means the agents are rewriting themselves with nobody steering."
       />
       <Gauge
         label="Tests green"
