@@ -8,12 +8,13 @@
 //! Pure SELECT throughout — readers must not mutate the stream they
 //! observe. All code lives in the ui module; kernel untouched.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
+    BurnPoint, ModelEffortStat,
     AgentStat, BranchStat, ChurnPoint, CompactionStat, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount, QualityPoint, RepoStat, SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome, WorkCell,
 };
 
@@ -882,6 +883,15 @@ struct CodeAgg {
     /// counting crossings.
     last_repo: HashMap<String, String>,
     repo_switches: i64,
+    /// Hour → (output, thinking, prompt, cache read). Every other
+    /// series on the page moves over time; tokens were only ever a
+    /// total, so nothing said WHEN the money went (#391).
+    burn: BTreeMap<String, (i64, i64, i64, i64)>,
+    /// Output tokens spent on a message with no human turn in the
+    /// steering window before it — the unsupervised share (#391).
+    unattended_out: i64,
+    /// (model, effort) → outcomes (#391).
+    model_effort: HashMap<(String, String), ModelEffortAgg>,
     /// session → (time, is_write) events, reduced after the walk into
     /// how long a write waited for its verification.
     verify_events: HashMap<String, Vec<(chrono::DateTime<chrono::Utc>, bool)>>,
@@ -1197,6 +1207,29 @@ struct EffortAgg {
     thinking_tokens: i64,
     tool_failures: i64,
     reverts: i64,
+    tests_passed: i64,
+    tests_failed: i64,
+}
+
+/// Outcomes attributable to one (model, reasoning level) pair (#391).
+/// Two separate tables cannot answer "does thinking harder pay" when
+/// the model and the level change together, which is how they are
+/// actually switched — the pair has to be one key.
+#[derive(Default)]
+struct ModelEffortAgg {
+    sessions: HashSet<String>,
+    messages: i64,
+    out_tokens: i64,
+    thinking_tokens: i64,
+    lines_added: i64,
+    lines_removed: i64,
+    edits_directed: i64,
+    edits_self: i64,
+    tool_calls: i64,
+    tool_failures: i64,
+    reverts: i64,
+    interventions: i64,
+    denials: i64,
     tests_passed: i64,
     tests_failed: i64,
 }
@@ -1565,6 +1598,7 @@ fn attribute_quality(
     branch_pair: &Option<(String, String)>,
     agent_name: &Option<String>,
     effort: &Option<String>,
+    me_key: &Option<(String, String)>,
     (passed, failed, errors): (i64, i64, i64),
 ) {
     if passed == 0 && failed == 0 && errors == 0 {
@@ -1590,6 +1624,12 @@ fn attribute_quality(
         let ea = code.efforts.entry(e.clone()).or_default();
         ea.tests_passed += passed;
         ea.tests_failed += failed;
+    }
+    // The pair the operator actually switches (#391).
+    if let Some(k) = me_key {
+        let me = code.model_effort.entry(k.clone()).or_default();
+        me.tests_passed += passed;
+        me.tests_failed += failed;
     }
 }
 
@@ -1823,6 +1863,15 @@ pub async fn stats_for_range_capped(
         // hour of the backfill — one bar at 09 for six days of work
         // (#372).
         let hour_of_day = i64::from(chrono::Timelike::hour(&when));
+        // Was anyone steering when this message happened? Hoisted from
+        // the write path so the token accounting can ask it too (#391):
+        // the same ten-minute window, one computation per message.
+        let steered = human_turns
+            .get(&superx_ops::record_uuid(&m.session))
+            .is_some_and(|turns| {
+                let cut = when - chrono::Duration::minutes(STEERING_MINUTES);
+                turns.iter().rev().skip_while(|h| **h > when).take(1).any(|h| *h >= cut)
+            });
 
         // The 24×7 picture (#337): every session's span in the range.
         {
@@ -1919,6 +1968,21 @@ pub async fn stats_for_range_capped(
             .map(str::to_string);
         if let Some(known) = &model_opt {
             code.models.entry(known.clone()).or_default().messages += 1;
+        }
+        // Model and reasoning level ride the same messages, so the pair
+        // is a key (#391).
+        let me_key = model_opt.clone().zip(effort.clone());
+        if let Some(k) = &me_key {
+            let sid = superx_ops::record_uuid(&m.session);
+            let me = code.model_effort.entry(k.clone()).or_default();
+            me.messages += 1;
+            me.sessions.insert(sid);
+            if get_str(raw, "toolDenialKind").is_some() {
+                me.denials += 1;
+            }
+            if raw.get("interruptedMessageId").is_some() || raw.get("userFeedback").is_some() {
+                me.interventions += 1;
+            }
         }
         {
             let sid = superx_ops::record_uuid(&m.session);
@@ -2074,6 +2138,18 @@ pub async fn stats_for_range_capped(
                     .out_tokens += out;
                 agg.out_tokens += out;
                 code.out_tokens += out;
+                // Spent with nobody steering (#391).
+                if !steered {
+                    code.unattended_out += out;
+                }
+                if let Some(k) = &me_key {
+                    let me = code.model_effort.entry(k.clone()).or_default();
+                    me.out_tokens += out;
+                    me.thinking_tokens += usage
+                        .get("output_tokens_details")
+                        .and_then(obj)
+                        .map_or(0, |d| get_int(d, "thinking_tokens"));
+                }
                 if let Some(an) = &agent_name {
                     code.agents.entry(an.clone()).or_default().out_tokens += out;
                 }
@@ -2117,6 +2193,19 @@ pub async fn stats_for_range_capped(
                 let inp = get_int(usage, "input_tokens");
                 let cw = get_int(usage, "cache_creation_input_tokens");
                 let cr = get_int(usage, "cache_read_input_tokens");
+                // WHEN the money went (#391), in the same buckets the
+                // churn chart uses.
+                {
+                    let th = usage
+                        .get("output_tokens_details")
+                        .and_then(obj)
+                        .map_or(0, |d| get_int(d, "thinking_tokens"));
+                    let b = code.burn.entry(hour_key.clone()).or_insert((0, 0, 0, 0));
+                    b.0 += out;
+                    b.1 += th;
+                    b.2 += inp + cw;
+                    b.3 += cr;
+                }
                 code.in_tokens += inp;
                 code.cache_write += cw;
                 code.cache_read += cr;
@@ -2170,6 +2259,9 @@ pub async fn stats_for_range_capped(
                                         if let Some(e) = &effort {
                                             code.efforts.entry(e.clone()).or_default().tool_failures += 1;
                                         }
+                                        if let Some(k) = &me_key {
+                                            code.model_effort.entry(k.clone()).or_default().tool_failures += 1;
+                                        }
                                         if let Some(key) = &branch_pair {
                                             code.branches
                                                 .entry(key.clone())
@@ -2212,7 +2304,7 @@ pub async fn stats_for_range_capped(
                                     Some(text) if SHELL_TOOLS.contains(&name.as_str()) => {
                                         let d = score_output(&text, &mut code, &hour_key);
                                         attribute_quality(
-                                            &mut code, &branch_pair, &agent_name, &effort, d,
+                                            &mut code, &branch_pair, &agent_name, &effort, &me_key, d,
                                         );
                                         if cmd_opt.is_some_and(commits) {
                                             if let Some((ins, del)) = shortstat(&text) {
@@ -2267,6 +2359,9 @@ pub async fn stats_for_range_capped(
                             }
                             // When does work go wrong (#337)?
                             code.by_hour.entry(hour_of_day).or_insert((0, 0)).0 += 1;
+                            if let Some(k) = &me_key {
+                                code.model_effort.entry(k.clone()).or_default().tool_calls += 1;
+                            }
                             // Instrument the call itself (#308).
                             if name.starts_with("mcp__") {
                                 code.mcp += 1;
@@ -2355,17 +2450,6 @@ pub async fn stats_for_range_capped(
                                 // design moving; one with nobody
                                 // steering is the agent going in
                                 // circles (operator insight, #337).
-                                let steered = human_turns
-                                    .get(&superx_ops::record_uuid(&m.session))
-                                    .is_some_and(|turns| {
-                                        let cut = when - chrono::Duration::minutes(STEERING_MINUTES);
-                                        turns
-                                            .iter()
-                                            .rev()
-                                            .skip_while(|h| **h > when)
-                                            .take(1)
-                                            .any(|h| *h >= cut)
-                                    });
                                 // Did this call REWRITE something? The lines it
                                 // replaced may be unknown; the event is not
                                 // (#388). A whole new file is not a rewrite —
@@ -2392,6 +2476,18 @@ pub async fn stats_for_range_capped(
                                     let ea = code.efforts.entry(e.clone()).or_default();
                                     ea.lines_added += n;
                                     ea.lines_removed += replaced;
+                                }
+                                if let Some(k) = &me_key {
+                                    let me = code.model_effort.entry(k.clone()).or_default();
+                                    me.lines_added += n;
+                                    me.lines_removed += replaced;
+                                    if rewrote {
+                                        if steered {
+                                            me.edits_directed += 1;
+                                        } else {
+                                            me.edits_self += 1;
+                                        }
+                                    }
                                 }
                                 if let Some(key) = &branch_pair {
                                     let b = code.branches.entry(key.clone()).or_default();
@@ -2576,6 +2672,9 @@ pub async fn stats_for_range_capped(
                                     {
                                         if seen.contains(&key) {
                                             code.reverts += 1;
+                                            if let Some(k) = &me_key {
+                                                code.model_effort.entry(k.clone()).or_default().reverts += 1;
+                                            }
                                             if let Some(an) = &agent_name {
                                                 code.agents.entry(an.clone()).or_default().reverts += 1;
                                             }
@@ -2685,6 +2784,17 @@ pub async fn stats_for_range_capped(
                                                         a.edits_directed += 1;
                                                     } else {
                                                         a.edits_self += 1;
+                                                    }
+                                                }
+                                            }
+                                            if let Some(k) = &me_key {
+                                                let me = code.model_effort.entry(k.clone()).or_default();
+                                                me.lines_added += n;
+                                                if rewrote {
+                                                    if steered {
+                                                        me.edits_directed += 1;
+                                                    } else {
+                                                        me.edits_self += 1;
                                                     }
                                                 }
                                             }
@@ -2887,7 +2997,7 @@ pub async fn stats_for_range_capped(
                                     // The call already went by and it
                                     // was a shell: score immediately.
                                     let d = score_output(text, &mut code, &hour_key);
-                                    attribute_quality(&mut code, &branch_pair, &agent_name, &effort, d);
+                                    attribute_quality(&mut code, &branch_pair, &agent_name, &effort, &me_key, d);
                                 } else {
                                     pending_output.insert(id.to_string(), text.to_string());
                                 }
@@ -3100,6 +3210,19 @@ pub async fn stats_for_range_capped(
             }
         }
     }
+    // How much rope did each agent get (#391)? The gap from one human
+    // turn to the next, within a session, is how long it flew before it
+    // needed anything.
+    let mut turn_gaps: Vec<i64> = Vec::new();
+    let mut human_turn_count = 0i64;
+    for turns in human_turns.values() {
+        human_turn_count += turns.len() as i64;
+        for w in turns.windows(2) {
+            turn_gaps.push((w[1] - w[0]).num_minutes().max(0));
+        }
+    }
+    let autonomy_p50_mins = median(&mut turn_gaps);
+
     // A file whose oldest event in the window was a full Write was
     // created here; anything else already existed.
     let mut files_created = 0i64;
@@ -3413,6 +3536,52 @@ pub async fn stats_for_range_capped(
         },
         churn_directed: code.churn_directed,
         churn_self: code.churn_self,
+        burn: code
+            .burn
+            .into_iter()
+            .map(|(t, (out, thinking, input, cache_read))| BurnPoint {
+                t,
+                out,
+                thinking,
+                input,
+                cache_read,
+            })
+            .collect(),
+        model_effort: {
+            let mut v: Vec<ModelEffortStat> = code
+                .model_effort
+                .into_iter()
+                .map(|((model, effort), me)| ModelEffortStat {
+                    model,
+                    effort,
+                    sessions: me.sessions.len() as i64,
+                    messages: me.messages,
+                    out_tokens: me.out_tokens,
+                    thinking_tokens: me.thinking_tokens,
+                    lines_added: me.lines_added,
+                    lines_removed: me.lines_removed,
+                    edits_directed: me.edits_directed,
+                    edits_self: me.edits_self,
+                    tool_calls: me.tool_calls,
+                    tool_failures: me.tool_failures,
+                    reverts: me.reverts,
+                    interventions: me.interventions,
+                    denials: me.denials,
+                    tests_passed: me.tests_passed,
+                    tests_failed: me.tests_failed,
+                })
+                .collect();
+            v.sort_by(|a, b| {
+                b.messages
+                    .cmp(&a.messages)
+                    .then(a.model.cmp(&b.model))
+                    .then(a.effort.cmp(&b.effort))
+            });
+            v
+        },
+        human_turns: human_turn_count,
+        autonomy_p50_mins,
+        unattended_out_tokens: code.unattended_out,
         edits_directed: code.edits_directed,
         edits_self: code.edits_self,
         efforts: {

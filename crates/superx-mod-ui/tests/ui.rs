@@ -2540,3 +2540,54 @@ async fn a_version_suffix_is_not_a_language() {
     assert_eq!(langs, vec!["rs"], "{langs:?}");
     assert_eq!(s.files_touched, 4, "every file is still a file");
 }
+
+/// Tokens over time, and the pair the operator actually switches (#391).
+/// Every other series moved over time; tokens were a total, so nothing
+/// said WHEN the money went. And model and reasoning level ride the
+/// same messages, so comparing them needs one key, with the sample size
+/// beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn burn_moves_over_time_and_the_model_effort_pair_is_one_key() {
+    let kernel = fresh_kernel().await;
+    let (agent, steered) = seed_agent_and_session(&kernel, "claude_code", "burn-a").await;
+    let (agent2, alone) = seed_agent_and_session(&kernel, "claude_code", "burn-b").await;
+    let spend = |model: &str, effort: &str, out: i64, think: i64, inp: i64, cache: i64| serde_json::json!({
+        "cwd": "/w/superx", "effort": effort,
+        "message": {"model": model, "usage": {
+            "output_tokens": out, "input_tokens": inp, "cache_read_input_tokens": cache,
+            "output_tokens_details": {"thinking_tokens": think}},
+            "content": []}
+    });
+
+    // One pair spends after a human turn; the other flies alone.
+    kernel.log_message(superx_kernel::NewMessage {
+        session: steered.clone(), agent: agent.clone(), role: "user".into(),
+        content: "go".into(), raw: None, seq: None, emitted_at: None,
+    }).await.expect("human turn");
+    log_tool_message(&kernel, &steered, &agent, spend("claude-opus-5", "max", 1000, 300, 50, 900)).await;
+    log_tool_message(&kernel, &alone, &agent2, spend("claude-fable-5-1", "xhigh", 400, 200, 10, 100)).await;
+    log_tool_message(&kernel, &alone, &agent2, spend("claude-fable-5-1", "xhigh", 600, 100, 20, 200)).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // The burn series carries every kind of token, in one bucket here.
+    assert_eq!(s.burn.len(), 1, "one hour of spending: {:?}", s.burn.iter().map(|b| &b.t).collect::<Vec<_>>());
+    let b = &s.burn[0];
+    assert_eq!((b.out, b.thinking, b.input, b.cache_read), (2000, 600, 80, 1200));
+    assert_eq!(b.out, s.out_tokens_window, "the series sums to the range's output");
+
+    // Unattended: everything the second session spent, and nothing the
+    // first did — the operator had just spoken to it.
+    assert_eq!(s.unattended_out_tokens, 1000);
+    assert_eq!(s.human_turns, 1);
+
+    // The pair is one key, with its sample size.
+    assert_eq!(s.model_effort.len(), 2, "{:?}", s.model_effort.iter().map(|p| (&p.model, &p.effort)).collect::<Vec<_>>());
+    let pair = |m: &str| s.model_effort.iter().find(|p| p.model == m).expect("pair");
+    let fable = pair("claude-fable-5-1");
+    assert_eq!((fable.effort.as_str(), fable.sessions, fable.messages), ("xhigh", 1, 2));
+    assert_eq!((fable.out_tokens, fable.thinking_tokens), (1000, 300));
+    let opus = pair("claude-opus-5");
+    assert_eq!((opus.effort.as_str(), opus.sessions, opus.messages), ("max", 1, 1));
+    assert_eq!((opus.out_tokens, opus.thinking_tokens), (1000, 300));
+}

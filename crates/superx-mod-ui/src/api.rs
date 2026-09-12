@@ -217,6 +217,19 @@ pub struct StatsSummary {
     /// chart. `added` and `removed` are separate series so the UI can
     /// diverge them around zero.
     pub churn: Vec<ChurnPoint>,
+    /// Token spend per bucket — the burn series (#391).
+    pub burn: Vec<BurnPoint>,
+    /// Model × reasoning level against outcome, biggest sample first.
+    pub model_effort: Vec<ModelEffortStat>,
+    /// Human turns in the range — how often you had to say something.
+    pub human_turns: i64,
+    /// Median minutes between one human turn and the next, within a
+    /// session: how long an agent flies before it needs you. `0` when
+    /// no session had two turns.
+    pub autonomy_p50_mins: i64,
+    /// Output tokens spent on a message with no human turn in the ten
+    /// minutes before it — the unsupervised share of the spend.
+    pub unattended_out_tokens: i64,
     /// Edits whose added text a LATER edit removed from the same
     /// file — work that was thrown away. Counts each undo
     /// relationship, so a flip-flop (A→B, B→A, A→B) scores 2: the
@@ -679,6 +692,52 @@ pub struct SlowOp {
     pub label: String,
     pub ms: i64,
     pub at: String,
+}
+
+/// One bucket of token spend (#391). Every other series on the page
+/// moves over time; tokens were only ever a total, so nothing said
+/// WHEN the money went, or on which repo.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct BurnPoint {
+    pub t: String,
+    /// Tokens the models produced.
+    pub out: i64,
+    /// Of `out`, the part spent reasoning.
+    pub thinking: i64,
+    /// Prompt sent fresh, plus what the vendor wrote to its cache.
+    pub input: i64,
+    /// Prompt served back out of the vendor's cache.
+    pub cache_read: i64,
+}
+
+/// One (model, reasoning level) pair against what it produced (#391).
+/// The operator switches both together, so two separate tables cannot
+/// say which of them moved the outcome — the pair is the key, and the
+/// sample size rides beside every figure because a comparison without
+/// one is a guess.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ModelEffortStat {
+    pub model: String,
+    pub effort: String,
+    /// Sample size: sessions and messages behind every figure here.
+    pub sessions: i64,
+    pub messages: i64,
+    pub out_tokens: i64,
+    pub thinking_tokens: i64,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    /// Rewrites someone asked for, and rewrites nobody did (#389).
+    pub edits_directed: i64,
+    pub edits_self: i64,
+    pub tool_calls: i64,
+    pub tool_failures: i64,
+    pub reverts: i64,
+    pub interventions: i64,
+    pub denials: i64,
+    pub tests_passed: i64,
+    pub tests_failed: i64,
 }
 
 /// One hour of code movement.
