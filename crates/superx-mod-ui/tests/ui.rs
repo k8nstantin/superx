@@ -2617,3 +2617,111 @@ async fn burn_moves_over_time_and_the_model_effort_pair_is_one_key() {
     let opus = s.model_effort.iter().find(|p| p.model == "claude-opus-5").expect("pair");
     assert_eq!((opus.denials, opus.interventions), (0, 0), "the other session was not stopped");
 }
+
+/// The gates are an ORDER (#392): a pull request counts as gated when
+/// tests, clippy and the audit all ran after the last change before it.
+/// A write after the checks re-opens the question. A pull request from
+/// a session that changed nothing is neither gated nor ungated, so the
+/// two never have to sum to the number opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_request_is_gated_only_when_the_checks_ran_after_the_last_change() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let good = kernel.create_entity("node_session").await.expect("s1");
+    let bad = kernel.create_entity("node_session").await.expect("s2");
+    let clean = kernel.create_entity("node_session").await.expect("s3");
+    let now = chrono::Utc::now();
+    let at = |mins: i64| now - chrono::Duration::minutes(mins);
+    let write = |path: &str| serde_json::json!({"cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "effort": "max", "content": [
+            {"type": "tool_use", "id": "e", "name": "Write",
+             "input": {"file_path": path, "content": "fn a() {}"}}]}});
+    let shell = |cmd: &str| serde_json::json!({"cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "effort": "max", "content": [
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": cmd}}]}});
+
+    // Gated: write, then all three checks, then the pull request.
+    log_tool_message_at(&kernel, &good, &agent, write("/w/superx/a.rs"), at(50)).await;
+    log_tool_message_at(&kernel, &good, &agent, shell("cargo test --workspace"), at(40)).await;
+    log_tool_message_at(&kernel, &good, &agent, shell("cargo clippy --workspace -- -D warnings"), at(39)).await;
+    log_tool_message_at(&kernel, &good, &agent, shell("python3 tools/skill_audit.py"), at(38)).await;
+    log_tool_message_at(&kernel, &good, &agent, shell("gh pr create --base main"), at(30)).await;
+
+    // Ungated: the checks ran, then it wrote again, then opened.
+    log_tool_message_at(&kernel, &bad, &agent, write("/w/superx/b.rs"), at(50)).await;
+    log_tool_message_at(&kernel, &bad, &agent, shell("cargo test --workspace"), at(45)).await;
+    log_tool_message_at(&kernel, &bad, &agent, shell("cargo clippy --workspace -- -D warnings"), at(44)).await;
+    log_tool_message_at(&kernel, &bad, &agent, shell("python3 tools/skill_audit.py"), at(43)).await;
+    log_tool_message_at(&kernel, &bad, &agent, write("/w/superx/b.rs"), at(20)).await;
+    log_tool_message_at(&kernel, &bad, &agent, shell("gh pr create --base main"), at(10)).await;
+
+    // Neither: it opened a pull request without changing anything.
+    log_tool_message_at(&kernel, &clean, &agent, shell("gh pr create --base main"), at(5)).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.prs_opened, 3);
+    assert_eq!(s.prs_gated, 1, "only the one whose checks followed its last write");
+    assert_eq!(s.prs_ungated, 1, "the one that wrote again afterwards");
+}
+
+/// The line a module lane must never cross (#392): the kernel's own
+/// crate, and schema files. Ordinary paths are not deviations, and a
+/// shell edit into the kernel is caught as surely as a `Write` is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writing_into_the_kernel_or_a_schema_file_is_recorded() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let write = |path: &str| serde_json::json!({"cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "e", "name": "Write",
+             "input": {"file_path": path, "content": "x"}}]}});
+    log_tool_message(&kernel, &session, &agent, write("/w/superx/crates/superx-mod-ui/src/stats.rs")).await;
+    log_tool_message(&kernel, &session, &agent, write("/w/superx/crates/superx-kernel/src/capture.rs")).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({"cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "b", "name": "Bash",
+             "input": {"command": "sed -i 's/a/b/' schema/kernel.surql"}}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.bright_line_writes, 2, "the kernel crate and the schema file, not the module's own source");
+    let mut named: Vec<&str> = s.bright_line_paths.iter().map(String::as_str).collect();
+    named.sort_unstable();
+    assert_eq!(named, vec!["/w/superx/crates/superx-kernel/src/capture.rs", "/w/superx/schema/kernel.surql"]);
+}
+
+/// How hard the machine was working (#395): how many sessions spoke and
+/// how many repositories were open in each bucket, beside what moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn intensity_counts_the_fronts_open_in_each_bucket() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let one = kernel.create_entity("node_session").await.expect("s1");
+    let two = kernel.create_entity("node_session").await.expect("s2");
+    let now = chrono::Utc::now();
+    let hour_ago = now - chrono::Duration::hours(1);
+    let msg = |cwd: &str| serde_json::json!({"cwd": cwd,
+        "message": {"model": "claude-opus-5", "usage": {"output_tokens": 100}, "content": [
+            {"type": "tool_use", "id": "e", "name": "Write",
+             "input": {"file_path": format!("{cwd}/a.rs"), "content": "a\nb"}}]}});
+
+    // One hour: two sessions across two repositories.
+    log_tool_message_at(&kernel, &one, &agent, msg("/w/alpha"), hour_ago).await;
+    log_tool_message_at(&kernel, &two, &agent, msg("/w/beta"), hour_ago).await;
+    // The next: one session, one repository.
+    log_tool_message_at(&kernel, &one, &agent, msg("/w/alpha"), now).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.intensity.len(), 2, "{:?}", s.intensity.iter().map(|i| &i.t).collect::<Vec<_>>());
+    let busy = s.intensity.iter().max_by_key(|i| i.sessions).expect("busiest");
+    assert_eq!((busy.sessions, busy.repos), (2, 2));
+    assert_eq!(busy.lines_added, 4, "two lines from each");
+    assert_eq!(busy.out_tokens, 200);
+    assert_eq!((s.peak_sessions, s.peak_repos), (2, 2));
+
+    // And each sortie says what it was like, not only how long it was.
+    let span = s.timeline.iter().find(|t| t.identity == superx_ops::record_uuid(&one)).expect("sortie");
+    assert_eq!(span.repos, 1, "that session never left its repository");
+    assert_eq!(span.lines_added, 4);
+    assert_eq!(span.out_tokens, 200);
+}

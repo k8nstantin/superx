@@ -219,6 +219,26 @@ pub struct StatsSummary {
     pub churn: Vec<ChurnPoint>,
     /// Token spend per bucket — the burn series (#391).
     pub burn: Vec<BurnPoint>,
+    /// How many fronts were open per bucket — the intensity series (#395).
+    pub intensity: Vec<IntensityPoint>,
+    /// The most sessions, and the most repositories, open at once in
+    /// any one bucket of the range (#395).
+    pub peak_sessions: i64,
+    pub peak_repos: i64,
+
+    // ── what went wrong, and what was skipped (#392) ──────────────
+    /// Pull requests opened in a session that had written something,
+    /// with all three gates run after the last write: tests, clippy and
+    /// the skill audit. The rest of `prs_opened` either skipped a gate
+    /// or was opened by a session that changed nothing.
+    pub prs_gated: i64,
+    /// Opened after a write with at least one gate missing.
+    pub prs_ungated: i64,
+    /// Writes into territory a module lane must never touch — the
+    /// kernel's crate, or a schema file. The rule is absolute.
+    pub bright_line_writes: i64,
+    /// The paths, so the lamp names what it found.
+    pub bright_line_paths: Vec<String>,
     /// Model × reasoning level against outcome, biggest sample first.
     pub model_effort: Vec<ModelEffortStat>,
     /// Human turns in the range — how often you had to say something.
@@ -422,6 +442,9 @@ pub struct LiveSession {
     /// `commit 5db4a18`, `pushed` — and when, RFC3339 (#381).
     pub shipped: Option<String>,
     pub shipped_at: Option<String>,
+    /// Its newest message was the agent speaking without calling a
+    /// tool — it has stopped, and the next move is yours (#381 D).
+    pub awaiting: bool,
     /// A classified state rather than a raw tool name: `writing`,
     /// `verifying`, `reading`, `thinking`, `waiting`. `Bash` alone
     /// does not distinguish `cargo test` from `ls`.
@@ -679,6 +702,12 @@ pub struct SessionSpan {
     pub identity: String,
     pub agent: String,
     pub repo: Option<String>,
+    /// What the sortie was LIKE, not just how long it lasted (#395):
+    /// the lines and tokens behind those messages, and how many
+    /// repositories it moved between.
+    pub lines_added: i64,
+    pub out_tokens: i64,
+    pub repos: i64,
     /// RFC3339 bounds of its activity inside the range.
     pub start: String,
     pub end: String,
@@ -709,6 +738,22 @@ pub struct BurnPoint {
     pub input: i64,
     /// Prompt served back out of the vendor's cache.
     pub cache_read: i64,
+}
+
+/// How hard the machine was working in one bucket (#395). Burn says
+/// what was spent and churn says what moved; this says how many fronts
+/// were open at the same time.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct IntensityPoint {
+    pub t: String,
+    /// Sessions that spoke in this bucket.
+    pub sessions: i64,
+    /// Distinct repositories worked in it.
+    pub repos: i64,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub out_tokens: i64,
 }
 
 /// One (model, reasoning level) pair against what it produced (#391).

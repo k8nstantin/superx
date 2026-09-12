@@ -3,6 +3,7 @@
 //! whitelisted command execution with history persisted to the
 //! module's OWN database.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::time::Duration;
 
@@ -41,6 +42,47 @@ const CHART_EVENT_WINDOW: u32 = 2000; // skill-allow: §9-const — aggregation 
 struct AppState {
     kernel: Kernel,
     events: broadcast::Sender<String>,
+    /// Answers already computed, by key, with when they were (#390).
+    /// The long ranges cost ten seconds and the page polls every
+    /// fifteen; between two polls the answer barely moves, and two
+    /// pilots on the same range should not each pay for it.
+    cache: std::sync::Arc<std::sync::Mutex<HashMap<String, (std::time::Instant, String)>>>,
+}
+
+impl AppState {
+    /// A body computed less than `ttl` ago, if there is one.
+    fn cached(&self, key: &str, ttl: u64) -> Option<String> {
+        if ttl == 0 {
+            return None;
+        }
+        let map = self.cache.lock().ok()?;
+        let (at, body) = map.get(key)?;
+        (at.elapsed().as_secs() < ttl).then(|| body.clone())
+    }
+
+    fn remember(&self, key: &str, body: &str) {
+        if let Ok(mut map) = self.cache.lock() {
+            // Bounded: one entry per range plus a handful — a runaway
+            // key space would be a leak, not a cache.
+            if map.len() >= CACHE_ENTRIES {
+                map.clear();
+            }
+            map.insert(key.to_string(), (std::time::Instant::now(), body.to_string()));
+        }
+    }
+}
+
+/// Distinct answers held at once.
+const CACHE_ENTRIES: usize = 32; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// A JSON body that is already serialized.
+fn json_body(body: String) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 /// Bind and spawn the server + the single SSE poller task.
@@ -49,6 +91,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
     let state = AppState {
         kernel: kernel.clone(),
         events: events.clone(),
+        cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
     let app = Router::new()
         .route("/api/status", get(api_status))
@@ -294,14 +337,21 @@ struct SessionsQuery {
 async fn api_sessions(
     State(state): State<AppState>,
     Query(q): Query<SessionsQuery>,
-) -> Json<Vec<SessionView>> {
+) -> axum::response::Response {
     let kernel = &state.kernel;
+    // Four substrate round-trips per session (#380); until that is one
+    // query, at least two pollers share the cost (#390).
+    let ttl = crate::resolved_cache_secs(kernel).await;
+    let key = format!("sessions:{}", q.agent.clone().unwrap_or_default());
+    if let Some(body) = state.cached(&key, ttl) {
+        return json_body(body);
+    }
     let mut out = Vec::new();
     let Ok(sessions) = kernel
         .list_named_entities("node_session", "attr_session_descriptor")
         .await
     else {
-        return Json(out);
+        return json_body(serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string()));
     };
     // The context bar's denominator — resolved once per request.
     let window = crate::resolved_context_window(kernel).await;
@@ -382,7 +432,13 @@ async fn api_sessions(
             effort,
         });
     }
-    Json(out)
+    match serde_json::to_string(&out) {
+        Ok(body) => {
+            state.remember(&key, &body);
+            json_body(body)
+        }
+        Err(_) => json_body("[]".to_string()),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -458,7 +514,8 @@ struct RangeQuery {
 async fn api_stats(
     State(state): State<AppState>,
     Query(q): Query<RangeQuery>,
-) -> Response<StatsSummary> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
     let kernel = &state.kernel;
     let window = crate::resolved_stats_window(kernel).await;
     // Scroll-back (#326): a named range replaces the fixed newest-N
@@ -470,9 +527,20 @@ async fn api_stats(
     } else {
         "window".to_string()
     };
+    let ttl = crate::resolved_cache_secs(kernel).await;
+    let key = format!("stats:{range}:{window}");
+    if let Some(body) = state.cached(&key, ttl) {
+        return json_body(body);
+    }
     match crate::stats::stats_for_range(kernel, window, &range).await {
-        Ok(s) => Response::ok(s),
-        Err(e) => Response::err(e.to_string()),
+        Ok(s) => match serde_json::to_string(&s) {
+            Ok(body) => {
+                state.remember(&key, &body);
+                json_body(body)
+            }
+            Err(e) => err_response(&e.to_string()).into_response(),
+        },
+        Err(e) => err_response(&e.to_string()).into_response(),
     }
 }
 

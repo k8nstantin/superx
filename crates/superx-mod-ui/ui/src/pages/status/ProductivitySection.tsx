@@ -194,6 +194,50 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
       </Grid>
 
       <Panel
+        title="How hard it was working — fronts open, and what moved"
+        scope="range"
+        range={range}
+        note={`${long ? 'per day' : 'per hour'} · peak ${n(s?.peak_sessions)} session${n(s?.peak_sessions) === 1 ? '' : 's'} and ${n(s?.peak_repos)} repositor${n(s?.peak_repos) === 1 ? 'y' : 'ies'} at once`}
+        mb="md"
+      >
+        {(s?.intensity?.length ?? 0) === 0 ? (
+          <Text size="xs" c="dimmed">
+            nothing happened in this range
+          </Text>
+        ) : (
+          <EChart
+            height={220}
+            option={{
+              grid: { left: 58, right: 48, top: 18, bottom: 26 },
+              tooltip: { ...TOOLTIP, trigger: 'axis' },
+              legend: { data: ['lines written', 'sessions', 'repos'], textStyle: { color: INK_MUTED }, right: 0, top: -2 },
+              xAxis: {
+                type: 'category',
+                data: (s?.intensity ?? []).map((p) => label(p.t)),
+                axisLabel: { color: AXIS.axisLabel.color },
+                axisLine: { lineStyle: { color: GRID_LINE } },
+              },
+              yAxis: [
+                {
+                  type: 'value',
+                  axisLabel: { color: AXIS.axisLabel.color, formatter: (v: number) => fmtCompact(v) },
+                  splitLine: { lineStyle: { color: GRID_LINE } },
+                },
+                // Fronts open is a small count beside line volume, so it
+                // gets its own axis or it would sit flat on the floor.
+                { type: 'value', minInterval: 1, axisLabel: { color: AXIS.axisLabel.color }, splitLine: { show: false } },
+              ],
+              series: [
+                { name: 'lines written', type: 'bar', itemStyle: { color: CHART_COLORS[0] }, data: (s?.intensity ?? []).map((p) => n(p.lines_added)) },
+                { name: 'sessions', type: 'line', yAxisIndex: 1, smooth: true, symbol: 'circle', symbolSize: 5, itemStyle: { color: OK }, data: (s?.intensity ?? []).map((p) => n(p.sessions)) },
+                { name: 'repos', type: 'line', yAxisIndex: 1, smooth: true, symbol: 'circle', symbolSize: 5, itemStyle: { color: CANCEL }, data: (s?.intensity ?? []).map((p) => n(p.repos)) },
+              ],
+            }}
+          />
+        )}
+      </Panel>
+
+      <Panel
         title="Where the burn went — repository against what it produced"
         scope="range"
         range={range}

@@ -14,7 +14,7 @@ use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
-    BurnPoint, ModelEffortStat,
+    BurnPoint, IntensityPoint, ModelEffortStat,
     AgentStat, BranchStat, ChurnPoint, CompactionStat, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount, QualityPoint, RepoStat, SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome, WorkCell,
 };
 
@@ -206,6 +206,9 @@ fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
     }
     out
 }
+
+/// Bright-line paths named on the page, at most (#392).
+const BRIGHT_LINE_SHOWN: usize = 6; // skill-allow: §9-const — render-layer cap
 
 /// Paths taken from one inspecting call, at most.
 const INSPECT_PATHS: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
@@ -890,6 +893,18 @@ struct CodeAgg {
     /// Output tokens spent on a message with no human turn in the
     /// steering window before it — the unsupervised share (#391).
     unattended_out: i64,
+    /// Hour → how many fronts were open and what moved (#395).
+    intensity: BTreeMap<String, IntensityAgg>,
+    /// session → the repositories it moved between (#395).
+    session_repos: HashMap<String, HashSet<String>>,
+    /// session → what it did that the gates care about, with when (#392).
+    gate_events: HashMap<String, Vec<(chrono::DateTime<chrono::Utc>, GateEvent)>>,
+    /// Writes into territory a module lane must never touch: the
+    /// kernel's crate, and schema files (#392).
+    bright_line: BTreeMap<String, i64>,
+    /// Sessions already met. The walk is newest-first, so the first
+    /// message seen for a session is its newest (#381 D).
+    seen_sessions: HashSet<String>,
     /// (model, effort) → outcomes (#391).
     model_effort: HashMap<(String, String), ModelEffortAgg>,
     /// session → the pair it was running. An interruption, a refusal or
@@ -1224,6 +1239,32 @@ struct EffortAgg {
     tests_failed: i64,
 }
 
+/// How hard the machine was working in one bucket (#395). Burn says
+/// what was spent and churn says what moved; neither says how many
+/// fronts were open at once, which is the difference between one agent
+/// thinking and four agents rewriting four repositories.
+#[derive(Default)]
+struct IntensityAgg {
+    sessions: HashSet<String>,
+    repos: HashSet<String>,
+    added: i64,
+    removed: i64,
+    out_tokens: i64,
+}
+
+/// What a session did that the gates care about (#392). Collected with
+/// its time because the question is an ORDER — did the checks run after
+/// the last change and before the pull request — and the walk runs
+/// newest-first, so it can only be answered once it has finished.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GateEvent {
+    Wrote,
+    Tested,
+    Linted,
+    Audited,
+    OpenedPr,
+}
+
 /// Outcomes attributable to one (model, reasoning level) pair (#391).
 /// Two separate tables cannot answer "does thinking harder pay" when
 /// the model and the level change together, which is how they are
@@ -1306,6 +1347,9 @@ struct LiveAgg {
     lines_added: i64,
     lines_removed: i64,
     replaced_unknown: i64,
+    /// Its newest message was the agent speaking without calling a
+    /// tool: it has stopped, and the next move is yours (#381 D).
+    awaiting: bool,
     /// The newest thing this session shipped, and when (#381).
     shipped: Option<String>,
     shipped_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1646,6 +1690,15 @@ fn attribute_quality(
     }
 }
 
+/// A write into territory a module lane must never touch (#392): the
+/// kernel's own crate, or a schema file. The rule is absolute, and the
+/// path is already extracted for every write (#374, #382).
+fn note_bright_line(code: &mut CodeAgg, path: &str) {
+    if path.contains("/crates/superx-kernel/") || path.ends_with(".surql") {
+        *code.bright_line.entry(path.to_string()).or_insert(0) += 1;
+    }
+}
+
 /// One in-engine `count() GROUP ALL` over a table.
 async fn count_rows(kernel: &Kernel, query: &'static str) -> Result<i64> {
     let rows: Vec<Value> = kernel.db().query(query).await?.take(0)?;
@@ -1982,6 +2035,40 @@ pub async fn stats_for_range_capped(
         if let Some(known) = &model_opt {
             code.models.entry(known.clone()).or_default().messages += 1;
         }
+        // How many fronts were open in this bucket (#395). The repo
+        // half joins below, once the working directory is known.
+        code.intensity
+            .entry(hour_key.clone())
+            .or_default()
+            .sessions
+            .insert(superx_ops::record_uuid(&m.session));
+        // Is this session waiting on YOU (#381 D)? The walk is
+        // newest-first, so the first message met for a session is its
+        // newest. An assistant turn that called no tool is the agent
+        // having stopped and said something — a question, or a report —
+        // and nothing has happened since.
+        {
+            let sid = superx_ops::record_uuid(&m.session);
+            if code.seen_sessions.insert(sid.clone()) {
+                let called_a_tool = raw
+                    .get("message")
+                    .and_then(obj)
+                    .and_then(|msg| msg.get("content"))
+                    .and_then(|c| match c {
+                        Value::Array(a) => Some(a),
+                        _ => None,
+                    })
+                    .is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(obj)
+                            .any(|b| get_str(b, "type") == Some("tool_use"))
+                    });
+                if m.role == "assistant" && !called_a_tool {
+                    code.live.entry(sid).or_default().awaiting = true;
+                }
+            }
+        }
         // Model and reasoning level ride the same messages, so the pair
         // is a key (#391).
         let me_key = model_opt.clone().zip(effort.clone());
@@ -2062,6 +2149,13 @@ pub async fn stats_for_range_capped(
         // Which repo the agent was standing in (#308, #325), and which
         // branch of it (#350).
         let repo_key = get_str(raw, "cwd").map(|c| c.rsplit('/').next().unwrap_or(c).to_string());
+        if let Some(rk) = &repo_key {
+            code.intensity.entry(hour_key.clone()).or_default().repos.insert(rk.clone());
+            code.session_repos
+                .entry(superx_ops::record_uuid(&m.session))
+                .or_default()
+                .insert(rk.clone());
+        }
         if let Some(c) = get_str(raw, "cwd") {
             code.cwds.insert(c.to_string());
         }
@@ -2245,6 +2339,7 @@ pub async fn stats_for_range_capped(
                         .get("output_tokens_details")
                         .and_then(obj)
                         .map_or(0, |d| get_int(d, "thinking_tokens"));
+                    code.intensity.entry(hour_key.clone()).or_default().out_tokens += out;
                     let b = code.burn.entry(hour_key.clone()).or_insert((0, 0, 0, 0));
                     b.0 += out;
                     b.1 += th;
@@ -2478,9 +2573,12 @@ pub async fn stats_for_range_capped(
                                 }
                                 if n > 0 || replaced > 0 {
                                     let hour = when.format("%Y-%m-%dT%H").to_string();
-                                    let slot = code.churn.entry(hour).or_insert((0, 0));
+                                    let slot = code.churn.entry(hour.clone()).or_insert((0, 0));
                                     slot.0 += n;
                                     slot.1 += replaced;
+                                    let it = code.intensity.entry(hour).or_default();
+                                    it.added += n;
+                                    it.removed += replaced;
                                 }
                                 // Undo detection (#324). The walk is
                                 // newest-first, so `removed_text`
@@ -2628,6 +2726,15 @@ pub async fn stats_for_range_capped(
                                     code.path_origin.insert(pth.to_string(), creates);
                                     if let Some(rk) = &repo_key {
                                         code.path_repo.insert(pth.to_string(), rk.clone());
+                                    }
+                                }
+                                if rewrote || n > 0 {
+                                    code.gate_events
+                                        .entry(superx_ops::record_uuid(&m.session))
+                                        .or_default()
+                                        .push((when, GateEvent::Wrote));
+                                    if let Some(pth) = touched_path(input) {
+                                        note_bright_line(&mut code, pth);
                                     }
                                 }
                                 // A write is one half of the
@@ -2846,7 +2953,8 @@ pub async fn stats_for_range_capped(
                                             let sid = superx_ops::record_uuid(&m.session);
                                             if n > 0 {
                                                 let hour = when.format("%Y-%m-%dT%H").to_string();
-                                                code.churn.entry(hour).or_insert((0, 0)).0 += n;
+                                                code.churn.entry(hour.clone()).or_insert((0, 0)).0 += n;
+                                                code.intensity.entry(hour).or_default().added += n;
                                                 if let Some(e) = &effort {
                                                     code.efforts.entry(e.clone()).or_default().lines_added += n;
                                                 }
@@ -2873,6 +2981,10 @@ pub async fn stats_for_range_capped(
                                                 code.lines_added += n;
                                             }
                                             code.verify_events.entry(sid.clone()).or_default().push((when, true));
+                                            code.gate_events.entry(sid.clone()).or_default().push((when, GateEvent::Wrote));
+                                            for path in &w.paths {
+                                                note_bright_line(&mut code, path);
+                                            }
                                             let l = code.live.entry(sid).or_default();
                                             l.lines_added += n;
                                             l.replaced_unknown += 1;
@@ -2949,6 +3061,28 @@ pub async fn stats_for_range_capped(
                                             *code.command_lines.entry(key).or_insert(0) += 1;
                                         }
                                     }
+                                    // What the gates saw, and when (#392).
+                                    // The question is an ORDER — did the
+                                    // checks run after the last change and
+                                    // before the pull request — so the
+                                    // events are collected here and judged
+                                    // once the walk has finished.
+                                    {
+                                        let sid = superx_ops::record_uuid(&m.session);
+                                        let mut note = |e: GateEvent| {
+                                            code.gate_events.entry(sid.clone()).or_default().push((when, e));
+                                        };
+                                        for label in command_labels(cmd) {
+                                            match label.as_str() {
+                                                "cargo test" => note(GateEvent::Tested),
+                                                "cargo clippy" => note(GateEvent::Linted),
+                                                _ => {}
+                                            }
+                                        }
+                                        if cmd.contains("skill_audit") {
+                                            note(GateEvent::Audited);
+                                        }
+                                    }
                                     // What the call SHIPPED (#381): the
                                     // outcomes beside all this effort.
                                     for (ship, num) in shipping(cmd) {
@@ -2970,6 +3104,10 @@ pub async fn stats_for_range_capped(
                                             }
                                             Ship::PrOpened => {
                                                 code.prs_opened += 1;
+                                                code.gate_events
+                                                    .entry(superx_ops::record_uuid(&m.session))
+                                                    .or_default()
+                                                    .push((when, GateEvent::OpenedPr));
                                                 format!("PR{} opened", detail(true))
                                             }
                                             Ship::PrMerged => {
@@ -3133,6 +3271,46 @@ pub async fn stats_for_range_capped(
         .map(|(name, value)| NameCount { name, value })
         .collect();
     tools.sort_by_key(|t| std::cmp::Reverse(t.value));
+
+    // What a sortie was LIKE (#395) — kept before the map is consumed.
+    let session_work: HashMap<String, (i64, i64)> = per_session
+        .iter()
+        .map(|(k, a)| (k.clone(), (a.lines, a.out_tokens)))
+        .collect();
+
+    // Were the gates run (#392)? The question is an order, which only
+    // the finished walk can answer. A pull request counts as gated when
+    // tests, clippy and the audit all ran after the last write before
+    // it. One opened by a session that changed nothing is neither —
+    // there was nothing to check — so the two never sum to `prs_opened`
+    // and the page says so.
+    let (mut prs_gated, mut prs_ungated) = (0i64, 0i64);
+    for events in code.gate_events.values_mut() {
+        events.sort_by_key(|(t, _)| *t);
+        let (mut tested, mut linted, mut audited, mut wrote) = (false, false, false, false);
+        for (_, e) in events.iter() {
+            match e {
+                GateEvent::Wrote => {
+                    wrote = true;
+                    tested = false;
+                    linted = false;
+                    audited = false;
+                }
+                GateEvent::Tested => tested = true,
+                GateEvent::Linted => linted = true,
+                GateEvent::Audited => audited = true,
+                GateEvent::OpenedPr => {
+                    if wrote {
+                        if tested && linted && audited {
+                            prs_gated += 1;
+                        } else {
+                            prs_ungated += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let mut top: Vec<(String, SessAgg)> = per_session.into_iter().collect();
     top.sort_by_key(|(_, a)| std::cmp::Reverse(a.messages));
@@ -3624,6 +3802,24 @@ pub async fn stats_for_range_capped(
             });
             v
         },
+        intensity: code
+            .intensity
+            .iter()
+            .map(|(t, i)| IntensityPoint {
+                t: t.clone(),
+                sessions: i.sessions.len() as i64,
+                repos: i.repos.len() as i64,
+                lines_added: i.added,
+                lines_removed: i.removed,
+                out_tokens: i.out_tokens,
+            })
+            .collect(),
+        peak_sessions: code.intensity.values().map(|i| i.sessions.len() as i64).max().unwrap_or(0),
+        peak_repos: code.intensity.values().map(|i| i.repos.len() as i64).max().unwrap_or(0),
+        prs_gated,
+        prs_ungated,
+        bright_line_writes: code.bright_line.values().sum(),
+        bright_line_paths: code.bright_line.keys().take(BRIGHT_LINE_SHOWN).cloned().collect(),
         human_turns: human_turn_count,
         autonomy_p50_mins,
         unattended_out_tokens: code.unattended_out,
@@ -3703,6 +3899,9 @@ pub async fn stats_for_range_capped(
                     identity: sid.clone(),
                     agent: agent.clone(),
                     repo: repo.clone(),
+                    lines_added: session_work.get(sid).map_or(0, |w| w.0),
+                    out_tokens: session_work.get(sid).map_or(0, |w| w.1),
+                    repos: code.session_repos.get(sid).map_or(0, |r| r.len() as i64),
                     start: start.to_rfc3339(),
                     end: end.to_rfc3339(),
                     messages: *msgs,
@@ -3748,6 +3947,7 @@ pub async fn stats_for_range_capped(
                             .context_tokens
                             .map(|c| ((c * 100) / context_window.max(1)).clamp(0, 100)),
                         files_now: l.files_now.clone(),
+                        awaiting: l.awaiting,
                         shipped: l.shipped.clone(),
                         shipped_at: l.shipped_at.map(|t| t.to_rfc3339()),
                         // No classifiable call in the window: say what

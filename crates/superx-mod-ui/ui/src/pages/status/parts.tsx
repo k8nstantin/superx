@@ -57,6 +57,8 @@ export const baseName = (p: string) => p.split('/').slice(-2).join('/')
 // analysis constants (STEERING_MINUTES, DURABLE_MINS, REVISIT_AT);
 // these say only where a dial turns amber and red.
 export const BANDS = {
+  // Seconds of quiet after an agent stops before the lamp lights (#381 D).
+  awaitingSecs: 120,
   /// replaced ÷ (added + replaced): under this is new code…
   churnOk: 25,
   /// …over this the window spent itself rewriting.

@@ -7,6 +7,7 @@ import type { CompactionStat } from "./CompactionStat";
 import type { EffortStat } from "./EffortStat";
 import type { Exposure } from "./Exposure";
 import type { HourRate } from "./HourRate";
+import type { IntensityPoint } from "./IntensityPoint";
 import type { Landed } from "./Landed";
 import type { LiveSession } from "./LiveSession";
 import type { ModelEffortStat } from "./ModelEffortStat";
@@ -175,6 +176,35 @@ churn: Array<ChurnPoint>,
  * Token spend per bucket — the burn series (#391).
  */
 burn: Array<BurnPoint>, 
+/**
+ * How many fronts were open per bucket — the intensity series (#395).
+ */
+intensity: Array<IntensityPoint>, 
+/**
+ * The most sessions, and the most repositories, open at once in
+ * any one bucket of the range (#395).
+ */
+peak_sessions: bigint, peak_repos: bigint, 
+/**
+ * Pull requests opened in a session that had written something,
+ * with all three gates run after the last write: tests, clippy and
+ * the skill audit. The rest of `prs_opened` either skipped a gate
+ * or was opened by a session that changed nothing.
+ */
+prs_gated: bigint, 
+/**
+ * Opened after a write with at least one gate missing.
+ */
+prs_ungated: bigint, 
+/**
+ * Writes into territory a module lane must never touch — the
+ * kernel's crate, or a schema file. The rule is absolute.
+ */
+bright_line_writes: bigint, 
+/**
+ * The paths, so the lamp names what it found.
+ */
+bright_line_paths: Array<string>, 
 /**
  * Model × reasoning level against outcome, biggest sample first.
  */

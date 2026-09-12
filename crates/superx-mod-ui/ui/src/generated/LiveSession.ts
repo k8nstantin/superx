@@ -53,6 +53,11 @@ files_now: Array<string>,
  */
 shipped: string | null, shipped_at: string | null, 
 /**
+ * Its newest message was the agent speaking without calling a
+ * tool — it has stopped, and the next move is yours (#381 D).
+ */
+awaiting: boolean, 
+/**
  * A classified state rather than a raw tool name: `writing`,
  * `verifying`, `reading`, `thinking`, `waiting`. `Bash` alone
  * does not distinguish `cargo test` from `ls`.
