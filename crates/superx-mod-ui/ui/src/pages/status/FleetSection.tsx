@@ -366,6 +366,14 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                     <Table.Th ta="right">Took off</Table.Th>
                     <Table.Th ta="right">Airtime</Table.Th>
                     <Table.Th ta="right">Msgs</Table.Th>
+                    <Table.Th ta="right">
+                      <Tooltip label="messages a minute — a two-hour sortie at four a minute is a different animal from one at four an hour (#395)" withArrow multiline w={260}>
+                        <span>Msgs/min</span>
+                      </Tooltip>
+                    </Table.Th>
+                    <Table.Th ta="right">Lines/h</Table.Th>
+                    <Table.Th ta="right">Tok/h</Table.Th>
+                    <Table.Th ta="right">Repos</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
@@ -385,6 +393,22 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                         <Table.Td ta="right"><Text size="xs">{start.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</Text></Table.Td>
                         <Table.Td ta="right"><Text size="xs" ff={MONO}>{mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`}</Text></Table.Td>
                         <Table.Td ta="right">{String(sp.messages)}</Table.Td>
+                        <Table.Td ta="right">
+                          <Text size="xs" ff={MONO}>
+                            {mins > 0 ? (Math.round((n(sp.messages) * 10) / mins) / 10).toFixed(1) : '—'}
+                          </Text>
+                        </Table.Td>
+                        <Table.Td ta="right">
+                          <Text size="xs" ff={MONO}>
+                            {mins > 0 && n(sp.lines_added) > 0 ? fmtCompact(Math.round((n(sp.lines_added) * 60) / mins)) : '—'}
+                          </Text>
+                        </Table.Td>
+                        <Table.Td ta="right">
+                          <Text size="xs" ff={MONO}>
+                            {mins > 0 && n(sp.out_tokens) > 0 ? fmtCompact(Math.round((n(sp.out_tokens) * 60) / mins)) : '—'}
+                          </Text>
+                        </Table.Td>
+                        <Table.Td ta="right">{n(sp.repos) === 0 ? '—' : String(sp.repos)}</Table.Td>
                       </Table.Tr>
                     )
                   })}

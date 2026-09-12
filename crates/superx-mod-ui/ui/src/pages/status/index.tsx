@@ -6,6 +6,7 @@ import { useBreadcrumb } from '../../Breadcrumbs'
 import { Annunciator } from './Annunciator'
 import { CodeSection } from './CodeSection'
 import { CostSection } from './CostSection'
+import { DeviationsSection } from './DeviationsSection'
 import { FleetSection } from './FleetSection'
 import { FlightDeck } from './FlightDeck'
 import { Gauges } from './Gauges'
@@ -28,6 +29,7 @@ const SECTIONS = [
   ['gauges', 'Gauges'],
   ['code', 'Code'],
   ['quality', 'Quality'],
+  ['deviations', 'Deviations'],
   ['fleet', 'Fleet'],
   ['productivity', 'Productivity'],
   ['cost', 'Cost'],
@@ -185,6 +187,13 @@ export default function StatusPage() {
       </Section>
       <Section id="quality" title="Quality" blurb="what the commands reported, when it went wrong, what the agents waited on">
         <QualitySection s={s} range={s?.range ?? range} />
+      </Section>
+      <Section
+        id="deviations"
+        title="Deviations"
+        blurb="what went wrong, and what was skipped"
+      >
+        <DeviationsSection s={s} range={s?.range ?? range} />
       </Section>
       <Section id="fleet" title="Fleet" blurb="agents, reasoning levels, models and branches compared on outcome, not volume">
         <FleetSection s={s} range={s?.range ?? range} />

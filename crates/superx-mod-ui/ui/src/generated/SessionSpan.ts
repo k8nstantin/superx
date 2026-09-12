@@ -5,6 +5,12 @@
  */
 export type SessionSpan = { identity: string, agent: string, repo: string | null, 
 /**
+ * What the sortie was LIKE, not just how long it lasted (#395):
+ * the lines and tokens behind those messages, and how many
+ * repositories it moved between.
+ */
+lines_added: bigint, out_tokens: bigint, repos: bigint, 
+/**
  * RFC3339 bounds of its activity inside the range.
  */
 start: string, end: string, messages: bigint, };

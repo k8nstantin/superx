@@ -103,6 +103,15 @@ pub async fn resolved_stats_window(kernel: &Kernel) -> u32 {
 /// substrate.
 pub const DEFAULT_RANGE_PARAM: &str = "attr_ui_default_range";
 
+/// How long a computed answer may be served again (#390). The long
+/// ranges walk twenty thousand rows and ask every repository what
+/// landed; the page polls every fifteen seconds, and between two polls
+/// the answer barely moves. Seconds; `0` disables the cache entirely.
+pub const CACHE_SECS_PARAM: &str = "attr_ui_cache_secs";
+
+/// Fallback when the parameter is unset.
+pub const DEFAULT_CACHE_SECS: u64 = 20; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
 /// Fallback when the parameter is unset or names no known range.
 pub const DEFAULT_RANGE: &str = "24h";
 
@@ -122,6 +131,23 @@ pub async fn resolved_default_range(kernel: &Kernel) -> String {
     match kernel.get_parameter(entity, DEFAULT_RANGE_PARAM).await {
         Ok(Some(Value::String(r))) if RANGES.contains(&r.as_str()) => r,
         _ => DEFAULT_RANGE.to_string(),
+    }
+}
+
+/// Resolve how long an answer may be reused, in seconds.
+pub async fn resolved_cache_secs(kernel: &Kernel) -> u64 {
+    let Ok(Some(entity)) = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+    else {
+        return DEFAULT_CACHE_SECS;
+    };
+    match kernel.get_parameter(entity, CACHE_SECS_PARAM).await {
+        Ok(Some(Value::Number(n))) => n
+            .to_int()
+            .filter(|&v| v >= 0)
+            .map_or(DEFAULT_CACHE_SECS, |v| v as u64),
+        _ => DEFAULT_CACHE_SECS,
     }
 }
 

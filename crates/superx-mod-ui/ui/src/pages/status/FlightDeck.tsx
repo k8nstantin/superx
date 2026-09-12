@@ -238,6 +238,13 @@ export function FlightDeck({
                         )}
                       </Table.Td>
                       <Table.Td>
+                        {l.awaiting && (
+                          <Tooltip label="this session's newest message called no tool — it has stopped and is waiting on you" withArrow>
+                            <Badge variant="light" color="yellow" size="xs" mr={6}>
+                              waiting
+                            </Badge>
+                          </Tooltip>
+                        )}
                         {l.shipped ? (
                           <Tooltip label={l.shipped_at ?? ''} withArrow>
                             <Text size="xs" style={{ whiteSpace: 'nowrap' }}>

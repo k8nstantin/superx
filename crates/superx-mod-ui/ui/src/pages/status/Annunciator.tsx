@@ -33,6 +33,11 @@ export function Annunciator({
   const nearCeiling = live.filter((l) => l.context_pct != null && n(l.context_pct) >= BANDS.contextWarn).length
   const atCeiling = live.filter((l) => l.context_pct != null && n(l.context_pct) >= BANDS.contextBad).length
 
+  // An agent whose newest message called no tool has stopped talking to
+  // the machine and started talking to you (#381 D). Idle for a couple
+  // of minutes on top of that, and the ball is in your court.
+  const waiting = live.filter((l) => l.awaiting && n(l.idle_secs) >= BANDS.awaitingSecs).length
+
   const modulesDown = (status?.modules ?? []).filter((m) => m.lifecycle !== 'active').length
   const moduleFailures = (i?.module_health ?? []).reduce((a, h) => a + n(h.failures_recent), 0)
 
@@ -51,6 +56,14 @@ export function Annunciator({
         sub={i ? `${fmtCompact(i.events_last_hour)} events this hour` : ''}
         tip="age of the newest captured event — the capture-alive signal. Amber past five minutes, red past thirty."
         onClick={() => jump('systems')}
+      />
+      <Lamp
+        label="Waiting on you"
+        value={s ? (waiting > 0 ? String(waiting) : 'none') : '…'}
+        tone={waiting > 0 ? 'warn' : 'ok'}
+        sub={waiting > 0 ? 'stopped, needs an answer' : 'nobody is blocked'}
+        tip="live sessions whose newest message called no tool — the agent has stopped and said something — and which have been quiet since. The one thing on the machine no other instrument says."
+        onClick={() => jump('deck')}
       />
       <Lamp
         label="Modules"
