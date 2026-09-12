@@ -214,7 +214,16 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                   <Table.Th ta="right">Share of burn</Table.Th>
                   <Table.Th ta="right">Lines +/−</Table.Th>
                   <Table.Th ta="right">Landed +/−</Table.Th>
-                  <Table.Th ta="right">Tok / line</Table.Th>
+                  <Table.Th ta="right">
+                    <Tooltip
+                      label="this directory's output tokens ÷ the lines the transcript saw it write. Landed lines belong to the repository, which a worktree shares, so they are not a denominator for one directory's spend."
+                      withArrow
+                      multiline
+                      w={280}
+                    >
+                      <span>Tok / written</span>
+                    </Tooltip>
+                  </Table.Th>
                   <Table.Th ta="right">Files</Table.Th>
                   <Table.Th ta="right">Tests</Table.Th>
                   <Table.Th ta="right">Fails</Table.Th>
@@ -229,10 +238,14 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                     // fold into it (#386), so it only matches where the
                     // working directory IS the repository.
                     const land = (s?.landed?.repos ?? []).find((l) => l.name === r.name)
-                    // Tokens per line uses whatever the repository landed
-                    // when it can, and falls back to what was written.
-                    const denom = land ? n(land.added) : n(r.lines_added)
-                    const perLine = denom > 0 ? Math.round(n(r.out_tokens) / denom) : null
+                    // Tokens against THIS directory's own written lines.
+                    // Landed lines belong to the repository and a worktree
+                    // shares them, so dividing one directory's spend by
+                    // them read 3 tokens a line for a checkout that wrote
+                    // nothing, and a dash for one that wrote 5.9k lines
+                    // and landed none of them yet.
+                    const written = n(r.lines_added)
+                    const perLine = written > 0 ? Math.round(n(r.out_tokens) / written) : null
                     return (
                       <Table.Tr key={r.name}>
                         <Table.Td>
@@ -277,7 +290,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                           )}
                         </Table.Td>
                         <Table.Td ta="right">
-                          <Text size="xs" ff={MONO} c={land ? undefined : 'dimmed'}>
+                          <Text size="xs" ff={MONO} c={perLine == null ? 'dimmed' : undefined}>
                             {perLine == null ? '—' : fmtCompact(perLine)}
                           </Text>
                         </Table.Td>
