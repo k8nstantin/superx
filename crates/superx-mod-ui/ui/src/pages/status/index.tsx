@@ -10,15 +10,17 @@ import { FleetSection } from './FleetSection'
 import { FlightDeck } from './FlightDeck'
 import { Gauges } from './Gauges'
 import { HistorySection } from './HistorySection'
+import { ProductivitySection } from './ProductivitySection'
 import { QualitySection } from './QualitySection'
 import { Section, rangeLabel } from './parts'
 import { readHash, writeHash } from '../../route'
 import { SystemsSection } from './SystemsSection'
 
 // The cockpit (#367). One sticky bar carries the sections and the
-// range; below it, nine bands in the order a pilot reads them: what is
+// range; below it, ten bands in the order a pilot reads them: what is
 // wrong, who is in the air, the primary instruments, then the code,
-// its quality, the fleet, the cost, the long view and the machine.
+// its quality, the fleet, what it all cost against what came back, the
+// cost itself, the long view and the machine.
 
 const SECTIONS = [
   ['warnings', 'Warnings'],
@@ -27,6 +29,7 @@ const SECTIONS = [
   ['code', 'Code'],
   ['quality', 'Quality'],
   ['fleet', 'Fleet'],
+  ['productivity', 'Productivity'],
   ['cost', 'Cost'],
   ['history', 'History'],
   ['systems', 'Systems'],
@@ -185,6 +188,13 @@ export default function StatusPage() {
       </Section>
       <Section id="fleet" title="Fleet" blurb="agents, reasoning levels, models and branches compared on outcome, not volume">
         <FleetSection s={s} range={s?.range ?? range} />
+      </Section>
+      <Section
+        id="productivity"
+        title="Productivity"
+        blurb="effort divided by outcome — and the human half of the loop"
+      >
+        <ProductivitySection s={s} range={s?.range ?? range} />
       </Section>
       <Section id="cost" title="Cost" blurb="what the tokens bought, and what left this machine">
         <CostSection s={s} i={i} range={s?.range ?? range} />
