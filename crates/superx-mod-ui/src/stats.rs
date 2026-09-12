@@ -3942,6 +3942,7 @@ pub async fn stats_for_range_capped(
                         out_tokens: l.out_tokens,
                         tool_failures: l.tool_failures,
                         idle_secs: idle,
+                        last_seen_at: Some(newest.to_rfc3339()),
                         context_tokens: l.context_tokens,
                         context_pct: l
                             .context_tokens

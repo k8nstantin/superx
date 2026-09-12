@@ -39,8 +39,21 @@ event_kinds: Array<NameCount>,
 module_startup: Array<NameCount>, 
 /**
  * Age of the newest captured event — the capture-alive signal.
+ * An age computed on the server goes stale the moment it is sent:
+ * this panel refreshes once a minute, the flight deck every
+ * fifteen seconds, and a cached answer freezes it further, so two
+ * panels showed two different lags for the same instance (#400).
+ * The timestamp below is the truth; the age is what it was when
+ * the answer was built, kept for anything that wants the server's
+ * own view.
  */
-last_event_secs: bigint | null, events_last_hour: bigint, 
+last_event_secs: bigint | null, 
+/**
+ * When the newest captured event happened, RFC3339. The page
+ * counts up from this, every second, so every age on it is the
+ * same age.
+ */
+last_event_at: string | null, events_last_hour: bigint, 
 /**
  * Per-module health from the lifecycle stream (#367): the
  * substrate held every `module_failed` and nothing read them.

@@ -3,7 +3,7 @@ import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import type { StatusResponse } from '../../generated/StatusResponse'
 import { AXIS, CHART_COLORS, EChart, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
-import { BANDS, Panel, Stat, fmtAge, fmtBytes, fmtCompact, n, pct } from './parts'
+import { BANDS, Panel, Stat, ageOf, fmtAge, fmtBytes, fmtCompact, n, pct, useNow } from './parts'
 
 // The OS itself (#367): module health read off the lifecycle stream,
 // substrate totals, and what capture spends itself on. The registry
@@ -29,7 +29,8 @@ export function SystemsSection({
     if ((a.lifecycle === 'active') !== (b.lifecycle === 'active')) return a.lifecycle === 'active' ? 1 : -1
     return a.name.localeCompare(b.name)
   })
-  const lag = i?.last_event_secs == null ? null : n(i.last_event_secs)
+  const now = useNow()
+  const lag = ageOf(i?.last_event_at, now) ?? (i?.last_event_secs == null ? null : n(i.last_event_secs))
 
   return (
     <>
@@ -42,7 +43,7 @@ export function SystemsSection({
         <Stat
           label="Events this hour"
           value={i ? fmtCompact(i.events_last_hour) : '…'}
-          sub={i ? `newest ${fmtAge(i.last_event_secs)} ago` : ''}
+          sub={i ? `newest ${lag == null ? '—' : fmtAge(lag)} ago` : ''}
           tone={lag == null ? 'none' : lag >= BANDS.lagBad ? 'bad' : lag >= BANDS.lagWarn ? 'warn' : 'ok'}
         />
       </SimpleGrid>
@@ -106,7 +107,7 @@ export function SystemsSection({
                           {h.last_event.replace('module_', '')}
                           <Text span size="xs" c="dimmed">
                             {' · '}
-                            {fmtAge(h.last_event_secs)} ago
+                            {fmtAge(ageOf(h.last_event_at, now) ?? n(h.last_event_secs))} ago
                           </Text>
                         </Text>
                       ) : (

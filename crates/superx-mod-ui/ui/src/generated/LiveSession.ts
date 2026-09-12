@@ -30,6 +30,12 @@ replaced_unknown: bigint, out_tokens: bigint, tool_failures: bigint,
  */
 idle_secs: bigint, 
 /**
+ * When this session was last heard from, RFC3339. The page ages
+ * it itself, so the column ticks instead of jumping a poll at a
+ * time (#400).
+ */
+last_seen_at: string | null, 
+/**
  * Context in play at its newest usage-bearing message — fresh
  * input plus what the cache served and stored (#367). The one
  * reading a pilot needs before compaction hits; it lived on the
