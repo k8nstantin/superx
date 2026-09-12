@@ -2725,3 +2725,39 @@ async fn intensity_counts_the_fronts_open_in_each_bucket() {
     assert_eq!(span.lines_added, 4);
     assert_eq!(span.out_tokens, 200);
 }
+
+/// What the substrate holds (#398). The engine reports no storage size
+/// and the kernel does not hand a module the datastore path, so the
+/// tables are enumerated from the engine's own catalogue, counted, and
+/// weighed from a sample of their rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_substrate_reports_its_tables_rows_and_weight() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    for i in 0..5 {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "cwd": "/w/superx",
+            "message": {"model": "claude-opus-5", "content": [
+                {"type": "tool_use", "id": format!("t{i}"), "name": "Read",
+                 "input": {"file_path": format!("/w/superx/{i}.rs")}}]}})).await;
+    }
+
+    let i = superx_mod_ui::insights::insights_summary(&kernel).await.expect("insights");
+
+    let message = i.tables.iter().find(|t| t.name == "message").expect("the message table");
+    assert_eq!(message.rows, 5, "every message logged");
+    assert!(message.sampled > 0 && message.sampled <= message.rows, "sampled {}", message.sampled);
+    assert!(message.avg_row_bytes > 0, "a row weighs something");
+    assert_eq!(message.bytes_est, message.avg_row_bytes * message.rows);
+
+    // Entities were created too, so more than one table is reported and
+    // the totals are the sum of the parts.
+    assert!(i.tables.len() >= 2, "{:?}", i.tables.iter().map(|t| &t.name).collect::<Vec<_>>());
+    assert_eq!(i.db_rows_total, i.tables.iter().map(|t| t.rows).sum::<i64>());
+    assert_eq!(i.db_bytes_est, i.tables.iter().map(|t| t.bytes_est).sum::<i64>());
+
+    // Biggest first, so the page can read the top row as the answer.
+    let bytes: Vec<i64> = i.tables.iter().map(|t| t.bytes_est).collect();
+    assert!(bytes.windows(2).all(|w| w[0] >= w[1]), "{bytes:?}");
+}

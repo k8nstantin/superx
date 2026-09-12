@@ -3,7 +3,7 @@ import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import type { StatusResponse } from '../../generated/StatusResponse'
 import { AXIS, CHART_COLORS, EChart, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
-import { BANDS, Panel, Stat, fmtAge, fmtCompact, n } from './parts'
+import { BANDS, Panel, Stat, fmtAge, fmtBytes, fmtCompact, n, pct } from './parts'
 
 // The OS itself (#367): module health read off the lifecycle stream,
 // substrate totals, and what capture spends itself on. The registry
@@ -229,6 +229,89 @@ export function SystemsSection({
           </Panel>
         </Grid.Col>
       </Grid>
+      <Panel
+        title="What the substrate holds"
+        scope="all"
+        range={range}
+        note="every table, biggest first · bytes are the rows' own weight, measured from a sample"
+        mb="md"
+      >
+        <SimpleGrid cols={{ base: 2, md: 4 }} spacing="xs" mb="sm">
+          <Stat label="Rows" value={fmtCompact(i?.db_rows_total)} sub={`across ${(i?.tables ?? []).length} tables`} />
+          <Stat
+            label="Data"
+            value={i ? `≈ ${fmtBytes(i.db_bytes_est)}` : '—'}
+            sub="uncompressed, as rows"
+            tip="the engine reports no storage size, so this is measured: a sample of each table's rows is serialised, averaged, and multiplied by the count. What the data weighs written out — the files on disk are smaller, because RocksDB compresses them."
+          />
+          <Stat
+            label="Biggest table"
+            value={(i?.tables ?? [])[0]?.name ?? '—'}
+            sub={(i?.tables ?? [])[0] ? `${pct(n((i?.tables ?? [])[0].bytes_est), n(i?.db_bytes_est))}% of the data` : ''}
+          />
+          <Stat
+            label="Widest row"
+            value={(() => {
+              const w = [...(i?.tables ?? [])].sort((a, b) => n(b.avg_row_bytes) - n(a.avg_row_bytes))[0]
+              return w ? `${fmtBytes(w.avg_row_bytes)}` : '—'
+            })()}
+            sub={(() => {
+              const w = [...(i?.tables ?? [])].sort((a, b) => n(b.avg_row_bytes) - n(a.avg_row_bytes))[0]
+              return w ? `in ${w.name}` : ''
+            })()}
+          />
+        </SimpleGrid>
+        {(i?.tables ?? []).length === 0 ? (
+          <Text size="xs" c="dimmed">
+            the substrate reported no tables.
+          </Text>
+        ) : (
+          <Table.ScrollContainer minWidth={720}>
+            <Table striped highlightOnHover>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>Table</Table.Th>
+                  <Table.Th ta="right">Rows</Table.Th>
+                  <Table.Th ta="right">Share of rows</Table.Th>
+                  <Table.Th ta="right">Data</Table.Th>
+                  <Table.Th ta="right">Share of data</Table.Th>
+                  <Table.Th ta="right">Average row</Table.Th>
+                  <Table.Th ta="right">Sampled</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {(i?.tables ?? []).map((t) => (
+                  <Table.Tr key={t.name}>
+                    <Table.Td>
+                      <Text size="xs" ff={MONO}>
+                        {t.name}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td ta="right">{fmtCompact(t.rows)}</Table.Td>
+                    <Table.Td ta="right">
+                      <Text size="xs" c="dimmed">
+                        {n(t.rows) === 0 ? '—' : `${pct(n(t.rows), n(i?.db_rows_total))}%`}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td ta="right">{n(t.bytes_est) === 0 ? '—' : `≈ ${fmtBytes(t.bytes_est)}`}</Table.Td>
+                    <Table.Td ta="right">
+                      <Text size="xs" c="dimmed">
+                        {n(t.bytes_est) === 0 ? '—' : `${pct(n(t.bytes_est), n(i?.db_bytes_est))}%`}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td ta="right">{n(t.avg_row_bytes) === 0 ? '—' : fmtBytes(t.avg_row_bytes)}</Table.Td>
+                    <Table.Td ta="right">
+                      <Text size="xs" c="dimmed">
+                        {n(t.sampled) === 0 ? '—' : String(t.sampled)}
+                      </Text>
+                    </Table.Td>
+                  </Table.Tr>
+                ))}
+              </Table.Tbody>
+            </Table>
+          </Table.ScrollContainer>
+        )}
+      </Panel>
       {(s?.boot_durations?.length ?? 0) > 0 && (
         <Panel title="Boot durations" scope="all" range={range} note="the newest boots, in milliseconds" mb="md">
           <EChart

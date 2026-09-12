@@ -3,6 +3,7 @@ import type { AgentSplit } from "./AgentSplit";
 import type { HeatCell } from "./HeatCell";
 import type { ModuleHealth } from "./ModuleHealth";
 import type { NameCount } from "./NameCount";
+import type { TableStat } from "./TableStat";
 import type { TimeCount } from "./TimeCount";
 import type { TokenTotals } from "./TokenTotals";
 
@@ -44,4 +45,12 @@ last_event_secs: bigint | null, events_last_hour: bigint,
  * Per-module health from the lifecycle stream (#367): the
  * substrate held every `module_failed` and nothing read them.
  */
-module_health: Array<ModuleHealth>, };
+module_health: Array<ModuleHealth>, 
+/**
+ * Every table in the substrate, biggest first (#398).
+ */
+tables: Array<TableStat>, 
+/**
+ * Rows across all of them, and what they weigh, estimated.
+ */
+db_rows_total: bigint, db_bytes_est: bigint, };
