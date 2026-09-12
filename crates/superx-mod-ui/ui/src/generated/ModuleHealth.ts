@@ -12,6 +12,10 @@ export type ModuleHealth = { name: string,
  */
 last_event: string, last_event_secs: bigint, 
 /**
+ * When it happened, RFC3339 — the page ages it itself (#400).
+ */
+last_event_at: string | null, 
+/**
  * `module_failed` + `module_start_failed` + `module_start_abandoned`.
  */
 failures_recent: bigint, failures_total: bigint, 

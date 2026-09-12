@@ -3,7 +3,7 @@ import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { MONO } from '../../EChart'
 import { LivenessDot } from '../../LivenessDot'
-import { BANDS, Churn, CoverageStrip, FAIL, Panel, Stat, fmtAge, fmtCompact, n, type Tone } from './parts'
+import { BANDS, Churn, CoverageStrip, FAIL, Panel, Stat, ageOf, fmtAge, fmtCompact, n, useNow, type Tone } from './parts'
 import { openSession } from '../../route'
 
 // The flight deck (#367): one row per agent in the air, and the fleet
@@ -49,8 +49,10 @@ export function FlightDeck({
   loading: boolean
 }) {
   const live = s?.live ?? []
+  const now = useNow()
+  const lag = ageOf(i?.last_event_at, now) ?? (i?.last_event_secs == null ? null : n(i.last_event_secs))
   const lagTone: Tone =
-    i?.last_event_secs == null ? 'none' : n(i.last_event_secs) >= BANDS.lagBad ? 'bad' : n(i.last_event_secs) >= BANDS.lagWarn ? 'warn' : 'ok'
+    lag == null ? 'none' : lag >= BANDS.lagBad ? 'bad' : lag >= BANDS.lagWarn ? 'warn' : 'ok'
   return (
     <>
       <SimpleGrid cols={{ base: 2, md: 3, lg: 6 }} spacing="xs" mb="md">
@@ -79,7 +81,7 @@ export function FlightDeck({
         />
         <Stat
           label="Capture lag"
-          value={i ? fmtAge(i.last_event_secs) : '…'}
+          value={lag == null ? '…' : fmtAge(lag)}
           sub={i ? `${fmtCompact(i.events_last_hour)} events this hour` : ''}
           tip="age of the newest captured event — how current this whole page is"
           tone={lagTone}
@@ -285,7 +287,7 @@ export function FlightDeck({
                       <Table.Td ta="right" c={n(l.tool_failures) > 0 ? 'red.4' : undefined}>
                         {String(l.tool_failures)}
                       </Table.Td>
-                      <Table.Td ta="right">{fmtAge(l.idle_secs)}</Table.Td>
+                      <Table.Td ta="right">{fmtAge(ageOf(l.last_seen_at, now) ?? n(l.idle_secs))}</Table.Td>
                     </Table.Tr>
                   )
                 })}

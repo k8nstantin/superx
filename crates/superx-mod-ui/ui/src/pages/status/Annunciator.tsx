@@ -2,7 +2,7 @@ import { SimpleGrid } from '@mantine/core'
 import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import type { StatusResponse } from '../../generated/StatusResponse'
-import { BANDS, Lamp, fmtAge, fmtCompact, lowGood, n, pct, type Tone } from './parts'
+import { BANDS, Lamp, ageOf, fmtAge, fmtCompact, lowGood, n, pct, useNow, type Tone } from './parts'
 
 // The annunciator panel (#367): a row of lamps that stay dark until
 // something is wrong. A pilot does not read twelve numbers to learn
@@ -19,6 +19,7 @@ export function Annunciator({
   status: StatusResponse | undefined
   jump: (id: string) => void
 }) {
+  const now = useNow()
   const count = (v: number | bigint | null | undefined, bad = false): Tone =>
     n(v) > 0 ? (bad ? 'bad' : 'warn') : 'ok'
 
@@ -36,12 +37,15 @@ export function Annunciator({
   // An agent whose newest message called no tool has stopped talking to
   // the machine and started talking to you (#381 D). Idle for a couple
   // of minutes on top of that, and the ball is in your court.
-  const waiting = live.filter((l) => l.awaiting && n(l.idle_secs) >= BANDS.awaitingSecs).length
+  const waiting = live.filter((l) => l.awaiting && (ageOf(l.last_seen_at, now) ?? n(l.idle_secs)) >= BANDS.awaitingSecs).length
 
   const modulesDown = (status?.modules ?? []).filter((m) => m.lifecycle !== 'active').length
   const moduleFailures = (i?.module_health ?? []).reduce((a, h) => a + n(h.failures_recent), 0)
 
-  const lag = i?.last_event_secs == null ? null : n(i.last_event_secs)
+  // Aged here, not on the server: this panel refreshes once a minute
+  // and the flight deck every fifteen seconds, so a server-computed age
+  // made the two disagree about the same instance (#400).
+  const lag = ageOf(i?.last_event_at, now) ?? (i?.last_event_secs == null ? null : n(i.last_event_secs))
   const lagTone = lowGood(lag, BANDS.lagWarn, BANDS.lagBad)
 
   const loading = !s

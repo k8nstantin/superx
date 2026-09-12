@@ -2761,3 +2761,43 @@ async fn the_substrate_reports_its_tables_rows_and_weight() {
     let bytes: Vec<i64> = i.tables.iter().map(|t| t.bytes_est).collect();
     assert!(bytes.windows(2).all(|w| w[0] >= w[1]), "{bytes:?}");
 }
+
+/// An age computed on the server is stale the moment it is sent, and
+/// staler still when the answer is cached or the panel refreshes once a
+/// minute — two panels showed two different capture lags for the same
+/// instance (#400). Every age now travels as the timestamp it is
+/// measured from, so the page can count up from it and all of them
+/// agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_age_travels_as_the_moment_it_is_measured_from() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "r", "name": "Read", "input": {"file_path": "/w/superx/a.rs"}}]}})).await;
+    kernel
+        .log_telemetry(
+            "probe",
+            superx_kernel::types::Value::Object(superx_kernel::message::json_to_object(
+                &serde_json::json!({}),
+            )),
+            None,
+        )
+        .await
+        .expect("telemetry");
+
+    let i = superx_mod_ui::insights::insights_summary(&kernel).await.expect("insights");
+    let at = i.last_event_at.as_deref().expect("the newest event carries its moment");
+    let parsed = chrono::DateTime::parse_from_rfc3339(at).expect("rfc3339");
+    let drift = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
+    assert!((0..120).contains(&drift), "the moment is recent and in the past: {drift}s");
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    let row = s.live.first().expect("a live row");
+    let seen = row.last_seen_at.as_deref().expect("the row carries when it was last heard");
+    assert!(chrono::DateTime::parse_from_rfc3339(seen).is_ok(), "rfc3339: {seen}");
+    // The server's own view is kept beside it, and the two agree now.
+    assert!((row.idle_secs - drift).abs() < 120, "idle {} against {drift}", row.idle_secs);
+}

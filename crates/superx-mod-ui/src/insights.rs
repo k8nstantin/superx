@@ -315,10 +315,12 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
         .query("SELECT valid_from FROM telemetry_stream ORDER BY valid_from DESC LIMIT 1")
         .await?
         .take(0)?;
-    let last_event_secs = newest.first().and_then(obj).and_then(|o| match o.get("valid_from") {
-        Some(Value::Datetime(d)) => Some((chrono::Utc::now() - **d).num_seconds().max(0)),
+    let last_event_at_dt = newest.first().and_then(obj).and_then(|o| match o.get("valid_from") {
+        Some(Value::Datetime(d)) => Some(**d),
         _ => None,
     });
+    let last_event_secs = last_event_at_dt.map(|d| (chrono::Utc::now() - d).num_seconds().max(0));
+    let last_event_at = last_event_at_dt.map(|d| d.to_rfc3339());
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(RECENT_SECS);
     let recent: Vec<Value> = kernel
         .db()
@@ -354,6 +356,7 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
                     name: name.to_string(),
                     last_event: event.to_string(),
                     last_event_secs: (now - at).num_seconds().max(0),
+                    last_event_at: Some(at.to_rfc3339()),
                     failures_recent: 0,
                     failures_total: 0,
                     last_error: None,
@@ -381,6 +384,7 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
                 name: name.to_string(),
                 last_event: String::new(),
                 last_event_secs: -1,
+                last_event_at: None,
                 failures_recent: 0,
                 failures_total: total,
                 last_error: None,
@@ -409,6 +413,7 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
         event_kinds,
         module_startup,
         last_event_secs,
+        last_event_at,
         events_last_hour,
         module_health,
         tables,

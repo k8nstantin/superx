@@ -424,6 +424,10 @@ pub struct LiveSession {
     pub tool_failures: i64,
     /// Seconds since its newest message.
     pub idle_secs: i64,
+    /// When this session was last heard from, RFC3339. The page ages
+    /// it itself, so the column ticks instead of jumping a poll at a
+    /// time (#400).
+    pub last_seen_at: Option<String>,
     /// Context in play at its newest usage-bearing message — fresh
     /// input plus what the cache served and stored (#367). The one
     /// reading a pilot needs before compaction hits; it lived on the
@@ -861,7 +865,18 @@ pub struct InsightsSummary {
     /// Newest startup reading per module, in milliseconds.
     pub module_startup: Vec<NameCount>,
     /// Age of the newest captured event — the capture-alive signal.
+    /// An age computed on the server goes stale the moment it is sent:
+    /// this panel refreshes once a minute, the flight deck every
+    /// fifteen seconds, and a cached answer freezes it further, so two
+    /// panels showed two different lags for the same instance (#400).
+    /// The timestamp below is the truth; the age is what it was when
+    /// the answer was built, kept for anything that wants the server's
+    /// own view.
     pub last_event_secs: Option<i64>,
+    /// When the newest captured event happened, RFC3339. The page
+    /// counts up from this, every second, so every age on it is the
+    /// same age.
+    pub last_event_at: Option<String>,
     pub events_last_hour: i64,
     /// Per-module health from the lifecycle stream (#367): the
     /// substrate held every `module_failed` and nothing read them.
@@ -906,6 +921,8 @@ pub struct ModuleHealth {
     /// The newest lifecycle event and its age.
     pub last_event: String,
     pub last_event_secs: i64,
+    /// When it happened, RFC3339 — the page ages it itself (#400).
+    pub last_event_at: Option<String>,
     /// `module_failed` + `module_start_failed` + `module_start_abandoned`.
     pub failures_recent: i64,
     pub failures_total: i64,

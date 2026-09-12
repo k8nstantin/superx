@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Badge, Card, Group, SimpleGrid, Text, Title, Tooltip } from '@mantine/core'
 import { CANCEL, EChart, FAIL, GRID_LINE, INK, INK_MUTED, MONO, OK, TRACK, UNKNOWN } from '../../EChart'
 
@@ -28,6 +28,27 @@ export function fmtBytes(v: number | bigint | null | undefined): string {
   if (x < 1024) return `${x} B`
   if (x < 1024 * 1024) return `${(x / 1024).toFixed(1)} KB`
   return `${(x / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/// A clock that ticks once a second, so an age on the page counts up
+/// instead of standing still between polls (#400). Every panel reading
+/// it shows the same age at the same moment, whatever its own refresh
+/// interval or whether its answer came from the cache.
+export function useNow(): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
+  return now
+}
+
+/// Seconds between a timestamp and now, for an age the page keeps
+/// itself. `null` when there is no timestamp to count from.
+export function ageOf(at: string | null | undefined, now: number): number | null {
+  if (!at) return null
+  const t = new Date(at).getTime()
+  return Number.isNaN(t) ? null : Math.max(0, Math.round((now - t) / 1000))
 }
 
 export function fmtAge(secs: number | bigint | null | undefined): string {
