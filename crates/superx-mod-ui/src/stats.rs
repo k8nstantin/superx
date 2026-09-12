@@ -892,6 +892,19 @@ struct CodeAgg {
     unattended_out: i64,
     /// (model, effort) → outcomes (#391).
     model_effort: HashMap<(String, String), ModelEffortAgg>,
+    /// session → the pair it was running. An interruption, a refusal or
+    /// a tool result names no model — they ride the user's turn or the
+    /// result line — so attributing them to the message's own pair
+    /// attributed them to nothing, and every pair reported that nobody
+    /// had ever had to step in. The walk is newest-first, so the first
+    /// pair seen for a session is the one it is running now.
+    session_pair: HashMap<String, (String, String)>,
+    /// session → (denials, interruptions) seen BEFORE its pair was
+    /// known. The walk is newest-first, so a session stopped on its
+    /// last breath is met before anything that names what it was
+    /// running; these are held and drained when the pair appears, the
+    /// same way a tool result is held for its call.
+    pending_steps: HashMap<String, (i64, i64)>,
     /// session → (time, is_write) events, reduced after the walk into
     /// how long a write waited for its verification.
     verify_events: HashMap<String, Vec<(chrono::DateTime<chrono::Utc>, bool)>>,
@@ -1972,16 +1985,48 @@ pub async fn stats_for_range_capped(
         // Model and reasoning level ride the same messages, so the pair
         // is a key (#391).
         let me_key = model_opt.clone().zip(effort.clone());
+        let sid_here = superx_ops::record_uuid(&m.session);
         if let Some(k) = &me_key {
-            let sid = superx_ops::record_uuid(&m.session);
+            let first = !code.session_pair.contains_key(&sid_here);
+            code.session_pair.entry(sid_here.clone()).or_insert_with(|| k.clone());
+            let held = if first { code.pending_steps.remove(&sid_here) } else { None };
             let me = code.model_effort.entry(k.clone()).or_default();
             me.messages += 1;
-            me.sessions.insert(sid);
-            if get_str(raw, "toolDenialKind").is_some() {
-                me.denials += 1;
+            me.sessions.insert(sid_here.clone());
+            if let Some((d, i)) = held {
+                me.denials += d;
+                me.interventions += i;
             }
-            if raw.get("interruptedMessageId").is_some() || raw.get("userFeedback").is_some() {
-                me.interventions += 1;
+        }
+        // Being stopped or refused belongs to whatever the session was
+        // running, not to the message that carries the flag — that one
+        // names no model (#391).
+        if get_str(raw, "toolDenialKind").is_some()
+            || raw.get("interruptedMessageId").is_some()
+            || raw.get("userFeedback").is_some()
+        {
+            let denied = get_str(raw, "toolDenialKind").is_some();
+            match code.session_pair.get(&sid_here).cloned() {
+                Some(k) => {
+                    let me = code.model_effort.entry(k).or_default();
+                    if denied {
+                        me.denials += 1;
+                    } else {
+                        me.interventions += 1;
+                    }
+                }
+                // The pair comes later in the walk. Hold it for whatever
+                // this session turns out to have been running; a session
+                // that never names one keeps it unattributed, which is
+                // the honest answer.
+                None => {
+                    let e = code.pending_steps.entry(sid_here.clone()).or_insert((0, 0));
+                    if denied {
+                        e.0 += 1;
+                    } else {
+                        e.1 += 1;
+                    }
+                }
             }
         }
         {

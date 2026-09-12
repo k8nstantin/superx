@@ -2590,4 +2590,30 @@ async fn burn_moves_over_time_and_the_model_effort_pair_is_one_key() {
     let opus = pair("claude-opus-5");
     assert_eq!((opus.effort.as_str(), opus.sessions, opus.messages), ("max", 1, 1));
     assert_eq!((opus.out_tokens, opus.thinking_tokens), (1000, 300));
+
+    // Being stopped or refused belongs to whatever the session was
+    // running. Those lines name no model — a denial rides the result,
+    // an interruption rides your turn — so attributing them to the
+    // message's own pair attributed them to nothing, and every pair
+    // reported that nobody had ever had to step in (#391).
+    kernel.log_message(superx_kernel::NewMessage {
+        session: alone.clone(), agent: agent2.clone(), role: "tool".into(), content: String::new(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "toolDenialKind": "permission", "message": {"content": []}}))),
+        seq: None, emitted_at: None,
+    }).await.expect("denial");
+    kernel.log_message(superx_kernel::NewMessage {
+        session: alone.clone(), agent: agent2.clone(), role: "user".into(),
+        content: "no, stop".into(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "userFeedback": true, "message": {"content": []}}))),
+        seq: None, emitted_at: None,
+    }).await.expect("intervention");
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!((s.denials, s.interventions), (1, 1), "the range counts them");
+    let fable = s.model_effort.iter().find(|p| p.model == "claude-fable-5-1").expect("pair");
+    assert_eq!((fable.denials, fable.interventions), (1, 1), "and so does the pair that was running");
+    let opus = s.model_effort.iter().find(|p| p.model == "claude-opus-5").expect("pair");
+    assert_eq!((opus.denials, opus.interventions), (0, 0), "the other session was not stopped");
 }
