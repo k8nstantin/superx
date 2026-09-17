@@ -10,7 +10,7 @@
 //! already holds. Anything unreadable degrades to `—` and is counted,
 //! never invented. Nothing is written anywhere.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -21,6 +21,11 @@ use crate::api::{ChurnPoint, Landed, LandedRepo};
 
 /// Repositories read per request, at most.
 const LANDED_REPOS: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
+/// Files blamed per repository when measuring survival (#405). Blame
+/// is the only way to ask "is this line still here", and it costs one
+/// pass per file.
+const SURVIVAL_FILES: usize = 600; // skill-allow: §9-const — read-path bound, not a policy tunable
+
 /// A git call slower than this is abandoned and counted unreadable.
 const GIT_TIMEOUT_MS: u64 = 4_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
@@ -54,6 +59,17 @@ async fn main_ref(dir: &Path) -> String {
         }
     }
     "HEAD".to_string()
+}
+
+/// The repository root a working directory belongs to, if it is one.
+pub async fn toplevel(dir: &Path) -> Option<String> {
+    if !dir.is_dir() {
+        return None;
+    }
+    git(dir, &["rev-parse", "--show-toplevel"])
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// The repository's name: the directory holding `.git` — for a
@@ -162,4 +178,107 @@ pub async fn landed(cwds: &HashSet<String>, since: Option<DateTime<Utc>>) -> Lan
         .map(|(t, (added, removed))| ChurnPoint { t, added, removed })
         .collect();
     landed
+}
+
+
+/// One commit on a main line: when it landed, how many lines it added,
+/// and how many of those are still in the working tree today (#405).
+///
+/// This is the only rework measure with no blind spot. The transcript
+/// cannot see what a shell edit replaced (#383), and lines written are
+/// undercounted because of it — but git knows exactly what landed and
+/// blame knows exactly what is left. Both sides come from the
+/// repository, so the ratio is honest whatever tools the agent used.
+pub struct CommitSurvival {
+    pub hash: String,
+    /// When it landed, RFC3339, so it can be matched to whoever was
+    /// working then.
+    pub at: DateTime<Utc>,
+    pub added: i64,
+    /// Of those added lines, how many blame still attributes here.
+    pub alive: i64,
+}
+
+/// What survived, per commit, on one repository's main line.
+///
+/// Read-only, and bounded: at most [`SURVIVAL_FILES`] tracked files,
+/// binaries and built bundles skipped. An unreadable repository yields
+/// nothing rather than a guess.
+pub async fn survival(dir: &Path, since: Option<DateTime<Utc>>) -> Vec<CommitSurvival> {
+    let branch = main_ref(dir).await;
+    let mut args = vec!["log", "--first-parent", "-m", "--numstat", "--format=%x01%H %ct"];
+    let since_s = since.map(|s| s.to_rfc3339());
+    if let Some(s) = &since_s {
+        args.push("--since");
+        args.push(s);
+    }
+    args.push(&branch);
+    let Some(out) = git(dir, &args).await else {
+        return Vec::new();
+    };
+    let mut commits: Vec<CommitSurvival> = Vec::new();
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix('\u{1}') {
+            let mut parts = rest.split_whitespace();
+            let (Some(hash), Some(ts)) = (parts.next(), parts.next()) else { continue };
+            let Some(at) = ts.parse::<i64>().ok().and_then(|t| Utc.timestamp_opt(t, 0).single()) else {
+                continue;
+            };
+            commits.push(CommitSurvival { hash: hash.to_string(), at, added: 0, alive: 0 });
+            continue;
+        }
+        if let Some(c) = commits.last_mut() {
+            let mut p = line.split('\t');
+            if let (Some(a), Some(_)) = (p.next(), p.next()) {
+                if let Ok(a) = a.trim().parse::<i64>() {
+                    c.added += a;
+                }
+            }
+        }
+    }
+    if commits.is_empty() {
+        return commits;
+    }
+
+    // Which commit does each surviving line still belong to?
+    let Some(listing) = git(dir, &["ls-files"]).await else {
+        return commits;
+    };
+    let mut alive: HashMap<String, i64> = HashMap::new();
+    for file in listing
+        .lines()
+        .filter(|f| !f.is_empty() && !skip_for_survival(f))
+        .take(SURVIVAL_FILES)
+    {
+        let Some(blame) = git(dir, &["blame", "--line-porcelain", "--", file]).await else {
+            continue;
+        };
+        for line in blame.lines() {
+            // A porcelain header opens with the commit and three
+            // numbers; everything else is content.
+            let Some((hash, rest)) = line.split_once(' ') else { continue };
+            if hash.len() == 40
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && rest.starts_with(|c: char| c.is_ascii_digit())
+            {
+                *alive.entry(hash.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    for c in &mut commits {
+        c.alive = alive.get(&c.hash).copied().unwrap_or(0);
+    }
+    commits
+}
+
+/// Files whose lines say nothing about whether work survived: built
+/// bundles, lockfiles and binaries.
+fn skip_for_survival(path: &str) -> bool {
+    path.contains("/dist/")
+        || path.ends_with(".lock")
+        || path.ends_with(".tsbuildinfo")
+        || matches!(
+            path.rsplit('.').next(),
+            Some("png" | "jpg" | "jpeg" | "ico" | "woff" | "woff2" | "svg" | "pdf")
+        )
 }

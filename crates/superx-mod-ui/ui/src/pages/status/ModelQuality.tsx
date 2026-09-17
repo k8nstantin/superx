@@ -194,6 +194,105 @@ export function ModelQuality({ s, range }: { s: StatsSummary | undefined; range:
       </Panel>
 
       <Panel
+        title="Rework — how much of what each model landed is still there"
+        scope="range"
+        range={range}
+        note="read from the repositories: git says what landed, blame says what is left"
+        mb="md"
+      >
+        {(s?.model_survival?.length ?? 0) === 0 ? (
+          <Text size="xs" c="dimmed">
+            no commit in this range could be credited to a model.
+          </Text>
+        ) : (
+          <>
+            <Table.ScrollContainer minWidth={820}>
+              <Table striped highlightOnHover>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>Model</Table.Th>
+                    <Table.Th ta="right">Commits</Table.Th>
+                    <Table.Th ta="right">Lines landed</Table.Th>
+                    <Table.Th ta="right">Still there</Table.Th>
+                    <Table.Th ta="right">Survived</Table.Th>
+                    <Table.Th ta="right">Rewritten or deleted</Table.Th>
+                    <Table.Th ta="right">
+                      <Tooltip
+                        label="output tokens this model spent, divided by the lines of its work still in the tree. Per-token price says what a model costs to run; this says what it costs to keep."
+                        withArrow
+                        multiline
+                        w={300}
+                      >
+                        <span>Tokens per line kept</span>
+                      </Tooltip>
+                    </Table.Th>
+                    <Table.Th ta="right">Age of that work</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {(s?.model_survival ?? []).map((m) => {
+                    const landed = n(m.landed)
+                    const alive = n(m.alive)
+                    const pc = landed > 0 ? Math.round((alive * 100) / landed) : null
+                    const young = n(m.median_age_days) < 14
+                    return (
+                      <Table.Tr key={m.model}>
+                        <Table.Td>
+                          <Text size="xs" ff={MONO}>
+                            {m.model}
+                          </Text>
+                        </Table.Td>
+                        <Table.Td ta="right">{String(m.commits)}</Table.Td>
+                        <Table.Td ta="right">{fmtCompact(landed)}</Table.Td>
+                        <Table.Td ta="right">{fmtCompact(alive)}</Table.Td>
+                        <Table.Td ta="right">
+                          <Text size="xs" ff={MONO} c={pc == null ? undefined : pc >= 70 ? OK : pc < 50 ? FAIL : CANCEL}>
+                            {pc == null ? '—' : `${pc}%`}
+                          </Text>
+                        </Table.Td>
+                        <Table.Td ta="right">
+                          <Text size="xs" ff={MONO} c={pc == null ? undefined : 100 - pc >= 50 ? FAIL : undefined}>
+                            {pc == null ? '—' : `${100 - pc}%`}
+                          </Text>
+                        </Table.Td>
+                        <Table.Td ta="right">
+                          <Text size="xs" ff={MONO} fw={600}>
+                            {(() => {
+                              const tok = models.find((x) => x.model === m.model)?.tokens ?? 0
+                              return alive > 0 && tok > 0 ? fmtCompact(Math.round(tok / alive)) : '—'
+                            })()}
+                          </Text>
+                        </Table.Td>
+                        <Table.Td ta="right">
+                          <Tooltip
+                            label={`oldest ${m.oldest_days}d, newest ${m.newest_days}d — newer work has had less time to be replaced`}
+                            withArrow
+                          >
+                            <Text size="xs" ff={MONO} c={young ? 'orange.4' : 'dimmed'}>
+                              {String(m.median_age_days)}d median
+                            </Text>
+                          </Tooltip>
+                        </Table.Td>
+                      </Table.Tr>
+                    )
+                  })}
+                </Table.Tbody>
+              </Table>
+            </Table.ScrollContainer>
+            <Text size="xs" c="dimmed" mt="xs">
+              This is the measure the hygiene rates miss. A model can pass every test and fail every call cleanly and
+              still have its work deleted again, which is what an agent going off the objective actually costs. The
+              last column is why a per-token price settles nothing: a model at half the price that keeps a third of
+              its work is the more expensive one, and the arithmetic is only visible once both halves are measured
+              here. Read the age column before ranking — newer work has had less time to be replaced, so a young
+              cohort flatters itself — and remember that work from different phases is not directly comparable, since
+              a deliberate rebuild deletes good code too.
+            </Text>
+          </>
+        )}
+      </Panel>
+
+      <Panel
         title="Model quality over time"
         scope="range"
         range={range}

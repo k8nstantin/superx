@@ -14,7 +14,7 @@ use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
-    BurnPoint, IntensityPoint, ModelEffortStat, ModelQualityPoint, ModelRepoStat,
+    BurnPoint, IntensityPoint, ModelEffortStat, ModelQualityPoint, ModelRepoStat, ModelSurvival,
     AgentStat, BranchStat, ChurnPoint, CompactionStat, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount, QualityPoint, RepoStat, SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome, WorkCell,
 };
 
@@ -235,6 +235,11 @@ fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
     }
     out
 }
+
+/// Points kept per working directory when tracking which model was
+/// there — enough to place a commit, bounded so a long range cannot
+/// grow it without limit (#405).
+const MODEL_TIMELINE: usize = 4_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
 /// Bright-line paths named on the page, at most (#392).
 const BRIGHT_LINE_SHOWN: usize = 6; // skill-allow: §9-const — render-layer cap
@@ -940,6 +945,10 @@ struct CodeAgg {
     /// outcomes per repository (#403).
     model_time: BTreeMap<(String, String), ModelSliceAgg>,
     model_repo: BTreeMap<(String, String), ModelSliceAgg>,
+    /// Every working directory's model timeline: when, and which. A
+    /// commit is credited to whoever was working there as it landed
+    /// (#405).
+    cwd_models: BTreeMap<String, Vec<(chrono::DateTime<chrono::Utc>, String)>>,
     /// session → the pair it was running. An interruption, a refusal or
     /// a tool result names no model — they ride the user's turn or the
     /// result line — so attributing them to the message's own pair
@@ -2223,6 +2232,12 @@ pub async fn stats_for_range_capped(
         }
         if let Some(c) = get_str(raw, "cwd") {
             code.cwds.insert(c.to_string());
+            if let Some(m) = &model_opt {
+                let seen = code.cwd_models.entry(c.to_string()).or_default();
+                if seen.len() < MODEL_TIMELINE {
+                    seen.push((when, m.clone()));
+                }
+            }
         }
         let branch_key =
             get_str(raw, "gitBranch").filter(|b| !b.is_empty()).map(str::to_string);
@@ -3626,6 +3641,59 @@ pub async fn stats_for_range_capped(
     };
     let landed = crate::landed::landed(&code.cwds, landed_since).await;
 
+    // How much of each model's landed work is still there (#405)? Git
+    // says what landed and blame says what is left, so the ratio has
+    // none of the transcript's blind spots. A commit is credited to
+    // whichever model was working that directory as it landed.
+    let model_survival = {
+        let mut timeline: Vec<(chrono::DateTime<chrono::Utc>, String)> =
+            code.cwd_models.values().flatten().cloned().collect();
+        timeline.sort_by_key(|(t, _)| *t);
+        let mut per: HashMap<String, (i64, i64, i64, Vec<i64>)> = HashMap::new();
+        if !timeline.is_empty() {
+            let now = chrono::Utc::now();
+            let mut roots: Vec<&String> = code.cwds.iter().collect();
+            roots.sort();
+            let mut done: HashSet<String> = HashSet::new();
+            for cwd in roots {
+                let dir = std::path::Path::new(cwd);
+                let Some(top) = crate::landed::toplevel(dir).await else { continue };
+                if !done.insert(top.clone()) {
+                    continue;
+                }
+                for c in crate::landed::survival(std::path::Path::new(&top), landed_since).await {
+                    // The newest activity at or before the commit.
+                    let idx = timeline.partition_point(|(t, _)| *t <= c.at);
+                    let Some((_, model)) = idx.checked_sub(1).and_then(|i| timeline.get(i)) else {
+                        continue;
+                    };
+                    let e = per.entry(model.clone()).or_insert((0, 0, 0, Vec::new()));
+                    e.0 += 1;
+                    e.1 += c.added;
+                    e.2 += c.alive;
+                    e.3.push((now - c.at).num_days().max(0));
+                }
+            }
+        }
+        let mut v: Vec<ModelSurvival> = per
+            .into_iter()
+            .map(|(model, (commits, landed, alive, mut ages))| {
+                ages.sort_unstable();
+                ModelSurvival {
+                    model,
+                    commits,
+                    landed,
+                    alive,
+                    median_age_days: ages.get(ages.len() / 2).copied().unwrap_or(0),
+                    oldest_days: ages.last().copied().unwrap_or(0),
+                    newest_days: ages.first().copied().unwrap_or(0),
+                }
+            })
+            .collect();
+        v.sort_by_key(|m| std::cmp::Reverse(m.landed));
+        v
+    };
+
     Ok(StatsSummary {
         landed,
         agents,
@@ -3907,6 +3975,7 @@ pub async fn stats_for_range_capped(
                 out_tokens: a.out_tokens,
             })
             .collect(),
+        model_survival,
         model_repos: {
             let mut v: Vec<ModelRepoStat> = code
                 .model_repo
