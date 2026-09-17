@@ -115,30 +115,14 @@ const per = (a: number, b: number, mult = 1) => (b > 0 ? Math.round((a * mult) /
 /// per unit, what was WASTED, how the work WENT, and the totals that
 /// put the rates in context.
 function metrics(): Metric[] {
+  // Only measures whose job is a plain RANKING stay as bars. Anything
+  // that is a proportion, a pair of values, or two measures against
+  // each other gets the form that fits it, below.
   return [
-    // what you get
-    { title: 'Surviving lines per 1M tokens', note: 'the headline', good: 'high', pick: (d) => n(d.alive_per_mtok) },
-    { title: 'Surviving lines per hour', note: 'productivity, in time', good: 'high', pick: (d) => n(d.alive_per_hour) },
     { title: 'Landed lines per 1M tokens', note: 'before survival is counted', good: 'high', pick: (d) => per(n(d.added), n(d.out_tokens), 1_000_000) },
-    { title: 'Survived', note: 'of what it landed', good: 'high', fmt: (v) => `${v}%`, pick: (d) => n(d.survived_pct) },
-    // what you spend per unit
-    { title: 'Tokens per surviving line', note: 'the bill actually paid', good: 'low', pick: (d) => n(d.tokens_per_line_kept) },
-    { title: 'Tokens per landed line', note: 'the bill before rework', good: 'low', pick: (d) => n(d.tokens_per_line_landed) },
-    { title: 'Hours per 1,000 surviving lines', note: 'your time, per unit kept', good: 'low', pick: (d) => per(n(d.minutes), n(d.alive) * 60, 1000) },
-    { title: 'Context carried per turn', note: 'paid again every turn', good: 'low', fmt: fmtCompact, pick: (d) => n(d.context_avg) },
-    // what was wasted
-    { title: 'Tokens thrown away', note: 'spent on lines now gone', good: 'low', fmt: fmtCompact, pick: (d) => n(d.tokens_thrown) },
-    { title: 'Hours thrown away', note: 'time spent on lines now gone', good: 'low', pick: (d) => Math.round(n(d.minutes_thrown) / 60) },
-    { title: 'Lines thrown away', note: 'landed, then removed', good: 'low', fmt: fmtCompact, pick: (d) => n(d.thrown) },
     { title: 'Lines removed per 100 added', note: 'churn while working', good: 'low', pick: (d) => n(d.removed_per_100_added) },
-    // how the work went
-    { title: 'Commits that say fix or revert', note: "the agent's own word for it", good: 'low', fmt: (v) => `${v}%`, pick: (d) => n(d.rework_pct) },
     { title: 'Files returned to 3+ times', note: 'per 100 commits', good: 'low', pick: (d) => n(d.thrash_per_100_commits) },
     { title: 'Times you put it back on course', note: 'per 100 of your turns', good: 'low', pick: (d) => n(d.corrections_per_100) },
-    { title: 'Largest prompt it ever carried', note: 'peak context', good: 'low', fmt: fmtCompact, pick: (d) => n(d.context_peak) },
-    // the totals the rates came from
-    { title: 'Output tokens, total', note: 'what was spent', good: 'low', fmt: fmtCompact, pick: (d) => n(d.out_tokens) },
-    { title: 'Hours, total', note: 'wall clock across every stint', good: 'low', pick: (d) => Math.round(n(d.minutes) / 60) },
     { title: 'Lines still in the tree', note: 'the actual output', good: 'high', fmt: fmtCompact, pick: (d) => n(d.alive) },
     { title: 'Age of the work', note: 'days — the confounder, check it', good: 'high', fmt: (v) => `${v}d`, pick: (d) => n(d.median_age_days) },
   ]
@@ -177,6 +161,143 @@ function mini(rows: Row[], m: Metric) {
           formatter: (p: { value: number }) => (m.fmt ? m.fmt(p.value) : `${p.value}`),
         },
         data: sorted.map(m.pick),
+      },
+    ],
+  }
+}
+
+
+/// A dumbbell: two values of the SAME unit per family, joined by the
+/// line whose length is the gap. The right form when the story is the
+/// DISTANCE between two numbers — typical against peak, the price
+/// before rework against the price after — where two separate bars
+/// make the reader do the subtraction.
+function dumbbell(
+  rows: Row[],
+  a: (d: Row) => number,
+  b: (d: Row) => number,
+  aName: string,
+  bName: string,
+  axis: string,
+  fmt: (v: number) => string,
+) {
+  const names = rows.map((r) => r.model)
+  return {
+    tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: { data: [aName, bName], textStyle: { color: INK_MUTED }, top: 0, right: 0 },
+    grid: { left: 96, right: 88, top: 30, bottom: 40 },
+    xAxis: {
+      ...AXIS,
+      type: 'value',
+      name: axis,
+      nameLocation: 'middle',
+      nameGap: 22,
+      nameTextStyle: { color: INK_MUTED },
+      axisLabel: { color: INK_MUTED, formatter: (x: number) => fmt(x) },
+      splitLine: { lineStyle: { color: GRID_LINE } },
+    },
+    yAxis: {
+      type: 'category',
+      data: names,
+      axisLabel: { color: INK, fontSize: 11 },
+      axisLine: { lineStyle: { color: GRID_LINE } },
+    },
+    series: [
+      {
+        name: 'gap',
+        type: 'custom',
+        silent: true,
+        renderItem: (
+          _p: unknown,
+          api: { value: (i: number) => number; coord: (v: number[]) => number[] },
+        ) => {
+          const lo = api.coord([api.value(1), api.value(0)])
+          const hi = api.coord([api.value(2), api.value(0)])
+          return {
+            type: 'line',
+            shape: { x1: lo[0], y1: lo[1], x2: hi[0], y2: hi[1] },
+            style: { stroke: GRID_LINE, lineWidth: 2 },
+          }
+        },
+        data: rows.map((r, i) => [i, a(r), b(r)]),
+        encode: { x: [1, 2], y: 0 },
+      },
+      {
+        name: aName,
+        type: 'scatter',
+        symbolSize: 11,
+        itemStyle: { color: IDENT[2], borderColor: '#150420', borderWidth: 2 },
+        data: rows.map(a),
+      },
+      {
+        name: bName,
+        type: 'scatter',
+        symbolSize: 11,
+        itemStyle: { color: IDENT[0], borderColor: '#150420', borderWidth: 2 },
+        label: {
+          show: true,
+          position: 'right',
+          color: INK,
+          fontSize: 10,
+          formatter: (p: { value: number }) => fmt(p.value),
+        },
+        data: rows.map(b),
+      },
+    ],
+  }
+}
+
+/// Cheap against good, as a place on a map. Two measures of different
+/// units belong on two axes of ONE plot, never on two y-scales of one
+/// bar chart.
+function quadrant(rows: Row[]) {
+  return {
+    tooltip: {
+      ...TOOLTIP,
+      formatter: (p: { data: [number, number, string, number] }) =>
+        `${p.data[2]}<br/>${fmtCompact(p.data[0])} tokens per surviving line<br/>${p.data[1]}% survived · ${fmtCompact(p.data[3])} lines landed`,
+    },
+    grid: { left: 58, right: 40, top: 26, bottom: 46 },
+    xAxis: {
+      ...AXIS,
+      type: 'value',
+      name: 'tokens per surviving line  →  dearer',
+      nameLocation: 'middle',
+      nameGap: 26,
+      nameTextStyle: { color: INK_MUTED },
+      axisLabel: { color: INK_MUTED, formatter: (x: number) => fmtCompact(x) },
+      splitLine: { lineStyle: { color: GRID_LINE } },
+    },
+    yAxis: {
+      ...AXIS,
+      type: 'value',
+      name: 'survived %',
+      max: 100,
+      splitLine: { lineStyle: { color: GRID_LINE } },
+    },
+    series: [
+      {
+        type: 'scatter',
+        symbolSize: (d: number[]) => Math.max(14, Math.min(54, Math.sqrt(d[3]) / 3)),
+        itemStyle: {
+          color: (p: { dataIndex: number }) => IDENT[p.dataIndex % IDENT.length],
+          opacity: 0.85,
+          borderColor: '#150420',
+          borderWidth: 2,
+        },
+        label: {
+          show: true,
+          position: 'top',
+          color: INK,
+          fontSize: 11,
+          formatter: (p: { data: [number, number, string] }) => p.data[2],
+        },
+        data: rows.map((r) => [
+          n(r.tokens_per_line_kept),
+          n(r.survived_pct),
+          r.model,
+          n(r.added),
+        ]),
       },
     ],
   }
@@ -224,6 +345,47 @@ function stacked(rows: Row[], kept: (d: Row) => number, gone: (d: Row) => number
       },
     ],
   }
+}
+
+/// The four headline comparisons, as figures rather than charts.
+///
+/// A single number per family, compared once, is read faster as a
+/// number than as a picture of a number — so these are not charts, and
+/// the guidance is explicit that sometimes the right form is no chart
+/// at all. Each carries the ratio, which is the part that actually
+/// decides anything.
+function heroes(rows: Row[]): { k: string; v: string; sub: string; good: boolean }[] {
+  const v = verdict(rows)
+  if (!v) return []
+  const ratio = (a: number, b: number) => (b > 0 ? `${(a / b).toFixed(1)}×` : '—')
+  const hrsPer1k = (d: Row) =>
+    n(d.alive) > 0 ? Math.round(n(d.minutes) / 60 / (n(d.alive) / 1000)) : 0
+  return [
+    {
+      k: 'Lasting lines per 1M tokens',
+      v: ratio(n(v.best.alive_per_mtok), n(v.worst.alive_per_mtok)),
+      sub: `${fmtCompact(n(v.best.alive_per_mtok))} from ${v.best.model} · ${fmtCompact(n(v.worst.alive_per_mtok))} from ${v.worst.model}`,
+      good: true,
+    },
+    {
+      k: 'Lasting lines per hour',
+      v: ratio(n(v.best.alive_per_hour), n(v.worst.alive_per_hour)),
+      sub: `${n(v.best.alive_per_hour)} from ${v.best.model} · ${n(v.worst.alive_per_hour)} from ${v.worst.model}`,
+      good: true,
+    },
+    {
+      k: 'Tokens per surviving line',
+      v: ratio(n(v.worst.tokens_per_line_kept), n(v.best.tokens_per_line_kept)),
+      sub: `${fmtCompact(n(v.worst.tokens_per_line_kept))} from ${v.worst.model} · ${fmtCompact(n(v.best.tokens_per_line_kept))} from ${v.best.model}`,
+      good: false,
+    },
+    {
+      k: 'Hours per 1,000 surviving lines',
+      v: ratio(hrsPer1k(v.worst), hrsPer1k(v.best)),
+      sub: `${hrsPer1k(v.worst)}h from ${v.worst.model} · ${hrsPer1k(v.best)}h from ${v.best.model}`,
+      good: false,
+    },
+  ]
 }
 
 function verdict(rows: Row[]) {
@@ -319,24 +481,115 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
   return (
     <>
       <Panel title="Which model to reach for" scope="all" range={null} note="one walk of git, one set of numbers" mb="md">
+        {/* The heading is a NAME, not a claim. An earlier version put the
+            computed conclusion here, so the section retitled itself every
+            time the numbers moved — 3.0x one hour, 1.4x the next — which
+            reads as an unstable instrument rather than a finding. The
+            comparison belongs in a table; the heading stays put. */}
         {v && (
           <Box mb="md">
-            <Title order={3} style={{ lineHeight: 1.25 }}>
-              {v.best.model} produces {v.tokX.toFixed(1)}× more lasting code per token than {v.worst.model}, and {v.hrX.toFixed(1)}× more per hour.
-            </Title>
-            <Text size="sm" c="dimmed" mt={6}>
-              {fmtCompact(n(v.best.alive_per_mtok))} surviving lines per million output tokens against{' '}
-              {fmtCompact(n(v.worst.alive_per_mtok))}, and {n(v.best.alive_per_hour)} per hour against{' '}
-              {n(v.worst.alive_per_hour)}. That is the whole argument: the cheaper token buys less
-              code that lasts, so it is the dearer choice. {v.worst.model} spent{' '}
-              {fmtCompact(n(v.worst.out_tokens))} tokens and {Math.round(n(v.worst.minutes) / 60)} hours
-              to leave {fmtCompact(n(v.worst.alive))} lines standing; {v.best.model} spent{' '}
-              {fmtCompact(n(v.best.out_tokens))} and {Math.round(n(v.best.minutes) / 60)} hours to leave{' '}
-              {fmtCompact(n(v.best.alive))}.
+            <Table fz="sm" horizontalSpacing="md" verticalSpacing={6} withTableBorder>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>Per unit spent</Table.Th>
+                  <Table.Th ta="right">{v.best.model}</Table.Th>
+                  <Table.Th ta="right">{v.worst.model}</Table.Th>
+                  <Table.Th ta="right">Ratio</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                <Table.Tr>
+                  <Table.Td>Lasting lines per 1M output tokens</Table.Td>
+                  <Table.Td ta="right" c={KEPT}>{fmtCompact(n(v.best.alive_per_mtok))}</Table.Td>
+                  <Table.Td ta="right">{fmtCompact(n(v.worst.alive_per_mtok))}</Table.Td>
+                  <Table.Td ta="right">{v.tokX.toFixed(1)}×</Table.Td>
+                </Table.Tr>
+                <Table.Tr>
+                  <Table.Td>Lasting lines per hour</Table.Td>
+                  <Table.Td ta="right" c={KEPT}>{n(v.best.alive_per_hour)}</Table.Td>
+                  <Table.Td ta="right">{n(v.worst.alive_per_hour)}</Table.Td>
+                  <Table.Td ta="right">{v.hrX.toFixed(1)}×</Table.Td>
+                </Table.Tr>
+                <Table.Tr>
+                  <Table.Td>Spent, to leave that behind</Table.Td>
+                  <Table.Td ta="right">
+                    {fmtCompact(n(v.best.out_tokens))} · {Math.round(n(v.best.minutes) / 60)}h
+                  </Table.Td>
+                  <Table.Td ta="right">
+                    {fmtCompact(n(v.worst.out_tokens))} · {Math.round(n(v.worst.minutes) / 60)}h
+                  </Table.Td>
+                  <Table.Td ta="right">—</Table.Td>
+                </Table.Tr>
+              </Table.Tbody>
+            </Table>
+            <Text size="xs" c="dimmed" mt={6}>
+              A cheaper token that buys fewer lasting lines is the dearer choice. These are rates,
+              so the totals they came from are in the full table at the foot of the section.
             </Text>
           </Box>
         )}
-        <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }} spacing="xs">
+        <SimpleGrid cols={{ base: 2, md: 4 }} spacing="xs" mb="md">
+          {heroes(fams).map((h) => (
+            <Box key={h.k} style={{ border: `1px solid ${GRID_LINE}`, borderRadius: 8, padding: '12px 14px' }}>
+              <Text fz={10} c="dimmed" tt="uppercase" style={{ letterSpacing: '0.08em' }}>
+                {h.k}
+              </Text>
+              <Text fz={26} fw={600} c={h.good ? KEPT : THROWN} style={{ lineHeight: 1.15, fontVariantNumeric: 'tabular-nums' }}>
+                {h.v}
+              </Text>
+              <Text fz={11} c="dimmed">
+                {h.sub}
+              </Text>
+            </Box>
+          ))}
+        </SimpleGrid>
+        <Text size="xs" c="dimmed">
+          Four numbers, no chart: a single headline comparison is read faster as a figure than as a
+          picture of a figure. Everything below is the working behind them.
+        </Text>
+      </Panel>
+
+      <SimpleGrid cols={{ base: 1, lg: 3 }} mb="md">
+        <Panel title="Of what it landed" scope="all" range={null} note="still there against gone">
+          <EChart
+            option={stacked(fams, (d) => n(d.alive), (d) => Math.max(0, n(d.added) - n(d.alive)), 'lines', 'still there', 'gone')}
+            height={60 + fams.length * 40}
+          />
+        </Panel>
+        <Panel title="Of what it cost" scope="all" range={null} note="tokens that bought lasting code, against tokens that did not">
+          <EChart
+            option={stacked(fams, (d) => Math.max(0, n(d.out_tokens) - n(d.tokens_thrown)), (d) => n(d.tokens_thrown), 'output tokens', 'kept', 'thrown away')}
+            height={60 + fams.length * 40}
+          />
+        </Panel>
+        <Panel title="Of your time" scope="all" range={null} note="the cost you cannot get back">
+          <EChart
+            option={stacked(fams, (d) => Math.max(0, Math.round((n(d.minutes) - n(d.minutes_thrown)) / 60)), (d) => Math.round(n(d.minutes_thrown) / 60), 'hours', 'hours that lasted', 'hours thrown away')}
+            height={60 + fams.length * 40}
+          />
+        </Panel>
+      </SimpleGrid>
+
+      <SimpleGrid cols={{ base: 1, lg: 3 }} mb="md">
+        <Panel title="Cheap against good" scope="all" range={null} note="bubble is lines landed · bottom right is the worst place to be">
+          <EChart option={quadrant(fams)} height={230} />
+        </Panel>
+        <Panel title="What a line cost, before and after rework" scope="all" range={null} note="the gap is the rework tax">
+          <EChart
+            option={dumbbell(fams, (d) => n(d.tokens_per_line_landed), (d) => n(d.tokens_per_line_kept), 'per line landed', 'per line still there', 'output tokens per line', fmtCompact)}
+            height={230}
+          />
+        </Panel>
+        <Panel title="Context it carried" scope="all" range={null} note="typical turn against its largest">
+          <EChart
+            option={dumbbell(fams, (d) => n(d.context_avg), (d) => n(d.context_peak), 'typical prompt', 'largest prompt', 'tokens in the prompt', fmtCompact)}
+            height={230}
+          />
+        </Panel>
+      </SimpleGrid>
+
+      <Panel title="The rankings" scope="all" range={null} note="measures whose job is simply an order" mb="md">
+        <SimpleGrid cols={{ base: 1, md: 2, xl: 3 }} spacing="xs">
           {ms.map((m) => (
             <Box key={m.title}>
               <Text fz={11} fw={600} c={INK}>
@@ -345,30 +598,15 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
               <Text fz={9} c="dimmed" mb={2}>
                 {m.note} · {m.good === 'high' ? 'higher is better' : 'lower is better'}
               </Text>
-              <EChart option={mini(fams, m)} height={26 + rows.length * 22} />
+              <EChart option={mini(fams, m)} height={26 + fams.length * 22} />
             </Box>
           ))}
         </SimpleGrid>
         <Text size="xs" c="dimmed" mt="sm">
-          Green is the better family on that measure. Point releases are folded together — you reach for Fable or you reach for Opus — and every rate is recomputed from the summed totals rather than averaged.{' '} Twenty measures, one walk of git: rates are shown
-          beside the totals they came from, so a thin sample cannot hide behind a ratio.
+          Green is the better family. Point releases are folded together — you reach for Fable or you
+          reach for Opus — and every rate is recomputed from the summed totals rather than averaged.
         </Text>
       </Panel>
-
-      <SimpleGrid cols={{ base: 1, lg: 2 }} mb="md">
-        <Panel title="Tokens: what was kept, what was thrown away" scope="all" range={null} note="the money">
-          <EChart
-            option={stacked(fams, (d) => Math.max(0, n(d.out_tokens) - n(d.tokens_thrown)), (d) => n(d.tokens_thrown), 'output tokens', 'bought code still there', 'thrown away')}
-            height={70 + rows.length * 44}
-          />
-        </Panel>
-        <Panel title="Hours: what was kept, what was thrown away" scope="all" range={null} note="the time, which is the one you cannot get back">
-          <EChart
-            option={stacked(fams, (d) => Math.max(0, Math.round((n(d.minutes) - n(d.minutes_thrown)) / 60)), (d) => Math.round(n(d.minutes_thrown) / 60), 'hours', 'hours that lasted', 'hours thrown away')}
-            height={70 + rows.length * 44}
-          />
-        </Panel>
-      </SimpleGrid>
 
       {repos.length > 0 && (
         <Panel title="Where it happened, repository by repository" scope="all" range={null} note="so one bad checkout is visible rather than averaged away" mb="md">
