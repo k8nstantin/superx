@@ -1,4 +1,4 @@
-import { Group, SimpleGrid, Text, Tooltip } from '@mantine/core'
+import { Group, SimpleGrid, Table, Text, Tooltip } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { MONO } from '../../EChart'
 import { CANCEL, Counter, FAIL, Panel, Stat, n, pct } from './parts'
@@ -87,6 +87,105 @@ export function DeviationsSection({ s, range }: { s: StatsSummary | undefined; r
               </Text>
             ))}
           </Group>
+        )}
+      </Panel>
+
+      <Panel
+        title="Focus — how many things it was doing between your turns"
+        scope="range"
+        range={range}
+        note="one instruction should mean one thing · distinct directories touched in each gap between your turns"
+        mb="md"
+      >
+        {(s?.focus?.length ?? 0) === 0 ? (
+          <Text size="xs" c="dimmed">
+            no session in this range did work between two of your turns.
+          </Text>
+        ) : (
+          <Table.ScrollContainer minWidth={720}>
+            <Table striped highlightOnHover>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>Session</Table.Th>
+                  <Table.Th>Model</Table.Th>
+                  <Table.Th ta="right">Windows</Table.Th>
+                  <Table.Th ta="right">Typical streams</Table.Th>
+                  <Table.Th ta="right">Worst</Table.Th>
+                  <Table.Th ta="right">Branches</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {(s?.focus ?? []).map((f) => (
+                  <Table.Tr key={f.identity}>
+                    <Table.Td>
+                      <Text size="xs" ff={MONO}>
+                        {f.identity.slice(0, 13)}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <Text size="xs" c="dimmed">
+                        {f.model ?? '—'}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td ta="right">{String(f.windows)}</Table.Td>
+                    <Table.Td ta="right">
+                      <Text size="xs" ff={MONO} c={n(f.median_streams) >= 3 ? FAIL : n(f.median_streams) >= 2 ? CANCEL : undefined}>
+                        {String(f.median_streams)}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td ta="right">
+                      <Text size="xs" ff={MONO} c={n(f.max_streams) >= 4 ? FAIL : undefined}>
+                        {String(f.max_streams)}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td ta="right">
+                      <Text size="xs" ff={MONO} c={n(f.branches) >= 3 ? CANCEL : undefined}>
+                        {String(f.branches)}
+                      </Text>
+                    </Table.Td>
+                  </Table.Tr>
+                ))}
+              </Table.Tbody>
+            </Table>
+          </Table.ScrollContainer>
+        )}
+        <Text size="xs" c="dimmed" mt="xs">
+          A session answering one instruction by editing a document, patching a throwaway script and juggling branches
+          shows three. It needs no reading of prose — the tool calls say it. {n(s?.branches_opened)} branch
+          {n(s?.branches_opened) === 1 ? ' was' : 'es were'} opened in this range.
+        </Text>
+      </Panel>
+
+      <Panel
+        title="One artifact, several copies"
+        scope="range"
+        range={range}
+        note="the same text written to more than one path — it drifts apart from the moment it is written twice"
+        mb="md"
+      >
+        {(s?.duplicates?.length ?? 0) === 0 ? (
+          <Text size="xs" c="dimmed">
+            nothing in this range was written to two places at once.
+          </Text>
+        ) : (
+          <>
+            {(s?.duplicates ?? []).map((d) => (
+              <Group key={d.paths.join('|')} gap={8} wrap="wrap" mb={4}>
+                <Text size="xs" ff={MONO} c={FAIL}>
+                  ×{String(d.copies)}
+                </Text>
+                {d.paths.map((p) => (
+                  <Text key={p} size="xs" ff={MONO} c="dimmed">
+                    {p.split('/').slice(-2).join('/')}
+                  </Text>
+                ))}
+              </Group>
+            ))}
+            <Text size="xs" c="dimmed" mt="xs">
+              This is the mechanism behind a task and a document that disagree: the copy that gets read is not the copy
+              that was updated, and whatever it leaves out is invented by whoever picks the work up.
+            </Text>
+          </>
         )}
       </Panel>
 

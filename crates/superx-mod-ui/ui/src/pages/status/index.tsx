@@ -8,6 +8,7 @@ import { CodeSection } from './CodeSection'
 import { CostSection } from './CostSection'
 import { DeviationsSection } from './DeviationsSection'
 import { FleetSection } from './FleetSection'
+import { ModelQuality } from './ModelQuality'
 import { FlightDeck } from './FlightDeck'
 import { Gauges } from './Gauges'
 import { HistorySection } from './HistorySection'
@@ -32,6 +33,7 @@ const SECTIONS = [
   ['deviations', 'Deviations'],
   ['fleet', 'Fleet'],
   ['productivity', 'Productivity'],
+  ['realcost', 'The real cost'],
   ['cost', 'Cost'],
   ['history', 'History'],
   ['systems', 'Systems'],
@@ -204,6 +206,13 @@ export default function StatusPage() {
         blurb="effort divided by outcome — and the human half of the loop"
       >
         <ProductivitySection s={s} range={s?.range ?? range} />
+      </Section>
+      <Section
+        id="realcost"
+        title="The real cost"
+        blurb="a price per token says what a model costs to run — this says what it costs to keep"
+      >
+        <ModelQuality s={s} range={s?.range ?? range} />
       </Section>
       <Section id="cost" title="Cost" blurb="what the tokens bought, and what left this machine">
         <CostSection s={s} i={i} range={s?.range ?? range} />

@@ -4,14 +4,19 @@ import type { BranchStat } from "./BranchStat";
 import type { BurnPoint } from "./BurnPoint";
 import type { ChurnPoint } from "./ChurnPoint";
 import type { CompactionStat } from "./CompactionStat";
+import type { DuplicateWrite } from "./DuplicateWrite";
 import type { EffortStat } from "./EffortStat";
 import type { Exposure } from "./Exposure";
+import type { FocusStat } from "./FocusStat";
 import type { HourRate } from "./HourRate";
 import type { IntensityPoint } from "./IntensityPoint";
 import type { Landed } from "./Landed";
 import type { LiveSession } from "./LiveSession";
 import type { ModelEffortStat } from "./ModelEffortStat";
+import type { ModelQualityPoint } from "./ModelQualityPoint";
+import type { ModelRepoStat } from "./ModelRepoStat";
 import type { ModelStat } from "./ModelStat";
+import type { ModelSurvival } from "./ModelSurvival";
 import type { NameCount } from "./NameCount";
 import type { QualityPoint } from "./QualityPoint";
 import type { RepoStat } from "./RepoStat";
@@ -209,6 +214,34 @@ bright_line_paths: Array<string>,
  * Model × reasoning level against outcome, biggest sample first.
  */
 model_effort: Array<ModelEffortStat>, 
+/**
+ * Each model's outcomes bucket by bucket — is it getting better or
+ * worse, and is the difference between two of them real (#403)?
+ */
+model_quality: Array<ModelQualityPoint>, 
+/**
+ * Each model's outcomes per repository, for the only comparison
+ * that holds the work roughly constant (#403).
+ */
+model_repos: Array<ModelRepoStat>, 
+/**
+ * How much of each model's landed work is still in the tree —
+ * rework measured from the repository, not the transcript (#405).
+ */
+model_survival: Array<ModelSurvival>, 
+/**
+ * How scattered each session was between your turns (#406).
+ */
+focus: Array<FocusStat>, 
+/**
+ * The same content written to several paths — one artifact, many
+ * copies, guaranteed to drift apart (#406).
+ */
+duplicates: Array<DuplicateWrite>, 
+/**
+ * Branches created in the range: `git checkout -b` and its kin.
+ */
+branches_opened: bigint, 
 /**
  * Human turns in the range — how often you had to say something.
  */
