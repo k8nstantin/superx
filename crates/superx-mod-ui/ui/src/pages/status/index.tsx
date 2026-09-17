@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { Alert, Box, Button, Group, Loader, Text } from '@mantine/core'
-import { fetchInsights, fetchStats, fetchStatus, fetchThrown } from '../../api'
+import { fetchCompare, fetchInsights, fetchStats, fetchStatus, fetchThrown } from '../../api'
 import { useBreadcrumb } from '../../Breadcrumbs'
 import { Annunciator } from './Annunciator'
 import { CodeSection } from './CodeSection'
 import { CostSection } from './CostSection'
 import { DeviationsSection } from './DeviationsSection'
 import { FleetSection } from './FleetSection'
+import { ModelComparison } from './ModelComparison'
 import { ThrownAwaySection } from './ThrownAway'
 import { FlightDeck } from './FlightDeck'
 import { Gauges } from './Gauges'
@@ -34,6 +35,7 @@ const SECTIONS = [
   ['fleet', 'Fleet'],
   ['productivity', 'Productivity'],
   ['thrown', 'Thrown away'],
+  ['models', 'Model comparison'],
   ['cost', 'Cost'],
   ['history', 'History'],
   ['systems', 'Systems'],
@@ -90,6 +92,7 @@ export default function StatusPage() {
   // Read from git, cached server-side for minutes: it moves when
   // commits land, not when the page polls.
   const thrown = useQuery({ queryKey: ['thrown'], queryFn: fetchThrown, refetchInterval: 300000 })
+  const compare = useQuery({ queryKey: ['compare'], queryFn: fetchCompare, refetchInterval: 300000 })
 
   const s = stats.data
   const i = insights.data
@@ -216,6 +219,13 @@ export default function StatusPage() {
         blurb="a price per token says what a model costs to run — this says what it cost to keep, and what was paid for twice"
       >
         <ThrownAwaySection t={thrown.data} />
+      </Section>
+      <Section
+        id="models"
+        title="Model comparison"
+        blurb="which model to reach for — what its work is worth, how hard it churns, and what happens when the model is switched"
+      >
+        <ModelComparison c={compare.data} />
       </Section>
       <Section id="cost" title="Cost" blurb="what the tokens bought, and what left this machine">
         <CostSection s={s} i={i} range={s?.range ?? range} />

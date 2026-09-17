@@ -20,6 +20,7 @@ use superx_kernel::{
 };
 
 pub mod activity;
+pub mod compare;
 pub mod api;
 pub mod insights;
 pub mod landed;

@@ -1244,3 +1244,80 @@ pub struct ThrownSummary {
     /// seconds, because git blame is not free.
     pub computed_at: String,
 }
+
+/// One direction of model switch (#406), and what the incoming model
+/// did in its first hours holding the work.
+///
+/// The operator's account is that work is handed over when a budget
+/// runs out and rework follows. That makes the switch an event worth
+/// measuring rather than a footnote, so it gets its own row.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct Handoff {
+    pub from: String,
+    pub to: String,
+    /// How many times this direction of switch happened.
+    pub switches: i64,
+    /// Commits the incoming model landed within the takeover window.
+    pub commits: i64,
+    pub added: i64,
+    pub removed: i64,
+    pub alive: i64,
+    /// Of what it wrote just after taking over, how much is still there.
+    pub survived_pct: i64,
+}
+
+/// Whether a model stayed on the objective (#406), read from git.
+///
+/// Going off course leaves marks a transcript cannot hide: commits
+/// whose own subject says the work is being redone, files returned to
+/// again and again, and commits that reach across directories they
+/// were not sent to.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct Deviation {
+    pub model: String,
+    pub commits: i64,
+    pub added: i64,
+    pub removed: i64,
+    pub alive: i64,
+    pub survived_pct: i64,
+    /// Lines removed per hundred added — whether it is building or
+    /// churning.
+    pub removed_per_100_added: i64,
+    /// Commits whose subject says fix, revert, undo, redo.
+    pub rework_commits: i64,
+    pub rework_pct: i64,
+    /// Files it came back to three times or more. Compare per commit,
+    /// never raw: the model with more commits touches more files.
+    pub thrash_files: i64,
+    /// Thrash files per hundred commits — the comparable form.
+    pub thrash_per_100_commits: i64,
+    /// Commits touching more than one top-level directory.
+    ///
+    /// NOT charted, and not a deviation signal: it measures repository
+    /// LAYOUT, not behaviour. A repo whose code all sits under
+    /// `crates/` reports one directory per commit however far the work
+    /// wandered, while a flat repo reports several for a commit that
+    /// never left its lane. Measured here at 2% for one model and 66%
+    /// for another purely because they worked in different repos. Kept
+    /// because it is honest data, exposed with this warning so nobody
+    /// draws it.
+    pub multi_dir_commits: i64,
+    pub multi_dir_pct: i64,
+    /// Directories per commit, times ten, so it stays an integer.
+    pub dirs_per_commit_x10: i64,
+    /// The operator's half, for the same model.
+    pub operator_turns: i64,
+    pub corrections: i64,
+    pub corrections_per_100: i64,
+}
+
+/// The model-comparison answer (#406).
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct CompareSummary {
+    pub handoffs: Vec<Handoff>,
+    pub deviations: Vec<Deviation>,
+    pub computed_at: String,
+}

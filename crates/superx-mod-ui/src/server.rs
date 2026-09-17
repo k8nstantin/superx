@@ -107,6 +107,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/stats", get(api_stats))
         .route("/api/insights", get(api_insights))
         .route("/api/thrown", get(api_thrown))
+        .route("/api/compare", get(api_compare))
         .route("/api/actions", get(api_actions))
         .route("/api/charts/summary", get(api_charts))
         .route("/api/events", get(api_events))
@@ -600,6 +601,33 @@ async fn api_thrown(State(state): State<AppState>) -> axum::response::Response {
         uncredited_lines,
         repos,
         sessions,
+        computed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match serde_json::to_string(&summary) {
+        Ok(body) => {
+            state.remember(KEY, &body);
+            json_body(body)
+        }
+        Err(e) => json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
+    }
+}
+
+/// Model comparison (#406): the switches, and whether each model
+/// stayed on the objective. Same cache lifetime and same reason as
+/// [`api_thrown`] — it walks git, not the message stream.
+async fn api_compare(State(state): State<AppState>) -> axum::response::Response {
+    const KEY: &str = "compare";
+    if let Some(body) = state.cached(KEY, THROWN_CACHE_SECS) {
+        return json_body(body);
+    }
+    let runs = match crate::thrown::model_runs(&state.kernel).await {
+        Ok(r) => r,
+        Err(e) => return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
+    };
+    let (handoffs, deviations) = crate::compare::compare(&runs).await;
+    let summary = crate::api::CompareSummary {
+        handoffs,
+        deviations,
         computed_at: chrono::Utc::now().to_rfc3339(),
     };
     match serde_json::to_string(&summary) {

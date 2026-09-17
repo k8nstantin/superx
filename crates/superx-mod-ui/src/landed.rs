@@ -24,6 +24,10 @@ const LANDED_REPOS: usize = 8; // skill-allow: §9-const — read-path bound, no
 /// Files blamed per repository when measuring survival (#405). Blame
 /// is the only way to ask "is this line still here", and it costs one
 /// pass per file.
+/// Paths kept per commit. Enough to read scope and thrash; a vendor
+/// drop must not make one commit weigh as much as the rest.
+const FILES_PER_COMMIT: usize = 64; // skill-allow: §9-const — read-path bound, not a policy tunable
+
 const SURVIVAL_FILES: usize = 600; // skill-allow: §9-const — read-path bound, not a policy tunable
 
 /// A git call slower than this is abandoned and counted unreadable.
@@ -202,6 +206,13 @@ pub struct CommitSurvival {
     pub removed: i64,
     /// Of those added lines, how many blame still attributes here.
     pub alive: i64,
+    /// The paths this commit touched, so scope and thrash can be read
+    /// without a second walk. Bounded per commit: a vendor drop must
+    /// not make one commit weigh as much as the rest of the history.
+    pub files: Vec<String>,
+    /// The commit subject, lower-cased. A model that keeps landing
+    /// "fix", "revert" and "undo" is redoing its own work.
+    pub subject: String,
 }
 
 /// What survived, per commit, on one repository's main line.
@@ -211,7 +222,13 @@ pub struct CommitSurvival {
 /// nothing rather than a guess.
 pub async fn survival(dir: &Path, since: Option<DateTime<Utc>>) -> Vec<CommitSurvival> {
     let branch = main_ref(dir).await;
-    let mut args = vec!["log", "--first-parent", "-m", "--numstat", "--format=%x01%H %ct"];
+    let mut args = vec![
+        "log",
+        "--first-parent",
+        "-m",
+        "--numstat",
+        "--format=%x01%H %ct %s",
+    ];
     let since_s = since.map(|s| s.to_rfc3339());
     if let Some(s) = &since_s {
         args.push("--since");
@@ -224,8 +241,9 @@ pub async fn survival(dir: &Path, since: Option<DateTime<Utc>>) -> Vec<CommitSur
     let mut commits: Vec<CommitSurvival> = Vec::new();
     for line in out.lines() {
         if let Some(rest) = line.strip_prefix('\u{1}') {
-            let mut parts = rest.split_whitespace();
+            let mut parts = rest.splitn(3, ' ');
             let (Some(hash), Some(ts)) = (parts.next(), parts.next()) else { continue };
+            let subject = parts.next().unwrap_or("").to_ascii_lowercase();
             let Some(at) = ts.parse::<i64>().ok().and_then(|t| Utc.timestamp_opt(t, 0).single()) else {
                 continue;
             };
@@ -235,6 +253,8 @@ pub async fn survival(dir: &Path, since: Option<DateTime<Utc>>) -> Vec<CommitSur
                 added: 0,
                 removed: 0,
                 alive: 0,
+                files: Vec::new(),
+                subject,
             });
             continue;
         }
@@ -247,6 +267,11 @@ pub async fn survival(dir: &Path, since: Option<DateTime<Utc>>) -> Vec<CommitSur
                 // A binary file reports `-` in both columns.
                 if let Ok(d) = d.trim().parse::<i64>() {
                     c.removed += d;
+                }
+                if let Some(path) = p.next() {
+                    if c.files.len() < FILES_PER_COMMIT && !path.is_empty() {
+                        c.files.push(path.to_string());
+                    }
                 }
             }
         }
