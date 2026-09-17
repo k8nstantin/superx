@@ -1153,98 +1153,6 @@ pub struct ModelRun {
     pub context_peak: i64,
 }
 
-/// What a model's work threw away (#406) — the section's whole point.
-///
-/// `thrown` is lines that landed and are no longer in the tree;
-/// `tokens_thrown` charges the model's own price per landed line
-/// against them, which is the number a price list never shows.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ThrownAway {
-    pub model: String,
-    pub sessions: i64,
-    pub messages: i64,
-    pub out_tokens: i64,
-    pub commits: i64,
-    /// Lines added by commits credited to this model.
-    pub landed: i64,
-    /// Of those, how many blame still finds in the tree.
-    pub alive: i64,
-    /// `landed - alive` — the work that did not last.
-    pub thrown: i64,
-    pub survived_pct: i64,
-    pub tokens_per_line_landed: i64,
-    /// The bill that is actually paid: tokens divided by the lines
-    /// that are still there.
-    pub tokens_per_line_kept: i64,
-    pub tokens_thrown: i64,
-    /// Days since the median credited commit — the confounder, shown
-    /// so the reader checks it before ranking.
-    pub median_age_days: i64,
-
-    // ── how often it had to be put back on course (#406) ──────────
-    /// The operator's own turns while this model was working. The
-    /// denominator: one person writes them all, so their style is a
-    /// constant and a difference between models is the models.
-    pub operator_turns: i64,
-    /// Turns that told it to do the work AGAIN. The turn is the
-    /// operator's; the cause is the agent leaving the instruction, and
-    /// this is the only place that leaving is written down.
-    pub redo_asks: i64,
-    /// Turns carrying plain frustration.
-    pub escalations: i64,
-    /// Redo asks per hundred operator turns — the rate at which the
-    /// work had to be put back on course.
-    pub redo_per_100: i64,
-    /// Wall-clock minutes across every stint.
-    pub minutes: i64,
-    /// Tokens carried in the prompt per turn, averaged over stints by
-    /// message count, and the largest single prompt seen.
-    pub context_avg: i64,
-    pub context_peak: i64,
-}
-
-/// One model run as a point on the correlation (#406): how often the
-/// work had to be put back on course against how much of it lasted.
-/// Three models make three points, which is not a scatter; a run each
-/// is a sample the reader can actually judge.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct RunPoint {
-    pub model: String,
-    pub session: String,
-    pub landed: i64,
-    pub survived_pct: i64,
-    /// How long the stint ran. Run length is the lever: a model left
-    /// to run long degrades, and this is the axis that shows it.
-    pub minutes: i64,
-    pub messages: i64,
-    pub operator_turns: i64,
-    pub corrections: i64,
-    pub corrections_per_100: i64,
-}
-
-/// The whole answer to "what did it throw away" (#406), with the
-/// honesty fields beside it: a commit no session covers is counted
-/// here rather than credited to the nearest model, and the page says
-/// so before it ranks anything.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ThrownSummary {
-    pub models: Vec<ThrownAway>,
-    /// One point per run for the correlation panel.
-    pub points: Vec<RunPoint>,
-    /// Commits no single session covered, and the lines they added.
-    pub uncredited_commits: i64,
-    pub uncredited_lines: i64,
-    /// Repositories read, and sessions rolled up.
-    pub repos: i64,
-    pub sessions: i64,
-    /// When this was computed, RFC3339 — it is cached for minutes, not
-    /// seconds, because git blame is not free.
-    pub computed_at: String,
-}
-
 /// One direction of model switch (#406), and what the incoming model
 /// did in its first hours holding the work.
 ///
@@ -1311,6 +1219,55 @@ pub struct Deviation {
     pub operator_turns: i64,
     pub corrections: i64,
     pub corrections_per_100: i64,
+
+    // ── what it cost, folded in from the pricing walk ─────────────
+    /// Output tokens across every stint of this model.
+    pub out_tokens: i64,
+    pub messages: i64,
+    pub runs: i64,
+    /// Lines that landed and are no longer in the tree.
+    pub thrown: i64,
+    /// The model's own price per landed line, charged on the lines
+    /// that did not last. The column no price list carries.
+    pub tokens_thrown: i64,
+    pub tokens_per_line_landed: i64,
+    /// The bill actually paid: tokens over the lines still standing.
+    pub tokens_per_line_kept: i64,
+    /// Days since the median credited commit — the confounder, shown
+    /// so it can be checked before anything is ranked.
+    pub median_age_days: i64,
+    /// Tokens carried in the prompt per turn, and the largest seen.
+    pub context_avg: i64,
+    pub context_peak: i64,
+    /// Wall-clock minutes across every stint, and the share of them
+    /// charged to work that did not last. Time is the cost the
+    /// operator actually feels: a token bill is recoverable, a week is
+    /// not.
+    pub minutes: i64,
+    pub minutes_thrown: i64,
+
+    // ── productivity: what you GET, not what you spend ────────────
+    /// Surviving lines per million output tokens. The headline: a
+    /// cheaper token that produces fewer lasting lines is the dearer
+    /// choice, and this is the number that says so in one figure.
+    pub alive_per_mtok: i64,
+    /// Surviving lines per hour of wall clock.
+    pub alive_per_hour: i64,
+}
+
+/// One repository, one model (#406) — so a repo that went badly after a
+/// switch can be seen rather than averaged away across every checkout.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct RepoModel {
+    pub repo: String,
+    pub model: String,
+    pub commits: i64,
+    pub added: i64,
+    pub alive: i64,
+    pub removed: i64,
+    pub survived_pct: i64,
+    pub rework_commits: i64,
 }
 
 /// The model-comparison answer (#406).
@@ -1319,5 +1276,7 @@ pub struct Deviation {
 pub struct CompareSummary {
     pub handoffs: Vec<Handoff>,
     pub deviations: Vec<Deviation>,
+    /// Per repository and model, biggest first.
+    pub repos: Vec<RepoModel>,
     pub computed_at: String,
 }

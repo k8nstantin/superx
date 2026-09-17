@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { Alert, Box, Button, Group, Loader, Text } from '@mantine/core'
-import { fetchCompare, fetchInsights, fetchStats, fetchStatus, fetchThrown } from '../../api'
+import { fetchCompare, fetchInsights, fetchStats, fetchStatus } from '../../api'
 import { useBreadcrumb } from '../../Breadcrumbs'
 import { Annunciator } from './Annunciator'
 import { CodeSection } from './CodeSection'
@@ -9,7 +9,6 @@ import { CostSection } from './CostSection'
 import { DeviationsSection } from './DeviationsSection'
 import { FleetSection } from './FleetSection'
 import { ModelComparison } from './ModelComparison'
-import { ThrownAwaySection } from './ThrownAway'
 import { FlightDeck } from './FlightDeck'
 import { Gauges } from './Gauges'
 import { HistorySection } from './HistorySection'
@@ -34,7 +33,6 @@ const SECTIONS = [
   ['deviations', 'Deviations'],
   ['fleet', 'Fleet'],
   ['productivity', 'Productivity'],
-  ['thrown', 'Thrown away'],
   ['models', 'Model comparison'],
   ['cost', 'Cost'],
   ['history', 'History'],
@@ -91,7 +89,6 @@ export default function StatusPage() {
   const insights = useQuery({ queryKey: ['insights'], queryFn: fetchInsights, refetchInterval: 60000 })
   // Read from git, cached server-side for minutes: it moves when
   // commits land, not when the page polls.
-  const thrown = useQuery({ queryKey: ['thrown'], queryFn: fetchThrown, refetchInterval: 300000 })
   const compare = useQuery({ queryKey: ['compare'], queryFn: fetchCompare, refetchInterval: 300000 })
 
   const s = stats.data
@@ -212,13 +209,6 @@ export default function StatusPage() {
         blurb="effort divided by outcome — and the human half of the loop"
       >
         <ProductivitySection s={s} range={s?.range ?? range} />
-      </Section>
-      <Section
-        id="thrown"
-        title="What the work threw away"
-        blurb="a price per token says what a model costs to run — this says what it cost to keep, and what was paid for twice"
-      >
-        <ThrownAwaySection t={thrown.data} />
       </Section>
       <Section
         id="models"

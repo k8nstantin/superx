@@ -47,4 +47,47 @@ dirs_per_commit_x10: bigint,
 /**
  * The operator's half, for the same model.
  */
-operator_turns: bigint, corrections: bigint, corrections_per_100: bigint, };
+operator_turns: bigint, corrections: bigint, corrections_per_100: bigint, 
+/**
+ * Output tokens across every stint of this model.
+ */
+out_tokens: bigint, messages: bigint, runs: bigint, 
+/**
+ * Lines that landed and are no longer in the tree.
+ */
+thrown: bigint, 
+/**
+ * The model's own price per landed line, charged on the lines
+ * that did not last. The column no price list carries.
+ */
+tokens_thrown: bigint, tokens_per_line_landed: bigint, 
+/**
+ * The bill actually paid: tokens over the lines still standing.
+ */
+tokens_per_line_kept: bigint, 
+/**
+ * Days since the median credited commit — the confounder, shown
+ * so it can be checked before anything is ranked.
+ */
+median_age_days: bigint, 
+/**
+ * Tokens carried in the prompt per turn, and the largest seen.
+ */
+context_avg: bigint, context_peak: bigint, 
+/**
+ * Wall-clock minutes across every stint, and the share of them
+ * charged to work that did not last. Time is the cost the
+ * operator actually feels: a token bill is recoverable, a week is
+ * not.
+ */
+minutes: bigint, minutes_thrown: bigint, 
+/**
+ * Surviving lines per million output tokens. The headline: a
+ * cheaper token that produces fewer lasting lines is the dearer
+ * choice, and this is the number that says so in one figure.
+ */
+alive_per_mtok: bigint, 
+/**
+ * Surviving lines per hour of wall clock.
+ */
+alive_per_hour: bigint, };

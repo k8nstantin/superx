@@ -1,4 +1,4 @@
-//! What a model's work threw away (#406).
+//! The uncapped per-model reading layer (#406).
 //!
 //! The question this answers is not "did the calls succeed" — tool
 //! failure and test pass rates put the models within noise of each
@@ -21,21 +21,15 @@
 //! there are tens of sessions rather than tens of thousands of rows.
 //! Cost scales with sessions, and the attribution covers all of them.
 
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
 use superx_kernel::types::{RecordId, Value};
 use superx_kernel::{Kernel, Result};
 
-use crate::api::{ModelRun, RunPoint, ThrownAway};
+use crate::api::ModelRun;
 
 /// Working directories kept per session. A session is normally one
 /// checkout; the cap catches the occasional wanderer without letting
 /// one session claim every repository on the machine.
-/// A run must have landed at least this much for its survival rate to
-/// be a point rather than noise.
-const RUN_MIN_LANDED: i64 = 200; // skill-allow: §9-const — render-layer floor, not a policy tunable
-
 const CWDS_PER_SESSION: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
 
 fn str_of(row: &Value, key: &str) -> Option<String> {
@@ -325,232 +319,12 @@ pub fn credit(claims: &[Claim], at: DateTime<Utc>) -> Option<&str> {
     }
 }
 
-/// Roll credited commits and per-model token totals into the answer.
-/// Pure, so the arithmetic is tested without touching git.
-#[must_use]
-#[derive(Debug, Default, Clone)]
-pub struct Spend {
-    pub out_tokens: i64,
-    pub messages: i64,
-    pub runs: i64,
-    pub operator_turns: i64,
-    pub redo_asks: i64,
-    pub escalations: i64,
-    pub minutes: i64,
-    pub context_weighted: i64,
-    pub context_msgs: i64,
-    pub context_peak: i64,
-}
-
-#[must_use]
-pub fn tally(
-    credited: &[(String, i64, i64, i64)],
-    spend: &HashMap<String, Spend>,
-) -> Vec<ThrownAway> {
-    let mut per: HashMap<String, (i64, i64, i64, Vec<i64>)> = HashMap::new();
-    for (model, added, alive, age) in credited {
-        let e = per.entry(model.clone()).or_insert((0, 0, 0, Vec::new()));
-        e.0 += 1;
-        e.1 += added;
-        e.2 += alive;
-        e.3.push(*age);
-    }
-    let mut out: Vec<ThrownAway> = per
-        .into_iter()
-        .map(|(model, (commits, landed, alive, mut ages))| {
-            ages.sort_unstable();
-            let median_age_days = ages.get(ages.len() / 2).copied().unwrap_or(0);
-            let sp = spend.get(&model).cloned().unwrap_or_default();
-            let (out_tokens, messages, sessions) = (sp.out_tokens, sp.messages, sp.runs);
-            let thrown = (landed - alive).max(0);
-            // What the discarded lines cost: the model's own price per
-            // landed line, charged on the lines that did not last.
-            let tokens_thrown = if landed > 0 {
-                out_tokens.saturating_mul(thrown) / landed
-            } else {
-                0
-            };
-            ThrownAway {
-                model,
-                sessions,
-                messages,
-                out_tokens,
-                commits,
-                landed,
-                alive,
-                thrown,
-                survived_pct: if landed > 0 { (100 * alive) / landed } else { 0 },
-                tokens_per_line_landed: if landed > 0 { out_tokens / landed } else { 0 },
-                tokens_per_line_kept: if alive > 0 { out_tokens / alive } else { 0 },
-                tokens_thrown,
-                median_age_days,
-                operator_turns: sp.operator_turns,
-                redo_asks: sp.redo_asks,
-                escalations: sp.escalations,
-                redo_per_100: if sp.operator_turns > 0 {
-                    (100 * sp.redo_asks) / sp.operator_turns
-                } else {
-                    0
-                },
-                minutes: sp.minutes,
-                context_avg: if sp.context_msgs > 0 {
-                    sp.context_weighted / sp.context_msgs
-                } else {
-                    0
-                },
-                context_peak: sp.context_peak,
-            }
-        })
-        .collect();
-    out.sort_by_key(|m| std::cmp::Reverse(m.tokens_thrown));
-    out
-}
-
-/// Roll the model runs up into what each model threw away.
-///
-/// A commit is credited to the model that was in charge of **that
-/// directory** when it landed, via [`credit`]. Anything it declines is
-/// reported as uncredited rather than absorbed by a neighbour — most
-/// of those are a repository's history from before capture began, or
-/// a human's own commits.
-#[must_use]
-pub async fn thrown_away(runs: &[ModelRun]) -> (Vec<ThrownAway>, Vec<RunPoint>, i64, i64) {
-    // Claims per top-level repository, and the earliest moment any
-    // model was at work — the git walk needs no commit older than that.
-    let mut claims: HashMap<String, Vec<Claim>> = HashMap::new();
-    let mut earliest: Option<DateTime<Utc>> = None;
-    for r in runs {
-        let (Ok(from), Ok(to)) = (
-            DateTime::parse_from_rfc3339(&r.first),
-            DateTime::parse_from_rfc3339(&r.last),
-        ) else {
-            continue;
-        };
-        let (from, to) = (from.with_timezone(&Utc), to.with_timezone(&Utc));
-        earliest = Some(earliest.map_or(from, |e: DateTime<Utc>| e.min(from)));
-        for cwd in &r.cwds {
-            let Some(top) = crate::landed::toplevel(std::path::Path::new(cwd)).await else {
-                continue;
-            };
-            claims.entry(top).or_default().push(Claim {
-                model: r.model.clone(),
-                from,
-                to,
-            });
-        }
-    }
-
-    // Everything that is summed per model rather than read from git.
-    let mut spend: HashMap<String, Spend> = HashMap::new();
-    for r in runs {
-        let e = spend.entry(r.model.clone()).or_default();
-        e.out_tokens += r.out_tokens;
-        e.messages += r.messages;
-        e.runs += 1;
-        e.operator_turns += r.operator_turns;
-        e.redo_asks += r.redo_asks;
-        e.escalations += r.escalations;
-        e.minutes += r.minutes;
-        // Context is a per-turn figure, so it averages by message
-        // count rather than by run: a two-message stint must not weigh
-        // the same as a thousand-message one.
-        e.context_weighted += r.context_avg.saturating_mul(r.messages);
-        e.context_msgs += if r.context_avg > 0 { r.messages } else { 0 };
-        e.context_peak = e.context_peak.max(r.context_peak);
-    }
-
-    let mut credited: Vec<(String, i64, i64, i64)> = Vec::new();
-    // Per RUN as well as per model: three models make three points,
-    // which is not a scatter. Each run is its own point, so the
-    // relationship between going off course and work that lasts can be
-    // seen rather than asserted.
-    let mut per_run: HashMap<usize, (i64, i64)> = HashMap::new();
-    let mut uncredited_commits = 0i64;
-    let mut uncredited_lines = 0i64;
-    let now = Utc::now();
-    let mut roots: Vec<&String> = claims.keys().collect();
-    roots.sort();
-    for top in roots {
-        let list = &claims[top];
-        for c in crate::landed::survival(std::path::Path::new(top), earliest).await {
-            match credit(list, c.at) {
-                Some(model) => {
-                    credited.push((
-                        model.to_string(),
-                        c.added,
-                        c.alive,
-                        (now - c.at).num_days().max(0),
-                    ));
-                    // The run that owned this checkout at that moment.
-                    if let Some(i) = runs.iter().position(|r| {
-                        r.model == model
-                            && r.cwds.iter().any(|w| w.starts_with(top.as_str()))
-                            && DateTime::parse_from_rfc3339(&r.first)
-                                .map(|f| f.with_timezone(&Utc) <= c.at)
-                                .unwrap_or(false)
-                            && DateTime::parse_from_rfc3339(&r.last)
-                                .map(|l| c.at <= l.with_timezone(&Utc))
-                                .unwrap_or(false)
-                    }) {
-                        let e = per_run.entry(i).or_insert((0, 0));
-                        e.0 += c.added;
-                        e.1 += c.alive;
-                    }
-                }
-                None => {
-                    uncredited_commits += 1;
-                    uncredited_lines += c.added;
-                }
-            }
-        }
-    }
-
-    // Points for the correlation: one per run that both landed work
-    // and saw the operator speak, so neither axis is invented.
-    let mut points: Vec<RunPoint> = per_run
-        .into_iter()
-        .filter_map(|(i, (landed, alive))| {
-            let r = runs.get(i)?;
-            (landed >= RUN_MIN_LANDED && r.operator_turns > 0).then(|| RunPoint {
-                model: r.model.clone(),
-                session: r.session.clone(),
-                landed,
-                survived_pct: (100 * alive) / landed,
-                minutes: r.minutes,
-                messages: r.messages,
-                operator_turns: r.operator_turns,
-                corrections: r.redo_asks,
-                corrections_per_100: (100 * r.redo_asks) / r.operator_turns,
-            })
-        })
-        .collect();
-    points.sort_by_key(|p| std::cmp::Reverse(p.landed));
-
-    (
-        tally(&credited, &spend),
-        points,
-        uncredited_commits,
-        uncredited_lines,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
-    }
-
-    /// Tokens, messages and runs for one model — the fields the
-    /// arithmetic tests care about; the rest default to zero.
-    fn spend_of(out_tokens: i64, messages: i64, runs: i64) -> Spend {
-        Spend {
-            out_tokens,
-            messages,
-            runs,
-            ..Spend::default()
-        }
     }
 
     fn claim(model: &str, from: &str, to: &str) -> Claim {
@@ -609,98 +383,4 @@ mod tests {
         assert_eq!(credit(&claims, t("2026-06-02T00:00:00Z")), Some("fable"));
     }
 
-    #[test]
-    fn thrown_tokens_are_the_models_own_price_on_the_lines_that_died() {
-        // 1000 lines landed, 400 still there: 600 thrown of 1000, and
-        // 1_000_000 tokens bought the lot.
-        let credited = vec![("opus".to_string(), 1000, 400, 10)];
-        let mut tokens = HashMap::new();
-        tokens.insert("opus".to_string(), spend_of(1_000_000, 500, 3));
-        let out = tally(&credited, &tokens);
-        assert_eq!(out.len(), 1);
-        let m = &out[0];
-        assert_eq!(m.thrown, 600);
-        assert_eq!(m.survived_pct, 40);
-        assert_eq!(m.tokens_per_line_landed, 1000);
-        assert_eq!(m.tokens_per_line_kept, 2500);
-        assert_eq!(m.tokens_thrown, 600_000);
-    }
-
-    /// The headline ordering: worst waste first, so the page does not
-    /// have to sort it again.
-    #[test]
-    fn models_come_back_worst_waste_first() {
-        let credited = vec![
-            ("fable".to_string(), 1000, 900, 30),
-            ("opus".to_string(), 1000, 300, 20),
-        ];
-        let mut tokens = HashMap::new();
-        tokens.insert("fable".to_string(), spend_of(1_000_000, 100, 1));
-        tokens.insert("opus".to_string(), spend_of(1_000_000, 100, 1));
-        let out = tally(&credited, &tokens);
-        assert_eq!(out[0].model, "opus");
-        assert_eq!(out[0].tokens_thrown, 700_000);
-        assert_eq!(out[1].tokens_thrown, 100_000);
-    }
-
-    #[test]
-    fn a_model_that_landed_nothing_reports_zero_not_a_division_by_zero() {
-        let credited: Vec<(String, i64, i64, i64)> = Vec::new();
-        let mut tokens = HashMap::new();
-        tokens.insert("ghost".to_string(), spend_of(5_000, 10, 1));
-        assert!(tally(&credited, &tokens).is_empty());
-    }
-
-    /// Going off course is counted as a RATE against the operator's own
-    /// turns, not as a raw total. One model getting twice the work is
-    /// otherwise indistinguishable from one going wrong twice as often.
-    #[test]
-    fn being_told_again_is_a_rate_not_a_count() {
-        let credited = vec![
-            ("busy".to_string(), 1000, 500, 10),
-            ("rare".to_string(), 1000, 500, 10),
-        ];
-        let mut spend = HashMap::new();
-        // Twice the turns, twice the redo asks: the SAME rate.
-        spend.insert(
-            "busy".to_string(),
-            Spend { out_tokens: 10, messages: 400, runs: 2, operator_turns: 200, redo_asks: 20, ..Spend::default() },
-        );
-        spend.insert(
-            "rare".to_string(),
-            Spend { out_tokens: 10, messages: 200, runs: 1, operator_turns: 100, redo_asks: 10, ..Spend::default() },
-        );
-        let out = tally(&credited, &spend);
-        let busy = out.iter().find(|m| m.model == "busy").unwrap();
-        let rare = out.iter().find(|m| m.model == "rare").unwrap();
-        assert_eq!(busy.redo_per_100, 10);
-        assert_eq!(rare.redo_per_100, 10);
-        assert_eq!(busy.redo_asks, 20);
-    }
-
-    /// A model nobody spoke to reports no rate rather than dividing by
-    /// zero and claiming perfection.
-    #[test]
-    fn no_operator_turns_means_no_rate_not_a_perfect_score() {
-        let credited = vec![("silent".to_string(), 100, 50, 5)];
-        let mut spend = HashMap::new();
-        spend.insert("silent".to_string(), Spend { out_tokens: 10, ..Spend::default() });
-        let out = tally(&credited, &spend);
-        assert_eq!(out[0].redo_per_100, 0);
-        assert_eq!(out[0].operator_turns, 0);
-    }
-
-    #[test]
-    fn the_median_age_is_reported_so_the_confounder_is_checkable() {
-        let credited = vec![
-            ("opus".to_string(), 10, 5, 1),
-            ("opus".to_string(), 10, 5, 30),
-            ("opus".to_string(), 10, 5, 100),
-        ];
-        let mut tokens = HashMap::new();
-        tokens.insert("opus".to_string(), spend_of(300, 10, 1));
-        let out = tally(&credited, &tokens);
-        assert_eq!(out[0].median_age_days, 30);
-        assert_eq!(out[0].commits, 3);
-    }
 }

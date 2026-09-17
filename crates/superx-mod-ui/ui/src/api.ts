@@ -8,7 +8,6 @@ import type { ActionView } from './generated/ActionView'
 import type { ChartsSummary } from './generated/ChartsSummary'
 import type { StatsSummary } from './generated/StatsSummary'
 import type { InsightsSummary } from './generated/InsightsSummary'
-import type { ThrownSummary } from './generated/ThrownSummary'
 import type { CompareSummary } from './generated/CompareSummary'
 
 async function get<T>(path: string): Promise<T> {
@@ -51,7 +50,6 @@ export const fetchInsights = () => get<InsightsSummary>('/api/insights')
 /// What each model's work threw away (#406). Read from git rather than
 /// the transcript, and cached server-side for minutes — it moves when
 /// commits land, not when the page polls.
-export const fetchThrown = () => get<ThrownSummary>('/api/thrown')
 /// Model comparison (#406): the switches, and whether each model stayed
 /// on the objective. Same git-backed read, same server-side cache.
 export const fetchCompare = () => get<CompareSummary>('/api/compare')

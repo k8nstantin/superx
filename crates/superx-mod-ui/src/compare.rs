@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
-use crate::api::{Deviation, Handoff, ModelRun};
+use crate::api::{Deviation, Handoff, ModelRun, RepoModel};
 use crate::thrown::{credit, Claim};
 
 /// Commit subjects that mean the work is being done again. Read from
@@ -80,7 +80,7 @@ fn claims_by_repo(runs: &[ModelRun]) -> (HashMap<String, Vec<Claim>>, Option<Dat
 /// repository: walking twice would double the cost of the most
 /// expensive read in the module.
 #[must_use]
-pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>) {
+pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>, Vec<RepoModel>) {
     let (by_cwd, earliest) = claims_by_repo(runs);
 
     // Fold the per-cwd claims onto repository roots.
@@ -96,6 +96,9 @@ pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>) {
     let mut dev: HashMap<String, DevAcc> = HashMap::new();
     // Per (from, to): what the incoming model did in its first hours.
     let mut hand: HashMap<(String, String), HandAcc> = HashMap::new();
+    // Per repository and model, so one checkout that went badly after a
+    // switch is visible instead of averaged into every other.
+    let mut per_repo: HashMap<(String, String), DevAcc> = HashMap::new();
 
     let mut roots: Vec<&String> = claims.keys().collect();
     roots.sort();
@@ -128,11 +131,26 @@ pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>) {
             if is_rework(&c.subject) {
                 e.rework_commits += 1;
             }
+            let short = std::path::Path::new(top)
+                .file_name()
+                .map_or_else(|| top.clone(), |n| n.to_string_lossy().into_owned());
+            let rk = per_repo
+                .entry((short, model.to_string()))
+                .or_default();
+            rk.commits += 1;
+            rk.added += c.added;
+            rk.removed += c.removed;
+            rk.alive += c.alive;
+            if is_rework(&c.subject) {
+                rk.rework_commits += 1;
+            }
+
             let dirs: HashSet<&str> = c.files.iter().map(|f| top_dir(f)).collect();
             if dirs.len() > 1 {
                 e.multi_dir_commits += 1;
             }
             e.dir_spread += dirs.len() as i64;
+            e.ages.push((Utc::now() - c.at).num_days().max(0));
             for f in &c.files {
                 let k = (model.to_string(), f.clone());
                 let n = touched.entry(k).or_insert(0);
@@ -187,20 +205,32 @@ pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>) {
         .collect();
     handoffs.sort_by_key(|h| std::cmp::Reverse(h.switches));
 
-    let mut runs_by_model: HashMap<&str, (i64, i64)> = HashMap::new();
+    // Tokens, turns and context per model — the same rollup the pricing
+    // view used, folded in here so there is ONE number per quantity.
+    // Two walks computing "survived %" separately is how two sections
+    // came to disagree with each other on screen.
+    let mut sp: HashMap<&str, SpendAcc> = HashMap::new();
     for r in runs {
-        let e = runs_by_model.entry(r.model.as_str()).or_insert((0, 0));
-        e.0 += r.operator_turns;
-        e.1 += r.redo_asks;
+        let e = sp.entry(r.model.as_str()).or_default();
+        e.out_tokens += r.out_tokens;
+        e.messages += r.messages;
+        e.runs += 1;
+        e.operator_turns += r.operator_turns;
+        e.corrections += r.redo_asks;
+        e.context_weighted += r.context_avg.saturating_mul(r.messages);
+        e.context_msgs += if r.context_avg > 0 { r.messages } else { 0 };
+        e.context_peak = e.context_peak.max(r.context_peak);
+        e.minutes += r.minutes;
     }
 
     let mut deviations: Vec<Deviation> = dev
         .into_iter()
         .map(|(model, a)| {
-            let (op, redo) = runs_by_model
-                .get(model.as_str())
-                .copied()
-                .unwrap_or((0, 0));
+            let s = sp.get(model.as_str()).cloned().unwrap_or_default();
+            let (op, redo) = (s.operator_turns, s.corrections);
+            let thrown = (a.added - a.alive).max(0);
+            let mut ages = a.ages.clone();
+            ages.sort_unstable();
             Deviation {
                 model,
                 commits: a.commits,
@@ -243,12 +273,67 @@ pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>) {
                 operator_turns: op,
                 corrections: redo,
                 corrections_per_100: if op > 0 { (100 * redo) / op } else { 0 },
+                out_tokens: s.out_tokens,
+                messages: s.messages,
+                runs: s.runs,
+                thrown,
+                tokens_thrown: if a.added > 0 {
+                    s.out_tokens.saturating_mul(thrown) / a.added
+                } else {
+                    0
+                },
+                tokens_per_line_landed: if a.added > 0 { s.out_tokens / a.added } else { 0 },
+                tokens_per_line_kept: if a.alive > 0 { s.out_tokens / a.alive } else { 0 },
+                median_age_days: ages.get(ages.len() / 2).copied().unwrap_or(0),
+                context_avg: if s.context_msgs > 0 {
+                    s.context_weighted / s.context_msgs
+                } else {
+                    0
+                },
+                context_peak: s.context_peak,
+                minutes: s.minutes,
+                // Time is charged the way tokens are: the model's own
+                // rate, applied to the work that did not last.
+                minutes_thrown: if a.added > 0 {
+                    s.minutes.saturating_mul(thrown) / a.added
+                } else {
+                    0
+                },
+                alive_per_mtok: if s.out_tokens > 0 {
+                    (a.alive.saturating_mul(1_000_000)) / s.out_tokens
+                } else {
+                    0
+                },
+                alive_per_hour: if s.minutes > 0 {
+                    (a.alive * 60) / s.minutes
+                } else {
+                    0
+                },
             }
         })
         .collect();
     deviations.sort_by_key(|d| std::cmp::Reverse(d.added));
 
-    (handoffs, deviations)
+    let mut repos: Vec<RepoModel> = per_repo
+        .into_iter()
+        .map(|((repo, model), a)| RepoModel {
+            repo,
+            model,
+            commits: a.commits,
+            added: a.added,
+            alive: a.alive,
+            removed: a.removed,
+            survived_pct: if a.added > 0 {
+                (100 * a.alive) / a.added
+            } else {
+                0
+            },
+            rework_commits: a.rework_commits,
+        })
+        .collect();
+    repos.sort_by_key(|r| std::cmp::Reverse(r.added));
+
+    (handoffs, deviations, repos)
 }
 
 #[derive(Default)]
@@ -261,6 +346,20 @@ struct DevAcc {
     thrash_files: i64,
     multi_dir_commits: i64,
     dir_spread: i64,
+    ages: Vec<i64>,
+}
+
+#[derive(Default, Clone)]
+struct SpendAcc {
+    out_tokens: i64,
+    messages: i64,
+    runs: i64,
+    operator_turns: i64,
+    corrections: i64,
+    context_weighted: i64,
+    context_msgs: i64,
+    context_peak: i64,
+    minutes: i64,
 }
 
 #[derive(Default)]
