@@ -8,4 +8,22 @@
  * between two models is real and when it is noise. The page computes
  * the intervals from these.
  */
-export type ModelQualityPoint = { model: string, t: string, messages: bigint, tool_calls: bigint, tool_failures: bigint, tests_passed: bigint, tests_failed: bigint, interventions: bigint, denials: bigint, lines_added: bigint, out_tokens: bigint, };
+export type ModelQualityPoint = { model: string, t: string, messages: bigint, tool_calls: bigint, tool_failures: bigint, tests_passed: bigint, tests_failed: bigint, interventions: bigint, denials: bigint, 
+/**
+ * The prompt this model carried, summed and counted so an average
+ * falls out, and the largest it reached (#407). Filling a window
+ * to do a small thing is paid for on every turn after.
+ */
+context_sum: bigint, context_n: bigint, context_max: bigint, 
+/**
+ * The agent's own words: admitting the work was wrong, and saying
+ * it is doing it again. Its assessment, not a guess at yours, and
+ * the half of the record no vendor publishes (#406).
+ */
+admissions: bigint, redo_talk: bigint, 
+/**
+ * Your turns that lost patience, credited to whatever was running.
+ * One person writes them all, so the style is a constant and a
+ * difference between models is the models.
+ */
+escalations: bigint, lines_added: bigint, out_tokens: bigint, };

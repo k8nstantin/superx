@@ -14,7 +14,8 @@ use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
-    BurnPoint, IntensityPoint, ModelEffortStat, ModelQualityPoint, ModelRepoStat, ModelSurvival,
+    BurnPoint, DuplicateWrite, FocusStat, IntensityPoint, ModelEffortStat, ModelQualityPoint,
+    ModelRepoStat, ModelSurvival,
     AgentStat, BranchStat, ChurnPoint, CompactionStat, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount, QualityPoint, RepoStat, SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome, WorkCell,
 };
 
@@ -31,6 +32,45 @@ const DEFAULT_ACTIVE_SECS: i64 = 300; // skill-allow: §9-const — bootstrap fa
 const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 /// Tools that inspect rather than change (issue #308).
 const READ_TOOLS: &[&str] = &["Read", "Glob", "Grep", "NotebookRead"];
+
+/// Phrases an agent uses when it is admitting the work was wrong.
+/// Its own assessment, which is cheaper and sharper than guessing at
+/// the operator's mood — and it is the half of the record that no
+/// vendor publishes (#406).
+const ADMISSIONS: [&str; 12] = [
+    "my error",
+    "my mistake",
+    "my fault",
+    "i was wrong",
+    "i should have",
+    "i shouldn't have",
+    "worse than i thought",
+    "wrong branch",
+    "i broke",
+    "i missed",
+    "died again",
+    "failed again",
+];
+
+/// Phrases that mean the work is being done again rather than done.
+const REDO_TALK: [&str; 6] = [
+    "third attempt",
+    "second attempt",
+    "try again",
+    "start over",
+    "from scratch",
+    "rewriting it",
+];
+
+/// What frustration looks like in the operator's own turns. One person
+/// writes them all, so their style is a constant and a difference
+/// between models is the models (#406).
+const ESCALATIONS: [&str; 6] = ["fuck", "shit", "wtf", "!!", "??", "damn"];
+
+fn says_any(text: &str, markers: &[&str]) -> bool {
+    let low = text.to_ascii_lowercase();
+    markers.iter().any(|m| low.contains(m))
+}
 
 /// Where a reading happened: the bucket of time, and the repository.
 /// One parameter rather than two, so the helpers that carry it stay
@@ -241,6 +281,12 @@ fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
 /// grow it without limit (#405).
 const MODEL_TIMELINE: usize = 4_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
+/// Sessions and duplicate artifacts named on the page, at most (#406).
+const FOCUS_ROWS: usize = 12; // skill-allow: §9-const — render-layer cap
+
+/// Paths remembered per written shape, at most (#406).
+const DUP_PATHS: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
+
 /// Bright-line paths named on the page, at most (#392).
 const BRIGHT_LINE_SHOWN: usize = 6; // skill-allow: §9-const — render-layer cap
 
@@ -274,6 +320,9 @@ struct ShellWrite {
     /// than editing it in place. The created/modified split reads this
     /// the way it reads a whole-file `Write` (#388).
     whole_file: bool,
+    /// The shape of the text it wrote, where the call carried it — so
+    /// the same content landing in two files is visible (#406).
+    shape: Option<u64>,
 }
 
 /// The heredocs in a command: the line that opened each, with its body.
@@ -411,6 +460,7 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
     let mut added = 0i64;
     let mut wrote = false;
     let mut whole_file = false;
+    let mut shape = None;
     // Heredocs first: their bodies say what was written, and where.
     for (line, body) in heredocs(cmd) {
         for stage in split_stages(&line) {
@@ -425,6 +475,7 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
                 added += line_count(body.trim_end_matches('\n'));
                 wrote = true;
                 whole_file = true;
+                shape = shape.or_else(|| snippet_key(&body));
                 for t in targets {
                     note_path(&mut paths, t);
                 }
@@ -432,6 +483,7 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
                 added += line_count(body.trim_end_matches('\n'));
                 wrote = true;
                 whole_file = true;
+                shape = shape.or_else(|| snippet_key(&body));
                 for w in stripped.split_whitespace().skip(1) {
                     if let Some(p) = written_path(w, cwd) {
                         note_path(&mut paths, p);
@@ -481,7 +533,7 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
             wrote = true;
         }
     }
-    wrote.then_some(ShellWrite { paths, added, whole_file })
+    wrote.then_some(ShellWrite { paths, added, whole_file, shape })
 }
 
 /// What a shell stage SHIPPED (#381): outcomes, where every other
@@ -945,6 +997,17 @@ struct CodeAgg {
     /// outcomes per repository (#403).
     model_time: BTreeMap<(String, String), ModelSliceAgg>,
     model_repo: BTreeMap<(String, String), ModelSliceAgg>,
+    /// (session, window between your turns) → the distinct directories
+    /// worked in it. One instruction should mean one thing (#406).
+    focus: HashMap<(String, usize), HashSet<String>>,
+    /// The shape of a written snippet → every path it was written to.
+    /// One artifact in several files drifts apart by construction
+    /// (#406) — it is what made a Jira task and a README disagree.
+    written_shapes: HashMap<u64, Vec<String>>,
+    /// session → the branches it moved between (#406).
+    session_branches: HashMap<String, HashSet<String>>,
+    /// Branches opened in the range.
+    branches_opened: i64,
     /// Every working directory's model timeline: when, and which. A
     /// commit is credited to whoever was working there as it landed
     /// (#405).
@@ -1317,6 +1380,18 @@ enum GateEvent {
 #[derive(Default)]
 struct ModelSliceAgg {
     messages: i64,
+    /// The prompt a model carried, summed and counted so an average
+    /// falls out, plus the largest it ever grew (#407). A model that
+    /// fills its window to do a small thing is paying for the window
+    /// on every turn.
+    context_sum: i64,
+    context_n: i64,
+    context_max: i64,
+    /// The agent saying the work was wrong, and saying it is doing it
+    /// again; and the operator losing patience (#406).
+    admissions: i64,
+    redo_talk: i64,
+    escalations: i64,
     tool_calls: i64,
     tool_failures: i64,
     tests_passed: i64,
@@ -2171,9 +2246,24 @@ pub async fn stats_for_range_capped(
         };
         let repo_key = get_str(raw, "cwd").map(|c| c.rsplit('/').next().unwrap_or(c).to_string());
         // The model's own slices: this message, in this bucket, on this
-        // repository (#403).
+        // repository (#403), and what was said in it (#406).
         if let Some(k) = &me_key {
             model_slice!(code, k.0, bucket, repo_key.as_ref(), messages += 1);
+            if m.role == "assistant" && !m.content.is_empty() {
+                if says_any(&m.content, &ADMISSIONS) {
+                    model_slice!(code, k.0, bucket, repo_key.as_ref(), admissions += 1);
+                }
+                if says_any(&m.content, &REDO_TALK) {
+                    model_slice!(code, k.0, bucket, repo_key.as_ref(), redo_talk += 1);
+                }
+            }
+        }
+        // The operator's frustration belongs to whatever was running,
+        // not to their own turn, which names no model (#406).
+        if m.role == "user" && !m.content.is_empty() && says_any(&m.content, &ESCALATIONS) {
+            if let Some(k) = code.session_pair.get(&sid_here).cloned() {
+                model_slice!(code, k.0, bucket, repo_key.as_ref(), escalations += 1);
+            }
         }
 
         // Being stopped or refused belongs to whatever the session was
@@ -2223,6 +2313,12 @@ pub async fn stats_for_range_capped(
         }
         // Which repo the agent was standing in (#308, #325), and which
         // branch of it (#350).
+        if let Some(b) = get_str(raw, "gitBranch").filter(|b| !b.is_empty()) {
+            code.session_branches
+                .entry(superx_ops::record_uuid(&m.session))
+                .or_default()
+                .insert(b.to_string());
+        }
         if let Some(rk) = &repo_key {
             code.intensity.entry(hour_key.clone()).or_default().repos.insert(rk.clone());
             code.session_repos
@@ -2421,6 +2517,21 @@ pub async fn stats_for_range_capped(
                         .and_then(obj)
                         .map_or(0, |d| get_int(d, "thinking_tokens"));
                     code.intensity.entry(hour_key.clone()).or_default().out_tokens += out;
+                    // What the prompt weighed on this turn (#407).
+                    let ctx = get_int(usage, "input_tokens")
+                        + get_int(usage, "cache_read_input_tokens")
+                        + get_int(usage, "cache_creation_input_tokens");
+                    if ctx > 0 {
+                        if let Some(k) = &me_key {
+                            model_slice!(code, k.0, bucket, repo_key.as_ref(), context_sum += ctx);
+                            model_slice!(code, k.0, bucket, repo_key.as_ref(), context_n += 1);
+                            let e = code
+                                .model_time
+                                .entry((k.0.clone(), bucket.clone()))
+                                .or_default();
+                            e.context_max = e.context_max.max(ctx);
+                        }
+                    }
                     let b = code.burn.entry(hour_key.clone()).or_insert((0, 0, 0, 0));
                     b.0 += out;
                     b.1 += th;
@@ -2952,6 +3063,28 @@ pub async fn stats_for_range_capped(
                                 if let Some(path) = touched_path(input)
                                     .or_else(|| get_str(input, "path"))
                                 {
+                                    // Which of your instructions was this
+                                    // answering, and was it the only thing
+                                    // being answered (#406)?
+                                    if let Some(dir) = dir_of(path) {
+                                        let sid = superx_ops::record_uuid(&m.session);
+                                        let w = human_turns
+                                            .get(&sid)
+                                            .map_or(0, |t| t.partition_point(|h| *h <= when));
+                                        code.focus.entry((sid, w)).or_default().insert(dir);
+                                    }
+                                    // The same text in two files drifts apart
+                                    // by construction (#406).
+                                    if let Some(text) = get_str(input, "content")
+                                        .or_else(|| get_str(input, "new_string"))
+                                    {
+                                        if let Some(shape) = snippet_key(text) {
+                                            let seen = code.written_shapes.entry(shape).or_default();
+                                            if !seen.iter().any(|p| p == path) && seen.len() < DUP_PATHS {
+                                                seen.push(path.to_string());
+                                            }
+                                        }
+                                    }
                                     *code.files.entry(path.to_string()).or_insert(0) += 1;
                                     if let Some(ext) = extension_of(path) {
                                         *code.languages.entry(ext).or_insert(0) += 1;
@@ -3070,7 +3203,7 @@ pub async fn stats_for_range_capped(
                                             for path in &w.paths {
                                                 note_bright_line(&mut code, path);
                                             }
-                                            let l = code.live.entry(sid).or_default();
+                                            let l = code.live.entry(sid.clone()).or_default();
                                             l.lines_added += n;
                                             l.replaced_unknown += 1;
                                             if rewrote {
@@ -3090,6 +3223,18 @@ pub async fn stats_for_range_capped(
                                                 }
                                             }
                                             for path in &w.paths {
+                                                if let Some(dir) = dir_of(path) {
+                                                    let win = human_turns
+                                                        .get(&sid)
+                                                        .map_or(0, |t| t.partition_point(|h| *h <= when));
+                                                    code.focus.entry((sid.clone(), win)).or_default().insert(dir);
+                                                }
+                                                if let Some(shape) = w.shape {
+                                                    let seen = code.written_shapes.entry(shape).or_default();
+                                                    if !seen.iter().any(|p| p == path) && seen.len() < DUP_PATHS {
+                                                        seen.push(path.clone());
+                                                    }
+                                                }
                                                 // Created here or already there?
                                                 // A whole-file write creates, as
                                                 // `Write` does; an in-place edit
@@ -3145,6 +3290,15 @@ pub async fn stats_for_range_capped(
                                         if let Some(key) = repeat_key(cmd) {
                                             *code.command_lines.entry(key).or_insert(0) += 1;
                                         }
+                                    }
+                                    // Branch sprawl (#406): a session that
+                                    // opens branches faster than it closes
+                                    // them ends with overlapping work on each.
+                                    if cmd.contains("checkout -b")
+                                        || cmd.contains("checkout -B")
+                                        || cmd.contains("switch -c")
+                                    {
+                                        code.branches_opened += 1;
                                     }
                                     // What the gates saw, and when (#392).
                                     // The question is an ORDER — did the
@@ -3971,11 +4125,57 @@ pub async fn stats_for_range_capped(
                 tests_failed: a.tests_failed,
                 interventions: a.interventions,
                 denials: a.denials,
+                context_sum: a.context_sum,
+                context_n: a.context_n,
+                context_max: a.context_max,
+                admissions: a.admissions,
+                redo_talk: a.redo_talk,
+                escalations: a.escalations,
                 lines_added: a.lines_added,
                 out_tokens: a.out_tokens,
             })
             .collect(),
         model_survival,
+        // How scattered each session was between your turns (#406).
+        focus: {
+            let mut per: HashMap<String, Vec<i64>> = HashMap::new();
+            for ((sid, _), dirs) in &code.focus {
+                per.entry(sid.clone()).or_default().push(dirs.len() as i64);
+            }
+            let mut v: Vec<FocusStat> = per
+                .into_iter()
+                .map(|(sid, mut widths)| {
+                    widths.sort_unstable();
+                    FocusStat {
+                        model: code.live.get(&sid).and_then(|l| l.model.clone()),
+                        windows: widths.len() as i64,
+                        median_streams: widths[widths.len() / 2],
+                        max_streams: widths.last().copied().unwrap_or(0),
+                        branches: code.session_branches.get(&sid).map_or(0, |b| b.len() as i64),
+                        identity: identity.get(&sid).cloned().unwrap_or(sid),
+                    }
+                })
+                .collect();
+            v.sort_by_key(|f| std::cmp::Reverse(f.max_streams));
+            v.truncate(FOCUS_ROWS);
+            v
+        },
+        // One artifact, several files — guaranteed to drift (#406).
+        duplicates: {
+            let mut v: Vec<DuplicateWrite> = code
+                .written_shapes
+                .values()
+                .filter(|paths| paths.len() > 1)
+                .map(|paths| DuplicateWrite {
+                    copies: paths.len() as i64,
+                    paths: paths.clone(),
+                })
+                .collect();
+            v.sort_by_key(|d| std::cmp::Reverse(d.copies));
+            v.truncate(FOCUS_ROWS);
+            v
+        },
+        branches_opened: code.branches_opened,
         model_repos: {
             let mut v: Vec<ModelRepoStat> = code
                 .model_repo

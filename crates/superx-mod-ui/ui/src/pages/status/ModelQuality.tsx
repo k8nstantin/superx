@@ -2,6 +2,7 @@ import { Group, Table, Text, Tooltip } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
 import { CANCEL, FAIL, OK, Panel, fmtCompact, n } from './parts'
+import { RealCost } from './RealCost'
 
 // Is one model actually better than another (#403)?
 //
@@ -52,6 +53,9 @@ export function ModelQuality({ s, range }: { s: StatsSummary | undefined; range:
       msgs: pts.filter((p) => p.model === m).reduce((a, p) => a + n(p.messages), 0),
       stepped: pts.filter((p) => p.model === m).reduce((a, p) => a + n(p.interventions) + n(p.denials), 0),
       tokens: pts.filter((p) => p.model === m).reduce((a, p) => a + n(p.out_tokens), 0),
+      admits: pts.filter((p) => p.model === m).reduce((a, p) => a + n(p.admissions), 0),
+      redo: pts.filter((p) => p.model === m).reduce((a, p) => a + n(p.redo_talk), 0),
+      escalations: pts.filter((p) => p.model === m).reduce((a, p) => a + n(p.escalations), 0),
       lines: pts.filter((p) => p.model === m).reduce((a, p) => a + n(p.lines_added), 0),
     }))
     .sort((a, b) => b.calls - a.calls)
@@ -101,6 +105,8 @@ export function ModelQuality({ s, range }: { s: StatsSummary | undefined; range:
 
   return (
     <>
+      <RealCost s={s} range={range} />
+
       <Panel
         title="Is one model better? — and is the difference real"
         scope="range"
@@ -125,6 +131,16 @@ export function ModelQuality({ s, range }: { s: StatsSummary | undefined; range:
                     <Table.Th ta="right">Tests</Table.Th>
                     <Table.Th ta="right">Test pass rate</Table.Th>
                     <Table.Th ta="right">Stepped in / 1k msgs</Table.Th>
+                    <Table.Th ta="right">
+                      <Tooltip label="the agent's own words admitting the work was wrong, per 100 of its messages — its assessment, not a guess at yours" withArrow multiline w={280}>
+                        <span>Admits / 100</span>
+                      </Tooltip>
+                    </Table.Th>
+                    <Table.Th ta="right">
+                      <Tooltip label="your turns that lost patience, per 100 of its messages. One person writes them all, so the style is a constant and a difference here is the model." withArrow multiline w={280}>
+                        <span>You escalated / 100</span>
+                      </Tooltip>
+                    </Table.Th>
                     <Table.Th ta="right">Out tokens</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
@@ -163,6 +179,16 @@ export function ModelQuality({ s, range }: { s: StatsSummary | undefined; range:
                           </Text>
                         </Table.Td>
                         <Table.Td ta="right">{m.msgs === 0 ? '—' : (Math.round((m.stepped * 10000) / m.msgs) / 10).toFixed(1)}</Table.Td>
+                        <Table.Td ta="right">
+                          <Text size="xs" ff={MONO} c={m.msgs > 0 && (m.admits * 100) / m.msgs >= 1 ? FAIL : undefined}>
+                            {m.msgs === 0 ? '—' : ((m.admits * 100) / m.msgs).toFixed(2)}
+                          </Text>
+                        </Table.Td>
+                        <Table.Td ta="right">
+                          <Text size="xs" ff={MONO} c={m.msgs > 0 && (m.escalations * 100) / m.msgs >= 2 ? FAIL : undefined}>
+                            {m.msgs === 0 ? '—' : ((m.escalations * 100) / m.msgs).toFixed(2)}
+                          </Text>
+                        </Table.Td>
                         <Table.Td ta="right">{fmtCompact(m.tokens)}</Table.Td>
                       </Table.Tr>
                     )
@@ -185,9 +211,10 @@ export function ModelQuality({ s, range }: { s: StatsSummary | undefined; range:
               ))
             )}
             <Text size="xs" c="dimmed" mt="xs">
-              These are hygiene measures: whether calls worked and whether tests passed. They do not say whether the
-              work was the right work. A session can score perfectly here and still be thrown away — one in this
-              instance was — so read this beside what landed, not instead of it.
+              The first two are hygiene: whether calls worked and whether tests passed. They barely separate models.
+              The last two are the record no vendor publishes — what the agent said about its own work, and what you
+              said about it — and they separate cleanly. Read them beside the rework table: a model that admits more,
+              is sworn at more, and keeps less of what it lands is expensive however it is priced.
             </Text>
           </>
         )}

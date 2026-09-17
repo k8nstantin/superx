@@ -250,6 +250,13 @@ pub struct StatsSummary {
     /// How much of each model's landed work is still in the tree —
     /// rework measured from the repository, not the transcript (#405).
     pub model_survival: Vec<ModelSurvival>,
+    /// How scattered each session was between your turns (#406).
+    pub focus: Vec<FocusStat>,
+    /// The same content written to several paths — one artifact, many
+    /// copies, guaranteed to drift apart (#406).
+    pub duplicates: Vec<DuplicateWrite>,
+    /// Branches created in the range: `git checkout -b` and its kin.
+    pub branches_opened: i64,
     /// Human turns in the range — how often you had to say something.
     pub human_turns: i64,
     /// Median minutes between one human turn and the next, within a
@@ -787,6 +794,21 @@ pub struct ModelQualityPoint {
     pub tests_failed: i64,
     pub interventions: i64,
     pub denials: i64,
+    /// The prompt this model carried, summed and counted so an average
+    /// falls out, and the largest it reached (#407). Filling a window
+    /// to do a small thing is paid for on every turn after.
+    pub context_sum: i64,
+    pub context_n: i64,
+    pub context_max: i64,
+    /// The agent's own words: admitting the work was wrong, and saying
+    /// it is doing it again. Its assessment, not a guess at yours, and
+    /// the half of the record no vendor publishes (#406).
+    pub admissions: i64,
+    pub redo_talk: i64,
+    /// Your turns that lost patience, credited to whatever was running.
+    /// One person writes them all, so the style is a constant and a
+    /// difference between models is the models.
+    pub escalations: i64,
     pub lines_added: i64,
     pub out_tokens: i64,
 }
@@ -807,6 +829,37 @@ pub struct ModelRepoStat {
     pub tests_failed: i64,
     pub lines_added: i64,
     pub out_tokens: i64,
+}
+
+/// How scattered one session was (#406).
+///
+/// Between two of your turns the agent should be doing one thing. The
+/// count of distinct directories it touched in that window is how many
+/// it was actually doing, and it needs no reading of prose — a session
+/// that answered one instruction by editing a document, patching a
+/// throwaway script and juggling branches shows three.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct FocusStat {
+    pub identity: String,
+    pub model: Option<String>,
+    /// Gaps between your turns that contained any work at all.
+    pub windows: i64,
+    /// Distinct directories touched in the typical window, and the worst.
+    pub median_streams: i64,
+    pub max_streams: i64,
+    /// Branches the session moved between — sprawl, in one number.
+    pub branches: i64,
+}
+
+/// The same text written to more than one path (#406) — the failure
+/// that produces a document, a task and a README that disagree.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct DuplicateWrite {
+    /// The paths that received the same content, newest naming first.
+    pub paths: Vec<String>,
+    pub copies: i64,
 }
 
 /// How much of one model's landed work is still there (#405).

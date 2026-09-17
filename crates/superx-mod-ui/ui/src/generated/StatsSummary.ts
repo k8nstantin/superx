@@ -4,8 +4,10 @@ import type { BranchStat } from "./BranchStat";
 import type { BurnPoint } from "./BurnPoint";
 import type { ChurnPoint } from "./ChurnPoint";
 import type { CompactionStat } from "./CompactionStat";
+import type { DuplicateWrite } from "./DuplicateWrite";
 import type { EffortStat } from "./EffortStat";
 import type { Exposure } from "./Exposure";
+import type { FocusStat } from "./FocusStat";
 import type { HourRate } from "./HourRate";
 import type { IntensityPoint } from "./IntensityPoint";
 import type { Landed } from "./Landed";
@@ -227,6 +229,19 @@ model_repos: Array<ModelRepoStat>,
  * rework measured from the repository, not the transcript (#405).
  */
 model_survival: Array<ModelSurvival>, 
+/**
+ * How scattered each session was between your turns (#406).
+ */
+focus: Array<FocusStat>, 
+/**
+ * The same content written to several paths — one artifact, many
+ * copies, guaranteed to drift apart (#406).
+ */
+duplicates: Array<DuplicateWrite>, 
+/**
+ * Branches created in the range: `git checkout -b` and its kin.
+ */
+branches_opened: bigint, 
 /**
  * Human turns in the range — how often you had to say something.
  */
