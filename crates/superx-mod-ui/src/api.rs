@@ -1120,3 +1120,73 @@ pub struct SseEvent {
     pub session_src: Option<String>,
     pub valid_from: String,
 }
+
+/// One model's stint inside one session (#406), aggregated inside the
+/// engine. No message payload crosses the wire: every field is a sum,
+/// an indexed edge lookup or a grouped count, so the walk is uncapped
+/// without being expensive.
+///
+/// A session is not one model — the operator switches mid-session —
+/// so the run, not the session, is the unit that owns a span.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ModelRun {
+    pub session: String,
+    pub model: String,
+    /// The checkouts this session worked in, heaviest first.
+    pub cwds: Vec<String>,
+    /// RFC3339 bounds of the stint, so a commit can be bracketed.
+    pub first: String,
+    pub last: String,
+    pub messages: i64,
+    pub out_tokens: i64,
+}
+
+/// What a model's work threw away (#406) — the section's whole point.
+///
+/// `thrown` is lines that landed and are no longer in the tree;
+/// `tokens_thrown` charges the model's own price per landed line
+/// against them, which is the number a price list never shows.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ThrownAway {
+    pub model: String,
+    pub sessions: i64,
+    pub messages: i64,
+    pub out_tokens: i64,
+    pub commits: i64,
+    /// Lines added by commits credited to this model.
+    pub landed: i64,
+    /// Of those, how many blame still finds in the tree.
+    pub alive: i64,
+    /// `landed - alive` — the work that did not last.
+    pub thrown: i64,
+    pub survived_pct: i64,
+    pub tokens_per_line_landed: i64,
+    /// The bill that is actually paid: tokens divided by the lines
+    /// that are still there.
+    pub tokens_per_line_kept: i64,
+    pub tokens_thrown: i64,
+    /// Days since the median credited commit — the confounder, shown
+    /// so the reader checks it before ranking.
+    pub median_age_days: i64,
+}
+
+/// The whole answer to "what did it throw away" (#406), with the
+/// honesty fields beside it: a commit no session covers is counted
+/// here rather than credited to the nearest model, and the page says
+/// so before it ranks anything.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ThrownSummary {
+    pub models: Vec<ThrownAway>,
+    /// Commits no single session covered, and the lines they added.
+    pub uncredited_commits: i64,
+    pub uncredited_lines: i64,
+    /// Repositories read, and sessions rolled up.
+    pub repos: i64,
+    pub sessions: i64,
+    /// When this was computed, RFC3339 — it is cached for minutes, not
+    /// seconds, because git blame is not free.
+    pub computed_at: String,
+}

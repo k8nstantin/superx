@@ -72,6 +72,11 @@ impl AppState {
     }
 }
 
+/// How long the thrown-away answer is held. Git blame across every
+/// repository is expensive and the answer only moves when a commit
+/// lands, so this is minutes where the status page is seconds.
+const THROWN_CACHE_SECS: u64 = 600; // skill-allow: §9-const — read-path bound, not a policy tunable
+
 /// Distinct answers held at once.
 const CACHE_ENTRIES: usize = 32; // skill-allow: §9-const — read-path bound, not a policy tunable
 
@@ -101,6 +106,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/activity", get(api_activity))
         .route("/api/stats", get(api_stats))
         .route("/api/insights", get(api_insights))
+        .route("/api/thrown", get(api_thrown))
         .route("/api/actions", get(api_actions))
         .route("/api/charts/summary", get(api_charts))
         .route("/api/events", get(api_events))
@@ -552,6 +558,60 @@ async fn api_insights(State(state): State<AppState>) -> Response<InsightsSummary
         Ok(s) => Response::ok(s),
         Err(e) => Response::err(e.to_string()),
     }
+}
+
+/// What each model's work threw away (#406).
+///
+/// Held for [`THROWN_CACHE_SECS`] rather than the status page's
+/// seconds: this reads git blame across every repository the sessions
+/// worked in, the answer moves only when commits land, and a page that
+/// recomputes it on every poll would spend more than it measures.
+async fn api_thrown(State(state): State<AppState>) -> axum::response::Response {
+    const KEY: &str = "thrown";
+    if let Some(body) = state.cached(KEY, THROWN_CACHE_SECS) {
+        return json_body(body);
+    }
+    let runs = match crate::thrown::model_runs(&state.kernel).await {
+        Ok(f) => f,
+        Err(e) => return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
+    };
+    let sessions = {
+        let mut s: std::collections::HashSet<&String> = std::collections::HashSet::new();
+        for r in &runs {
+            s.insert(&r.session);
+        }
+        s.len() as i64
+    };
+    let repos = {
+        let mut r: std::collections::HashSet<&String> = std::collections::HashSet::new();
+        for f in &runs {
+            for c in &f.cwds {
+                r.insert(c);
+            }
+        }
+        r.len() as i64
+    };
+    let (models, uncredited_commits, uncredited_lines) = crate::thrown::thrown_away(&runs).await;
+    let summary = crate::api::ThrownSummary {
+        models,
+        uncredited_commits,
+        uncredited_lines,
+        repos,
+        sessions,
+        computed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match serde_json::to_string(&summary) {
+        Ok(body) => {
+            state.remember(KEY, &body);
+            json_body(body)
+        }
+        Err(e) => json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
+    }
+}
+
+/// A JSON string literal, quotes and escapes included.
+fn json_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 /// The GLOBAL feed backlog — everything the OS captured, merged
