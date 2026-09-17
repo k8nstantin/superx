@@ -195,6 +195,11 @@ pub struct CommitSurvival {
     /// working then.
     pub at: DateTime<Utc>,
     pub added: i64,
+    /// Lines this commit REMOVED. They belonged to whoever wrote them
+    /// earlier, so this is the other half of the story: a model that
+    /// takes over and deletes its predecessor's work shows up here and
+    /// nowhere else.
+    pub removed: i64,
     /// Of those added lines, how many blame still attributes here.
     pub alive: i64,
 }
@@ -224,14 +229,24 @@ pub async fn survival(dir: &Path, since: Option<DateTime<Utc>>) -> Vec<CommitSur
             let Some(at) = ts.parse::<i64>().ok().and_then(|t| Utc.timestamp_opt(t, 0).single()) else {
                 continue;
             };
-            commits.push(CommitSurvival { hash: hash.to_string(), at, added: 0, alive: 0 });
+            commits.push(CommitSurvival {
+                hash: hash.to_string(),
+                at,
+                added: 0,
+                removed: 0,
+                alive: 0,
+            });
             continue;
         }
         if let Some(c) = commits.last_mut() {
             let mut p = line.split('\t');
-            if let (Some(a), Some(_)) = (p.next(), p.next()) {
+            if let (Some(a), Some(d)) = (p.next(), p.next()) {
                 if let Ok(a) = a.trim().parse::<i64>() {
                     c.added += a;
+                }
+                // A binary file reports `-` in both columns.
+                if let Ok(d) = d.trim().parse::<i64>() {
+                    c.removed += d;
                 }
             }
         }

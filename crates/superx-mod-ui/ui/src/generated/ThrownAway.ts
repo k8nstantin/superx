@@ -29,4 +29,34 @@ tokens_per_line_kept: bigint, tokens_thrown: bigint,
  * Days since the median credited commit — the confounder, shown
  * so the reader checks it before ranking.
  */
-median_age_days: bigint, };
+median_age_days: bigint, 
+/**
+ * The operator's own turns while this model was working. The
+ * denominator: one person writes them all, so their style is a
+ * constant and a difference between models is the models.
+ */
+operator_turns: bigint, 
+/**
+ * Turns that told it to do the work AGAIN. The turn is the
+ * operator's; the cause is the agent leaving the instruction, and
+ * this is the only place that leaving is written down.
+ */
+redo_asks: bigint, 
+/**
+ * Turns carrying plain frustration.
+ */
+escalations: bigint, 
+/**
+ * Redo asks per hundred operator turns — the rate at which the
+ * work had to be put back on course.
+ */
+redo_per_100: bigint, 
+/**
+ * Wall-clock minutes across every stint.
+ */
+minutes: bigint, 
+/**
+ * Tokens carried in the prompt per turn, averaged over stints by
+ * message count, and the largest single prompt seen.
+ */
+context_avg: bigint, context_peak: bigint, };

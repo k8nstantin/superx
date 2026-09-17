@@ -1138,8 +1138,19 @@ pub struct ModelRun {
     /// RFC3339 bounds of the stint, so a commit can be bracketed.
     pub first: String,
     pub last: String,
+    /// Wall-clock minutes the stint spanned.
+    pub minutes: i64,
     pub messages: i64,
     pub out_tokens: i64,
+    /// The operator's own turns inside the span (`role = 'user'`), and
+    /// the two kinds worth counting separately.
+    pub operator_turns: i64,
+    pub redo_asks: i64,
+    pub escalations: i64,
+    /// Tokens carried in the prompt per turn: fresh input plus
+    /// everything read back from cache.
+    pub context_avg: i64,
+    pub context_peak: i64,
 }
 
 /// What a model's work threw away (#406) — the section's whole point.
@@ -1170,6 +1181,47 @@ pub struct ThrownAway {
     /// Days since the median credited commit — the confounder, shown
     /// so the reader checks it before ranking.
     pub median_age_days: i64,
+
+    // ── how often it had to be put back on course (#406) ──────────
+    /// The operator's own turns while this model was working. The
+    /// denominator: one person writes them all, so their style is a
+    /// constant and a difference between models is the models.
+    pub operator_turns: i64,
+    /// Turns that told it to do the work AGAIN. The turn is the
+    /// operator's; the cause is the agent leaving the instruction, and
+    /// this is the only place that leaving is written down.
+    pub redo_asks: i64,
+    /// Turns carrying plain frustration.
+    pub escalations: i64,
+    /// Redo asks per hundred operator turns — the rate at which the
+    /// work had to be put back on course.
+    pub redo_per_100: i64,
+    /// Wall-clock minutes across every stint.
+    pub minutes: i64,
+    /// Tokens carried in the prompt per turn, averaged over stints by
+    /// message count, and the largest single prompt seen.
+    pub context_avg: i64,
+    pub context_peak: i64,
+}
+
+/// One model run as a point on the correlation (#406): how often the
+/// work had to be put back on course against how much of it lasted.
+/// Three models make three points, which is not a scatter; a run each
+/// is a sample the reader can actually judge.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct RunPoint {
+    pub model: String,
+    pub session: String,
+    pub landed: i64,
+    pub survived_pct: i64,
+    /// How long the stint ran. Run length is the lever: a model left
+    /// to run long degrades, and this is the axis that shows it.
+    pub minutes: i64,
+    pub messages: i64,
+    pub operator_turns: i64,
+    pub corrections: i64,
+    pub corrections_per_100: i64,
 }
 
 /// The whole answer to "what did it throw away" (#406), with the
@@ -1180,6 +1232,8 @@ pub struct ThrownAway {
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct ThrownSummary {
     pub models: Vec<ThrownAway>,
+    /// One point per run for the correlation panel.
+    pub points: Vec<RunPoint>,
     /// Commits no single session covered, and the lines they added.
     pub uncredited_commits: i64,
     pub uncredited_lines: i64,

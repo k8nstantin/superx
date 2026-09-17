@@ -3,6 +3,7 @@ import { AXIS, EChart, GRID_LINE, INK, INK_MUTED, TOOLTIP } from '../../EChart'
 import { Panel, fmtCompact, n } from './parts'
 import type { ThrownSummary } from '../../generated/ThrownSummary'
 import type { ThrownAway as Row } from '../../generated/ThrownAway'
+import type { RunPoint } from '../../generated/RunPoint'
 
 // What the work threw away (#406).
 //
@@ -24,6 +25,11 @@ import type { ThrownAway as Row } from '../../generated/ThrownAway'
 
 const KEPT = '#199e70'
 const THROWN = '#e66767'
+/// Model identity, in fixed order, never cycled. This triple passed
+/// `validate_palette.js` in both modes; the blue/magenta pair it
+/// replaced failed CVD separation at deltaE 2.0.
+const IDENT = ['#B833E8', '#c98500', '#3987e5']
+const hueOf = (names: string[], m: string) => IDENT[Math.max(0, names.indexOf(m)) % IDENT.length]
 
 /// A model only counts in the verdict when it landed enough for the
 /// ratio to mean anything. Below this the page shows the row and
@@ -118,6 +124,13 @@ export function ThrownAwaySection({ t }: { t: ThrownSummary | undefined }) {
   // than by the spend chart's order. Cheapest at the top once ECharts
   // flips the category axis.
   const byPrice = [...rows].sort((a, b) => n(b.tokens_per_line_kept) - n(a.tokens_per_line_kept))
+  const byCourse = [...rows].sort((a, b) => n(b.redo_per_100) - n(a.redo_per_100))
+  const points: RunPoint[] = t.points ?? []
+  // Whether the off-course rates actually separate. A null result is a
+  // result; the panel says so rather than implying a ranking.
+  const courseHigh = byCourse.length > 0 ? n(byCourse[0].redo_per_100) : 0
+  const courseLow = byCourse.length > 0 ? n(byCourse[byCourse.length - 1].redo_per_100) : 0
+  const courseSpread = courseHigh - courseLow
 
   // The headline: what each model's tokens bought, split by whether it
   // is still there. Part-to-whole, so a stacked bar, and both segments
@@ -218,6 +231,129 @@ export function ThrownAwaySection({ t }: { t: ThrownSummary | undefined }) {
     ],
   }
 
+  // Off course: how often the work had to be put back on track. A
+  // RATE against the operator's own turns, because one model getting
+  // twice the work would otherwise look twice as bad.
+  const offCourse = {
+    tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
+    grid: { left: 150, right: 60, top: 14, bottom: 40 },
+    xAxis: {
+      ...AXIS,
+      type: 'value',
+      name: 'times put back on course, per 100 of your turns',
+      nameLocation: 'middle',
+      nameGap: 24,
+      nameTextStyle: { color: INK_MUTED },
+      splitLine: { lineStyle: { color: GRID_LINE } },
+    },
+    yAxis: {
+      type: 'category',
+      data: byCourse.map((r) => r.model),
+      axisLabel: { color: INK },
+      axisLine: { lineStyle: { color: GRID_LINE } },
+    },
+    series: [
+      {
+        type: 'bar',
+        barWidth: 16,
+        itemStyle: { color: THROWN, borderRadius: [0, 4, 4, 0] },
+        label: {
+          show: true,
+          position: 'right',
+          color: INK,
+          fontSize: 11,
+          formatter: (p: { value: number }) => `${p.value}`,
+        },
+        data: byCourse.map((r) => n(r.redo_per_100)),
+      },
+    ],
+  }
+
+  // What it carried to do the work. Two measures of the SAME unit, so
+  // they share one axis rather than growing a second one.
+  const carried = {
+    tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: { data: ['typical prompt', 'largest prompt'], textStyle: { color: INK_MUTED }, top: 0, right: 0 },
+    grid: { left: 150, right: 80, top: 30, bottom: 40 },
+    xAxis: {
+      ...AXIS,
+      type: 'value',
+      name: 'tokens carried in the prompt, per turn',
+      nameLocation: 'middle',
+      nameGap: 24,
+      nameTextStyle: { color: INK_MUTED },
+      axisLabel: { color: INK_MUTED, formatter: (x: number) => fmtCompact(x) },
+      splitLine: { lineStyle: { color: GRID_LINE } },
+    },
+    yAxis: {
+      type: 'category',
+      data: names,
+      axisLabel: { color: INK },
+      axisLine: { lineStyle: { color: GRID_LINE } },
+    },
+    series: [
+      {
+        name: 'typical prompt',
+        type: 'bar',
+        barWidth: 10,
+        itemStyle: { color: '#B833E8', borderRadius: [0, 4, 4, 0] },
+        label: {
+          show: true,
+          position: 'right',
+          color: INK,
+          fontSize: 10,
+          formatter: (p: { value: number }) => (p.value > 0 ? fmtCompact(p.value) : ''),
+        },
+        data: rows.map((r) => n(r.context_avg)),
+      },
+      {
+        name: 'largest prompt',
+        type: 'bar',
+        barWidth: 10,
+        itemStyle: { color: '#3987e5', borderRadius: [0, 4, 4, 0] },
+        data: rows.map((r) => n(r.context_peak)),
+      },
+    ],
+  }
+
+  // The lever. Each point is one stint: how long it ran against how
+  // much of what it wrote is still there. Three models would be three
+  // points and no scatter at all, so the run is the unit.
+  const lever = {
+    tooltip: {
+      ...TOOLTIP,
+      formatter: (p: { data: [number, number, string, number] }) =>
+        `${p.data[2]}<br/>${Math.round(p.data[0])}h · ${p.data[1]}% still there · ${fmtCompact(p.data[3])} lines`,
+    },
+    legend: { data: names, textStyle: { color: INK_MUTED }, top: 0, right: 0 },
+    grid: { left: 60, right: 30, top: 30, bottom: 44 },
+    xAxis: {
+      ...AXIS,
+      type: 'value',
+      name: 'hours the stint ran  →  longer',
+      nameLocation: 'middle',
+      nameGap: 26,
+      nameTextStyle: { color: INK_MUTED },
+      splitLine: { lineStyle: { color: GRID_LINE } },
+    },
+    yAxis: {
+      ...AXIS,
+      type: 'value',
+      name: 'still there %',
+      max: 100,
+      splitLine: { lineStyle: { color: GRID_LINE } },
+    },
+    series: names.map((m) => ({
+      name: m,
+      type: 'scatter',
+      symbolSize: (d: number[]) => Math.max(8, Math.min(34, Math.sqrt(d[3]) / 2)),
+      itemStyle: { color: hueOf(names, m), opacity: 0.85, borderColor: '#150420', borderWidth: 2 },
+      data: points
+        .filter((p) => p.model === m)
+        .map((p) => [n(p.minutes) / 60, n(p.survived_pct), `${p.model} · ${p.session.slice(0, 18)}`, n(p.landed)]),
+    })),
+  }
+
   return (
     <>
       <Panel
@@ -311,6 +447,54 @@ export function ThrownAwaySection({ t }: { t: ThrownSummary | undefined }) {
           </Text>
         </Panel>
       </SimpleGrid>
+      <SimpleGrid cols={{ base: 1, lg: 2 }} mb="md">
+        <Panel
+          title="How often it had to be put back on course"
+          scope="all"
+          range={null}
+          note="your turn is the record; the agent leaving the instruction is the cause"
+        >
+          <EChart option={offCourse} height={40 + rows.length * 44} />
+          <Text size="xs" c="dimmed" mt={4}>
+            {courseSpread <= 5
+              ? `These models do not separate here: ${courseLow} to ${courseHigh} corrections per 100 turns is one spread, not a difference. Being put back on course happens at about the same rate whoever is working. It is what the work is WORTH afterwards that separates them, above.`
+              : `${byCourse[0]?.model} is put back on course ${n(byCourse[0]?.redo_per_100)} times per 100 of your turns, against ${courseLow} for the steadiest.`}{' '}
+            Counted against your own turns, so a model given twice the work does not look twice
+            as bad. The phrases are the ones you actually type, counted over 1,533 of your turns:
+            again, stop, wrong, instead, follow, missed, broke, redo.
+          </Text>
+        </Panel>
+
+        <Panel
+          title="What it carried to do the work"
+          scope="all"
+          range={null}
+          note="a model that fills the window pays for the window on every turn after"
+        >
+          <EChart option={carried} height={40 + rows.length * 48} />
+        </Panel>
+      </SimpleGrid>
+
+      {points.length >= 6 && (
+        <Panel
+          title="The lever: how long it ran against how much of it lasted"
+          scope="all"
+          range={null}
+          note={`one point per stint · ${points.length} stints that landed work`}
+          mb="md"
+        >
+          <EChart option={lever} height={320} />
+          <Text size="xs" c="dimmed" mt={4}>
+            Each point is one stint, sized by the lines it landed. At {points.length} stints this
+            is too few to claim a relationship between how long a run went and how much of it
+            lasted, and the points do not show one: the longest run here survived{' '}
+            {n(points.reduce((a, b) => (n(a.minutes) >= n(b.minutes) ? a : b)).survived_pct)}%. The
+            panel is here so the shape can be watched as stints accumulate, not so a line can be
+            drawn through eight points.
+          </Text>
+        </Panel>
+      )}
+
       {!v.ranked && rows.length > 1 && (
         <Text size="xs" c="dimmed">
           The page is not ranking these models. It will say one is worse only when the survival

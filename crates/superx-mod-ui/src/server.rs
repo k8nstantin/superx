@@ -591,9 +591,11 @@ async fn api_thrown(State(state): State<AppState>) -> axum::response::Response {
         }
         r.len() as i64
     };
-    let (models, uncredited_commits, uncredited_lines) = crate::thrown::thrown_away(&runs).await;
+    let (models, points, uncredited_commits, uncredited_lines) =
+        crate::thrown::thrown_away(&runs).await;
     let summary = crate::api::ThrownSummary {
         models,
+        points,
         uncredited_commits,
         uncredited_lines,
         repos,

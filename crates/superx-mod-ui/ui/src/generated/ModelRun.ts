@@ -17,4 +17,18 @@ cwds: Array<string>,
 /**
  * RFC3339 bounds of the stint, so a commit can be bracketed.
  */
-first: string, last: string, messages: bigint, out_tokens: bigint, };
+first: string, last: string, 
+/**
+ * Wall-clock minutes the stint spanned.
+ */
+minutes: bigint, messages: bigint, out_tokens: bigint, 
+/**
+ * The operator's own turns inside the span (`role = 'user'`), and
+ * the two kinds worth counting separately.
+ */
+operator_turns: bigint, redo_asks: bigint, escalations: bigint, 
+/**
+ * Tokens carried in the prompt per turn: fresh input plus
+ * everything read back from cache.
+ */
+context_avg: bigint, context_peak: bigint, };
