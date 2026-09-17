@@ -2,6 +2,7 @@ import { Grid, Group, SimpleGrid, Table, Text, Tooltip } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
 import { CANCEL, Counter, FAIL, OK, Panel, Stat, fmtCompact, n, pct } from './parts'
+import { ModelQuality } from './ModelQuality'
 
 // Productivity (#391). Every other band counts effort — lines, tokens,
 // calls, tests. This one divides effort by outcome, and measures the
@@ -443,6 +444,8 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
           </>
         )}
       </Panel>
+
+      <ModelQuality s={s} range={range} />
 
       <Panel
         title="The human half of the loop"

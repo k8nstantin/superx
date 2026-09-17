@@ -14,7 +14,7 @@ use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
-    BurnPoint, IntensityPoint, ModelEffortStat,
+    BurnPoint, IntensityPoint, ModelEffortStat, ModelQualityPoint, ModelRepoStat,
     AgentStat, BranchStat, ChurnPoint, CompactionStat, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount, QualityPoint, RepoStat, SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome, WorkCell,
 };
 
@@ -31,6 +31,35 @@ const DEFAULT_ACTIVE_SECS: i64 = 300; // skill-allow: §9-const — bootstrap fa
 const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 /// Tools that inspect rather than change (issue #308).
 const READ_TOOLS: &[&str] = &["Read", "Glob", "Grep", "NotebookRead"];
+
+/// Where a reading happened: the bucket of time, and the repository.
+/// One parameter rather than two, so the helpers that carry it stay
+/// within their argument budget (#403).
+struct Slice<'a> {
+    bucket: &'a str,
+    repo: Option<&'a String>,
+}
+
+/// Add to both of a model's slices at once (#403): the bucket of time
+/// it happened in, and the repository it happened to. Each site that
+/// already attributes to `model_effort` gains one line.
+macro_rules! model_slice {
+    ($code:expr, $model:expr, $bucket:expr, $repo:expr, $field:ident += $n:expr) => {{
+        let n = $n;
+        $code
+            .model_time
+            .entry(($model.to_string(), $bucket.to_string()))
+            .or_default()
+            .$field += n;
+        if let Some(r) = $repo {
+            $code
+                .model_repo
+                .entry(($model.to_string(), r.clone()))
+                .or_default()
+                .$field += n;
+        }
+    }};
+}
 
 fn obj(v: &Value) -> Option<&Object> {
     match v {
@@ -907,6 +936,10 @@ struct CodeAgg {
     seen_sessions: HashSet<String>,
     /// (model, effort) → outcomes (#391).
     model_effort: HashMap<(String, String), ModelEffortAgg>,
+    /// (model, bucket) → outcomes over time, and (model, repo) →
+    /// outcomes per repository (#403).
+    model_time: BTreeMap<(String, String), ModelSliceAgg>,
+    model_repo: BTreeMap<(String, String), ModelSliceAgg>,
     /// session → the pair it was running. An interruption, a refusal or
     /// a tool result names no model — they ride the user's turn or the
     /// result line — so attributing them to the message's own pair
@@ -1269,6 +1302,22 @@ enum GateEvent {
 /// Two separate tables cannot answer "does thinking harder pay" when
 /// the model and the level change together, which is how they are
 /// actually switched — the pair has to be one key.
+/// One model's outcomes in one slice — a bucket of time, or a
+/// repository (#403). The same counters either way, because the
+/// question is the same and only the slicing differs.
+#[derive(Default)]
+struct ModelSliceAgg {
+    messages: i64,
+    tool_calls: i64,
+    tool_failures: i64,
+    tests_passed: i64,
+    tests_failed: i64,
+    interventions: i64,
+    denials: i64,
+    lines_added: i64,
+    out_tokens: i64,
+}
+
 #[derive(Default)]
 struct ModelEffortAgg {
     sessions: HashSet<String>,
@@ -1656,6 +1705,7 @@ fn attribute_quality(
     agent_name: &Option<String>,
     effort: &Option<String>,
     me_key: &Option<(String, String)>,
+    at: &Slice<'_>,
     (passed, failed, errors): (i64, i64, i64),
 ) {
     if passed == 0 && failed == 0 && errors == 0 {
@@ -1682,11 +1732,14 @@ fn attribute_quality(
         ea.tests_passed += passed;
         ea.tests_failed += failed;
     }
-    // The pair the operator actually switches (#391).
+    // The pair the operator actually switches (#391), and the model's
+    // own slices over time and per repository (#403).
     if let Some(k) = me_key {
         let me = code.model_effort.entry(k.clone()).or_default();
         me.tests_passed += passed;
         me.tests_failed += failed;
+        model_slice!(code, k.0, at.bucket, at.repo, tests_passed += passed);
+        model_slice!(code, k.0, at.bucket, at.repo, tests_failed += failed);
     }
 }
 
@@ -2085,37 +2138,7 @@ pub async fn stats_for_range_capped(
                 me.interventions += i;
             }
         }
-        // Being stopped or refused belongs to whatever the session was
-        // running, not to the message that carries the flag — that one
-        // names no model (#391).
-        if get_str(raw, "toolDenialKind").is_some()
-            || raw.get("interruptedMessageId").is_some()
-            || raw.get("userFeedback").is_some()
-        {
-            let denied = get_str(raw, "toolDenialKind").is_some();
-            match code.session_pair.get(&sid_here).cloned() {
-                Some(k) => {
-                    let me = code.model_effort.entry(k).or_default();
-                    if denied {
-                        me.denials += 1;
-                    } else {
-                        me.interventions += 1;
-                    }
-                }
-                // The pair comes later in the walk. Hold it for whatever
-                // this session turns out to have been running; a session
-                // that never names one keeps it unattributed, which is
-                // the honest answer.
-                None => {
-                    let e = code.pending_steps.entry(sid_here.clone()).or_insert((0, 0));
-                    if denied {
-                        e.0 += 1;
-                    } else {
-                        e.1 += 1;
-                    }
-                }
-            }
-        }
+
         {
             let sid = superx_ops::record_uuid(&m.session);
             let l = code.live.entry(sid).or_default();
@@ -2137,6 +2160,49 @@ pub async fn stats_for_range_capped(
         } else {
             when.format("%Y-%m-%dT%H").to_string()
         };
+        let repo_key = get_str(raw, "cwd").map(|c| c.rsplit('/').next().unwrap_or(c).to_string());
+        // The model's own slices: this message, in this bucket, on this
+        // repository (#403).
+        if let Some(k) = &me_key {
+            model_slice!(code, k.0, bucket, repo_key.as_ref(), messages += 1);
+        }
+
+        // Being stopped or refused belongs to whatever the session was
+        // running, not to the message that carries the flag — that one
+        // names no model (#391).
+        if get_str(raw, "toolDenialKind").is_some()
+            || raw.get("interruptedMessageId").is_some()
+            || raw.get("userFeedback").is_some()
+        {
+            let denied = get_str(raw, "toolDenialKind").is_some();
+            match code.session_pair.get(&sid_here).cloned() {
+                Some(k) => {
+                    if denied {
+                        model_slice!(code, k.0, bucket, repo_key.as_ref(), denials += 1);
+                    } else {
+                        model_slice!(code, k.0, bucket, repo_key.as_ref(), interventions += 1);
+                    }
+                    let me = code.model_effort.entry(k).or_default();
+                    if denied {
+                        me.denials += 1;
+                    } else {
+                        me.interventions += 1;
+                    }
+                }
+                // The pair comes later in the walk. Hold it for whatever
+                // this session turns out to have been running; a session
+                // that never names one keeps it unattributed, which is
+                // the honest answer.
+                None => {
+                    let e = code.pending_steps.entry(sid_here.clone()).or_insert((0, 0));
+                    if denied {
+                        e.0 += 1;
+                    } else {
+                        e.1 += 1;
+                    }
+                }
+            }
+        }
         // Per-agent productivity (#337). Sessions are `agent/uuid`,
         // so the owning agent is resolved through the session.
         let sid_now = superx_ops::record_uuid(&m.session);
@@ -2148,7 +2214,6 @@ pub async fn stats_for_range_capped(
         }
         // Which repo the agent was standing in (#308, #325), and which
         // branch of it (#350).
-        let repo_key = get_str(raw, "cwd").map(|c| c.rsplit('/').next().unwrap_or(c).to_string());
         if let Some(rk) = &repo_key {
             code.intensity.entry(hour_key.clone()).or_default().repos.insert(rk.clone());
             code.session_repos
@@ -2282,6 +2347,7 @@ pub async fn stats_for_range_capped(
                     code.unattended_out += out;
                 }
                 if let Some(k) = &me_key {
+                    model_slice!(code, k.0, bucket, repo_key.as_ref(), out_tokens += out);
                     let me = code.model_effort.entry(k.clone()).or_default();
                     me.out_tokens += out;
                     me.thinking_tokens += usage
@@ -2401,6 +2467,7 @@ pub async fn stats_for_range_capped(
                                         }
                                         if let Some(k) = &me_key {
                                             code.model_effort.entry(k.clone()).or_default().tool_failures += 1;
+                                            model_slice!(code, k.0, bucket, repo_key.as_ref(), tool_failures += 1);
                                         }
                                         if let Some(key) = &branch_pair {
                                             code.branches
@@ -2444,7 +2511,8 @@ pub async fn stats_for_range_capped(
                                     Some(text) if SHELL_TOOLS.contains(&name.as_str()) => {
                                         let d = score_output(&text, &mut code, &hour_key);
                                         attribute_quality(
-                                            &mut code, &branch_pair, &agent_name, &effort, &me_key, d,
+                                            &mut code, &branch_pair, &agent_name, &effort, &me_key,
+                                            &Slice { bucket: &bucket, repo: repo_key.as_ref() }, d,
                                         );
                                         if cmd_opt.is_some_and(commits) {
                                             if let Some((ins, del)) = shortstat(&text) {
@@ -2501,6 +2569,7 @@ pub async fn stats_for_range_capped(
                             code.by_hour.entry(hour_of_day).or_insert((0, 0)).0 += 1;
                             if let Some(k) = &me_key {
                                 code.model_effort.entry(k.clone()).or_default().tool_calls += 1;
+                                model_slice!(code, k.0, bucket, repo_key.as_ref(), tool_calls += 1);
                             }
                             // Instrument the call itself (#308).
                             if name.starts_with("mcp__") {
@@ -2621,6 +2690,7 @@ pub async fn stats_for_range_capped(
                                     ea.lines_removed += replaced;
                                 }
                                 if let Some(k) = &me_key {
+                                    model_slice!(code, k.0, bucket, repo_key.as_ref(), lines_added += n);
                                     let me = code.model_effort.entry(k.clone()).or_default();
                                     me.lines_added += n;
                                     me.lines_removed += replaced;
@@ -3180,7 +3250,7 @@ pub async fn stats_for_range_capped(
                                     // The call already went by and it
                                     // was a shell: score immediately.
                                     let d = score_output(text, &mut code, &hour_key);
-                                    attribute_quality(&mut code, &branch_pair, &agent_name, &effort, &me_key, d);
+                                    attribute_quality(&mut code, &branch_pair, &agent_name, &effort, &me_key, &Slice { bucket: &bucket, repo: repo_key.as_ref() }, d);
                                 } else {
                                     pending_output.insert(id.to_string(), text.to_string());
                                 }
@@ -3820,6 +3890,42 @@ pub async fn stats_for_range_capped(
         prs_ungated,
         bright_line_writes: code.bright_line.values().sum(),
         bright_line_paths: code.bright_line.keys().take(BRIGHT_LINE_SHOWN).cloned().collect(),
+        model_quality: code
+            .model_time
+            .iter()
+            .map(|((model, t), a)| ModelQualityPoint {
+                model: model.clone(),
+                t: t.clone(),
+                messages: a.messages,
+                tool_calls: a.tool_calls,
+                tool_failures: a.tool_failures,
+                tests_passed: a.tests_passed,
+                tests_failed: a.tests_failed,
+                interventions: a.interventions,
+                denials: a.denials,
+                lines_added: a.lines_added,
+                out_tokens: a.out_tokens,
+            })
+            .collect(),
+        model_repos: {
+            let mut v: Vec<ModelRepoStat> = code
+                .model_repo
+                .iter()
+                .map(|((model, repo), a)| ModelRepoStat {
+                    model: model.clone(),
+                    repo: repo.clone(),
+                    messages: a.messages,
+                    tool_calls: a.tool_calls,
+                    tool_failures: a.tool_failures,
+                    tests_passed: a.tests_passed,
+                    tests_failed: a.tests_failed,
+                    lines_added: a.lines_added,
+                    out_tokens: a.out_tokens,
+                })
+                .collect();
+            v.sort_by_key(|r| std::cmp::Reverse(r.tool_calls));
+            v
+        },
         human_turns: human_turn_count,
         autonomy_p50_mins,
         unattended_out_tokens: code.unattended_out,

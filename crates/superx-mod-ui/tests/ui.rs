@@ -2801,3 +2801,59 @@ async fn every_age_travels_as_the_moment_it_is_measured_from() {
     // The server's own view is kept beside it, and the two agree now.
     assert!((row.idle_secs - drift).abs() < 120, "idle {} against {drift}", row.idle_secs);
 }
+
+/// Is one model better than another (#403)? The page can only answer
+/// that from counts, sliced two ways: over time, because within one
+/// model the day-to-day swing turned out larger than any gap between
+/// two of them, and per repository, because models do different work
+/// and a pooled comparison compares tasks as much as models.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_quality_is_sliced_by_time_and_by_repository() {
+    let kernel = fresh_kernel().await;
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let now = chrono::Utc::now();
+    let call = |model: &str, cwd: &str, id: &str| serde_json::json!({
+        "cwd": cwd, "effort": "max",
+        "message": {"model": model, "usage": {"output_tokens": 50}, "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": "cargo test"}}]}});
+    let result = |id: &str, failed: bool| serde_json::json!({
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "is_error": failed,
+             "content": "test result: ok. 4 passed; 1 failed; 0 ignored"}]}});
+
+    // Two models, the same repository, in the same hour: one call each,
+    // one of them failing.
+    log_tool_message_at(&kernel, &session, &agent, call("claude-opus-5", "/w/shared", "a"), now).await;
+    log_tool_message_at(&kernel, &session, &agent, result("a", true), now).await;
+    log_tool_message_at(&kernel, &session, &agent, call("claude-fable-5", "/w/shared", "b"), now).await;
+    log_tool_message_at(&kernel, &session, &agent, result("b", false), now).await;
+    // And one model alone in another repository, an hour earlier.
+    let before = now - chrono::Duration::hours(2);
+    log_tool_message_at(&kernel, &session, &agent, call("claude-opus-5", "/w/alone", "c"), before).await;
+    log_tool_message_at(&kernel, &session, &agent, result("c", false), before).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+
+    // Over time: opus appears in both buckets, fable in one.
+    let opus: Vec<_> = s.model_quality.iter().filter(|p| p.model == "claude-opus-5").collect();
+    assert_eq!(opus.len(), 2, "two buckets: {:?}", opus.iter().map(|p| &p.t).collect::<Vec<_>>());
+    assert_eq!(opus.iter().map(|p| p.tool_calls).sum::<i64>(), 2);
+    assert_eq!(opus.iter().map(|p| p.tool_failures).sum::<i64>(), 1);
+    let fable: Vec<_> = s.model_quality.iter().filter(|p| p.model == "claude-fable-5").collect();
+    assert_eq!(fable.len(), 1);
+    assert_eq!((fable[0].tool_calls, fable[0].tool_failures), (1, 0));
+
+    // Per repository: the shared one carries both models, so a like-for
+    // -like comparison is possible there and nowhere else.
+    let shared: Vec<_> = s.model_repos.iter().filter(|r| r.repo == "shared").collect();
+    assert_eq!(shared.len(), 2, "{:?}", shared.iter().map(|r| &r.model).collect::<Vec<_>>());
+    let alone: Vec<_> = s.model_repos.iter().filter(|r| r.repo == "alone").collect();
+    assert_eq!(alone.len(), 1);
+    assert_eq!(alone[0].model, "claude-opus-5");
+
+    // Tests reach the slices too, so a pass rate can be compared.
+    assert!(s.model_quality.iter().map(|p| p.tests_passed).sum::<i64>() > 0);
+    // And the tokens, so cost rides beside quality.
+    assert_eq!(s.model_quality.iter().map(|p| p.out_tokens).sum::<i64>(), s.out_tokens_window);
+}
