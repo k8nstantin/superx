@@ -46,7 +46,23 @@ export function Annunciator({
   // and the flight deck every fifteen seconds, so a server-computed age
   // made the two disagree about the same instance (#400).
   const lag = ageOf(i?.last_event_at, now) ?? (i?.last_event_secs == null ? null : n(i.last_event_secs))
-  const lagTone = lowGood(lag, BANDS.lagWarn, BANDS.lagBad)
+  // This is the age of the newest captured event, which is NOT the same
+  // as capture being behind. With nobody typing and no agent running,
+  // there is nothing to capture, the number climbs, and the lamp used to
+  // go red over an idle machine — an instrument reporting a fault when it
+  // meant an empty room. It reads as a fault only when something WAS
+  // running and its events have stopped arriving, or when the capture
+  // module is not active. Otherwise the machine is simply quiet.
+  const captureDown = (status?.modules ?? []).some(
+    (m) => m.name === 'capture' && m.lifecycle !== 'active',
+  )
+  const anythingLive = live.length > 0
+  const lagTone = captureDown
+    ? 'bad'
+    : anythingLive
+      ? lowGood(lag, BANDS.lagWarn, BANDS.lagBad)
+      : 'ok'
+  const quiet = !captureDown && !anythingLive && lag != null && lag >= BANDS.lagWarn
 
   const loading = !s
   const v = (x: number | bigint | null | undefined) => (loading ? '…' : fmtCompact(x))
@@ -54,11 +70,29 @@ export function Annunciator({
   return (
     <SimpleGrid cols={{ base: 2, sm: 4, lg: 7 }} spacing="xs" mb="md">
       <Lamp
-        label="Capture lag"
-        value={lag == null ? (i ? '—' : '…') : fmtAge(lag)}
+        label={captureDown ? 'Capture stopped' : 'Last captured'}
+        value={
+          captureDown
+            ? 'down'
+            : quiet
+              ? 'quiet'
+              : lag == null
+                ? i
+                  ? '—'
+                  : '…'
+                : fmtAge(lag)
+        }
         tone={lagTone}
-        sub={i ? `${fmtCompact(i.events_last_hour)} events this hour` : ''}
-        tip="age of the newest captured event — the capture-alive signal. Amber past five minutes, red past thirty."
+        sub={
+          !i
+            ? ''
+            : captureDown
+              ? 'the capture module is not active'
+              : quiet
+                ? `nothing running · newest ${fmtAge(lag ?? 0)} old`
+                : `${fmtCompact(i.events_last_hour)} events this hour`
+        }
+        tip="age of the newest captured event. It only counts as lag when something is actually running: with no live session there is nothing to capture, so the lamp reads quiet rather than raising an alarm over an idle machine. It goes red when the capture module itself is not active, which is the real failure."
         onClick={() => jump('systems')}
       />
       <Lamp
