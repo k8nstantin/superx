@@ -52,8 +52,43 @@ const ADMISSIONS: [&str; 12] = [
     "failed again",
 ];
 
-/// Phrases that mean the work is being done again rather than done.
-const REDO_TALK: [&str; 6] = [
+/// How the operator actually redirects work that has gone off course.
+///
+/// These are not guesses. They were counted over 1,533 of this
+/// operator's own turns in the captured transcripts, and they are the
+/// phrasings that actually occur: `again` in 8.0% of turns, `stop` in
+/// 6.7%, `wrong` in 6.5%, `instead` in 6.2%, `follow` in 4.2%. The
+/// phrases a previous version looked for — "second attempt", "rewriting
+/// it" — are what an AGENT writes about itself, and matched almost
+/// nothing in the operator's half of the record.
+///
+/// The turn is the operator's; the CAUSE is the agent leaving the
+/// instruction. This is the only place that leaving is written down,
+/// which is what makes it worth counting (#406).
+pub(crate) const CORRECTIONS: [&str; 18] = [
+    "again",
+    "stop",
+    "wrong",
+    "instead",
+    "follow",
+    "missed",
+    "broke",
+    "redo",
+    "throw",
+    "i said",
+    "i told you",
+    "deviat",
+    "start over",
+    "from scratch",
+    "revert",
+    "undo",
+    "not what",
+    "fix it",
+];
+
+/// Phrases that mean the work is being done again rather than done —
+/// the agent's own account of it, kept for the transcript-side walk.
+pub(crate) const REDO_TALK: [&str; 6] = [
     "third attempt",
     "second attempt",
     "try again",
@@ -62,10 +97,11 @@ const REDO_TALK: [&str; 6] = [
     "rewriting it",
 ];
 
-/// What frustration looks like in the operator's own turns. One person
+/// What plain contempt looks like in the operator's turns. One person
 /// writes them all, so their style is a constant and a difference
-/// between models is the models (#406).
-const ESCALATIONS: [&str; 6] = ["fuck", "shit", "wtf", "!!", "??", "damn"];
+/// between models is the models (#406). `fuck` alone lands in 20.4% of
+/// this operator's turns, so it is the loudest signal in the corpus.
+pub(crate) const ESCALATIONS: [&str; 6] = ["fuck", "shit", "wtf", "damn", "useless", "garbage"];
 
 fn says_any(text: &str, markers: &[&str]) -> bool {
     let low = text.to_ascii_lowercase();

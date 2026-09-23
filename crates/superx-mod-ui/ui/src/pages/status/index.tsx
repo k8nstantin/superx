@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { Alert, Box, Button, Group, Loader, Text } from '@mantine/core'
-import { fetchInsights, fetchStats, fetchStatus } from '../../api'
+import { fetchCompare, fetchInsights, fetchStats, fetchStatus } from '../../api'
 import { useBreadcrumb } from '../../Breadcrumbs'
 import { Annunciator } from './Annunciator'
 import { CodeSection } from './CodeSection'
 import { CostSection } from './CostSection'
 import { DeviationsSection } from './DeviationsSection'
 import { FleetSection } from './FleetSection'
-import { ModelQuality } from './ModelQuality'
+import { ModelComparison } from './ModelComparison'
 import { FlightDeck } from './FlightDeck'
 import { Gauges } from './Gauges'
 import { HistorySection } from './HistorySection'
@@ -33,7 +33,7 @@ const SECTIONS = [
   ['deviations', 'Deviations'],
   ['fleet', 'Fleet'],
   ['productivity', 'Productivity'],
-  ['realcost', 'The real cost'],
+  ['models', 'Model comparison'],
   ['cost', 'Cost'],
   ['history', 'History'],
   ['systems', 'Systems'],
@@ -87,6 +87,9 @@ export default function StatusPage() {
     retry: false,
   })
   const insights = useQuery({ queryKey: ['insights'], queryFn: fetchInsights, refetchInterval: 60000 })
+  // Read from git, cached server-side for minutes: it moves when
+  // commits land, not when the page polls.
+  const compare = useQuery({ queryKey: ['compare'], queryFn: fetchCompare, refetchInterval: 300000 })
 
   const s = stats.data
   const i = insights.data
@@ -208,11 +211,11 @@ export default function StatusPage() {
         <ProductivitySection s={s} range={s?.range ?? range} />
       </Section>
       <Section
-        id="realcost"
-        title="The real cost"
-        blurb="a price per token says what a model costs to run — this says what it costs to keep"
+        id="models"
+        title="Model comparison"
+        blurb="which model to reach for — what its work is worth, how hard it churns, and what happens when the model is switched"
       >
-        <ModelQuality s={s} range={s?.range ?? range} />
+        <ModelComparison c={compare.data} />
       </Section>
       <Section id="cost" title="Cost" blurb="what the tokens bought, and what left this machine">
         <CostSection s={s} i={i} range={s?.range ?? range} />

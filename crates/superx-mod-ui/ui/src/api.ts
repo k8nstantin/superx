@@ -8,6 +8,7 @@ import type { ActionView } from './generated/ActionView'
 import type { ChartsSummary } from './generated/ChartsSummary'
 import type { StatsSummary } from './generated/StatsSummary'
 import type { InsightsSummary } from './generated/InsightsSummary'
+import type { CompareSummary } from './generated/CompareSummary'
 
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(path)
@@ -46,6 +47,12 @@ export const fetchCharts = () => get<ChartsSummary>('/api/charts/summary')
 export const fetchStats = (range = 'window') =>
   get<StatsSummary>(`/api/stats?range=${encodeURIComponent(range)}`)
 export const fetchInsights = () => get<InsightsSummary>('/api/insights')
+/// What each model's work threw away (#406). Read from git rather than
+/// the transcript, and cached server-side for minutes — it moves when
+/// commits land, not when the page polls.
+/// Model comparison (#406): the switches, and whether each model stayed
+/// on the objective. Same git-backed read, same server-side cache.
+export const fetchCompare = () => get<CompareSummary>('/api/compare')
 
 export async function runCommand(argv: string[]): Promise<{ output: string; is_error: boolean }> {
   const r = await fetch('/api/command', {

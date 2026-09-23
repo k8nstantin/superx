@@ -51,8 +51,22 @@ export function FlightDeck({
   const live = s?.live ?? []
   const now = useNow()
   const lag = ageOf(i?.last_event_at, now) ?? (i?.last_event_secs == null ? null : n(i.last_event_secs))
+  // Age of the newest captured event is not the same as capture being
+  // behind. With nothing running there is nothing to capture, so the
+  // number climbs over an idle machine and the tile used to call that a
+  // fault. It is only lag while something is actually in the air.
+  const anythingLive = live.length > 0
+  const quiet = !anythingLive && lag != null && lag >= BANDS.lagWarn
   const lagTone: Tone =
-    lag == null ? 'none' : lag >= BANDS.lagBad ? 'bad' : lag >= BANDS.lagWarn ? 'warn' : 'ok'
+    lag == null
+      ? 'none'
+      : !anythingLive
+        ? 'ok'
+        : lag >= BANDS.lagBad
+          ? 'bad'
+          : lag >= BANDS.lagWarn
+            ? 'warn'
+            : 'ok'
   return (
     <>
       <SimpleGrid cols={{ base: 2, md: 3, lg: 6 }} spacing="xs" mb="md">
@@ -80,10 +94,16 @@ export function FlightDeck({
           sub="messages, last hour"
         />
         <Stat
-          label="Capture lag"
-          value={lag == null ? '…' : fmtAge(lag)}
-          sub={i ? `${fmtCompact(i.events_last_hour)} events this hour` : ''}
-          tip="age of the newest captured event — how current this whole page is"
+          label="Last captured"
+          value={quiet ? 'quiet' : lag == null ? '…' : fmtAge(lag)}
+          sub={
+            quiet
+              ? `nothing in the air · newest ${fmtAge(lag ?? 0)} old`
+              : i
+                ? `${fmtCompact(i.events_last_hour)} events this hour`
+                : ''
+          }
+          tip="age of the newest captured event — how current this page is. It counts as lag only while something is in the air; with nothing running there is nothing to capture, so it reads quiet rather than raising an alarm over an idle machine."
           tone={lagTone}
         />
         <Card withBorder p="sm">

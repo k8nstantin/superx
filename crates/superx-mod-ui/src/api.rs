@@ -1120,3 +1120,178 @@ pub struct SseEvent {
     pub session_src: Option<String>,
     pub valid_from: String,
 }
+
+/// One model's stint inside one session (#406), aggregated inside the
+/// engine. No message payload crosses the wire: every field is a sum,
+/// an indexed edge lookup or a grouped count, so the walk is uncapped
+/// without being expensive.
+///
+/// A session is not one model — the operator switches mid-session —
+/// so the run, not the session, is the unit that owns a span.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ModelRun {
+    pub session: String,
+    pub model: String,
+    /// The checkouts this session worked in, heaviest first.
+    pub cwds: Vec<String>,
+    /// RFC3339 bounds of the stint, so a commit can be bracketed.
+    pub first: String,
+    pub last: String,
+    /// Wall-clock minutes the stint spanned.
+    pub minutes: i64,
+    pub messages: i64,
+    pub out_tokens: i64,
+    /// The operator's own turns inside the span (`role = 'user'`), and
+    /// the two kinds worth counting separately.
+    pub operator_turns: i64,
+    pub redo_asks: i64,
+    pub escalations: i64,
+    /// Tokens carried in the prompt per turn: fresh input plus
+    /// everything read back from cache.
+    pub context_avg: i64,
+    pub context_peak: i64,
+}
+
+/// One direction of model switch (#406), and what the incoming model
+/// did in its first hours holding the work.
+///
+/// The operator's account is that work is handed over when a budget
+/// runs out and rework follows. That makes the switch an event worth
+/// measuring rather than a footnote, so it gets its own row.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct Handoff {
+    pub from: String,
+    pub to: String,
+    /// How many times this direction of switch happened.
+    pub switches: i64,
+    /// Commits the incoming model landed within the takeover window.
+    pub commits: i64,
+    pub added: i64,
+    pub removed: i64,
+    pub alive: i64,
+    /// Of what it wrote just after taking over, how much is still there.
+    pub survived_pct: i64,
+}
+
+/// Whether a model stayed on the objective (#406), read from git.
+///
+/// Going off course leaves marks a transcript cannot hide: commits
+/// whose own subject says the work is being redone, files returned to
+/// again and again, and commits that reach across directories they
+/// were not sent to.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct Deviation {
+    pub model: String,
+    pub commits: i64,
+    pub added: i64,
+    pub removed: i64,
+    pub alive: i64,
+    pub survived_pct: i64,
+    /// Lines removed per hundred added — whether it is building or
+    /// churning.
+    pub removed_per_100_added: i64,
+    /// Commits whose subject says fix, revert, undo, redo.
+    pub rework_commits: i64,
+    pub rework_pct: i64,
+    /// Files it came back to three times or more. Compare per commit,
+    /// never raw: the model with more commits touches more files.
+    pub thrash_files: i64,
+    /// Thrash files per hundred commits — the comparable form.
+    pub thrash_per_100_commits: i64,
+    /// Commits touching more than one top-level directory.
+    ///
+    /// NOT charted, and not a deviation signal: it measures repository
+    /// LAYOUT, not behaviour. A repo whose code all sits under
+    /// `crates/` reports one directory per commit however far the work
+    /// wandered, while a flat repo reports several for a commit that
+    /// never left its lane. Measured here at 2% for one model and 66%
+    /// for another purely because they worked in different repos. Kept
+    /// because it is honest data, exposed with this warning so nobody
+    /// draws it.
+    pub multi_dir_commits: i64,
+    pub multi_dir_pct: i64,
+    /// Directories per commit, times ten, so it stays an integer.
+    pub dirs_per_commit_x10: i64,
+    /// The operator's half, for the same model.
+    pub operator_turns: i64,
+    pub corrections: i64,
+    pub corrections_per_100: i64,
+
+    // ── what it cost, folded in from the pricing walk ─────────────
+    /// Output tokens across every stint of this model.
+    pub out_tokens: i64,
+    pub messages: i64,
+    pub runs: i64,
+    /// Lines that landed and are no longer in the tree.
+    pub thrown: i64,
+    /// The model's own price per landed line, charged on the lines
+    /// that did not last. The column no price list carries.
+    pub tokens_thrown: i64,
+    pub tokens_per_line_landed: i64,
+    /// The bill actually paid: tokens over the lines still standing.
+    pub tokens_per_line_kept: i64,
+    /// Days since the median credited commit — the confounder, shown
+    /// so it can be checked before anything is ranked.
+    pub median_age_days: i64,
+    /// Tokens carried in the prompt per turn, and the largest seen.
+    pub context_avg: i64,
+    pub context_peak: i64,
+    /// Wall-clock minutes across every stint, and the share of them
+    /// charged to work that did not last. Time is the cost the
+    /// operator actually feels: a token bill is recoverable, a week is
+    /// not.
+    pub minutes: i64,
+    pub minutes_thrown: i64,
+
+    // ── productivity: what you GET, not what you spend ────────────
+    /// Surviving lines per million output tokens. The headline: a
+    /// cheaper token that produces fewer lasting lines is the dearer
+    /// choice, and this is the number that says so in one figure.
+    pub alive_per_mtok: i64,
+    /// Surviving lines per hour of wall clock.
+    pub alive_per_hour: i64,
+
+    // ── work that never landed at all (#406) ──────────────────────
+    /// Commits written on a branch that never reached the main line,
+    /// and the lines they added.
+    ///
+    /// This is the larger and previously invisible half of waste. Every
+    /// other figure here measures work that LANDED and was later
+    /// replaced; a branch written, committed to, and then abandoned or
+    /// deleted appears in none of them, because none of it ever landed.
+    pub abandoned_commits: i64,
+    pub abandoned_lines: i64,
+    /// Abandoned lines as a share of everything written — landed plus
+    /// abandoned. The one number that says how much of the week the
+    /// repository never saw.
+    pub abandoned_pct: i64,
+}
+
+/// One repository, one model (#406) — so a repo that went badly after a
+/// switch can be seen rather than averaged away across every checkout.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct RepoModel {
+    pub repo: String,
+    pub model: String,
+    pub commits: i64,
+    pub added: i64,
+    pub alive: i64,
+    pub removed: i64,
+    pub survived_pct: i64,
+    pub rework_commits: i64,
+}
+
+/// The model-comparison answer (#406).
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct CompareSummary {
+    pub handoffs: Vec<Handoff>,
+    pub deviations: Vec<Deviation>,
+    /// Per repository and model, biggest first.
+    pub repos: Vec<RepoModel>,
+    pub computed_at: String,
+}
