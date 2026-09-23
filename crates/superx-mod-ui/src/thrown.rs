@@ -324,7 +324,9 @@ mod tests {
     use super::*;
 
     fn t(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+        DateTime::parse_from_rfc3339(s)
+            .expect("test fixtures are literal RFC3339 timestamps written in this file")
+            .with_timezone(&Utc)
     }
 
     fn claim(model: &str, from: &str, to: &str) -> Claim {
