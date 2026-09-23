@@ -115,6 +115,18 @@ pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>, Vec<Re
         }
 
         let commits = crate::landed::survival(std::path::Path::new(top), earliest).await;
+        // The complement: everything committed on a branch that never
+        // reached the main line. Credited to whoever was working when it
+        // was written, exactly as landed work is.
+        for c in crate::landed::abandoned(std::path::Path::new(top), earliest).await {
+            if c.added + c.removed > BULK_COMMIT {
+                continue;
+            }
+            let Some(model) = credit(list, c.at) else { continue };
+            let e = dev.entry(model.to_string()).or_default();
+            e.abandoned_commits += 1;
+            e.abandoned_lines += c.added;
+        }
         // Files a model has already touched here, for thrash.
         let mut touched: HashMap<(String, String), i64> = HashMap::new();
         for c in &commits {
@@ -309,6 +321,13 @@ pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>, Vec<Re
                 } else {
                     0
                 },
+                abandoned_commits: a.abandoned_commits,
+                abandoned_lines: a.abandoned_lines,
+                abandoned_pct: if a.added + a.abandoned_lines > 0 {
+                    (100 * a.abandoned_lines) / (a.added + a.abandoned_lines)
+                } else {
+                    0
+                },
             }
         })
         .collect();
@@ -347,6 +366,8 @@ struct DevAcc {
     multi_dir_commits: i64,
     dir_spread: i64,
     ages: Vec<i64>,
+    abandoned_commits: i64,
+    abandoned_lines: i64,
 }
 
 #[derive(Default, Clone)]

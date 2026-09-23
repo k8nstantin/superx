@@ -90,4 +90,20 @@ alive_per_mtok: bigint,
 /**
  * Surviving lines per hour of wall clock.
  */
-alive_per_hour: bigint, };
+alive_per_hour: bigint, 
+/**
+ * Commits written on a branch that never reached the main line,
+ * and the lines they added.
+ *
+ * This is the larger and previously invisible half of waste. Every
+ * other figure here measures work that LANDED and was later
+ * replaced; a branch written, committed to, and then abandoned or
+ * deleted appears in none of them, because none of it ever landed.
+ */
+abandoned_commits: bigint, abandoned_lines: bigint, 
+/**
+ * Abandoned lines as a share of everything written — landed plus
+ * abandoned. The one number that says how much of the week the
+ * repository never saw.
+ */
+abandoned_pct: bigint, };

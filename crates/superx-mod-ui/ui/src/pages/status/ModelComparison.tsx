@@ -125,6 +125,8 @@ function metrics(): Metric[] {
     { title: 'Times you put it back on course', note: 'per 100 of your turns', good: 'low', pick: (d) => n(d.corrections_per_100) },
     { title: 'Lines still in the tree', note: 'the actual output', good: 'high', fmt: fmtCompact, pick: (d) => n(d.alive) },
     { title: 'Age of the work', note: 'days — the confounder, check it', good: 'high', fmt: (v) => `${v}d`, pick: (d) => n(d.median_age_days) },
+    { title: 'Written but never landed', note: 'share of everything it wrote', good: 'low', fmt: (v) => `${v}%`, pick: (d) => n(d.abandoned_pct) },
+    { title: 'Commits on abandoned branches', note: 'deleted or never merged', good: 'low', pick: (d) => n(d.abandoned_commits) },
   ]
 }
 
@@ -147,20 +149,32 @@ function mini(rows: Row[], m: Metric) {
     },
     series: [
       {
+        // A lollipop, not a bar. One value per family needs a stem and a
+        // dot: the bar's area encodes nothing here, and the ink it costs
+        // is ink not spent on the number itself.
         type: 'bar',
-        barWidth: 11,
+        barWidth: 2,
+        itemStyle: { color: GRID_LINE },
+        data: sorted.map(m.pick),
+        z: 1,
+      },
+      {
+        type: 'scatter',
+        symbolSize: 11,
         itemStyle: {
           color: (p: { value: number }) => (p.value === best ? KEPT : THROWN),
-          borderRadius: [0, 3, 3, 0],
+          borderColor: '#150420',
+          borderWidth: 2,
         },
         label: {
           show: true,
           position: 'right',
           color: INK,
-          fontSize: 10,
+          fontSize: 11,
           formatter: (p: { value: number }) => (m.fmt ? m.fmt(p.value) : `${p.value}`),
         },
         data: sorted.map(m.pick),
+        z: 2,
       },
     ],
   }
@@ -227,7 +241,35 @@ function dumbbell(
         type: 'scatter',
         symbolSize: 11,
         itemStyle: { color: IDENT[2], borderColor: '#150420', borderWidth: 2 },
+        label: {
+          show: true,
+          position: 'left',
+          color: INK_MUTED,
+          fontSize: 10,
+          formatter: (p: { value: number }) => fmt(p.value),
+        },
         data: rows.map(a),
+      },
+      {
+        // The gap is the whole reason this form was chosen, so it is
+        // written on the line rather than left to be measured by eye.
+        name: 'gap',
+        type: 'scatter',
+        silent: true,
+        symbolSize: 0,
+        label: {
+          show: true,
+          position: 'top',
+          color: INK,
+          fontSize: 10,
+          fontWeight: 600,
+          formatter: (p: { dataIndex: number }) => {
+            const lo = a(rows[p.dataIndex])
+            const hi = b(rows[p.dataIndex])
+            return lo > 0 ? `${(hi / lo).toFixed(1)}×` : ''
+          },
+        },
+        data: rows.map((r) => (a(r) + b(r)) / 2),
       },
       {
         name: bName,
@@ -244,6 +286,132 @@ function dumbbell(
         data: rows.map(b),
       },
     ],
+  }
+}
+
+/// Where everything a model wrote ended up: still standing, landed and
+/// later replaced, or never landed at all.
+///
+/// Three parts of one whole, so a stacked bar. The third segment is the
+/// one the rest of the page cannot see — work committed on a branch that
+/// was abandoned or deleted, which never appears in any landed figure.
+function fate(rows: Row[]) {
+  const seg = (
+    name: string,
+    colour: string,
+    pickVal: (d: Row) => number,
+    labelRight = false,
+  ) => ({
+    name,
+    type: 'bar',
+    stack: 'fate',
+    barWidth: 18,
+    itemStyle: { color: colour, borderColor: 'transparent', borderWidth: 1 },
+    label: {
+      show: true,
+      position: labelRight ? 'right' : 'inside',
+      color: labelRight ? colour : '#fff',
+      fontSize: 10,
+      formatter: (p: { value: number; dataIndex: number }) => {
+        const r = rows[p.dataIndex]
+        const tot = n(r.alive) + Math.max(0, n(r.added) - n(r.alive)) + n(r.abandoned_lines)
+        return p.value > 0 && tot > 0
+          ? `${fmtCompact(p.value)}  ${Math.round((100 * p.value) / tot)}%`
+          : ''
+      },
+    },
+    data: rows.map(pickVal),
+  })
+  return {
+    tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: {
+      data: ['still standing', 'landed, then replaced', 'never landed'],
+      textStyle: { color: INK_MUTED },
+      top: 0,
+      right: 0,
+    },
+    grid: { left: 150, right: 96, top: 34, bottom: 42 },
+    xAxis: {
+      ...AXIS,
+      type: 'value',
+      name: 'lines written',
+      nameLocation: 'middle',
+      nameGap: 24,
+      nameTextStyle: { color: INK_MUTED },
+      axisLabel: { color: INK_MUTED, formatter: (x: number) => fmtCompact(x) },
+      splitLine: { lineStyle: { color: GRID_LINE } },
+    },
+    yAxis: {
+      type: 'category',
+      data: rows.map((r) => r.model),
+      axisLabel: { color: INK },
+      axisLine: { lineStyle: { color: GRID_LINE } },
+    },
+    series: [
+      seg('still standing', KEPT, (d) => n(d.alive)),
+      seg('landed, then replaced', THROWN, (d) => Math.max(0, n(d.added) - n(d.alive))),
+      seg('never landed', '#6B4C7A', (d) => n(d.abandoned_lines), true),
+    ],
+  }
+}
+
+/// What a million tokens buys, and how much of it is left.
+///
+/// A slopegraph, because the argument is a CHANGE between two states of
+/// one unit — lines landed, then lines still standing — and a slope
+/// shows decay in a way two bars never do. Both ends carry their value,
+/// so the chart is read without touching the axis, and the steeper line
+/// is the model losing more of what it wrote.
+function slope(rows: Row[]) {
+  const landed = (d: Row) => per(n(d.added), n(d.out_tokens), 1_000_000)
+  return {
+    tooltip: {
+      ...TOOLTIP,
+      trigger: 'item',
+      formatter: (p: { seriesName: string; data: number[] }) =>
+        `${p.seriesName}<br/>${p.data[0] === 0 ? 'landed' : 'still there'}: ${p.data[1]} lines per 1M tokens`,
+    },
+    legend: { data: rows.map((r) => r.model), textStyle: { color: INK_MUTED }, top: 0, right: 0 },
+    grid: { left: 34, right: 34, top: 34, bottom: 34 },
+    xAxis: {
+      type: 'category',
+      data: ['lines it landed', 'lines still there'],
+      boundaryGap: ['22%', '22%'],
+      axisLabel: { color: INK, fontSize: 11 },
+      axisLine: { lineStyle: { color: GRID_LINE } },
+      axisTick: { show: false },
+      splitLine: { show: false },
+    },
+    yAxis: {
+      ...AXIS,
+      type: 'value',
+      name: 'per 1M output tokens',
+      nameTextStyle: { color: INK_MUTED },
+      axisLabel: { show: false },
+      splitLine: { show: false },
+    },
+    series: rows.map((r, i) => ({
+      name: r.model,
+      type: 'line',
+      symbol: 'circle',
+      symbolSize: 11,
+      lineStyle: { width: 2, color: IDENT[i % IDENT.length] },
+      itemStyle: { color: IDENT[i % IDENT.length], borderColor: '#150420', borderWidth: 2 },
+      label: {
+        show: true,
+        color: INK,
+        fontSize: 11,
+        formatter: (p: { dataIndex: number; value: number[] }) =>
+          p.dataIndex === 0
+            ? `${r.model}  ${p.value[1]}`
+            : `${p.value[1]}  (${landed(r) > 0 ? Math.round((100 * n(r.alive_per_mtok)) / landed(r)) : 0}% kept)`,
+        position: (p: { dataIndex: number }) => (p.dataIndex === 0 ? 'left' : 'right'),
+      },
+      data: [
+        [0, landed(r)],
+        [1, n(r.alive_per_mtok)],
+      ],
+    })),
   }
 }
 
@@ -289,8 +457,10 @@ function quadrant(rows: Row[]) {
           show: true,
           position: 'top',
           color: INK,
-          fontSize: 11,
-          formatter: (p: { data: [number, number, string] }) => p.data[2],
+          fontSize: 10,
+          lineHeight: 13,
+          formatter: (p: { data: [number, number, string, number] }) =>
+            `${p.data[2]}\n${fmtCompact(p.data[0])} tok/line · ${p.data[1]}% kept`,
         },
         data: rows.map((r) => [
           n(r.tokens_per_line_kept),
@@ -331,7 +501,18 @@ function stacked(rows: Row[], kept: (d: Row) => number, gone: (d: Row) => number
         stack: 's',
         barWidth: 16,
         itemStyle: { color: KEPT, borderColor: 'transparent', borderWidth: 1 },
-        label: { show: true, color: '#fff', fontSize: 10, formatter: (p: { value: number }) => (p.value > 0 ? fmtCompact(p.value) : '') },
+        label: {
+          show: true,
+          color: '#fff',
+          fontSize: 10,
+          formatter: (p: { value: number; dataIndex: number }) => {
+            const r = rows[p.dataIndex]
+            const tot = kept(r) + gone(r)
+            return p.value > 0 && tot > 0
+              ? `${fmtCompact(p.value)}  ${Math.round((100 * p.value) / tot)}%`
+              : ''
+          },
+        },
         data: rows.map(kept),
       },
       {
@@ -340,7 +521,19 @@ function stacked(rows: Row[], kept: (d: Row) => number, gone: (d: Row) => number
         stack: 's',
         barWidth: 16,
         itemStyle: { color: THROWN, borderColor: 'transparent', borderWidth: 1 },
-        label: { show: true, position: 'right', color: THROWN, fontSize: 10, formatter: (p: { value: number }) => (p.value > 0 ? fmtCompact(p.value) : '') },
+        label: {
+          show: true,
+          position: 'right',
+          color: THROWN,
+          fontSize: 10,
+          formatter: (p: { value: number; dataIndex: number }) => {
+            const r = rows[p.dataIndex]
+            const tot = kept(r) + gone(r)
+            return p.value > 0 && tot > 0
+              ? `${fmtCompact(p.value)}  ${Math.round((100 * p.value) / tot)}%`
+              : ''
+          },
+        },
         data: rows.map(gone),
       },
     ],
@@ -549,6 +742,21 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
         </Text>
       </Panel>
 
+      <Panel
+        title="Everything it wrote, and where it ended up"
+        scope="all"
+        range={null}
+        note="the third bar is work that never reached the main line at all"
+        mb="md"
+      >
+        <EChart option={fate(fams)} height={76 + fams.length * 46} />
+        <Text size="xs" c="dimmed" mt={4}>
+          Every other figure on this page measures work that LANDED and was later replaced. A
+          branch written, committed to, and then abandoned or deleted appears in none of them,
+          because none of it ever landed. This is the only chart that counts it.
+        </Text>
+      </Panel>
+
       <SimpleGrid cols={{ base: 1, lg: 3 }} mb="md">
         <Panel title="Of what it landed" scope="all" range={null} note="still there against gone">
           <EChart
@@ -570,7 +778,10 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
         </Panel>
       </SimpleGrid>
 
-      <SimpleGrid cols={{ base: 1, lg: 3 }} mb="md">
+      <SimpleGrid cols={{ base: 1, lg: 2 }} mb="md">
+        <Panel title="What a million tokens buys" scope="all" range={null} note="and how much of it is still there">
+          <EChart option={slope(fams)} height={230} />
+        </Panel>
         <Panel title="Cheap against good" scope="all" range={null} note="bubble is lines landed · bottom right is the worst place to be">
           <EChart option={quadrant(fams)} height={230} />
         </Panel>
@@ -639,6 +850,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
               <Table.Th ta="right">Alive /Mtok</Table.Th>
               <Table.Th ta="right">Alive /hour</Table.Th>
               <Table.Th ta="right">Tok /kept</Table.Th>
+              <Table.Th ta="right">Never landed</Table.Th>
               <Table.Th ta="right">Age</Table.Th>
             </Table.Tr>
           </Table.Thead>
@@ -656,6 +868,9 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
                   <Table.Td ta="right">{fmtCompact(n(r.alive_per_mtok))}</Table.Td>
                   <Table.Td ta="right">{n(r.alive_per_hour)}</Table.Td>
                   <Table.Td ta="right">{fmtCompact(n(r.tokens_per_line_kept))}</Table.Td>
+                  <Table.Td ta="right" c={n(r.abandoned_pct) >= 50 ? THROWN : undefined}>
+                    {fmtCompact(n(r.abandoned_lines))} · {n(r.abandoned_pct)}%
+                  </Table.Td>
                   <Table.Td ta="right">{n(r.median_age_days)}d</Table.Td>
                 </Table.Tr>
               )
