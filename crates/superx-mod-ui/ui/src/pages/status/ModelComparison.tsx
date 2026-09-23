@@ -615,7 +615,54 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
   }
   const fams = byFamily(rows)
   const v = verdict(fams)
-  const hand = (c.handoffs ?? []).filter((h) => n(h.commits) > 0)
+  // Per repository, folded to families like everything else. Two point
+  // releases working the same checkout are one choice, not two.
+  const repoFam = (() => {
+    const acc = new Map<string, { repo: string; model: string; added: number; alive: number }>()
+    for (const r of c.repos ?? []) {
+      const k = `${r.repo}|${family(r.model)}`
+      const p = acc.get(k)
+      if (p) {
+        p.added += n(r.added)
+        p.alive += n(r.alive)
+      } else {
+        acc.set(k, { repo: r.repo, model: family(r.model), added: n(r.added), alive: n(r.alive) })
+      }
+    }
+    return [...acc.values()]
+      .map((r) => ({ ...r, survived_pct: r.added > 0 ? Math.round((100 * r.alive) / r.added) : 0 }))
+      .sort((a, b) => b.added - a.added)
+  })()
+  const repos = repoFam.filter((r) => r.added >= 1000).slice(0, 12)
+
+  // Handoffs between FAMILIES. A fable-5 to fable-5-1 change is a point
+  // release, not a decision to switch model, so folding removes it from
+  // the count rather than reporting it as a switch nobody made.
+  const handFam = (() => {
+    const acc = new Map<string, { from: string; to: string; switches: number; commits: number; added: number; alive: number }>()
+    for (const h of c.handoffs ?? []) {
+      const from = family(h.from)
+      const to = family(h.to)
+      if (from === to) continue
+      const k = `${from}|${to}`
+      const p = acc.get(k)
+      if (p) {
+        p.switches += n(h.switches)
+        p.commits += n(h.commits)
+        p.added += n(h.added)
+        p.alive += n(h.alive)
+      } else {
+        acc.set(k, { from, to, switches: n(h.switches), commits: n(h.commits), added: n(h.added), alive: n(h.alive) })
+      }
+    }
+    return [...acc.values()]
+      .map((h) => ({ ...h, survived_pct: h.added > 0 ? Math.round((100 * h.alive) / h.added) : 0 }))
+      .sort((a, b) => b.switches - a.switches)
+  })()
+  // Only switches that produced commits can say anything about what the
+  // incoming family then did.
+  const hand = handFam.filter((h) => h.commits > 0)
+
   const ms = metrics()
 
   const switchChart = {
@@ -629,7 +676,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
     },
     yAxis: {
       type: 'category',
-      data: hand.map((h) => `${h.from.replace('claude-', '')} → ${h.to.replace('claude-', '')}`),
+      data: hand.map((h) => `${h.from} → ${h.to}`),
       axisLabel: { color: INK, fontSize: 10 },
       axisLine: { lineStyle: { color: GRID_LINE } },
     },
@@ -644,7 +691,6 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
     }],
   }
 
-  const repos = (c.repos ?? []).filter((r) => n(r.added) >= 1000).slice(0, 12)
   const repoChart = {
     tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
     grid: { left: 210, right: 80, top: 10, bottom: 42 },
@@ -837,7 +883,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
         </Panel>
       )}
 
-      <Panel title="The comparison, in full" scope="all" range={null} note="by exact version, so a point release can still be inspected">
+      <Panel title="The comparison, in full" scope="all" range={null} note="point releases folded — reaching for Fable or Opus is the choice actually made">
         <Table striped withTableBorder fz="xs" horizontalSpacing="xs">
           <Table.Thead>
             <Table.Tr>
@@ -855,7 +901,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
-            {rows.map((r) => {
+            {fams.map((r) => {
               const thin = n(r.added) < MIN_ADDED
               return (
                 <Table.Tr key={r.model} opacity={thin ? 0.55 : 1}>
