@@ -15,7 +15,7 @@ use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
     BurnPoint, DuplicateWrite, FocusStat, IntensityPoint, ModelEffortStat, ModelQualityPoint,
-    ModelRepoStat, ModelSurvival,
+    ModelRepoStat,
     AgentStat, BranchStat, ChurnPoint, CompactionStat, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount, QualityPoint, RepoStat, SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome, WorkCell,
 };
 
@@ -3835,54 +3835,6 @@ pub async fn stats_for_range_capped(
     // says what landed and blame says what is left, so the ratio has
     // none of the transcript's blind spots. A commit is credited to
     // whichever model was working that directory as it landed.
-    let model_survival = {
-        let mut timeline: Vec<(chrono::DateTime<chrono::Utc>, String)> =
-            code.cwd_models.values().flatten().cloned().collect();
-        timeline.sort_by_key(|(t, _)| *t);
-        let mut per: HashMap<String, (i64, i64, i64, Vec<i64>)> = HashMap::new();
-        if !timeline.is_empty() {
-            let now = chrono::Utc::now();
-            let mut roots: Vec<&String> = code.cwds.iter().collect();
-            roots.sort();
-            let mut done: HashSet<String> = HashSet::new();
-            for cwd in roots {
-                let dir = std::path::Path::new(cwd);
-                let Some(top) = crate::landed::toplevel(dir).await else { continue };
-                if !done.insert(top.clone()) {
-                    continue;
-                }
-                for c in crate::landed::survival(std::path::Path::new(&top), landed_since).await {
-                    // The newest activity at or before the commit.
-                    let idx = timeline.partition_point(|(t, _)| *t <= c.at);
-                    let Some((_, model)) = idx.checked_sub(1).and_then(|i| timeline.get(i)) else {
-                        continue;
-                    };
-                    let e = per.entry(model.clone()).or_insert((0, 0, 0, Vec::new()));
-                    e.0 += 1;
-                    e.1 += c.added;
-                    e.2 += c.alive;
-                    e.3.push((now - c.at).num_days().max(0));
-                }
-            }
-        }
-        let mut v: Vec<ModelSurvival> = per
-            .into_iter()
-            .map(|(model, (commits, landed, alive, mut ages))| {
-                ages.sort_unstable();
-                ModelSurvival {
-                    model,
-                    commits,
-                    landed,
-                    alive,
-                    median_age_days: ages.get(ages.len() / 2).copied().unwrap_or(0),
-                    oldest_days: ages.last().copied().unwrap_or(0),
-                    newest_days: ages.first().copied().unwrap_or(0),
-                }
-            })
-            .collect();
-        v.sort_by_key(|m| std::cmp::Reverse(m.landed));
-        v
-    };
 
     Ok(StatsSummary {
         landed,
@@ -4171,7 +4123,6 @@ pub async fn stats_for_range_capped(
                 out_tokens: a.out_tokens,
             })
             .collect(),
-        model_survival,
         // How scattered each session was between your turns (#406).
         focus: {
             let mut per: HashMap<String, Vec<i64>> = HashMap::new();

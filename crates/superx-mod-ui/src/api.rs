@@ -247,9 +247,6 @@ pub struct StatsSummary {
     /// Each model's outcomes per repository, for the only comparison
     /// that holds the work roughly constant (#403).
     pub model_repos: Vec<ModelRepoStat>,
-    /// How much of each model's landed work is still in the tree —
-    /// rework measured from the repository, not the transcript (#405).
-    pub model_survival: Vec<ModelSurvival>,
     /// How scattered each session was between your turns (#406).
     pub focus: Vec<FocusStat>,
     /// The same content written to several paths — one artifact, many
@@ -870,26 +867,6 @@ pub struct DuplicateWrite {
 /// exactly how much of it is left. Both sides come from the
 /// repository, so the ratio holds whatever tools the agent used.
 ///
-/// A commit is credited to whichever model was working that repository
-/// when it landed. Newer work has had less time to be replaced, so the
-/// median age rides beside every row and the page compares only work
-/// old enough to have been at risk.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ModelSurvival {
-    pub model: String,
-    /// Commits credited to it, and the lines they added.
-    pub commits: i64,
-    pub landed: i64,
-    /// Of those lines, how many blame still finds in the tree.
-    pub alive: i64,
-    /// Days since the median commit — the recency caveat, in a number.
-    pub median_age_days: i64,
-    /// The oldest and newest commit credited, in days.
-    pub oldest_days: i64,
-    pub newest_days: i64,
-}
-
 /// One (model, reasoning level) pair against what it produced (#391).
 /// The operator switches both together, so two separate tables cannot
 /// say which of them moved the outcome — the pair is the key, and the

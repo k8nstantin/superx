@@ -16,7 +16,6 @@ import type { ModelEffortStat } from "./ModelEffortStat";
 import type { ModelQualityPoint } from "./ModelQualityPoint";
 import type { ModelRepoStat } from "./ModelRepoStat";
 import type { ModelStat } from "./ModelStat";
-import type { ModelSurvival } from "./ModelSurvival";
 import type { NameCount } from "./NameCount";
 import type { QualityPoint } from "./QualityPoint";
 import type { RepoStat } from "./RepoStat";
@@ -224,11 +223,6 @@ model_quality: Array<ModelQualityPoint>,
  * that holds the work roughly constant (#403).
  */
 model_repos: Array<ModelRepoStat>, 
-/**
- * How much of each model's landed work is still in the tree —
- * rework measured from the repository, not the transcript (#405).
- */
-model_survival: Array<ModelSurvival>, 
 /**
  * How scattered each session was between your turns (#406).
  */
