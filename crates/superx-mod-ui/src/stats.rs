@@ -824,8 +824,8 @@ fn written_path(w: &str, cwd: Option<&str>) -> Option<String> {
         return None;
     };
     // A device is never a file anyone wrote. Whether a real path is WORK
-    // — in a repository, not the agent's scratch — is the caller's call,
-    // made against the checkouts the range actually worked in (#412).
+    // — anything but the agent's own scratch; a file in a checkout the
+    // range worked in always is — is the caller's call (#412).
     if path.starts_with("/dev/") {
         return None;
     }

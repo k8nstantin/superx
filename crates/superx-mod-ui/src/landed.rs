@@ -226,6 +226,16 @@ pub struct RepoWork {
     /// Off-main commits on a branch some checkout still has out: work in
     /// flight, not work abandoned (#414).
     pub in_flight: HashSet<String>,
+    /// Off-main commits known only from the checkouts' reflogs — a merged
+    /// branch's, deleted after it merged. They say when LANDED work was
+    /// done; what of them did not land is nobody's abandoned work, since a
+    /// reflog also keeps every amended and rebased-away version of a
+    /// commit (#415 review).
+    pub recovered: HashSet<String>,
+    /// For a main line that took no commit in the period: how many of this
+    /// machine's commits went to other branches instead. The comparison
+    /// judges nothing there, so that count is all it needs (#415 review).
+    pub dormant_off: Option<i64>,
 }
 
 /// Commit logs the comparison reads: author time, author email, subject,
@@ -316,6 +326,45 @@ fn bounded<'a>(mut args: Vec<&'a str>, since: Option<&'a str>) -> Vec<&'a str> {
     args
 }
 
+/// One branch tip's work off the main line, noting in `work` which of its
+/// files reached the main line in exactly the version the branch ends with:
+/// those landed (#414). A squash commit writes precisely those versions; so
+/// does a replay onto a later main.
+async fn read_tip(
+    dir: &Path,
+    mainline: &str,
+    tip: &str,
+    since: Option<&str>,
+    versions: &HashMap<(String, String), String>,
+    work: &mut RepoWork,
+) -> Option<Vec<WorkCommit>> {
+    let mut landed_file: HashMap<String, String> = HashMap::new();
+    if let Some(base) = git(dir, &["merge-base", mainline, tip]).await {
+        let base = base.trim().to_string();
+        if let Some(diff) = git(dir, &["diff", "--raw", "--no-abbrev", "--no-renames", &base, tip]).await {
+            for (path, blob) in diff.lines().filter_map(raw_entry) {
+                if let Some(via) = versions.get(&(path.to_string(), blob.to_string())) {
+                    landed_file.insert(path.to_string(), via.clone());
+                }
+            }
+        }
+    }
+    let log = git(
+        dir,
+        &bounded(vec!["log", tip, "--not", mainline, "--no-merges", "--no-renames", "--numstat", WORK_FORMAT], since),
+    )
+    .await?;
+    let commits = parse_work_log(&log);
+    for c in &commits {
+        for (path, _, _) in &c.files {
+            if let Some(via) = landed_file.get(path) {
+                work.landed_via.insert((c.hash.clone(), path.clone()), via.clone());
+            }
+        }
+    }
+    Some(commits)
+}
+
 /// Read one repository for the comparison (#414). `None` when git cannot
 /// answer at all.
 pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>) -> Option<RepoWork> {
@@ -333,6 +382,25 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
         landed: parse_work_log(&landed_log),
         ..RepoWork::default()
     };
+    // A main line that took nothing in the period is not where the work
+    // lands, and the comparison will judge nothing here: count this
+    // machine's commits that went elsewhere — one call, where walking every
+    // branch took seconds (#415 review).
+    if work.landed.is_empty() {
+        let author = work.identity.as_ref().map(|me| format!("--author={me}"));
+        if let Some(author) = &author {
+            work.dormant_off = git(
+                dir,
+                &bounded(
+                    vec!["rev-list", "--count", "--no-merges", "-F", author, "--branches", "--remotes", "--not", mainline],
+                    since_s.as_deref(),
+                ),
+            )
+            .await
+            .and_then(|n| n.trim().parse().ok());
+        }
+        return Some(work);
+    }
     let versions = git(
         dir,
         &bounded(
@@ -361,48 +429,57 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
         .filter_map(|l| l.strip_prefix("branch "))
         .map(|b| b.trim().to_string())
         .collect();
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for tip in tips.lines().map(str::trim).filter(|t| !t.is_empty() && !t.ends_with("/HEAD")) {
         let live_tip = checked_out.contains(tip);
-        // Which of this branch's files reached the main line in exactly
-        // the version the branch ends with: those landed (#414). A
-        // squash commit writes precisely those versions; so does a
-        // replay onto a later main.
-        let mut landed_file: HashMap<String, String> = HashMap::new();
-        if let Some(base) = git(dir, &["merge-base", mainline, tip]).await {
-            let base = base.trim().to_string();
-            if let Some(diff) = git(dir, &["diff", "--raw", "--no-abbrev", "--no-renames", &base, tip]).await {
-                for (path, blob) in diff.lines().filter_map(raw_entry) {
-                    if let Some(via) = versions.get(&(path.to_string(), blob.to_string())) {
-                        landed_file.insert(path.to_string(), via.clone());
-                    }
-                }
-            }
-        }
-        let Some(log) = git(
-            dir,
-            &bounded(
-                vec!["log", tip, "--not", mainline, "--no-merges", "--no-renames", "--numstat", WORK_FORMAT],
-                since_s.as_deref(),
-            ),
-        )
-        .await
-        else {
+        let Some(commits) = read_tip(dir, mainline, tip, since_s.as_deref(), &versions, &mut work).await else {
             continue;
         };
-        for c in parse_work_log(&log) {
+        for c in commits {
             if live_tip {
                 work.in_flight.insert(c.hash.clone());
             }
-            for (path, _, _) in &c.files {
-                if let Some(via) = landed_file.get(path) {
-                    work.landed_via.insert((c.hash.clone(), path.clone()), via.clone());
-                }
-            }
-            if !seen.contains_key(&c.hash) {
-                seen.insert(c.hash.clone(), work.off_mainline.len());
+            if seen.insert(c.hash.clone()) {
                 work.off_mainline.push(c);
             }
+        }
+    }
+
+    // A branch deleted once it merged — as every merged branch here is —
+    // takes with it the only record of when its work was done: its squash
+    // then read as written the moment it merged, or as no one's work (#415
+    // review). Its commits are still in the HEAD reflog of every checkout
+    // that made them. One read takes every commit no branch holds, with the
+    // version each left of every file it touched: a version the main line
+    // carries landed with the commit that wrote it. They are read for what
+    // landed and nothing else.
+    let lost = git(
+        dir,
+        &bounded(
+            vec![
+                "log", "--reflog", "--not", mainline, "--branches", "--remotes", "--no-merges", "--no-renames",
+                "--raw", "--no-abbrev", "--numstat", WORK_FORMAT,
+            ],
+            since_s.as_deref(),
+        ),
+    )
+    .await
+    .unwrap_or_default();
+    let mut commit: Option<&str> = None;
+    for line in lost.lines() {
+        if let Some(rest) = line.strip_prefix('\u{1}') {
+            commit = rest.split(' ').next();
+            continue;
+        }
+        let (Some(hash), Some((path, blob))) = (commit, raw_entry(line)) else { continue };
+        if let Some(via) = versions.get(&(path.to_string(), blob.to_string())) {
+            work.landed_via.insert((hash.to_string(), path.to_string()), via.clone());
+        }
+    }
+    for c in parse_work_log(&lost) {
+        if seen.insert(c.hash.clone()) {
+            work.recovered.insert(c.hash.clone());
+            work.off_mainline.push(c);
         }
     }
 

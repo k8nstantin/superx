@@ -3938,3 +3938,50 @@ async fn the_comparison_reads_git_as_the_work_moved() {
     assert_eq!(c.unjudged[0].repo, "lake");
     assert!(c.repos.iter().all(|r| r.repo == "superx"), "one repository row, not one per checkout");
 }
+
+/// A merged branch is deleted — here every one is — and with it the only
+/// record of when its work was done (#415 review). Its commits are still
+/// in the reflog of the checkout that made them, so its squash is credited
+/// by when the branch was written, not by when it merged: the model that
+/// wrote it, not the one running when it landed. The amend's leftover, in
+/// that reflog too, is nobody's abandoned work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_squash_whose_branch_is_gone_is_credited_to_who_wrote_it() {
+    let kernel = fresh_kernel().await;
+    let now = chrono::Utc::now();
+    let t0 = now - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let repo = TestRepo::new_dated("superx", "main", t0 - chrono::Duration::hours(1));
+    let wt = repo.worktree("wt", "feat/a");
+    let main = repo.cwd();
+    let ten: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    let fifteen: String = (1..=15).map(|i| format!("line {i}\n")).collect();
+
+    // Fable writes the branch, then amends it.
+    repo.commit(wt, h(1.0), "t@t", "feat: a", &[("a.rs", &ten)]);
+    std::fs::write(std::path::Path::new(wt).join("a.rs"), &fifteen).expect("amend");
+    repo.git(&["-C", wt, "commit", "-q", "-a", "--amend", "--no-edit"]);
+    // The squash lands on main as the merging account, while Opus works.
+    repo.commit(main, h(3.5), "noreply@github.com", "feat: a (#1)", &[("a.rs", &fifteen)]);
+    // The checkout moves on and the branch is deleted, as merged branches are.
+    repo.git(&["-C", wt, "checkout", "-q", "--detach"]);
+    repo.git(&["branch", "-q", "-D", "feat/a"]);
+
+    let reply = |id: &str, model: &str, cwd: &str| serde_json::json!({
+        "cwd": cwd, "message": {"id": id, "model": model, "usage": {"output_tokens": 100},
+            "content": [{"type": "text", "text": "working"}]}});
+    let (agent, fable) = seed_agent_and_session(&kernel, "claude_code", "fable").await;
+    let (_, opus) = seed_agent_and_session(&kernel, "claude_code", "opus").await;
+    log_tool_message_at(&kernel, &fable, &agent, reply("f1", "claude-fable-5", wt), h(0.5)).await;
+    log_tool_message_at(&kernel, &fable, &agent, reply("f2", "claude-fable-5", wt), h(1.5)).await;
+    log_tool_message_at(&kernel, &opus, &agent, reply("o1", "claude-opus-5", main), h(3.0)).await;
+    log_tool_message_at(&kernel, &opus, &agent, reply("o2", "claude-opus-5", main), h(4.0)).await;
+
+    let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
+    let c = superx_mod_ui::compare::compare(&runs, &std::collections::HashMap::new()).await;
+    let row = |m: &str| c.deviations.iter().find(|d| d.model == m);
+    let f = row("fable").expect("fable wrote the branch");
+    assert_eq!((f.added, f.commits), (15, 1), "the squash, by when the branch was written");
+    assert_eq!(f.abandoned_lines, 0, "the amend's leftover is no abandoned work");
+    assert!(row("opus").is_none_or(|o| o.added == 0), "merging it did not make it opus's");
+}

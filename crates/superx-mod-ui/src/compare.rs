@@ -21,7 +21,9 @@
 //!   commits of any branch whose final version of a file the main line
 //!   carries — a squash or a replay lands a branch's work without
 //!   landing its commits. Those are credited by when the BRANCH work was
-//!   done, not by when the squash was merged.
+//!   done, not by when the squash was merged — and a branch deleted after
+//!   it merged is read back from the reflogs of the checkouts that made it
+//!   (#415 review).
 //! - **Never landed** is the rest of the branch work — on real branches,
 //!   by the identity this machine commits as. `refs/stash`, and another
 //!   person's branches pulled in through `refs/remotes`, are not it.
@@ -90,6 +92,11 @@ struct RepoClaims {
     /// A checkout to read it from.
     dir: String,
     claims: Vec<Claim>,
+    /// The start of the first run that worked here: nothing older can be
+    /// credited, so nothing older is walked. The oldest run anywhere — a
+    /// chat months back in no repository at all — dragged every walk back
+    /// with it (#415 review).
+    earliest: DateTime<Utc>,
 }
 
 /// Everything the comparison section draws.
@@ -115,10 +122,8 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
     // Claims per repository — by its common git dir, so a worktree is its
     // repository (#414).
     let mut repos: HashMap<String, RepoClaims> = HashMap::new();
-    let mut earliest: Option<DateTime<Utc>> = None;
     for r in runs {
         let (Some(from), Some(to)) = (parse(&r.first), parse(&r.last)) else { continue };
-        earliest = Some(earliest.map_or(from, |e| e.min(from)));
         let mut seen: HashSet<&str> = HashSet::new();
         for w in &r.work {
             let Some(co) = checkouts.of(&w.cwd) else { continue };
@@ -129,7 +134,9 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
                 name: co.repo.clone(),
                 dir: co.toplevel.clone(),
                 claims: Vec::new(),
+                earliest: from,
             });
+            rc.earliest = rc.earliest.min(from);
             rc.claims.push(Claim { model: r.model.clone(), from, to });
         }
     }
@@ -146,12 +153,19 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
         let rc = &repos[key];
         let dir = std::path::Path::new(&rc.dir);
         let mainline = crate::landed::mainline_of(dir, &rc.name, mainlines).await;
-        let Some(work) = crate::landed::repo_work(dir, &mainline, earliest).await else { continue };
+        let Some(work) = crate::landed::repo_work(dir, &mainline, Some(rc.earliest)).await else { continue };
         let ours = |author: &str| work.identity.as_deref() == Some(author);
 
         // A main line that took nothing while this machine's branches took
         // plenty is not where the work lands: say so, judge nothing.
-        let off_ours = work.off_mainline.iter().filter(|c| ours(&c.author)).count() as i64;
+        // Branch commits only: one known from a reflog alone may be an
+        // amend's or a rebase's leftover.
+        let off_ours = work.dormant_off.unwrap_or_else(|| {
+            work.off_mainline
+                .iter()
+                .filter(|c| ours(&c.author) && !work.recovered.contains(&c.hash))
+                .count() as i64
+        });
         if work.landed.is_empty() && off_ours > 0 {
             unjudged.push(UnjudgedRepo {
                 repo: rc.name.clone(),
@@ -188,11 +202,15 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
             if c.added() + c.removed() > BULK_COMMIT {
                 continue;
             }
+            // A commit known only from a reflog says when landed work was
+            // done, and nothing else (#415 review).
+            let recovered = work.recovered.contains(&c.hash);
             let mut never = 0i64;
             for (path, added, removed) in &c.files {
                 match work.landed_via.get(&(c.hash.clone(), path.clone())) {
                     Some(via) => shares.entry(via.as_str()).or_default().push((c.at, (added + removed).max(1))),
-                    None => never += added,
+                    None if !recovered => never += added,
+                    None => {}
                 }
             }
             if never > 0 {
