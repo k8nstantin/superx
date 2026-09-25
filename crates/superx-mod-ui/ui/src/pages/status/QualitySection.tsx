@@ -1,7 +1,7 @@
 import { Grid, Group, SimpleGrid, Table, Text } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
-import { BANDS, CANCEL, Counter, FAIL, Meter, OK, Panel, Stat, UNKNOWN, fmtAge, fmtCompact, fmtMs, n, pct, rangeLabel } from './parts'
+import { BANDS, CANCEL, Counter, FAIL, Meter, OK, Panel, Stat, UNKNOWN, fmtAge, fmtCompact, fmtMins, fmtMs, fmtSecs, n, pct, rangeLabel, steering } from './parts'
 import { openSession } from '../../route'
 
 // Did it hold (#367): what the commands reported, when it went wrong,
@@ -15,11 +15,8 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
 
   // Lines when the transcript can see what was replaced, else edits
   // (#388) — the panel must not go dark on a day of shell edits.
-  const inLines = n(s?.churn_directed) + n(s?.churn_self) > 0
-  const cd = inLines ? n(s?.churn_directed) : n(s?.edits_directed)
-  const cs = inLines ? n(s?.churn_self) : n(s?.edits_self)
+  const { lines: inLines, directed: cd, self: cs, onCourse: directedPct } = steering(s)
   const unit = inLines ? 'replaced lines' : 'edits'
-  const directedPct = pct(cd, cd + cs)
   const churnCause =
     directedPct == null
       ? ''
@@ -61,27 +58,31 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
         />
         <Stat
           label="Edit → verify"
-          value={n(s?.edit_to_verify_p50_secs) > 0 ? fmtMs(n(s?.edit_to_verify_p50_secs) * 1000) : '—'}
+          value={fmtSecs(s?.edit_to_verify_p50_secs)}
           sub="median wait to check"
           tip="long, with high churn, is the signature of an agent guessing"
         />
         <Stat
-          label="Code half-life"
-          value={n(s?.survival_p50_mins) > 0 ? fmtMs(n(s?.survival_p50_mins) * 60_000) : '—'}
-          sub="before it was rewritten"
-          tip="minutes means thrash; hours means the design moved"
+          label="Rewritten after"
+          value={fmtMins(s?.survival_p50_mins)}
+          sub="median life of text a later edit replaced"
+          tip="of the text a later edit replaced, how long it had lived — minutes means thrash, hours means the design moved. Text nobody replaced is not in it, so this is not the life of the code as a whole"
         />
         <Stat
           label="Compaction cost"
           value={fmtMs(s?.compaction_total_ms)}
           sub={s ? `${s.compactions} compaction(s)` : ''}
-          tip="wall-clock the agents spent re-reading their own history after the context filled"
+          tip={
+            s?.compaction_total_ms == null && n(s?.compactions) > 0
+              ? 'the agents compacted, but how long it took is not captured: the timing rides the transcript\'s system lines, which capture does not keep (#373)'
+              : 'wall-clock the agents spent re-reading their own history after the context filled'
+          }
         />
       </SimpleGrid>
 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 8 }}>
-          <Panel title="Quality over time" scope="range" range={range} note={`tests and tool failures per hour · ${note}`} h="100%">
+          <Panel title="Quality over time" scope="range" range={range} note={`tests and tool failures per hour · your time · ${note}`} h="100%">
             <EChart
               height={200}
               option={{
@@ -191,7 +192,7 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
           </Panel>
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 5 }}>
-          <Panel title="When it goes wrong" scope="range" range={range} note="failure rate by hour of day" h="100%">
+          <Panel title="When it goes wrong" scope="range" range={range} note="failure rate by hour of day · your time" h="100%">
             {byHour.length === 0 ? (
               <Text size="xs" c="dimmed">
                 no tool calls in this range
@@ -228,7 +229,9 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
       <Panel title="Compaction" scope="range" range={range} note="dead time, per session" mb="md">
         {(s?.compaction_sessions?.length ?? 0) === 0 ? (
           <Text size="xs" c="dimmed">
-            No session hit its context ceiling in this range.
+            {n(s?.compactions) > 0
+              ? `${n(s?.compactions)} compaction(s) in this range, untimed — the timing rides system lines that capture does not keep (#373).`
+              : 'No session hit its context ceiling in this range.'}
           </Text>
         ) : (
           <Table striped>

@@ -1,9 +1,10 @@
 import { Badge, Card, Group, Progress, SimpleGrid, Table, Text, Tooltip } from '@mantine/core'
 import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
+import type { StatusResponse } from '../../generated/StatusResponse'
 import { MONO } from '../../EChart'
 import { LivenessDot } from '../../LivenessDot'
-import { BANDS, Churn, CoverageStrip, FAIL, Panel, Stat, ageOf, fmtAge, fmtCompact, n, useNow, type Tone } from './parts'
+import { BANDS, Churn, CoverageStrip, FAIL, Panel, Stat, ageOf, captureDown, captureTone, fmtAge, fmtCompact, n, useNow, isCircling } from './parts'
 import { openSession } from '../../route'
 
 // The flight deck (#367): one row per agent in the air, and the fleet
@@ -14,6 +15,7 @@ const DOING_COLOR: Record<string, string> = {
   writing: 'teal',
   verifying: 'blue',
   reading: 'cyan',
+  working: 'indigo',
   thinking: 'grape',
   quiet: 'gray',
 }
@@ -42,10 +44,12 @@ function ContextCell({ pct, tokens }: { pct: number | bigint | null; tokens: num
 export function FlightDeck({
   s,
   i,
+  status,
   loading,
 }: {
   s: StatsSummary | undefined
   i: InsightsSummary | undefined
+  status: StatusResponse | undefined
   loading: boolean
 }) {
   const live = s?.live ?? []
@@ -56,17 +60,9 @@ export function FlightDeck({
   // number climbs over an idle machine and the tile used to call that a
   // fault. It is only lag while something is actually in the air.
   const anythingLive = live.length > 0
-  const quiet = !anythingLive && lag != null && lag >= BANDS.lagWarn
-  const lagTone: Tone =
-    lag == null
-      ? 'none'
-      : !anythingLive
-        ? 'ok'
-        : lag >= BANDS.lagBad
-          ? 'bad'
-          : lag >= BANDS.lagWarn
-            ? 'warn'
-            : 'ok'
+  const down = captureDown(status)
+  const quiet = !down && !anythingLive && lag != null && lag >= BANDS.lagWarn
+  const lagTone = captureTone(lag, anythingLive, down)
   return (
     <>
       <SimpleGrid cols={{ base: 2, md: 3, lg: 6 }} spacing="xs" mb="md">
@@ -94,10 +90,12 @@ export function FlightDeck({
           sub="messages, last hour"
         />
         <Stat
-          label="Last captured"
-          value={quiet ? 'quiet' : lag == null ? '…' : fmtAge(lag)}
+          label={down ? 'Capture stopped' : 'Last captured'}
+          value={down ? 'down' : quiet ? 'quiet' : lag == null ? '…' : fmtAge(lag)}
           sub={
-            quiet
+            down
+              ? 'the capture module is not active'
+              : quiet
               ? `nothing in the air · newest ${fmtAge(lag ?? 0)} old`
               : i
                 ? `${fmtCompact(i.events_last_hour)} events this hour`
@@ -118,7 +116,7 @@ export function FlightDeck({
               hours worked
             </Text>
           </Group>
-          <CoverageStrip hours={s?.active_hours_24h} />
+          <CoverageStrip hours={s?.active_hours} now={now} />
         </Card>
       </SimpleGrid>
 
@@ -126,7 +124,7 @@ export function FlightDeck({
         title="Running now"
         scope="live"
         range={null}
-        note="sessions with a message in the last five minutes · busiest first · click one to open its feed"
+        note="sessions with a message in the last five minutes · busiest first · figures cover the selected range · click one to open its feed"
         mb="md"
       >
         {live.length === 0 ? (
@@ -181,7 +179,7 @@ export function FlightDeck({
               </Table.Thead>
               <Table.Tbody>
                 {live.map((l) => {
-                  const circling = n(l.self_churn_pct) >= BANDS.selfChurnBad || n(l.files_revisited) >= BANDS.revisitedBad
+                  const circling = isCircling(l)
                   return (
                     <Table.Tr
                       key={l.identity}

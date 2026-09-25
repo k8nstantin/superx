@@ -2,12 +2,12 @@ import { Badge, Grid, Group, Progress, Table, Text, Tooltip } from '@mantine/cor
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
 import { sessionColor } from '../../Feed'
-import { BANDS, Churn, FAIL, OK, Panel, fmtAge, fmtCompact, fmtMs, n, pct } from './parts'
+import { BANDS, Churn, FAIL, OK, Panel, fmtAge, fmtCompact, fmtMs, fmtSecs, n, pct, steering } from './parts'
 import { openSession } from '../../route'
 
 // Who flew what (#367): agents, reasoning levels, models, branches and
 // repos compared on outcome rather than volume, the work cube, and the
-// sortie log — every session's span in the range.
+// sortie log — the ten newest sessions' spans in the range.
 
 function pctCell(v: number | null, bad: number, low = false) {
   if (v == null) return <Text size="xs" c="dimmed">—</Text>
@@ -42,7 +42,7 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
 
   return (
     <>
-      <Panel title="Agent productivity and what it cost" scope="range" range={range} note="tokens spent per line that survived — lower is cheaper work" mb="md">
+      <Panel title="Agent productivity and what it cost" scope="range" range={range} note="tokens sent and written per line added — lower is cheaper work" mb="md">
         {(s?.agent_stats?.length ?? 0) === 0 ? (
           <Text size="xs" c="dimmed">no agent wrote code in this range</Text>
         ) : (
@@ -63,7 +63,11 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                   <Table.Th ta="right">Tests</Table.Th>
                   <Table.Th ta="right">Sent</Table.Th>
                   <Table.Th ta="right">Written</Table.Th>
-                  <Table.Th ta="right">Tok/line</Table.Th>
+                  <Table.Th ta="right">
+                    <Tooltip label="tokens sent plus tokens written, per line this agent added — not per line that survived" withArrow multiline w={260}>
+                      <span>Sent+out / line</span>
+                    </Tooltip>
+                  </Table.Th>
                   <Table.Th ta="right">Switches</Table.Th>
                   <Table.Th ta="right">Verify</Table.Th>
                   <Table.Th ta="right">Compact</Table.Th>
@@ -77,11 +81,7 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                   const del = n(a.lines_removed)
                   const churn = pct(del, add + del)
                   const cost = add > 0 ? Math.round((n(a.in_tokens) + n(a.out_tokens)) / add) : null
-                  // Lines, else edits (#388).
-                  const unasked =
-                    n(a.churn_directed) + n(a.churn_self) > 0
-                      ? pct(n(a.churn_self), n(a.churn_directed) + n(a.churn_self))
-                      : pct(n(a.edits_self), n(a.edits_directed) + n(a.edits_self))
+                  const { unasked } = steering(a)
                   const tests = n(a.tests_passed) + n(a.tests_failed)
                   const passPct = pct(n(a.tests_passed), tests)
                   return (
@@ -107,7 +107,7 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                       <Table.Td ta="right">{fmtCompact(a.out_tokens)}</Table.Td>
                       <Table.Td ta="right">{cost == null ? '—' : fmtCompact(cost)}</Table.Td>
                       <Table.Td ta="right" c={n(a.repo_switches) > BANDS.switchesBad ? 'orange.4' : undefined}>{String(a.repo_switches)}</Table.Td>
-                      <Table.Td ta="right">{n(a.edit_to_verify_p50_secs) > 0 ? fmtMs(n(a.edit_to_verify_p50_secs) * 1000) : '—'}</Table.Td>
+                      <Table.Td ta="right">{fmtSecs(a.edit_to_verify_p50_secs)}</Table.Td>
                       <Table.Td ta="right">{n(a.compactions) > 0 ? `${a.compactions} · ${fmtMs(a.compaction_ms)}` : '—'}</Table.Td>
                       <Table.Td ta="right" c={n(a.reverts) > 0 ? 'orange.4' : undefined}>{String(a.reverts)}</Table.Td>
                       <Table.Td ta="right" c={n(a.tool_failures) > 0 ? 'red.4' : undefined}>{String(a.tool_failures)}</Table.Td>
@@ -135,7 +135,11 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                       <Table.Th ta="right">Lines +/−</Table.Th>
                       <Table.Th ta="right">Churn</Table.Th>
                       <Table.Th ta="right">Thinking</Table.Th>
-                      <Table.Th ta="right">Tok/line</Table.Th>
+                      <Table.Th ta="right">
+                      <Tooltip label="output tokens per line added — not per line that survived" withArrow multiline w={240}>
+                        <span>Out / line</span>
+                      </Tooltip>
+                    </Table.Th>
                       <Table.Th ta="right">Tests</Table.Th>
                       <Table.Th ta="right">Undone</Table.Th>
                       <Table.Th ta="right">Fails</Table.Th>
@@ -177,7 +181,11 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                     <Table.Th>Model</Table.Th>
                     <Table.Th ta="right">Lines +/−</Table.Th>
                     <Table.Th ta="right">Churn</Table.Th>
-                    <Table.Th ta="right">Tok/line</Table.Th>
+                    <Table.Th ta="right">
+                      <Tooltip label="output tokens per line added — not per line that survived" withArrow multiline w={240}>
+                        <span>Out / line</span>
+                      </Tooltip>
+                    </Table.Th>
                     <Table.Th ta="right">Undone</Table.Th>
                     <Table.Th ta="right">Fails</Table.Th>
                   </Table.Tr>
@@ -286,7 +294,7 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                           fmtAge(half * 60)
                         )}
                       </Table.Td>
-                      <Table.Td ta="right">{n(b.edit_to_verify_p50_secs) > 0 ? fmtMs(n(b.edit_to_verify_p50_secs) * 1000) : '—'}</Table.Td>
+                      <Table.Td ta="right">{fmtSecs(b.edit_to_verify_p50_secs)}</Table.Td>
                       <Table.Td ta="right">
                         {pass < 0 ? (
                           <Tooltip label={n(b.tests_run) > 0 ? `${b.tests_run} test run(s), but no tally could be read from the output` : 'this branch ran no tests'} withArrow>
@@ -354,7 +362,7 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
           </Panel>
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 6 }}>
-          <Panel title="Sortie log" scope="range" range={range} note="every session's span in the range · newest first" h="100%">
+          <Panel title="Sortie log" scope="range" range={range} note="the ten newest sessions in the range · local time" h="100%">
             {spans.length === 0 ? (
               <Text size="xs" c="dimmed">no session in this range</Text>
             ) : (
@@ -421,7 +429,7 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 7 }}>
-          <Panel title="Where the work went" scope="range" range={range} note={`lines written per agent, per repo, per ${long ? 'day' : 'hour'}`} h="100%">
+          <Panel title="Where the work went" scope="range" range={range} note={`lines written per agent, per repo, per ${long ? 'day' : 'hour'} · your time`} h="100%">
             {cells.length === 0 ? (
               <Text size="xs" c="dimmed">no code written in this range</Text>
             ) : (

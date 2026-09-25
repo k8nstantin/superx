@@ -35,9 +35,6 @@ const COMMAND_WHITELIST: &[&str] = &["agents", "sessions", "actions", "read", "m
 /// SSE poller page size per tick.
 const SSE_BATCH: u32 = 200; // skill-allow: §9-const — poll page bound
 
-/// Charts aggregation source window.
-const CHART_EVENT_WINDOW: u32 = 2000; // skill-allow: §9-const — aggregation page bound
-
 #[derive(Clone)]
 struct AppState {
     kernel: Kernel,
@@ -107,8 +104,6 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/stats", get(api_stats))
         .route("/api/insights", get(api_insights))
         .route("/api/compare", get(api_compare))
-        .route("/api/actions", get(api_actions))
-        .route("/api/charts/summary", get(api_charts))
         .route("/api/events", get(api_events))
         .route("/api/command", post(api_command))
         .fallback(get(static_assets))
@@ -143,7 +138,12 @@ async fn sse_poller(
     tx: broadcast::Sender<String>,
     stop: superx_kernel::supervise::CancelToken,
 ) {
-    let mut after = chrono::Utc::now();
+    // One cursor per stream (#413). Both reads are capped at a batch, and
+    // a shared cursor advanced to the newer of the two ends skipped every
+    // row the other stream had not reached yet — in a burst, whole runs of
+    // the feed never arrived.
+    let mut after_events = chrono::Utc::now();
+    let mut after_messages = after_events;
     loop {
         let poll = superx_ops::live_poll_secs(&kernel).await;
         tokio::time::sleep(Duration::from_secs(poll)).await;
@@ -154,14 +154,15 @@ async fn sse_poller(
             return;
         }
         if tx.receiver_count() == 0 {
-            after = chrono::Utc::now(); // nobody watching — skip ahead
+            // Nobody watching — skip ahead.
+            after_events = chrono::Utc::now();
+            after_messages = after_events;
             continue;
         }
-        let mut high = after;
-        if let Ok(actions) = kernel.telemetry_since(after, SSE_BATCH).await {
+        if let Ok(actions) = kernel.telemetry_since(after_events, SSE_BATCH).await {
             for a in &actions {
-                if a.valid_from > high {
-                    high = a.valid_from;
+                if a.valid_from > after_events {
+                    after_events = a.valid_from;
                 }
                 let ev = crate::activity::action_event(a);
                 if let Ok(json) = serde_json::to_string(&ev) {
@@ -169,10 +170,10 @@ async fn sse_poller(
                 }
             }
         }
-        if let Ok(messages) = kernel.messages_since(after, SSE_BATCH).await {
+        if let Ok(messages) = kernel.messages_since(after_messages, SSE_BATCH).await {
             for m in &messages {
-                if m.valid_from > high {
-                    high = m.valid_from;
+                if m.valid_from > after_messages {
+                    after_messages = m.valid_from;
                 }
                 let ev = crate::activity::message_event(m);
                 if let Ok(json) = serde_json::to_string(&ev) {
@@ -180,7 +181,6 @@ async fn sse_poller(
                 }
             }
         }
-        after = high;
     }
 }
 
@@ -407,8 +407,7 @@ async fn api_sessions(
             + crate::activity::session_action_count(kernel, s.entity_id.clone(), scope)
                 .await
                 .unwrap_or(0);
-        let last_active = kernel
-            .session_last_activity(s.entity_id.clone())
+        let last_active = crate::activity::session_last_emitted(kernel, s.entity_id.clone())
             .await
             .ok()
             .flatten()
@@ -515,6 +514,23 @@ async fn api_session_activity(
 #[derive(serde::Deserialize)]
 struct RangeQuery {
     range: Option<String>,
+    /// The viewer's offset from UTC, in minutes east (#415 review).
+    tz: Option<i32>,
+}
+
+/// The viewer's clock, for the hours and days the page buckets by: the
+/// offset its browser reports, in minutes east of UTC. Absent or out of
+/// range, UTC — a stale bookmark still renders.
+fn viewer_clock(tz: Option<i32>) -> chrono::FixedOffset {
+    tz.and_then(|m| m.checked_mul(60))
+        .and_then(chrono::FixedOffset::east_opt)
+        .unwrap_or_else(|| chrono::Offset::fix(&chrono::Utc))
+}
+
+/// The viewer's offset alone — for the endpoints that take nothing else.
+#[derive(serde::Deserialize)]
+struct ClockQuery {
+    tz: Option<i32>,
 }
 
 async fn api_stats(
@@ -533,12 +549,13 @@ async fn api_stats(
     } else {
         "window".to_string()
     };
+    let clock = viewer_clock(q.tz);
     let ttl = crate::resolved_cache_secs(kernel).await;
-    let key = format!("stats:{range}:{window}");
+    let key = format!("stats:{range}:{window}:{}", clock.local_minus_utc());
     if let Some(body) = state.cached(&key, ttl) {
         return json_body(body);
     }
-    match crate::stats::stats_for_range(kernel, window, &range).await {
+    match crate::stats::stats_for_range_on(kernel, window, &range, clock).await {
         Ok(s) => match serde_json::to_string(&s) {
             Ok(body) => {
                 state.remember(&key, &body);
@@ -553,10 +570,26 @@ async fn api_stats(
 /// Deep statistics (issue #237) — all-history aggregates computed in
 /// the engine. Separate from `/api/stats` so the live tiles keep their
 /// fast refresh while these poll lazily.
-async fn api_insights(State(state): State<AppState>) -> Response<InsightsSummary> {
-    match crate::insights::insights_summary(&state.kernel).await {
-        Ok(s) => Response::ok(s),
-        Err(e) => Response::err(e.to_string()),
+async fn api_insights(State(state): State<AppState>, Query(q): Query<ClockQuery>) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    // Whole-history, and seconds to compute (#415 review): held for the
+    // same while as the Status page's own figures, so two pilots — or two
+    // tabs — pay for it once.
+    let clock = viewer_clock(q.tz);
+    let ttl = crate::resolved_cache_secs(&state.kernel).await;
+    let key = format!("insights:{}", clock.local_minus_utc());
+    if let Some(body) = state.cached(&key, ttl) {
+        return json_body(body);
+    }
+    match crate::insights::insights_summary_on(&state.kernel, clock).await {
+        Ok(s) => match serde_json::to_string(&s) {
+            Ok(body) => {
+                state.remember(&key, &body);
+                json_body(body)
+            }
+            Err(e) => err_response(&e.to_string()).into_response(),
+        },
+        Err(e) => err_response(&e.to_string()).into_response(),
     }
 }
 
@@ -572,11 +605,13 @@ async fn api_compare(State(state): State<AppState>) -> axum::response::Response 
         Ok(r) => r,
         Err(e) => return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
     };
-    let (handoffs, deviations, repos) = crate::compare::compare(&runs).await;
+    let mainlines = crate::resolved_mainline_refs(&state.kernel).await;
+    let c = crate::compare::compare(&runs, &mainlines).await;
     let summary = crate::api::CompareSummary {
-        handoffs,
-        deviations,
-        repos,
+        handoffs: c.handoffs,
+        deviations: c.deviations,
+        repos: c.repos,
+        unjudged: c.unjudged,
         computed_at: chrono::Utc::now().to_rfc3339(),
     };
     match serde_json::to_string(&summary) {
@@ -612,117 +647,6 @@ async fn api_activity(
         Ok(events) => Response::ok(events),
         Err(e) => Response::err(e.to_string()),
     }
-}
-
-#[derive(serde::Deserialize)]
-struct ActionsQuery {
-    limit: Option<u32>,
-}
-
-async fn api_actions(
-    State(state): State<AppState>,
-    Query(q): Query<ActionsQuery>,
-) -> Json<Vec<ActionView>> {
-    let kernel = &state.kernel;
-    let limit = q.limit.unwrap_or(50).min(SSE_BATCH); // skill-allow: §9-or — render page default, query-param overridable
-    let mut events = kernel.recent_telemetry(limit).await.unwrap_or_default();
-    events.reverse();
-    Json(
-        events
-            .iter()
-            .map(|e| ActionView {
-                event: e.lifecycle_event.clone(),
-                summary: superx_ops::render_event(e).trim_end().to_string(),
-                agent_id: e.agent.as_ref().map(superx_ops::record_uuid),
-                valid_from: e.valid_from.to_rfc3339(),
-            })
-            .collect(),
-    )
-}
-
-async fn api_charts(State(state): State<AppState>) -> Json<ChartsSummary> {
-    let kernel = &state.kernel;
-    let events = kernel
-        .recent_telemetry(CHART_EVENT_WINDOW)
-        .await
-        .unwrap_or_default();
-
-    // Events per minute (over the fetched window).
-    let mut per_minute: std::collections::BTreeMap<String, i64> = Default::default();
-    let mut per_agent_id: std::collections::BTreeMap<String, i64> = Default::default();
-    let mut boots = Vec::new();
-    for e in &events {
-        let minute = e.valid_from.format("%H:%M").to_string();
-        *per_minute.entry(minute).or_insert(0) += 1;
-        if let Some(agent) = &e.agent {
-            *per_agent_id.entry(superx_ops::record_uuid(agent)).or_insert(0) += 1;
-        }
-        if e.lifecycle_event == "boot_complete" {
-            if let superx_kernel::types::Value::Object(o) = &e.payload {
-                if let Some(superx_kernel::types::Value::Number(n)) = o.get("duration_ms") {
-                    boots.push(TimeCount {
-                        t: e.valid_from.format("%m-%d %H:%M").to_string(),
-                        value: n.to_int().unwrap_or(0),
-                    });
-                }
-            }
-        }
-    }
-    // Agent ids → names.
-    let mut per_agent = Vec::new();
-    if let Ok(agents) = kernel
-        .list_named_entities("node_agent", "attr_agent_descriptor")
-        .await
-    {
-        for a in &agents {
-            let uuid = superx_ops::record_uuid(&a.entity_id);
-            if let Some(count) = per_agent_id.get(&uuid) {
-                let name = match &a.payload {
-                    superx_kernel::types::Value::Object(o) => match o.get("name") {
-                        Some(superx_kernel::types::Value::String(s)) => s.clone(),
-                        _ => uuid.clone(),
-                    },
-                    _ => uuid.clone(),
-                };
-                per_agent.push(NameCount {
-                    name,
-                    value: *count,
-                });
-            }
-        }
-    }
-    // Message roles via a grouped query (kernel read handle).
-    let mut message_roles = Vec::new();
-    if let Ok(mut resp) = kernel
-        .db()
-        .query("SELECT role, count() AS c FROM message GROUP BY role")
-        .await
-    {
-        if let Ok(rows) = resp.take::<Vec<superx_kernel::types::Value>>(0) {
-            for row in rows {
-                if let superx_kernel::types::Value::Object(o) = row {
-                    let role = match o.get("role") {
-                        Some(superx_kernel::types::Value::String(s)) => s.clone(),
-                        _ => continue,
-                    };
-                    let c = match o.get("c") {
-                        Some(superx_kernel::types::Value::Number(n)) => n.to_int().unwrap_or(0),
-                        _ => 0,
-                    };
-                    message_roles.push(NameCount { name: role, value: c });
-                }
-            }
-        }
-    }
-    Json(ChartsSummary {
-        events_per_minute: per_minute
-            .into_iter()
-            .map(|(t, value)| TimeCount { t, value })
-            .collect(),
-        per_agent,
-        message_roles,
-        boot_durations: boots,
-    })
 }
 
 async fn api_events(
@@ -832,6 +756,16 @@ impl<T: serde::Serialize> axum::response::IntoResponse for Response<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_viewers_clock_is_what_the_browser_reports_else_utc() {
+        let utc = chrono::Offset::fix(&chrono::Utc);
+        assert_eq!(viewer_clock(Some(-240)), chrono::FixedOffset::west_opt(4 * 3600).expect("UTC-4"));
+        assert_eq!(viewer_clock(Some(330)), chrono::FixedOffset::east_opt(330 * 60).expect("UTC+5:30"));
+        assert_eq!(viewer_clock(None), utc);
+        assert_eq!(viewer_clock(Some(100_000)), utc, "past a day is no offset");
+        assert_eq!(viewer_clock(Some(i32::MAX)), utc, "and never overflows");
+    }
 
     async fn get(path: &str) -> axum::response::Response {
         static_assets(path.parse::<axum::http::Uri>().expect("uri")).await

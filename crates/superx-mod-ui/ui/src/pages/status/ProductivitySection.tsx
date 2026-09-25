@@ -1,7 +1,7 @@
 import { Grid, Group, SimpleGrid, Table, Text, Tooltip } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
-import { CANCEL, Counter, FAIL, OK, Panel, Stat, fmtCompact, n, pct } from './parts'
+import { CANCEL, Counter, FAIL, OK, Panel, Stat, fmtCompact, fmtMins, n, pct, steering } from './parts'
 
 // Productivity (#391). Every other band counts effort — lines, tokens,
 // calls, tests. This one divides effort by outcome, and measures the
@@ -22,7 +22,9 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
   const landed = n(s?.landed?.added)
   const written = n(s?.lines_added)
   const merged = n(s?.prs_merged)
-  const hours = n(s?.active_hours_24h)
+  // Hours of THE RANGE that saw work (#413): the range's totals used to
+  // be divided by the last 24 hours' count, whatever the range.
+  const hours = n(s?.active_hours_range)
 
   const perLandedLine = landed > 0 ? Math.round(out / landed) : null
   const perMergedPr = merged > 0 ? Math.round(out / merged) : null
@@ -90,8 +92,8 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
               <Stat
                 label="Landed per hour"
                 value={landedPerHour == null ? '—' : fmtCompact(landedPerHour)}
-                sub={`over ${hours} active hour${hours === 1 ? '' : 's'}`}
-                tip="lines landed on main ÷ hours in which anything happened"
+                sub={`over ${hours} active hour${hours === 1 ? '' : 's'} of the range`}
+                tip="lines landed on main ÷ the hours of this range in which anything happened"
               />
               <Stat
                 label="Written · landed"
@@ -123,7 +125,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
             title="Burn over time — output tokens by repository"
             scope="range"
             range={range}
-            note={long ? 'per day' : 'per hour'}
+            note={long ? 'per day · your time' : 'per hour · your time'}
             h="100%"
           >
             {buckets.length === 0 ? (
@@ -197,7 +199,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
         title="How hard it was working — fronts open, and what moved"
         scope="range"
         range={range}
-        note={`${long ? 'per day' : 'per hour'} · peak ${n(s?.peak_sessions)} session${n(s?.peak_sessions) === 1 ? '' : 's'} and ${n(s?.peak_repos)} repositor${n(s?.peak_repos) === 1 ? 'y' : 'ies'} at once`}
+        note={`${long ? 'per day' : 'per hour'} · your time · peak ${n(s?.peak_sessions)} session${n(s?.peak_sessions) === 1 ? '' : 's'} and ${n(s?.peak_repos)} repositor${n(s?.peak_repos) === 1 ? 'y' : 'ies'} at once`}
         mb="md"
       >
         {(s?.intensity?.length ?? 0) === 0 ? (
@@ -392,7 +394,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                     const tests = n(p.tests_passed) + n(p.tests_failed)
                     const passPct = pct(n(p.tests_passed), tests)
                     const failRate = pct(n(p.tool_failures), n(p.tool_calls))
-                    const unasked = pct(n(p.edits_self), n(p.edits_directed) + n(p.edits_self))
+                    const { unasked } = steering(p)
                     const perLine = n(p.lines_added) > 0 ? Math.round(n(p.out_tokens) / n(p.lines_added)) : null
                     const think = pct(n(p.thinking_tokens), n(p.out_tokens))
                     // A row from a tenth of the biggest sample cannot be
@@ -426,7 +428,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                         <Table.Td ta="right">{perLine == null ? '—' : fmtCompact(perLine)}</Table.Td>
                         <Table.Td ta="right">{tests === 0 ? '—' : `${passPct}%`}</Table.Td>
                         <Table.Td ta="right">{n(p.tool_calls) === 0 ? '—' : `${failRate}%`}</Table.Td>
-                        <Table.Td ta="right">{n(p.edits_directed) + n(p.edits_self) === 0 ? '—' : `${unasked}%`}</Table.Td>
+                        <Table.Td ta="right">{unasked == null ? '—' : `${unasked}%`}</Table.Td>
                         <Table.Td ta="right">{n(p.interventions) + n(p.denials)}</Table.Td>
                       </Table.Tr>
                     )
@@ -459,11 +461,11 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
           <Counter
             label="Turns per hour"
             value={turnsPerHour == null ? '—' : turnsPerHour}
-            tip="your turns ÷ hours in which anything happened — how much of your attention the work consumed"
+            tip="your turns ÷ the hours of this range in which anything happened — how much of your attention the work consumed"
           />
           <Counter
             label="Autonomy span"
-            value={autonomy === 0 ? '—' : `${autonomy}m`}
+            value={fmtMins(autonomy)}
             tip="median minutes from one of your turns to the next, within a session — how long an agent flew before it needed you. A dash means no session had two turns in this range."
           />
           <Counter

@@ -3,7 +3,7 @@ import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import type { StatusResponse } from '../../generated/StatusResponse'
 import { AXIS, CHART_COLORS, EChart, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
-import { BANDS, Panel, Stat, ageOf, fmtAge, fmtBytes, fmtCompact, n, pct, useNow } from './parts'
+import { Panel, Stat, ageOf, captureDown, captureTone, fmtAge, fmtBytes, fmtCompact, n, pct, useNow } from './parts'
 
 // The OS itself (#367): module health read off the lifecycle stream,
 // substrate totals, and what capture spends itself on. The registry
@@ -38,13 +38,20 @@ export function SystemsSection({
         <Stat label="Agents" value={s ? String(s.agents) : '…'} tip="agents the OS has discovered" />
         <Stat label="Sessions" value={fmtCompact(s?.sessions_total)} sub={s ? `${s.sessions_active} live` : ''} />
         <Stat label="Events captured" value={fmtCompact(s?.events_total)} sub="all time" />
-        <Stat label="Messages" value={fmtCompact(s?.messages_total)} sub="all time" />
+        <Stat label="Message rows" value={fmtCompact(s?.messages_total)} sub="stored, all time" />
         <Stat label="Output tokens" value={fmtCompact(s?.output_tokens_total)} sub="all sessions" />
         <Stat
           label="Events this hour"
           value={i ? fmtCompact(i.events_last_hour) : '…'}
-          sub={i ? `newest ${lag == null ? '—' : fmtAge(lag)} ago` : ''}
-          tone={lag == null ? 'none' : lag >= BANDS.lagBad ? 'bad' : lag >= BANDS.lagWarn ? 'warn' : 'ok'}
+          sub={
+            captureDown(status)
+              ? 'the capture module is not active'
+              : i
+                ? `newest ${lag == null ? '—' : fmtAge(lag)} ago`
+                : ''
+          }
+          // The Warnings lamp's and the flight deck's rule, shared (#413).
+          tone={captureTone(lag, (s?.live?.length ?? 0) > 0, captureDown(status))}
         />
       </SimpleGrid>
 

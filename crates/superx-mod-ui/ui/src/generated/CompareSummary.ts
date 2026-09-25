@@ -2,6 +2,7 @@
 import type { Deviation } from "./Deviation";
 import type { Handoff } from "./Handoff";
 import type { RepoModel } from "./RepoModel";
+import type { UnjudgedRepo } from "./UnjudgedRepo";
 
 /**
  * The model-comparison answer (#406).
@@ -10,4 +11,8 @@ export type CompareSummary = { handoffs: Array<Handoff>, deviations: Array<Devia
 /**
  * Per repository and model, biggest first.
  */
-repos: Array<RepoModel>, computed_at: string, };
+repos: Array<RepoModel>, 
+/**
+ * Repositories the comparison could not judge, and why (#414).
+ */
+unjudged: Array<UnjudgedRepo>, computed_at: string, };

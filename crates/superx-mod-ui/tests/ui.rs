@@ -80,6 +80,23 @@ async fn ui_cli_reports_url_and_usage() {
         .await
         .expect_err("usage");
     assert!(err.to_string().contains("usage: superx ui url"));
+
+    // The branch a repository's work lands on, recorded by the operator
+    // (#415 review) — and read back by the comparison and by "landed".
+    let cli = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    let none = UiModule.cli(&kernel, &cli(&["mainline"])).await.expect("list");
+    assert!(none.contains("no main-line overrides"), "{none}");
+    let set = UiModule
+        .cli(&kernel, &cli(&["mainline", "gryphon-data-lake", "origin/sandbox"]))
+        .await
+        .expect("set");
+    assert_eq!(set, "gryphon-data-lake\torigin/sandbox\n");
+    let refs = superx_mod_ui::resolved_mainline_refs(&kernel).await;
+    assert_eq!(refs.get("gryphon-data-lake").map(String::as_str), Some("origin/sandbox"));
+    let unset = UiModule.cli(&kernel, &cli(&["mainline", "gryphon-data-lake", "--unset"])).await.expect("unset");
+    assert!(unset.contains("no main-line overrides"), "{unset}");
+    assert!(superx_mod_ui::resolved_mainline_refs(&kernel).await.is_empty());
+    assert!(UiModule.cli(&kernel, &cli(&["mainline", "only-a-repo"])).await.is_err(), "a repo needs a ref");
 }
 
 #[test]
@@ -302,7 +319,7 @@ async fn stats_summary_mines_tools_lines_and_sessions_from_raw_events() {
             raw: Some(json_to_object(&serde_json::json!({
                 "message": {"content": [
                     {"type": "tool_use", "name": "Edit",
-                     "input": {"new_string": "x\ny"}}
+                     "input": {"file_path": "b.rs", "new_string": "x\ny"}}
                 ]}
             }))),
             seq: None,
@@ -459,10 +476,12 @@ async fn insights_summary_reads_what_nothing_read_before() {
         })))
         .await
         .expect("cc msg");
+    // Gemini's `input` INCLUDES what it read from cache (#409): 110 in,
+    // 100 of them cached, is 10 sent fresh.
     kernel
         .log_message(msg(serde_json::json!({
             "model": "gemini-2.5-pro",
-            "tokens": {"input": 10, "output": 5, "cached": 100}
+            "tokens": {"input": 110, "output": 5, "cached": 100}
         })))
         .await
         .expect("gemini msg");
@@ -946,21 +965,23 @@ async fn cockpit_instruments_read_the_work() {
     let kernel = fresh_kernel().await;
     let agent = kernel.create_entity("node_agent").await.expect("agent");
     let session = kernel.create_entity("node_session").await.expect("session");
+    let repo = TestRepo::new("superx", "feat/cockpit");
+    let cwd = repo.cwd();
 
     // An Edit: three lines replace one — added and removed are
     // different numbers, which the old lines_written could not say.
     log_tool_message(&kernel, &session, &agent, serde_json::json!({
-        "cwd": "/Users/dev/projects/superx", "gitBranch": "feat/cockpit",
+        "cwd": cwd, "gitBranch": "feat/cockpit",
         "message": {"usage": {"output_tokens": 120, "output_tokens_details": {"thinking_tokens": 45}},
             "content": [{"type": "tool_use", "id": "t1", "name": "Edit",
-                "input": {"file_path": "/Users/dev/projects/superx/crates/mod/src/stats.rs",
+                "input": {"file_path": repo.file("crates/mod/src/stats.rs"),
                           "old_string": "one line", "new_string": "a\nb\nc"}}]}
     })).await;
 
     // A test run, a build, and a git push — three shell classes.
     for cmd in ["cargo test --workspace", "cargo build --release", "git push -u origin HEAD"] {
         log_tool_message(&kernel, &session, &agent, serde_json::json!({
-            "cwd": "/Users/dev/projects/superx",
+            "cwd": cwd,
             "message": {"content": [{"type": "tool_use", "id": "c", "name": "Bash",
                 "input": {"command": cmd}}]}
         })).await;
@@ -968,13 +989,13 @@ async fn cockpit_instruments_read_the_work() {
 
     // A read, an MCP call, a web fetch, a delegated subagent.
     for (name, input) in [
-        ("Read", serde_json::json!({"file_path": "/Users/dev/projects/superx/README.md"})),
+        ("Read", serde_json::json!({"file_path": repo.file("README.md")})),
         ("mcp__gdx__search", serde_json::json!({})),
         ("WebFetch", serde_json::json!({})),
         ("Task", serde_json::json!({})),
     ] {
         log_tool_message(&kernel, &session, &agent, serde_json::json!({
-            "cwd": "/Users/dev/projects/superx",
+            "cwd": cwd,
             "message": {"content": [{"type": "tool_use", "id": "x", "name": name, "input": input}]}
         })).await;
     }
@@ -984,13 +1005,14 @@ async fn cockpit_instruments_read_the_work() {
     // Code output, with the add/remove split the old figure lacked.
     assert_eq!(s.lines_added, 3, "new_string lines");
     assert_eq!(s.lines_removed, 1, "old_string lines");
-    assert_eq!(s.files_touched, 2, "the edited file and the read one");
+    // Reading is not touching (#412): the edited file, not the read one.
+    assert_eq!(s.files_touched, 1, "the edited file");
     assert_eq!(s.writes_window, 1);
     assert_eq!(s.reads_window, 1);
 
     // Language and directory mix come from the paths themselves.
     assert_eq!(s.languages.iter().find(|l| l.name == "rs").map(|l| l.value), Some(1));
-    assert_eq!(s.languages.iter().find(|l| l.name == "md").map(|l| l.value), Some(1));
+    assert_eq!(s.languages.iter().find(|l| l.name == "md").map(|l| l.value), None, "only read");
     assert!(s.dirs.iter().any(|d| d.name.ends_with("mod/src")), "{:?}", s.dirs);
 
     // Commands carry their subcommand, and are classified.
@@ -1182,6 +1204,8 @@ async fn churn_and_rework_signals() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repos_models_and_quality_are_separable() {
     let kernel = fresh_kernel().await;
+    let alpha = TestRepo::new("alpha", "main");
+    let beta = TestRepo::new("beta", "main");
     let a1 = kernel.create_entity("node_agent").await.expect("a1");
     let a2 = kernel.create_entity("node_agent").await.expect("a2");
     let s1 = kernel.create_entity("node_session").await.expect("s1");
@@ -1191,10 +1215,10 @@ async fn repos_models_and_quality_are_separable() {
     kernel.log_message(superx_kernel::NewMessage {
         session: s1.clone(), agent: a1.clone(), role: "assistant".into(), content: String::new(),
         raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
-            "cwd": "/w/alpha", "gitBranch": "main",
+            "cwd": alpha.cwd(), "gitBranch": "main",
             "message": {"model": "claude-fable-5", "usage": {"output_tokens": 300},
                 "content": [{"type": "tool_use", "id": "e1", "name": "Write",
-                    "input": {"file_path": "/w/alpha/src/a.rs", "content": "1\n2\n3"}}]}}))),
+                    "input": {"file_path": alpha.file("src/a.rs"), "content": "1\n2\n3"}}]}}))),
         seq: None, emitted_at: None,
     }).await.expect("m1");
 
@@ -1203,7 +1227,7 @@ async fn repos_models_and_quality_are_separable() {
     kernel.log_message(superx_kernel::NewMessage {
         session: s2.clone(), agent: a2.clone(), role: "assistant".into(), content: String::new(),
         raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
-            "cwd": "/w/beta",
+            "cwd": beta.cwd(),
             "message": {"model": "claude-opus-5",
                 "content": [{"type": "tool_use", "id": "b1", "name": "Bash",
                     "input": {"command": "cargo test --workspace"}}]}}))),
@@ -1212,7 +1236,7 @@ async fn repos_models_and_quality_are_separable() {
     kernel.log_message(superx_kernel::NewMessage {
         session: s2.clone(), agent: a2.clone(), role: "tool".into(), content: String::new(),
         raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
-            "cwd": "/w/beta",
+            "cwd": beta.cwd(),
             "message": {"content": [{"type": "tool_result", "tool_use_id": "b1", "is_error": true,
                 "content": "running 9 tests\ntest result: FAILED. 7 passed; 2 failed; 0 ignored\nerror[E0382]: borrow of moved value\nerror: could not compile `beta`"}]}}))),
         seq: None, emitted_at: None,
@@ -1222,14 +1246,14 @@ async fn repos_models_and_quality_are_separable() {
     kernel.log_message(superx_kernel::NewMessage {
         session: s2.clone(), agent: a2.clone(), role: "user".into(), content: "stop".into(),
         raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
-            "cwd": "/w/beta", "interruptedMessageId": "abc",
+            "cwd": beta.cwd(), "interruptedMessageId": "abc",
             "message": {"content": []}}))),
         seq: None, emitted_at: None,
     }).await.expect("m4");
     kernel.log_message(superx_kernel::NewMessage {
         session: s2.clone(), agent: a2.clone(), role: "system".into(), content: String::new(),
         raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
-            "cwd": "/w/beta", "isCompactSummary": true, "message": {"content": []}}))),
+            "cwd": beta.cwd(), "isCompactSummary": true, "message": {"content": []}}))),
         seq: None, emitted_at: None,
     }).await.expect("m5");
 
@@ -1340,12 +1364,13 @@ async fn quality_scoring_only_trusts_shell_output() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn churn_is_attributed_and_effort_is_measured() {
     let kernel = fresh_kernel().await;
+    let demo = TestRepo::new("demo", "main");
     let agent = kernel.create_entity("node_agent").await.expect("agent");
     let steered = kernel.create_entity("node_session").await.expect("s1");
     let alone = kernel.create_entity("node_session").await.expect("s2");
 
     let edit = |path: &str, old: &str, new: &str| {
-        serde_json::json!({"cwd": "/w/demo", "effort": "high",
+        serde_json::json!({"cwd": demo.cwd(), "effort": "high",
             "message": {"model": "claude-fable-5",
                 "usage": {"output_tokens": 90, "output_tokens_details": {"thinking_tokens": 40}},
                 "content": [{"type": "tool_use", "id": "e", "name": "Edit",
@@ -1358,11 +1383,11 @@ async fn churn_is_attributed_and_effort_is_measured() {
         content: "actually, do it the other way".into(), raw: None, seq: None, emitted_at: None,
     }).await.expect("human turn");
     log_tool_message(&kernel, &steered, &agent,
-        edit("/w/demo/a.rs", "one\ntwo", "three\nfour")).await;
+        edit(demo.file("a.rs"), "one\ntwo", "three\nfour")).await;
 
     // Session B: no instruction — the agent is going in circles.
     log_tool_message(&kernel, &alone, &agent,
-        edit("/w/demo/b.rs", "alpha\nbeta\ngamma", "delta")).await;
+        edit(demo.file("b.rs"), "alpha\nbeta\ngamma", "delta")).await;
 
     // A long operation, and a command that had to be stopped.
     kernel.log_message(superx_kernel::NewMessage {
@@ -1415,44 +1440,48 @@ async fn churn_is_attributed_and_effort_is_measured() {
 #[tokio::test]
 async fn productivity_and_exposure_are_measured_per_agent() {
     let kernel = fresh_kernel().await;
+    let other = TestRepo::new("other", "main");
+    let superx = TestRepo::new("superx", "main");
     let (fast, fast_s) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
     let (slow, slow_s) = seed_agent_and_session(&kernel, "gemini_cli", "bbb").await;
 
     // A productive agent: 40k tokens in, 3 lines out.
     log_tool_message(&kernel, &fast_s, &fast, serde_json::json!({
-        "cwd": "/w/superx",
+        "cwd": superx.cwd(),
         "message": {"model": "claude-fable-5",
             "usage": {"input_tokens": 1_000, "cache_creation_input_tokens": 39_000,
                       "cache_read_input_tokens": 500_000, "output_tokens": 700},
             "content": [{"type": "tool_use", "id": "w1", "name": "Write",
-                "input": {"file_path": "/w/superx/a.rs", "content": "one\ntwo\nthree"}}]}})).await;
+                "input": {"file_path": superx.file("a.rs"), "content": "one\ntwo\nthree"}}]}})).await;
 
     // An expensive one: the same 40k in, a single line out.
     log_tool_message(&kernel, &slow_s, &slow, serde_json::json!({
-        "cwd": "/w/other",
+        "cwd": other.cwd(),
         "message": {"model": "gemini-3-pro",
             "usage": {"input_tokens": 40_000, "output_tokens": 200},
             "content": [{"type": "tool_use", "id": "w2", "name": "Write",
-                "input": {"file_path": "/w/other/b.rs", "content": "solo"}}]}})).await;
+                "input": {"file_path": other.file("b.rs"), "content": "solo"}}]}})).await;
 
     // Reads: one inside the working directory, one far outside it —
     // and the outside one comes back holding a private key.
     log_tool_message(&kernel, &fast_s, &fast, serde_json::json!({
-        "cwd": "/w/superx",
+        "cwd": superx.cwd(),
         "message": {"model": "claude-fable-5", "content": [
             {"type": "tool_use", "id": "r1", "name": "Read",
-                "input": {"file_path": "/w/superx/src/lib.rs"}},
+                "input": {"file_path": superx.file("src/lib.rs")}},
             {"type": "tool_use", "id": "r2", "name": "Read",
                 "input": {"file_path": "/home/me/.ssh/id_rsa"}},
             {"type": "tool_use", "id": "r3", "name": "Read",
                 "input": {"file_path": "/private/tmp/claude-1/scratchpad/notes.md"}},
             {"type": "image", "source": {"type": "base64"}}]}})).await;
     log_tool_message(&kernel, &fast_s, &fast, serde_json::json!({
-        "cwd": "/w/superx",
+        "cwd": superx.cwd(),
         "message": {"model": "claude-fable-5", "content": [
             {"type": "tool_result", "tool_use_id": "r1", "content": "fn main() {}"},
+            // Assembled at run time: this file, read, holds no key block.
             {"type": "tool_result", "tool_use_id": "r2",
-                "content": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blb\n"}]}})).await;
+                "content": format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n",
+                    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW")}]}})).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
 
@@ -1495,6 +1524,8 @@ async fn productivity_and_exposure_are_measured_per_agent() {
 #[tokio::test]
 async fn work_is_cubed_by_agent_repo_and_hour() {
     let kernel = fresh_kernel().await;
+    let lake = TestRepo::new("lake", "main");
+    let superx = TestRepo::new("superx", "main");
     let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
     let (a2, s2) = seed_agent_and_session(&kernel, "gemini_cli", "bbb").await;
 
@@ -1505,15 +1536,15 @@ async fn work_is_cubed_by_agent_repo_and_hour() {
                 "input": {"file_path": path, "content": body}}]}});
 
     // Agent one writes in superx, then crosses into the data lake.
-    log_tool_message(&kernel, &s1, &a1, write("/w/superx", "/w/superx/new.rs", "a\nb\nc")).await;
-    log_tool_message(&kernel, &s1, &a1, write("/w/lake", "/w/lake/x.py", "one")).await;
+    log_tool_message(&kernel, &s1, &a1, write(superx.cwd(), superx.file("new.rs"), "a\nb\nc")).await;
+    log_tool_message(&kernel, &s1, &a1, write(lake.cwd(), lake.file("x.py"), "one")).await;
     // Agent two works the same repo as agent one.
-    log_tool_message(&kernel, &s2, &a2, write("/w/superx", "/w/superx/other.rs", "z")).await;
+    log_tool_message(&kernel, &s2, &a2, write(superx.cwd(), superx.file("other.rs"), "z")).await;
 
     // A file that already existed: its oldest event is an Edit.
     log_tool_message(&kernel, &s1, &a1, serde_json::json!({
-        "cwd": "/w/superx", "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
-            "input": {"file_path": "/w/superx/old.rs", "old_string": "was", "new_string": "is"}}]}})).await;
+        "cwd": superx.cwd(), "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
+            "input": {"file_path": superx.file("old.rs"), "old_string": "was", "new_string": "is"}}]}})).await;
 
     // Compaction: the agent stopped for two minutes and resumed with
     // less of its own history.
@@ -1521,7 +1552,7 @@ async fn work_is_cubed_by_agent_repo_and_hour() {
         session: s1.clone(), agent: a1.clone(), role: "system".into(),
         content: "Conversation compacted".into(),
         raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
-            "cwd": "/w/superx", "subtype": "compact_boundary",
+            "cwd": superx.cwd(), "subtype": "compact_boundary",
             "compactMetadata": {"trigger": "auto", "preTokens": 1_000_958, "durationMs": 134_803},
             "message": {"content": []}}))),
         seq: None, emitted_at: None,
@@ -1556,7 +1587,7 @@ async fn work_is_cubed_by_agent_repo_and_hour() {
     assert_eq!(s.files_modified, 1, "old.rs was edited, not created");
 
     // Compaction, per session and in total.
-    assert_eq!(s.compaction_total_ms, 134_803, "two minutes of dead time");
+    assert_eq!(s.compaction_total_ms, Some(134_803), "two minutes of dead time");
     let c = s.compaction_sessions.first().expect("a compacted session");
     assert_eq!(c.count, 1);
     assert_eq!(c.auto, 1);
@@ -1573,6 +1604,7 @@ async fn work_is_cubed_by_agent_repo_and_hour() {
 #[tokio::test]
 async fn survival_and_verification_latency_are_measured() {
     let kernel = fresh_kernel().await;
+    let superx = TestRepo::new("superx", "main");
     let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
     let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
 
@@ -1587,10 +1619,10 @@ async fn survival_and_verification_latency_are_measured() {
         m
     };
     let edit = |old: &str, new: &str| serde_json::json!({
-        "cwd": "/w/superx", "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
-            "input": {"file_path": "/w/superx/a.rs", "old_string": old, "new_string": new}}]}});
+        "cwd": superx.cwd(), "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
+            "input": {"file_path": superx.file("a.rs"), "old_string": old, "new_string": new}}]}});
     let shell = |cmd: &str| serde_json::json!({
-        "cwd": "/w/superx", "message": {"content": [{"type": "tool_use", "id": "b", "name": "Bash",
+        "cwd": superx.cwd(), "message": {"content": [{"type": "tool_use", "id": "b", "name": "Bash",
             "input": {"command": cmd}}]}});
 
     // Snippets must clear the 12-character noise floor `snippet_key`
@@ -1671,35 +1703,43 @@ async fn churn_and_quality_separate_by_branch() {
     let kernel = fresh_kernel().await;
     let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
     let (a2, s2) = seed_agent_and_session(&kernel, "gemini_cli", "bbb").await;
+    // One repository, two checkouts: the main one on feat/good and a
+    // worktree on feat/bad. Every line carries `gitBranch: feat/good` —
+    // Claude Code writes the branch of the directory the session was
+    // LAUNCHED in, whatever checkout it works in — so the worktree's rows
+    // are only told apart because the branch is read from git (#411).
+    let superx = TestRepo::new("superx", "feat/good");
+    let bad_tree = superx.worktree("bad", "feat/bad");
+    let bad_file = leak(format!("{bad_tree}/b.rs"));
 
-    let write = |branch: &str, path: &str, body: &str| serde_json::json!({
-        "cwd": "/w/superx", "gitBranch": branch,
+    let write = |cwd: &str, path: &str, body: &str| serde_json::json!({
+        "cwd": cwd, "gitBranch": "feat/good",
         "message": {"model": "claude-opus-5", "usage": {"output_tokens": 10},
             "content": [{"type": "tool_use", "id": "w", "name": "Write",
                 "input": {"file_path": path, "content": body}}]}});
-    let edit = |branch: &str, path: &str, old: &str, new: &str| serde_json::json!({
-        "cwd": "/w/superx", "gitBranch": branch,
+    let edit = |cwd: &str, path: &str, old: &str, new: &str| serde_json::json!({
+        "cwd": cwd, "gitBranch": "feat/good",
         "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
             "input": {"file_path": path, "old_string": old, "new_string": new}}]}});
 
     // Branch A: writes three lines and never rewrites them.
-    log_tool_message(&kernel, &s1, &a1, write("feat/good", "/w/superx/a.rs", "a\nb\nc")).await;
+    log_tool_message(&kernel, &s1, &a1, write(superx.cwd(), superx.file("a.rs"), "a\nb\nc")).await;
     // Branch B, same repo: writes one line then rewrites two, with no
     // human turn behind it — self-churn.
-    log_tool_message(&kernel, &s2, &a2, write("feat/bad", "/w/superx/b.rs", "x")).await;
-    log_tool_message(&kernel, &s2, &a2, edit("feat/bad", "/w/superx/b.rs", "one\ntwo", "uno")).await;
+    log_tool_message(&kernel, &s2, &a2, write(bad_tree, bad_file, "x")).await;
+    log_tool_message(&kernel, &s2, &a2, edit(bad_tree, bad_file, "one\ntwo", "uno")).await;
 
     // A failing call on the bad branch, so the failure RATE is
     // exercised: `pct` already scales by 100, and multiplying before
     // it made one failure in a hundred calls read as a hundred.
     log_tool_message(&kernel, &s2, &a2, serde_json::json!({
-        "cwd": "/w/superx", "gitBranch": "feat/bad",
+        "cwd": bad_tree, "gitBranch": "feat/good",
         "message": {"content": [{"type": "tool_use", "id": "b1", "name": "Bash",
             "input": {"command": "ls /nope"}}]}})).await;
     // The verdict rides a LATER message: the walk is newest-first, so
     // the result must be seen before the call it belongs to.
     log_tool_message(&kernel, &s2, &a2, serde_json::json!({
-        "cwd": "/w/superx", "gitBranch": "feat/bad",
+        "cwd": bad_tree, "gitBranch": "feat/good",
         "message": {"content": [
             {"type": "tool_result", "tool_use_id": "b1", "is_error": true}]}})).await;
 
@@ -1761,18 +1801,19 @@ async fn churn_and_quality_separate_by_branch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn command_outcomes_reach_branch_agent_and_effort() {
     let kernel = fresh_kernel().await;
+    let superx = TestRepo::new("superx", "feat/x");
     let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "aaa").await;
 
     // Output is scored when the CALL resolves the stashed text, so the
     // result must be the NEWER message — logged second, seen first by
     // a newest-first walk.
     log_tool_message(&kernel, &s1, &a1, serde_json::json!({
-        "cwd": "/w/superx", "gitBranch": "feat/x", "effort": "high",
+        "cwd": superx.cwd(), "gitBranch": "feat/x", "effort": "high",
         "message": {"model": "claude-opus-5", "content": [
             {"type": "tool_use", "id": "t1", "name": "Bash",
              "input": {"command": "cargo test --workspace"}}]}})).await;
     log_tool_message(&kernel, &s1, &a1, serde_json::json!({
-        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "cwd": superx.cwd(), "gitBranch": "feat/x",
         "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
             "is_error": false,
             "content": "test result: ok. 7 passed; 2 failed; 0 ignored"}]}})).await;
@@ -1783,11 +1824,11 @@ async fn command_outcomes_reach_branch_agent_and_effort() {
     // repos but not branches, so a failing branch reported a clean
     // failure rate and scored full marks on tool success.
     log_tool_message(&kernel, &s1, &a1, serde_json::json!({
-        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "cwd": superx.cwd(), "gitBranch": "feat/x",
         "message": {"content": [{"type": "tool_result", "tool_use_id": "t2",
             "is_error": true}]}})).await;
     log_tool_message(&kernel, &s1, &a1, serde_json::json!({
-        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "cwd": superx.cwd(), "gitBranch": "feat/x",
         "message": {"model": "claude-opus-5", "content": [
             {"type": "tool_use", "id": "t2", "name": "Bash",
              "input": {"command": "cargo build"}}]}})).await;
@@ -1920,10 +1961,11 @@ async fn range_walk_pages_without_losing_or_repeating_rows() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_inspection_counts_as_reading() {
     let kernel = fresh_kernel().await;
+    let superx = TestRepo::new("superx", "main");
     let (a1, s1) = seed_agent_and_session(&kernel, "claude_code", "reader").await;
     let (a2, s2) = seed_agent_and_session(&kernel, "claude_code", "verifier").await;
     let shell = |cmd: &str| {
-        serde_json::json!({"cwd": "/w/superx", "message": {"content": [
+        serde_json::json!({"cwd": superx.cwd(), "message": {"content": [
             {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": cmd}}]}})
     };
     log_tool_message(&kernel, &s1, &a1, shell("sed -i 's/a/b/' src/x.rs")).await;
@@ -1947,7 +1989,7 @@ async fn shell_inspection_counts_as_reading() {
     assert_eq!(reader.doing, "writing");
     assert_eq!(
         reader.files_now,
-        vec!["/w/superx/crates/foo.rs".to_string(), "/w/superx/src/x.rs".to_string()],
+        vec![superx.file("crates/foo.rs").to_string(), superx.file("src/x.rs").to_string()],
         "relative paths, resolved against cwd — the read first (newest), then the in-place edit"
     );
     assert_eq!(s.writes_window, 1, "sed -i is the one write");
@@ -2144,9 +2186,10 @@ async fn a_message_without_a_model_attributes_nothing_to_a_model_row() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notebook_edits_count_their_lines_and_their_file() {
     let kernel = fresh_kernel().await;
+    let superx = TestRepo::new("superx", "main");
     let agent = kernel.create_entity("node_agent").await.expect("agent");
     let session = kernel.create_entity("node_session").await.expect("session");
-    let nb = "/w/superx/nb/analysis.ipynb";
+    let nb = superx.file("nb/analysis.ipynb");
 
     for input in [
         serde_json::json!({"notebook_path": nb, "cell_id": "c1", "edit_mode": "replace",
@@ -2159,13 +2202,13 @@ async fn notebook_edits_count_their_lines_and_their_file() {
         serde_json::json!({"notebook_path": nb, "cell_id": "c3", "new_source": "z = 2"}),
     ] {
         log_tool_message(&kernel, &session, &agent, serde_json::json!({
-            "cwd": "/w/superx",
+            "cwd": superx.cwd(),
             "message": {"model": "claude-opus-5", "content": [
                 {"type": "tool_use", "id": "e", "name": "NotebookEdit", "input": input}]}
         })).await;
     }
     log_tool_message(&kernel, &session, &agent, serde_json::json!({
-        "cwd": "/w/superx",
+        "cwd": superx.cwd(),
         "message": {"model": "claude-opus-5", "content": [
             {"type": "tool_use", "id": "r", "name": "NotebookRead", "input": {"notebook_path": nb}}]}
     })).await;
@@ -2181,8 +2224,9 @@ async fn notebook_edits_count_their_lines_and_their_file() {
     // The notebook is a file the agent touched, in its language, and
     // it existed before the window — a cell edit is not a file created.
     assert_eq!(s.files_touched, 1, "one notebook, however many cells");
-    // Languages count touches, as they do for every other extension.
-    assert_eq!(s.languages.iter().find(|l| l.name == "ipynb").map(|l| l.value), Some(5));
+    // Languages count the edits, as they do for every other extension —
+    // the read is not one (#412).
+    assert_eq!(s.languages.iter().find(|l| l.name == "ipynb").map(|l| l.value), Some(4));
     assert_eq!((s.files_created, s.files_modified), (0, 1));
 
     // The live row shows the notebook under the agent's hands.
@@ -2208,6 +2252,125 @@ async fn log_tool_message_at(kernel: &Kernel, session: &superx_kernel::types::Re
         })
         .await
         .expect("message");
+}
+
+/// A throwaway git repository for the tests that need a real checkout
+/// (#411): a repository's name, its branches and its worktrees are read
+/// from git, not from the last folder of a path. Canonical from the start
+/// — macOS keeps the temp dir behind a symlink and git answers with the
+/// real path. Removed when dropped.
+struct TestRepo {
+    base: std::path::PathBuf,
+    root: std::path::PathBuf,
+}
+
+impl TestRepo {
+    /// A repository called `name`, on `branch`, with one commit.
+    fn new(name: &str, branch: &str) -> Self {
+        Self::new_dated(name, branch, chrono::Utc::now())
+    }
+
+    /// The same, with the first commit made at `when`.
+    fn new_dated(name: &str, branch: &str, when: chrono::DateTime<chrono::Utc>) -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir");
+        let base = tmp.join(format!(
+            "superx-repo-{}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let root = base.join(name);
+        std::fs::create_dir_all(&root).expect("repo dir");
+        let repo = Self { base, root };
+        repo.git(&["init", "-q", "-b", branch]);
+        // The identity this machine's agents commit as, in the repo's own
+        // config — which is where the comparison reads it (#414).
+        repo.git(&["config", "user.email", "t@t"]);
+        repo.git(&["config", "user.name", "t"]);
+        // Worktrees live inside the checkout, and are ignored there — as
+        // a real repository's `.claude/worktrees/` is.
+        std::fs::write(repo.root.join(".git/info/exclude"), ".claude/worktrees/\n").expect("exclude");
+        let root = repo.cwd();
+        repo.commit(root, when, "t@t", "init", &[("README", "x\n")]);
+        repo
+    }
+
+    /// Write `files` into the checkout at `dir` and commit them at `when`
+    /// as `email` — author and committer time both, as a real commit has.
+    fn commit(&self, dir: &str, when: chrono::DateTime<chrono::Utc>, email: &str, msg: &str,
+              files: &[(&str, &str)]) {
+        for (rel, body) in files {
+            let path = std::path::Path::new(dir).join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("dir");
+            }
+            std::fs::write(&path, body).expect("write");
+        }
+        let stamp = format!("@{} +0000", when.timestamp());
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C").arg(dir)
+                .args(["-c", &format!("user.email={email}"), "-c", "user.name=a", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .env("GIT_AUTHOR_DATE", &stamp)
+                .env("GIT_COMMITTER_DATE", &stamp)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", msg]);
+    }
+
+    fn git(&self, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// The checkout's root, as a transcript's `cwd` carries it. Paths are
+    /// leaked into `&'static str` so a fixture closure can take them as
+    /// the `&str` a transcript field is — a test process is short-lived.
+    fn cwd(&self) -> &'static str {
+        leak(self.root.to_string_lossy().into_owned())
+    }
+
+    /// A subdirectory of the checkout, created.
+    fn sub(&self, rel: &str) -> &'static str {
+        let p = self.root.join(rel);
+        std::fs::create_dir_all(&p).expect("subdir");
+        leak(p.to_string_lossy().into_owned())
+    }
+
+    /// A file path inside the checkout.
+    fn file(&self, rel: &str) -> &'static str {
+        leak(self.root.join(rel).to_string_lossy().into_owned())
+    }
+
+    /// A linked worktree on a new branch, where this repository's agents
+    /// keep them: `.claude/worktrees/<name>`.
+    fn worktree(&self, name: &str, branch: &str) -> &'static str {
+        let path = self.root.join(".claude/worktrees").join(name);
+        self.git(&["worktree", "add", "-q", "-b", branch, &path.to_string_lossy()]);
+        leak(path.to_string_lossy().into_owned())
+    }
+}
+
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+impl Drop for TestRepo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
 }
 
 /// Range membership follows the agent's clock. A restart that backfills
@@ -2274,7 +2437,7 @@ async fn every_range_but_the_window_admits_its_row_cap() {
             "message": {"model": "claude-opus-5", "content": []}})).await;
     }
     let s = |range: &'static str, cap: u32| {
-        superx_mod_ui::stats::stats_for_range_capped(&kernel, 2, range, cap)
+        superx_mod_ui::stats::stats_for_range_capped(&kernel, 2, range, cap, chrono::Offset::fix(&chrono::Utc))
     };
     assert!(s("all", 2).await.expect("all").truncated, "three rows, cap two: a sample");
     assert!(s("24h", 2).await.expect("24h").truncated);
@@ -2345,10 +2508,11 @@ async fn shell_edits_count_as_writing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shipping_is_read_from_the_shell() {
     let kernel = fresh_kernel().await;
+    let superx = TestRepo::new("superx", "main");
     let agent = kernel.create_entity("node_agent").await.expect("agent");
     let session = kernel.create_entity("node_session").await.expect("session");
     let call = |id: &str, cmd: &str| serde_json::json!({
-        "cwd": "/w/superx",
+        "cwd": superx.cwd(),
         "message": {"model": "claude-opus-5", "content": [
             {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}
     });
@@ -2375,10 +2539,28 @@ async fn shipping_is_read_from_the_shell() {
     // Not shipping: looking at a PR, a local merge.
     log_tool_message(&kernel, &session, &agent, call("v1", "gh pr view 379 --json state")).await;
     log_tool_message(&kernel, &session, &agent, call("v2", "git merge --no-edit origin/main")).await;
+    // Not shipped either, whatever the command says (#412): a merge the
+    // branch policy refused, a create that failed, nothing to commit, and
+    // a push the auto-mode classifier stopped before it ran.
+    log_tool_message(&kernel, &session, &agent, call("m2", "gh pr merge 380 --squash")).await;
+    log_tool_message(&kernel, &session, &agent, result("m2",
+        "X Pull request o/r#380 is not mergeable: the base branch policy prohibits the merge.\n")).await;
+    log_tool_message(&kernel, &session, &agent, call("g3", "gh pr create --base main --title t")).await;
+    log_tool_message(&kernel, &session, &agent, result("g3",
+        "pull request create failed: GraphQL: No commits between main and feat/x (createPullRequest)\n")).await;
+    log_tool_message(&kernel, &session, &agent, call("c4", "git commit -m 'four'")).await;
+    log_tool_message(&kernel, &session, &agent, result("c4", "On branch feat/x\nnothing to commit, working tree clean\n")).await;
+    log_tool_message(&kernel, &session, &agent, call("p2", "git push origin main")).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "toolDenialKind": "automode-blocked",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "p2", "is_error": true,
+            "content": "Permission for this action was denied by the Claude Code auto mode classifier."}]}
+    })).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
     assert_eq!((s.commits, s.pushes, s.prs_opened, s.prs_merged), (3, 1, 1, 1));
     assert_eq!((s.committed_added, s.committed_removed), (150, 28), "138 + 12 in, 28 out; the quiet commit carried none");
+    assert_eq!(s.commits_with_stat, 2, "two of the three commits printed what they committed");
 
     // The live row names the newest thing shipped, not the newest command.
     assert_eq!(s.live.len(), 1);
@@ -2459,12 +2641,13 @@ async fn landed_lines_are_read_from_the_repositories() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steering_reads_in_edits_when_replaced_lines_are_unknown() {
     let kernel = fresh_kernel().await;
+    let superx = TestRepo::new("superx", "feat/x");
     // Steering is per session: one the operator redirected, one left
     // to itself — the same shape as the line-counted test above.
     let (agent, steered) = seed_agent_and_session(&kernel, "claude_code", "steered").await;
     let (agent2, alone) = seed_agent_and_session(&kernel, "claude_code", "alone").await;
     let shell = |cmd: &str| serde_json::json!({
-        "cwd": "/w/superx", "gitBranch": "feat/x",
+        "cwd": superx.cwd(), "gitBranch": "feat/x",
         "message": {"model": "claude-opus-5", "content": [
             {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": cmd}}]}
     });
@@ -2528,11 +2711,12 @@ async fn a_version_suffix_is_not_a_language() {
     let kernel = fresh_kernel().await;
     let agent = kernel.create_entity("node_agent").await.expect("agent");
     let session = kernel.create_entity("node_session").await.expect("session");
+    // Written, not read: a read is not file work (#412).
     for path in ["/w/superx/src/a.rs", "/w/bin/superx.prev-5001959", "/w/bin/superx", "/w/notes/plan.2026-09-11"] {
         log_tool_message(&kernel, &session, &agent, serde_json::json!({
             "cwd": "/w/superx",
             "message": {"model": "claude-opus-5", "content": [
-                {"type": "tool_use", "id": "r", "name": "Read", "input": {"file_path": path}}]}
+                {"type": "tool_use", "id": "w", "name": "Write", "input": {"file_path": path, "content": "x"}}]}
         })).await;
     }
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
@@ -2626,42 +2810,83 @@ async fn burn_moves_over_time_and_the_model_effort_pair_is_one_key() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pull_request_is_gated_only_when_the_checks_ran_after_the_last_change() {
     let kernel = fresh_kernel().await;
+    let superx = TestRepo::new("superx", "main");
     let agent = kernel.create_entity("node_agent").await.expect("agent");
     let good = kernel.create_entity("node_session").await.expect("s1");
     let bad = kernel.create_entity("node_session").await.expect("s2");
     let clean = kernel.create_entity("node_session").await.expect("s3");
+    let red = kernel.create_entity("node_session").await.expect("s4");
     let now = chrono::Utc::now();
     let at = |mins: i64| now - chrono::Duration::minutes(mins);
-    let write = |path: &str| serde_json::json!({"cwd": "/w/superx",
+    let write = |id: &str, path: &str| serde_json::json!({"cwd": superx.cwd(),
         "message": {"model": "claude-opus-5", "effort": "max", "content": [
-            {"type": "tool_use", "id": "e", "name": "Write",
+            {"type": "tool_use", "id": id, "name": "Write",
              "input": {"file_path": path, "content": "fn a() {}"}}]}});
-    let shell = |cmd: &str| serde_json::json!({"cwd": "/w/superx",
+    let shell = |id: &str, cmd: &str| serde_json::json!({"cwd": superx.cwd(),
         "message": {"model": "claude-opus-5", "effort": "max", "content": [
-            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": cmd}}]}});
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let out = |id: &str, text: &str| serde_json::json!({"cwd": superx.cwd(),
+        "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}});
+    let tested = "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured";
+    let red_test = "test result: FAILED. 11 passed; 1 failed; 0 ignored";
+    let linted = "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.2s";
+    let audited = "✅ SKILL AUDIT CLEAN";
+    let pr = "https://github.com/o/superx/pull/12";
+    // One session's run of calls, each followed by what it printed.
+    let run = |calls: Vec<(&'static str, &'static str, Option<&'static str>, i64)>| calls;
 
-    // Gated: write, then all three checks, then the pull request.
-    log_tool_message_at(&kernel, &good, &agent, write("/w/superx/a.rs"), at(50)).await;
-    log_tool_message_at(&kernel, &good, &agent, shell("cargo test --workspace"), at(40)).await;
-    log_tool_message_at(&kernel, &good, &agent, shell("cargo clippy --workspace -- -D warnings"), at(39)).await;
-    log_tool_message_at(&kernel, &good, &agent, shell("python3 tools/skill_audit.py"), at(38)).await;
-    log_tool_message_at(&kernel, &good, &agent, shell("gh pr create --base main"), at(30)).await;
+    // Gated: write, then all three checks passing, then the pull request.
+    for (id, cmd, printed, mins) in run(vec![
+        ("g1", "cargo test --workspace", Some(tested), 40),
+        ("g2", "cargo clippy --workspace -- -D warnings", Some(linted), 39),
+        ("g3", "python3 tools/skill_audit.py", Some(audited), 38),
+        ("g4", "gh pr create --base main", Some(pr), 30),
+    ]) {
+        log_tool_message_at(&kernel, &good, &agent, shell(id, cmd), at(mins)).await;
+        if let Some(text) = printed {
+            log_tool_message_at(&kernel, &good, &agent, out(id, text), at(mins) + chrono::Duration::seconds(5)).await;
+        }
+    }
+    log_tool_message_at(&kernel, &good, &agent, write("g0", superx.file("a.rs")), at(50)).await;
 
     // Ungated: the checks ran, then it wrote again, then opened.
-    log_tool_message_at(&kernel, &bad, &agent, write("/w/superx/b.rs"), at(50)).await;
-    log_tool_message_at(&kernel, &bad, &agent, shell("cargo test --workspace"), at(45)).await;
-    log_tool_message_at(&kernel, &bad, &agent, shell("cargo clippy --workspace -- -D warnings"), at(44)).await;
-    log_tool_message_at(&kernel, &bad, &agent, shell("python3 tools/skill_audit.py"), at(43)).await;
-    log_tool_message_at(&kernel, &bad, &agent, write("/w/superx/b.rs"), at(20)).await;
-    log_tool_message_at(&kernel, &bad, &agent, shell("gh pr create --base main"), at(10)).await;
+    log_tool_message_at(&kernel, &bad, &agent, write("b0", superx.file("b.rs")), at(50)).await;
+    for (id, cmd, printed, mins) in run(vec![
+        ("b1", "cargo test --workspace", Some(tested), 45),
+        ("b2", "cargo clippy --workspace -- -D warnings", Some(linted), 44),
+        ("b3", "python3 tools/skill_audit.py", Some(audited), 43),
+    ]) {
+        log_tool_message_at(&kernel, &bad, &agent, shell(id, cmd), at(mins)).await;
+        if let Some(text) = printed {
+            log_tool_message_at(&kernel, &bad, &agent, out(id, text), at(mins) + chrono::Duration::seconds(5)).await;
+        }
+    }
+    log_tool_message_at(&kernel, &bad, &agent, write("b4", superx.file("b.rs")), at(20)).await;
+    log_tool_message_at(&kernel, &bad, &agent, shell("b5", "gh pr create --base main"), at(10)).await;
+    log_tool_message_at(&kernel, &bad, &agent, out("b5", pr), at(10) + chrono::Duration::seconds(5)).await;
+
+    // Ungated too: every check ran, but the tests FAILED (#412).
+    log_tool_message_at(&kernel, &red, &agent, write("r0", superx.file("c.rs")), at(50)).await;
+    for (id, cmd, printed, mins) in run(vec![
+        ("r1", "cargo test --workspace 2>&1 | tail -3", Some(red_test), 45),
+        ("r2", "cargo clippy --workspace -- -D warnings", Some(linted), 44),
+        ("r3", "python3 tools/skill_audit.py", Some(audited), 43),
+        ("r4", "gh pr create --base main", Some(pr), 40),
+    ]) {
+        log_tool_message_at(&kernel, &red, &agent, shell(id, cmd), at(mins)).await;
+        if let Some(text) = printed {
+            log_tool_message_at(&kernel, &red, &agent, out(id, text), at(mins) + chrono::Duration::seconds(5)).await;
+        }
+    }
 
     // Neither: it opened a pull request without changing anything.
-    log_tool_message_at(&kernel, &clean, &agent, shell("gh pr create --base main"), at(5)).await;
+    log_tool_message_at(&kernel, &clean, &agent, shell("c1", "gh pr create --base main"), at(5)).await;
+    log_tool_message_at(&kernel, &clean, &agent, out("c1", pr), at(5) + chrono::Duration::seconds(5)).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
-    assert_eq!(s.prs_opened, 3);
-    assert_eq!(s.prs_gated, 1, "only the one whose checks followed its last write");
-    assert_eq!(s.prs_ungated, 1, "the one that wrote again afterwards");
+    assert_eq!(s.prs_opened, 4);
+    assert_eq!(s.prs_gated, 1, "only the one whose checks passed after its last write");
+    assert_eq!(s.prs_ungated, 2, "the one that wrote again, and the one whose tests failed");
 }
 
 /// The line a module lane must never cross (#392): the kernel's own
@@ -2695,6 +2920,8 @@ async fn writing_into_the_kernel_or_a_schema_file_is_recorded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn intensity_counts_the_fronts_open_in_each_bucket() {
     let kernel = fresh_kernel().await;
+    let alpha = TestRepo::new("alpha", "main");
+    let beta = TestRepo::new("beta", "main");
     let agent = kernel.create_entity("node_agent").await.expect("agent");
     let one = kernel.create_entity("node_session").await.expect("s1");
     let two = kernel.create_entity("node_session").await.expect("s2");
@@ -2706,10 +2933,10 @@ async fn intensity_counts_the_fronts_open_in_each_bucket() {
              "input": {"file_path": format!("{cwd}/a.rs"), "content": "a\nb"}}]}});
 
     // One hour: two sessions across two repositories.
-    log_tool_message_at(&kernel, &one, &agent, msg("/w/alpha"), hour_ago).await;
-    log_tool_message_at(&kernel, &two, &agent, msg("/w/beta"), hour_ago).await;
+    log_tool_message_at(&kernel, &one, &agent, msg(alpha.cwd()), hour_ago).await;
+    log_tool_message_at(&kernel, &two, &agent, msg(beta.cwd()), hour_ago).await;
     // The next: one session, one repository.
-    log_tool_message_at(&kernel, &one, &agent, msg("/w/alpha"), now).await;
+    log_tool_message_at(&kernel, &one, &agent, msg(alpha.cwd()), now).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
     assert_eq!(s.intensity.len(), 2, "{:?}", s.intensity.iter().map(|i| &i.t).collect::<Vec<_>>());
@@ -2802,13 +3029,13 @@ async fn every_age_travels_as_the_moment_it_is_measured_from() {
     assert!((row.idle_secs - drift).abs() < 120, "idle {} against {drift}", row.idle_secs);
 }
 
-/// Is one model better than another (#403)? The page can only answer
-/// that from counts, sliced two ways: over time, because within one
-/// model the day-to-day swing turned out larger than any gap between
-/// two of them, and per repository, because models do different work
-/// and a pooled comparison compares tasks as much as models.
+/// Is one model better than another (#403)? Outcomes land on the model
+/// and reasoning level that MADE the call — a result line names no model
+/// — and the tokens ride beside them, so cost and quality compare on the
+/// same rows. (The time and repository slices #403 added had no reader
+/// on the page and were removed in #413.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn model_quality_is_sliced_by_time_and_by_repository() {
+async fn outcomes_land_on_the_model_that_made_the_call() {
     let kernel = fresh_kernel().await;
     let agent = kernel.create_entity("node_agent").await.expect("agent");
     let session = kernel.create_entity("node_session").await.expect("session");
@@ -2822,38 +3049,1005 @@ async fn model_quality_is_sliced_by_time_and_by_repository() {
             {"type": "tool_result", "tool_use_id": id, "is_error": failed,
              "content": "test result: ok. 4 passed; 1 failed; 0 ignored"}]}});
 
-    // Two models, the same repository, in the same hour: one call each,
-    // one of them failing.
     log_tool_message_at(&kernel, &session, &agent, call("claude-opus-5", "/w/shared", "a"), now).await;
     log_tool_message_at(&kernel, &session, &agent, result("a", true), now).await;
     log_tool_message_at(&kernel, &session, &agent, call("claude-fable-5", "/w/shared", "b"), now).await;
     log_tool_message_at(&kernel, &session, &agent, result("b", false), now).await;
-    // And one model alone in another repository, an hour earlier.
     let before = now - chrono::Duration::hours(2);
     log_tool_message_at(&kernel, &session, &agent, call("claude-opus-5", "/w/alone", "c"), before).await;
     log_tool_message_at(&kernel, &session, &agent, result("c", false), before).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    let pair = |m: &str| s.model_effort.iter().find(|p| p.model == m && p.effort == "max").expect(m);
+    let opus = pair("claude-opus-5");
+    assert_eq!((opus.tool_calls, opus.tool_failures), (2, 1));
+    let fable = pair("claude-fable-5");
+    assert_eq!((fable.tool_calls, fable.tool_failures), (1, 0));
+    assert!(opus.tests_passed > 0 && fable.tests_passed > 0, "tests reach the pair that ran them");
+    assert_eq!(s.model_effort.iter().map(|p| p.out_tokens).sum::<i64>(), s.out_tokens_window);
+}
 
-    // Over time: opus appears in both buckets, fable in one.
-    let opus: Vec<_> = s.model_quality.iter().filter(|p| p.model == "claude-opus-5").collect();
-    assert_eq!(opus.len(), 2, "two buckets: {:?}", opus.iter().map(|p| &p.t).collect::<Vec<_>>());
-    assert_eq!(opus.iter().map(|p| p.tool_calls).sum::<i64>(), 2);
-    assert_eq!(opus.iter().map(|p| p.tool_failures).sum::<i64>(), 1);
-    let fable: Vec<_> = s.model_quality.iter().filter(|p| p.model == "claude-fable-5").collect();
-    assert_eq!(fable.len(), 1);
-    assert_eq!((fable[0].tool_calls, fable[0].tool_failures), (1, 0));
+/// A reply is counted once, however many lines carry it (#409). Claude
+/// Code writes one line per content block — thinking, text, each tool
+/// call — and repeats the reply's whole `usage` on every one, under the
+/// same `message.id`. Gemini re-emits a record as it streams, fuller
+/// each time, under the same `id`. Every token figure summed rows, so a
+/// three-block reply cost three times what it did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reply_split_across_lines_is_counted_once() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "split").await;
+    let usage = serde_json::json!({
+        "input_tokens": 10, "cache_creation_input_tokens": 50,
+        "cache_read_input_tokens": 1_000, "output_tokens": 100,
+        "output_tokens_details": {"thinking_tokens": 40}
+    });
+    // One reply, three lines, in the order Claude Code writes them.
+    for block in [
+        serde_json::json!({"type": "thinking", "thinking": "…"}),
+        serde_json::json!({"type": "text", "text": "Reading the file."}),
+        serde_json::json!({"type": "tool_use", "id": "t1", "name": "Read",
+                           "input": {"file_path": "/w/a.rs"}}),
+    ] {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "effort": "max",
+            "message": {"id": "msg_A", "model": "claude-opus-5", "usage": usage,
+                        "content": [block]}
+        })).await;
+    }
+    // A second, one-line reply.
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "effort": "max",
+        "message": {"id": "msg_B", "model": "claude-opus-5",
+                    "usage": {"output_tokens": 20, "input_tokens": 5},
+                    "content": [{"type": "text", "text": "Done."}]}
+    })).await;
+    // A Gemini record emitted twice as it streamed: the newer is fuller.
+    let (gagent, gsession) = seed_agent_and_session(&kernel, "gemini_cli", "g").await;
+    for (out, thoughts) in [(5, 0), (7, 3)] {
+        log_tool_message(&kernel, &gsession, &gagent, serde_json::json!({
+            "id": "g-1", "type": "gemini", "model": "gemini-3.1-pro",
+            "tokens": {"input": 400, "output": out, "cached": 100, "thoughts": thoughts,
+                       "tool": 0, "total": 400 + out + thoughts}
+        })).await;
+    }
 
-    // Per repository: the shared one carries both models, so a like-for
-    // -like comparison is possible there and nowhere else.
-    let shared: Vec<_> = s.model_repos.iter().filter(|r| r.repo == "shared").collect();
-    assert_eq!(shared.len(), 2, "{:?}", shared.iter().map(|r| &r.model).collect::<Vec<_>>());
-    let alone: Vec<_> = s.model_repos.iter().filter(|r| r.repo == "alone").collect();
-    assert_eq!(alone.len(), 1);
-    assert_eq!(alone[0].model, "claude-opus-5");
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.out_tokens_window, 100 + 20 + 10, "each reply once; Gemini output + thoughts");
+    assert_eq!(s.output_tokens_total, 130, "the engine-side total agrees");
+    assert_eq!(s.tokens_last_hour, 130);
+    assert_eq!(s.thinking_tokens, 40 + 3);
+    assert_eq!(s.exposure.input_tokens, 10 + 5 + 300, "Gemini input less what it read from cache");
+    assert_eq!(s.exposure.cache_read_tokens, 1_000 + 100);
+    assert_eq!(s.exposure.cache_write_tokens, 50);
+    let opus = s.models.iter().find(|m| m.name == "claude-opus-5").expect("opus row");
+    assert_eq!((opus.messages, opus.out_tokens), (2, 120), "two replies, not four lines");
+    let gem = s.models.iter().find(|m| m.name == "gemini-3.1-pro").expect("gemini names its model");
+    assert_eq!((gem.messages, gem.out_tokens), (1, 10));
+    let pair = s.model_effort.iter().find(|p| p.model == "claude-opus-5").expect("pair");
+    assert_eq!((pair.messages, pair.out_tokens, pair.thinking_tokens), (2, 120, 40));
+    assert_eq!(s.tools_window, 1, "the Read, once");
+    let burn: i64 = s.burn.iter().map(|b| b.out).sum();
+    assert_eq!(burn, 130, "the burn series counts replies too");
 
-    // Tests reach the slices too, so a pass rate can be compared.
-    assert!(s.model_quality.iter().map(|p| p.tests_passed).sum::<i64>() > 0);
-    // And the tokens, so cost rides beside quality.
-    assert_eq!(s.model_quality.iter().map(|p| p.out_tokens).sum::<i64>(), s.out_tokens_window);
+    let (_, out) = superx_mod_ui::activity::session_token_stats(&kernel, session.clone())
+        .await
+        .expect("session tokens");
+    assert_eq!(out, Some(120), "the Sessions page counts replies");
+    let (ctx, gout) = superx_mod_ui::activity::session_token_stats(&kernel, gsession)
+        .await
+        .expect("gemini session tokens");
+    assert_eq!(gout, Some(10));
+    assert_eq!(ctx, Some(400), "Gemini's prompt is its input, not its total");
+
+    let i = superx_mod_ui::insights::insights_summary(&kernel).await.expect("insights");
+    assert_eq!(i.tokens.output, 130);
+    assert_eq!(i.tokens.input, 315);
+    assert_eq!(i.tokens.cache_read, 1_100);
+    assert_eq!(i.tokens.cache_write, 50);
+    let replies = |name: &str| i.models.iter().find(|m| m.name == name).map(|m| m.value);
+    assert_eq!(replies("claude-opus-5"), Some(2));
+    assert_eq!(replies("gemini-3.1-pro"), Some(1));
+    let claude = i.per_agent.iter().find(|a| a.name == "claude_code").expect("agent row");
+    assert_eq!((claude.messages, claude.output_tokens), (2, 120), "replies, as every other count; output per reply");
+}
+
+/// A session's context is the prompt its newest REAL reply answered (#415
+/// review): the `<synthetic>` stand-in the runtime writes for an API error
+/// carries all-zero usage, and taking it blanked the Sessions bar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_synthetic_reply_does_not_blank_the_context() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "ctx").await;
+    let now = chrono::Utc::now();
+    log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+        "message": {"id": "real", "model": "claude-opus-5", "content": [],
+            "usage": {"input_tokens": 3, "cache_read_input_tokens": 90_000,
+                      "cache_creation_input_tokens": 7, "output_tokens": 50}}}),
+        now - chrono::Duration::minutes(2)).await;
+    log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+        "message": {"id": "err", "model": "<synthetic>", "content": [],
+            "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 0, "output_tokens": 0}}}),
+        now - chrono::Duration::minutes(1)).await;
+
+    let (ctx, out) = superx_mod_ui::activity::session_token_stats(&kernel, session)
+        .await
+        .expect("session tokens");
+    assert_eq!(ctx, Some(90_010), "the real reply's prompt");
+    assert_eq!(out, Some(50));
+}
+
+/// Every "Msgs" on the page counts the same thing (#415 review): a reply
+/// once, however many lines Claude Code wrote for it, and every other row
+/// as itself. The model table counted replies while the repo, branch,
+/// live, agent, top-session and timeline rows counted lines, 3.45 to a
+/// reply, under the same label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_msgs_counts_a_reply_once() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "msgs").await;
+    // A prompt, as Claude Code writes one.
+    kernel.log_message(superx_kernel::NewMessage {
+        session: session.clone(), agent: agent.clone(), role: "user".into(), content: "go".into(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "type": "user", "origin": {"kind": "human"}, "cwd": repo.cwd(),
+            "message": {"role": "user", "content": "go"}}))),
+        seq: None, emitted_at: Some(chrono::Utc::now()),
+    }).await.expect("prompt");
+    for block in [
+        serde_json::json!({"type": "thinking", "thinking": "…"}),
+        serde_json::json!({"type": "text", "text": "Reading."}),
+        serde_json::json!({"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": repo.file("a.rs")}}),
+    ] {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "cwd": repo.cwd(),
+            "message": {"id": "msg_A", "model": "claude-opus-5", "usage": {"output_tokens": 9}, "content": [block]}
+        })).await;
+    }
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": repo.cwd(),
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "fn a() {}"}]}
+    })).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    // The prompt, the reply and the tool's result.
+    assert_eq!(s.messages_last_hour, 3);
+    assert_eq!(s.live[0].messages, 3);
+    assert_eq!(s.top_sessions[0].messages, 3);
+    assert_eq!(s.timeline[0].messages, 3);
+    let claude = s.agent_stats.iter().find(|a| a.name == "claude_code").expect("agent");
+    assert_eq!(claude.messages, 3);
+    assert_eq!(s.repos[0].messages, 3);
+    assert_eq!(s.branches[0].messages, 3);
+    let i = superx_mod_ui::insights::insights_summary(&kernel).await.expect("insights");
+    assert_eq!(i.per_agent.iter().find(|a| a.name == "claude_code").map(|a| a.messages), Some(3));
+}
+
+/// Lines come from the diff Claude Code recorded, not from the call's
+/// strings (#410). An Edit must carry enough unchanged text around the
+/// change to be unique, so its strings counted that context as removed
+/// AND added; a Write over a file counted all of it as new; a failed
+/// edit counted lines that never changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lines_are_read_from_the_recorded_diff() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let call = |id: &str, name: &str, input: serde_json::Value| serde_json::json!({
+        "cwd": repo.cwd(),
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": name, "input": input}]}});
+    let result = |id: &str, is_error: bool, tur: serde_json::Value| serde_json::json!({
+        "cwd": repo.cwd(), "toolUseResult": tur,
+        "message": {"content": [{"type": "tool_result", "tool_use_id": id, "is_error": is_error,
+            "content": "ok"}]}});
+
+    // One line inserted between three unchanged ones.
+    log_tool_message(&kernel, &session, &agent, call("e1", "Edit", serde_json::json!({
+        "file_path": repo.file("a.rs"), "old_string": "fn a() {\n    one();\n}",
+        "new_string": "fn a() {\n    one();\n    two();\n}"}))).await;
+    log_tool_message(&kernel, &session, &agent, result("e1", false, serde_json::json!({
+        "filePath": repo.file("a.rs"),
+        "structuredPatch": [{"oldStart": 1, "oldLines": 3, "newStart": 1, "newLines": 4,
+            "lines": [" fn a() {", "     one();", "+    two();", " }"]}]}))).await;
+    // A Write over an existing file: the diff is +2 −1, not +5.
+    log_tool_message(&kernel, &session, &agent, call("w1", "Write", serde_json::json!({
+        "file_path": repo.file("b.rs"), "content": "1\n2\n3\n4\n5"}))).await;
+    log_tool_message(&kernel, &session, &agent, result("w1", false, serde_json::json!({
+        "type": "update", "filePath": repo.file("b.rs"),
+        "structuredPatch": [{"oldStart": 1, "oldLines": 4, "newStart": 1, "newLines": 5,
+            "lines": [" 1", "-x", "+2", "+3", " 4", " 5"]}]}))).await;
+    // A new file: every line is added, and the file was created.
+    log_tool_message(&kernel, &session, &agent, call("w2", "Write", serde_json::json!({
+        "file_path": repo.file("c.rs"), "content": "a\nb"}))).await;
+    log_tool_message(&kernel, &session, &agent, result("w2", false, serde_json::json!({
+        "type": "create", "filePath": repo.file("c.rs"), "content": "a\nb", "structuredPatch": []}))).await;
+    // An edit that failed changed nothing.
+    log_tool_message(&kernel, &session, &agent, call("e2", "Edit", serde_json::json!({
+        "file_path": repo.file("d.rs"), "old_string": "missing", "new_string": "x\ny\nz"}))).await;
+    log_tool_message(&kernel, &session, &agent, result("e2", true,
+        serde_json::json!("Error: String to replace not found in file."))).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.lines_added, 1 + 2 + 2, "the inserted line, the Write's diff, the new file");
+    assert_eq!(s.lines_removed, 1, "only the line the Write replaced");
+    assert_eq!(s.writes_window, 3, "the failed edit wrote nothing");
+    assert_eq!((s.files_created, s.files_modified), (1, 2), "created, per the result; b.rs was there");
+    assert_eq!(s.edits_self + s.edits_directed, 1, "an insertion is not a rewrite; the Write over b.rs is");
+}
+
+/// The repository is the one git says a directory belongs to, and the
+/// branch is the one that checkout was on (#411). A subdirectory is its
+/// repository, a worktree is its repository's, stepping between them is
+/// not a switch, and a directory outside any repository is none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repos_and_branches_are_read_from_git() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let tree = repo.worktree("cockpit", "fix/409-read-true");
+    let src = repo.sub("crates/mod/src");
+    let tree_src = leak(format!("{tree}/crates"));
+    std::fs::create_dir_all(tree_src).expect("worktree subdir");
+    let elsewhere = std::fs::canonicalize(std::env::temp_dir()).expect("tmp");
+    let elsewhere = leak(elsewhere.to_string_lossy().into_owned());
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "wt").await;
+    let at = |cwd: &str| serde_json::json!({
+        // The launch directory's branch, as Claude Code stamps every line.
+        "cwd": cwd, "gitBranch": "main",
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "ls"}}]}});
+    for cwd in [repo.cwd(), src, tree, tree_src, elsewhere] {
+        log_tool_message(&kernel, &session, &agent, at(cwd)).await;
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    let names: Vec<&str> = s.repos.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, vec!["superx"], "one repository, not `src`, `cockpit` or the temp dir");
+    assert_eq!(s.repos[0].messages, 4, "the temp dir is in no repository");
+    assert_eq!(s.repo_switches, 0, "moving between a repo's checkouts and folders is not a switch");
+    let mut branches: Vec<&str> = s.branches.iter().map(|b| b.branch.as_str()).collect();
+    branches.sort_unstable();
+    assert_eq!(branches, vec!["fix/409-read-true", "main"],
+        "the worktree's rows carry ITS branch, not the launch directory's");
+    let names: Vec<&str> = s.projects.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names.len(), 1, "projects are repositories: {names:?}");
+}
+
+/// A read is not a write, `grep -i` is not an in-place edit, a heredoc
+/// into the scratchpad is neither, a shell edit inside a worktree is a
+/// write, and a refused call did nothing at all (#412).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_walk_reads_what_a_call_actually_did() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let tree = repo.worktree("w", "feat/x");
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let shell = |id: &str, cwd: &str, cmd: &str| serde_json::json!({
+        "cwd": cwd, "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let read = |id: &str, path: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Read", "input": {"file_path": path}}]}});
+
+    // Read three times: not a thrash file, not an existing file touched.
+    for id in ["r1", "r2", "r3"] {
+        log_tool_message(&kernel, &session, &agent, read(id, repo.file("lib.rs"))).await;
+    }
+    // Case-insensitive search: a read.
+    log_tool_message(&kernel, &session, &agent, shell("g", repo.cwd(), "grep -i fixme src/lib.rs")).await;
+    // A heredoc into the scratchpad: neither a read nor a write.
+    log_tool_message(&kernel, &session, &agent,
+        shell("s", repo.cwd(), "cat > /private/tmp/claude-1/scratchpad/notes.md <<'EOF'\nnotes\nEOF")).await;
+    // A heredoc into a file in a worktree: a write.
+    log_tool_message(&kernel, &session, &agent,
+        shell("h", tree, "cat > crates/new.rs <<'EOF'\nfn x() {}\nfn y() {}\nEOF")).await;
+    // An in-place sed: a write.
+    log_tool_message(&kernel, &session, &agent, shell("i", repo.cwd(), "sed -i '' 's/a/b/' src/lib.rs")).await;
+    // A refused write ran nothing.
+    log_tool_message(&kernel, &session, &agent, shell("x", repo.cwd(), "cat > src/gone.rs <<'EOF'\nx\nEOF")).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": repo.cwd(), "toolDenialKind": "user-rejected",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "x", "is_error": true,
+            "content": "The user doesn't want to proceed with this tool use."}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.writes_window, 2, "the worktree heredoc and the sed; not grep -i, not the scratchpad, not the refused one");
+    assert_eq!(s.reads_window, 4, "three Reads and the grep");
+    assert_eq!(s.lines_added, 2, "the worktree heredoc's two lines");
+    assert_eq!(s.thrash_files, 0, "reading a file three times is not thrash");
+    assert_eq!(s.files_modified, 1, "src/lib.rs was edited in place; lib.rs was only read");
+    assert_eq!(s.files_created, 1, "the heredoc wrote a file end to end");
+    assert!(s.files.iter().all(|f| !f.name.contains("scratchpad")), "{:?}", s.files);
+}
+
+/// A shell call reads and writes where it STANDS (#412): a `cd` moves the
+/// rest of its chain, one inside `( … )` only the rest of its subshell;
+/// `..` resolves as the filesystem would; and a git range is no file.
+/// Every path used to resolve against the transcript's `cwd`, so a heredoc
+/// written after `cd` into the scratchpad was a repository file, and a
+/// `cat` after `cd /etc` read inside the repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_call_reads_and_writes_where_it_stands() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    repo.sub("ui");
+    repo.sub("src");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "cd").await;
+    let shell = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    for (id, cmd) in [
+        // Into the scratchpad, by `cd`: no file of the repository.
+        ("w1", "cd /private/tmp/claude-1/scratchpad && cat > notes.md <<'EOF'\nnotes\nEOF"),
+        // Into a subdirectory, by `cd`: the file is there.
+        ("w2", "cd ui && cat > app.ts <<'EOF'\nexport const a = 1;\nEOF"),
+        // A subshell's `cd` ends with the subshell.
+        ("w3", "(cd ui && npm run build) && cat > top.rs <<'EOF'\nfn top() {}\nEOF"),
+        // Reads: `..` resolves to the README a Read names below…
+        ("r1", "cat src/../README"),
+        // …a range is not a path, the words after `--` are…
+        ("r2", "git diff origin/main...HEAD"),
+        ("r3", "git log --oneline -- src/lib.rs"),
+        // …`cd` moves a read out of the repository…
+        ("r4", "cd /etc && cat ssh/sshd_config"),
+        // …and a pattern, a program or a flag's value is no file: `/^fn`
+        // and `/` would each have been a read outside the repository.
+        ("r6", "sed -n '/^fn x/,/^}/p' src/lib.rs"),
+        ("r7", "grep -n -v '/generated/' ui/app.ts"),
+        ("r8", "awk -F / '/src/' src/main.rs | grep -v '/dist/'"),
+        // A quoted path is one path, spaces and all; a brace expansion
+        // names files the line does not spell.
+        ("r9", "cat \"/opt/My Files/notes.txt\""),
+        ("r10", "head -5 src/{a,b}.rs"),
+    ] {
+        log_tool_message(&kernel, &session, &agent, shell(id, cmd)).await;
+    }
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "r5", "name": "Read", "input": {"file_path": repo.file("README")}}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.writes_window, 2, "ui/app.ts and top.rs; the scratchpad note is not work");
+    let names: Vec<&str> = s.files.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.iter().any(|n| n.ends_with("/ui/app.ts")), "{names:?}");
+    assert!(names.iter().any(|n| n.ends_with("/superx/top.rs")), "the subshell's cd ended: {names:?}");
+    assert!(names.iter().all(|n| !n.contains("scratchpad") && !n.ends_with("/ui/top.rs")), "{names:?}");
+    assert_eq!(s.exposure.files_read, 6,
+        "README (twice, one path), src/lib.rs (twice), sshd_config, ui/app.ts, src/main.rs and \
+         the notes; never `origin/main...HEAD`, a pattern, a separator or a brace expansion");
+    assert_eq!(s.exposure.outside_reads, 2, "the cat after `cd /etc` and the notes, and nothing else");
+}
+
+/// One call writing two files from two heredocs wrote two texts, not one
+/// text twice (#406); the same text written into a second file IS a copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_heredoc_is_its_own_files_text() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "dup").await;
+    let shell = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    log_tool_message(&kernel, &session, &agent, shell("a",
+        "cat > a.rs <<'A'\nfn alpha() { one(); }\nA\ncat > b.rs <<'B'\nfn beta() { two(); }\nB")).await;
+    log_tool_message(&kernel, &session, &agent, shell("c",
+        "cat > c.rs <<'EOF'\nfn alpha() { one(); }\nEOF")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.duplicates.len(), 1, "{:?}", s.duplicates);
+    let mut paths: Vec<&str> = s.duplicates[0].paths.iter().map(String::as_str).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec![repo.file("a.rs"), repo.file("c.rs")], "b.rs holds another text");
+    assert_eq!(s.lines_added, 3);
+}
+
+/// A gate whose output went to a file is read by the exit code the
+/// session echoed for it (#412): `TEST_EXIT=0` passes and `TEST_EXIT=101`
+/// fails — and `latest=1` is no test's exit code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gate_run_into_a_file_is_read_by_the_exit_it_echoed() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let now = chrono::Utc::now();
+    let at = |mins: i64| now - chrono::Duration::minutes(mins);
+    let write = |id: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Write",
+             "input": {"file_path": repo.file("a.rs"), "content": "fn a() {}"}}]}});
+    let shell = |id: &str, cmd: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let out = |id: &str, text: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}});
+    for (tag, tested) in [("ok", "TEST_EXIT=0\nlatest=1"), ("red", "TEST_EXIT=101")] {
+        let session = kernel.create_entity("node_session").await.expect("session");
+        log_tool_message_at(&kernel, &session, &agent, write(&format!("{tag}0")), at(50)).await;
+        for (i, (cmd, printed)) in [
+            ("cargo test --workspace > /tmp/t.log 2>&1; echo TEST_EXIT=$?", tested),
+            ("cargo clippy --workspace -- -D warnings >/dev/null 2>&1; echo CLIPPY=$?", "CLIPPY=0"),
+            ("python3 tools/skill_audit.py | tail -1", "✅ SKILL AUDIT CLEAN"),
+            ("gh pr create --base main", "https://github.com/o/superx/pull/7"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("{tag}{}", i + 1);
+            let mins = 40 - i as i64;
+            log_tool_message_at(&kernel, &session, &agent, shell(&id, cmd), at(mins)).await;
+            log_tool_message_at(&kernel, &session, &agent, out(&id, printed),
+                at(mins) + chrono::Duration::seconds(5)).await;
+        }
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.prs_opened, 2);
+    assert_eq!(s.prs_gated, 1, "the run that echoed TEST_EXIT=0");
+    assert_eq!(s.prs_ungated, 1, "the run that echoed TEST_EXIT=101");
+}
+
+/// A shell call is judged file by file (#415 review). One call that edits
+/// the repository through a variable and logs to the scratchpad is a
+/// write; one that writes a scratch note and edits a repository file lends
+/// the note's lines and its "created" to nothing. `perl -MList::Util` and
+/// `sed -fscript.sed` edit nothing; `find -exec sed -i` and `xargs perl
+/// -pi` edit files the line never names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_call_is_judged_file_by_file() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    repo.sub("src");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "files").await;
+    let shell = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let scratch = "/private/tmp/claude-1/scratchpad";
+    for (id, cmd) in [
+        // Writes: through a variable, logging to scratch…
+        ("w1", format!("python3 - <<'EOF'\np = 'src/stats.rs'\ns = open(p).read()\nopen(p, 'w').write(s)\nEOF\ncargo check > {scratch}/chk.log 2>&1")),
+        // …a scratch note beside an in-place edit…
+        ("w2", format!("cat > {scratch}/notes.md <<'EOF'\none\ntwo\nthree\nEOF\nsed -i 's/a/b/' src/lib.rs")),
+        // …and edits handed to another program.
+        ("w3", "find src -name '*.rs' -exec sed -i 's/a/b/' {} +".to_string()),
+        ("w4", "grep -rl foo src | xargs perl -pi -e 's/foo/bar/'".to_string()),
+        // Not writes.
+        ("n1", "perl -MList::Util=sum -e 'print sum(1, 2)'".to_string()),
+        ("n2", "perl -Ilib -e 'print 1'".to_string()),
+        ("n3", "sed -fscript.sed src/lib.rs".to_string()),
+        // Neither a read nor a write: it deletes what it finds.
+        ("n4", format!("find {scratch} -name '*.log' -delete")),
+    ] {
+        log_tool_message(&kernel, &session, &agent, shell(id, &cmd)).await;
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.writes_window, 4, "the variable write, the sed beside the note, find -exec and xargs");
+    assert_eq!(s.lines_added, 0, "the note's three lines went to the scratchpad");
+    assert_eq!((s.files_created, s.files_modified), (0, 1), "src/lib.rs was edited, not created");
+    assert_eq!(s.reads_window, 1, "sed -f reads with a script; the perl one-liners are neither");
+}
+
+/// Exposure is every stage that looked (#413): a credentials file read in
+/// a chain that also asked git something went to the vendor all the
+/// same, while a stage whose output went elsewhere showed the model
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exposure_is_every_stage_that_looked() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "exposed").await;
+    let shell = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    log_tool_message(&kernel, &session, &agent,
+        shell("a", "ls ~/.netrc && grep -i bitbucket -A2 ~/.netrc; git config --get credential.helper")).await;
+    log_tool_message(&kernel, &session, &agent, shell("b", "cat /etc/hosts > /dev/null && git status")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.exposure.outside_reads, 1, "~/.netrc, once for the call; not /etc/hosts, sent to /dev/null");
+    assert_eq!(s.exposure.files_read, 1, "{:?}", s.exposure);
+    assert_eq!(s.reads_window, 1, "the second call only looked; the first also asked git");
+}
+
+/// What shipped is what each stage printed (#415 review): a commit is not
+/// undone by the clean `git status` after it; a commit or push the call
+/// may never have reached counts only if its output shows it; a commit's
+/// lines are the stat under its own header; and a hook's bracketed line
+/// is no commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_shipped_is_what_each_stage_printed() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "ship").await;
+    let now = chrono::Utc::now();
+    let call = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let result = |id: &str, failed: bool, body: &str| serde_json::json!({
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "is_error": failed, "content": body}]}});
+    let mut at = now - chrono::Duration::minutes(6);
+    for (id, cmd, failed, printed) in [
+        ("c1", "git commit -q -m one && git status", false,
+         "On branch main\nnothing to commit, working tree clean\n"),
+        ("c2", "git add gone.rs && git commit -q -m two", true,
+         "Exit code 128\nfatal: pathspec 'gone.rs' did not match any files"),
+        ("c3", "git commit --allow-empty -m three && git show --stat HEAD~1", false,
+         "[main 1a2b3c4d] three\ncommit 9f8e7d6c\nAuthor: t <t@t>\n\n    two\n\n a.rs | 3 +++\n 1 file changed, 3 insertions(+)\n"),
+        ("p1", "sleep 600 && git push -q", true, "Command timed out after 2m 0.0s"),
+        ("p2", "git push -q", false, ""),
+        ("c4", "git commit -m four", false,
+         "[WARNING] Unstaged files detected.\n[main 5e6f7a8b] four\n 2 files changed, 7 insertions(+), 1 deletion(-)\n"),
+    ] {
+        log_tool_message_at(&kernel, &session, &agent, call(id, cmd), at).await;
+        log_tool_message_at(&kernel, &session, &agent, result(id, failed, printed), at + chrono::Duration::seconds(5)).await;
+        at += chrono::Duration::minutes(1);
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.commits, 3, "one, three and four; not the commit a failed add never reached");
+    assert_eq!(s.pushes, 1, "the quiet push that returned; not the one that timed out");
+    assert_eq!(s.commits_with_stat, 1, "four's own stat; three is empty, and git show's stat is not its");
+    assert_eq!((s.committed_added, s.committed_removed), (7, 1));
+    assert_eq!(s.live.len(), 1);
+    assert_eq!(s.live[0].shipped.as_deref(), Some("commit 5e6f7a8b"), "the hook's [WARNING] line is no commit");
+}
+
+/// A gate's echoed exit code is its verdict (#415 review) — another
+/// command's `error:` line does not overturn `CLIPPY=0` — unless the gate
+/// was piped, when `$?` was the pipe's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_echoed_exit_is_the_verdict_unless_the_gate_was_piped() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let now = chrono::Utc::now();
+    let at = |mins: i64| now - chrono::Duration::minutes(mins);
+    let write = |id: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Write",
+             "input": {"file_path": repo.file("a.rs"), "content": "fn a() {}"}}]}});
+    let shell = |id: &str, cmd: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let out = |id: &str, text: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}});
+    for (tag, test_cmd, test_out) in [
+        ("ok", "cargo test --workspace > /tmp/t.log 2>&1; echo TEST_EXIT=$?", "TEST_EXIT=0"),
+        ("piped", "cargo test --workspace 2>&1 | tail -3; echo TEST_EXIT=$?",
+         "test result: FAILED. 11 passed; 1 failed; 0 ignored\nTEST_EXIT=0"),
+    ] {
+        let session = kernel.create_entity("node_session").await.expect("session");
+        log_tool_message_at(&kernel, &session, &agent, write(&format!("{tag}0")), at(50)).await;
+        for (i, (cmd, printed)) in [
+            (test_cmd, test_out),
+            ("cargo clippy --workspace -- -D warnings > /tmp/c.log 2>&1; echo CLIPPY=$?; git push --dry-run",
+             "CLIPPY=0\nerror: failed to push some refs to 'origin'"),
+            ("python3 tools/skill_audit.py", "✅ SKILL AUDIT CLEAN"),
+            ("gh pr create --base main", "https://github.com/o/superx/pull/8"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("{tag}{}", i + 1);
+            let mins = 40 - i as i64;
+            log_tool_message_at(&kernel, &session, &agent, shell(&id, cmd), at(mins)).await;
+            log_tool_message_at(&kernel, &session, &agent, out(&id, printed),
+                at(mins) + chrono::Duration::seconds(5)).await;
+        }
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.prs_opened, 2);
+    assert_eq!(s.prs_gated, 1, "CLIPPY=0 stands; the unpiped TEST_EXIT=0 stands");
+    assert_eq!(s.prs_ungated, 1, "the piped run's TEST_EXIT=0 is tail's; its tests failed");
+}
+
+/// A refused test run verified nothing (#415 review): the session is not
+/// "verifying" because the operator stopped `cargo test` before it ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_test_run_verified_nothing() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "refused").await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx", "message": {"id": "r", "model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "t", "name": "Bash", "input": {"command": "cargo test --workspace"}}]}})).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "toolDenialKind": "user-rejected",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "t", "is_error": true,
+            "content": "The user doesn't want to proceed with this tool use."}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.live.len(), 1);
+    assert_eq!(s.live[0].doing, "working", "a refused run is a call, not a verification");
+    assert_eq!(s.tests_run, 0);
+}
+
+/// What a live session is doing is what its NEWEST tool call is doing
+/// (#413) — not the strongest thing it did anywhere in the range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_session_is_doing_what_its_newest_call_does() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "now").await;
+    let now = chrono::Utc::now();
+    let call = |id: &str, name: &str, input: serde_json::Value| serde_json::json!({
+        "cwd": "/w/superx", "message": {"id": id, "model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": name, "input": input}]}});
+    // An hour ago it ran the tests; now it is reading.
+    log_tool_message_at(&kernel, &session, &agent,
+        call("t", "Bash", serde_json::json!({"command": "cargo test"})), now - chrono::Duration::hours(1)).await;
+    log_tool_message_at(&kernel, &session, &agent,
+        call("r", "Read", serde_json::json!({"file_path": "/w/superx/a.rs"})), now).await;
+
+    // Another session read, then fetched a page: it is working, not
+    // thinking — a fetch, a browser or an MCP call is none of the others.
+    let (agent2, fetching) = seed_agent_and_session(&kernel, "claude_code", "fetch").await;
+    log_tool_message_at(&kernel, &fetching, &agent2,
+        call("r2", "Read", serde_json::json!({"file_path": "/w/superx/b.rs"})), now - chrono::Duration::minutes(2)).await;
+    log_tool_message_at(&kernel, &fetching, &agent2,
+        call("f", "WebFetch", serde_json::json!({"url": "https://docs.rs"})), now).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.live.len(), 2);
+    let doing = |tool: &str| {
+        s.live.iter().find(|l| l.last_tool.as_deref() == Some(tool)).map(|l| l.doing.as_str())
+    };
+    assert_eq!(doing("Read"), Some("reading"), "the newest call, not the test run an hour ago");
+    assert_eq!(doing("WebFetch"), Some("working"));
+}
+
+/// Unknown is not zero (#413): compactions whose timing was never
+/// captured cost an unknown amount, and a median under a minute is under
+/// a minute, not "no data".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_reads_unknown_and_a_short_median_reads_short() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "u").await;
+    let now = chrono::Utc::now();
+    // A compaction summary, whose boundary line (and its timing) capture
+    // does not keep.
+    log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+        "isCompactSummary": true, "message": {"content": "Summary"}}), now).await;
+    // Two human turns thirty seconds apart.
+    for secs in [60, 30] {
+        kernel.log_message(superx_kernel::NewMessage {
+            session: session.clone(), agent: agent.clone(), role: "user".into(),
+            content: "go on".into(), raw: None, seq: None,
+            emitted_at: Some(now - chrono::Duration::seconds(secs)),
+        }).await.expect("turn");
+    }
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.compactions, 1);
+    assert_eq!(s.compaction_total_ms, None, "compacted, but the cost is unknown");
+    assert_eq!(s.autonomy_p50_mins, 0, "under a minute is 0, not the -1 of no data");
+    assert_eq!(s.survival_p50_mins, -1, "nothing was rewritten: no data");
+    assert!(s.active_hours_range >= 1);
+}
+
+/// Coverage counts the 24 clock hours the strip draws (#415 review): this
+/// hour and the 23 before it. A message a second before the first of them
+/// is under 24 hours old and sits in a 25th bucket, which let the tile read
+/// 25/24.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_counts_the_hours_the_strip_draws() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "cov").await;
+    let now = chrono::Utc::now();
+    let this_hour = now - chrono::Duration::seconds(now.timestamp().rem_euclid(3600));
+    for at in [now, this_hour - chrono::Duration::hours(23) - chrono::Duration::seconds(1)] {
+        log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+            "message": {"content": [{"type": "text", "text": "."}]}}), at).await;
+    }
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.active_hours_24h, 1, "{:?}", s.active_hours);
+}
+
+/// The page's hours and days are the viewer's (#415 review): at UTC−4 a
+/// reply written at 01:30 UTC ran at 21:30 the evening before, and every
+/// chart that buckets by hour or day — the burn series, the hour × weekday
+/// heatmap, the work calendar — says so, as the Sortie log already did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hours_and_days_are_the_viewers() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "tz").await;
+    let now = chrono::Utc::now();
+    let mut at = now.date_naive().and_hms_opt(1, 30, 0).expect("01:30").and_utc();
+    if at > now {
+        at -= chrono::Duration::days(1);
+    }
+    log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+        "message": {"id": "r", "model": "claude-opus-5", "usage": {"output_tokens": 5},
+            "content": [{"type": "text", "text": "."}]}}), at).await;
+    let clock = chrono::FixedOffset::west_opt(4 * 3600).expect("UTC-4");
+    let local = at.with_timezone(&clock);
+
+    let s = superx_mod_ui::stats::stats_for_range_on(&kernel, 500, "24h", clock).await.expect("stats");
+    let hour = local.format("%Y-%m-%dT%H").to_string();
+    assert!(s.burn.iter().any(|b| b.t == hour && b.out == 5), "{hour} in {:?}", s.burn.iter().map(|b| &b.t).collect::<Vec<_>>());
+    let i = superx_mod_ui::insights::insights_summary_on(&kernel, clock).await.expect("insights");
+    assert_eq!(i.hour_weekday.iter().map(|c| c.hour).collect::<Vec<_>>(), vec![21]);
+    let day = local.format("%Y-%m-%d").to_string();
+    assert_eq!(i.events_per_day.iter().map(|d| d.t.clone()).collect::<Vec<_>>(), vec![day]);
+}
+
+/// A refusal belongs to the model that made the refused call, even after
+/// the session switched to another (#413). It used to go to whatever the
+/// session was running NOW.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_lands_on_the_model_whose_call_was_refused() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "switch").await;
+    let reply = |id: &str, model: &str| serde_json::json!({
+        "cwd": "/w/superx", "effort": "max",
+        "message": {"id": id, "model": model, "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": "rm -rf target"}}]}});
+    log_tool_message(&kernel, &session, &agent, reply("m1", "claude-fable-5")).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "toolDenialKind": "user-rejected",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "m1", "is_error": true,
+            "content": "The user doesn't want to proceed with this tool use."}]}})).await;
+    // Then the operator switched models, and the new one worked on.
+    log_tool_message(&kernel, &session, &agent, reply("m2", "claude-opus-5")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    let pair = |m: &str| s.model_effort.iter().find(|p| p.model == m).expect(m);
+    assert_eq!(pair("claude-fable-5").denials, 1, "the refused call was fable's");
+    assert_eq!(pair("claude-opus-5").denials, 0, "switching to opus later does not make it opus's");
+}
+
+/// A credential is its shape, not its prefix (#413): this module names
+/// every prefix it looks for, so reading its own source lit the lamp,
+/// while a real token pasted into a command went by unscanned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secret_is_a_shape_and_commands_are_scanned() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "sec").await;
+    // A source file that merely NAMES the prefixes.
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx", "message": {"content": [
+            {"type": "tool_use", "id": "r", "name": "Read", "input": {"file_path": "/w/superx/stats.rs"}}]}})).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "r",
+            "content": "text.contains(\"AKIA\") || text.contains(\"ghp_\")\n\
+                        text.contains(\"-----BEGIN \") && text.contains(\"PRIVATE KEY-----\")"}]}})).await;
+    // A real key block, as a Read result carries it: numbered lines.
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx", "message": {"content": [
+            {"type": "tool_use", "id": "k", "name": "Read", "input": {"file_path": "/w/superx/id_rsa"}}]}})).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "k",
+            "content": format!("     1\t-----BEGIN RSA PRIVATE KEY-----\n     2\t{}", "MIIEowIBAAKCAQEA7bq98s1hd3kqQeLJ0n4YVmZ8xRk4dL0oPq2sT5uVwXyZ")}]}})).await;
+    // A command carrying something shaped like a real token.
+    let token = format!("ATATT3x{}", "Fq9Zb2Kd".repeat(6));
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx", "message": {"content": [
+            {"type": "tool_use", "id": "c", "name": "Bash",
+             "input": {"command": format!("curl -u me:{token} https://example.atlassian.net")}}]}})).await;
+
+    // A shell whose OUTPUT carries one names no file; the hit still has a
+    // place (#415 review).
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx", "message": {"content": [
+            {"type": "tool_use", "id": "o", "name": "Bash", "input": {"command": "env | grep TOKEN"}}]}})).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "o", "content": format!("TOKEN={token}")}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.exposure.secret_hits, 3, "the command's token, the key block and the output's token; not the source that names the markers");
+    assert_eq!(s.exposure.secret_paths.len(), 3, "{:?}", s.exposure.secret_paths);
+    assert!(s.exposure.secret_paths.iter().any(|p| p.starts_with("Bash input in")), "{:?}", s.exposure.secret_paths);
+    assert!(s.exposure.secret_paths.iter().any(|p| p.ends_with("id_rsa")), "{:?}", s.exposure.secret_paths);
+    assert!(s.exposure.secret_paths.iter().any(|p| p == "Bash output in /w/superx"), "{:?}", s.exposure.secret_paths);
+}
+
+/// A private key is found however a tool shows it (#415 review): in a
+/// service-account JSON file and an `.env` value, one line with `\n`
+/// escapes; in `grep -n -A2` output; encrypted, behind its headers, in a
+/// `Read` result. Prose naming the markers, and a marker over a short
+/// line, are not keys. The fixtures are assembled at run time, so reading
+/// this file is not a leak.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_key_is_found_however_a_tool_shows_it() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "keys").await;
+    let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC".repeat(2);
+    let begin = |kind: &str| format!("-----BEGIN {kind}PRIVATE KEY-----");
+    let end = format!("-----END {}PRIVATE KEY-----", "");
+    let shown = [
+        format!("{{\"type\": \"service_account\", \"private_key\": \"{}\\n{body}\\n{end}\\n\"}}", begin("")),
+        format!("PRIVATE_KEY=\"{}\\n{body}\\n{end}\"", begin("RSA ")),
+        format!("1:{}\n2-{body}\n3-{body}", begin("OPENSSH ")),
+        format!("     1\t{}\n     2\tProc-Type: 4,ENCRYPTED\n     3\tDEK-Info: AES-128-CBC,{}\n     4\t\n     5\t{body}",
+            begin("RSA "), "0123456789ABCDEF".repeat(2)),
+        // Not keys.
+        format!("/// A block opens {} and the body follows\n/// on the next line, as base64.", begin("")),
+        format!("{}\nMIIEvQIBADAN\n{end}", begin("")),
+    ];
+    for (i, text) in shown.iter().enumerate() {
+        let id = format!("k{i}");
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "cwd": "/w/superx", "message": {"content": [
+                {"type": "tool_use", "id": id, "name": "Read", "input": {"file_path": format!("/w/superx/key{i}")}}]}})).await;
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}})).await;
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.exposure.secret_hits, 4, "{:?}", s.exposure.secret_paths);
+    let mut paths = s.exposure.secret_paths.clone();
+    paths.sort();
+    assert_eq!(paths, vec!["/w/superx/key0", "/w/superx/key1", "/w/superx/key2", "/w/superx/key3"]);
+}
+
+/// The model comparison reads git as the work actually moved (#414).
+///
+/// One repository, two checkouts. Fable writes a branch in a worktree;
+/// Opus, in the main checkout, squash-merges it as the account that
+/// clicks merge. The squash is Fable's work — credited by when the
+/// branch was written, not by when it merged — and it is counted once,
+/// not once per checkout, and blamed at the main line though the main
+/// checkout has another branch out. Fable's abandoned branch is never
+/// landed; a teammate's branch is not this machine's work at all. And a
+/// second repository whose main line took nothing is not judged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_comparison_reads_git_as_the_work_moved() {
+    let kernel = fresh_kernel().await;
+    let now = chrono::Utc::now();
+    let t0 = now - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let repo = TestRepo::new_dated("superx", "main", t0 - chrono::Duration::hours(1));
+    let wt = repo.worktree("wt", "feat/a");
+    let wt2 = repo.worktree("wt2", "feat/b");
+    let wt3 = repo.worktree("wt3", "feat/c");
+    let main = repo.cwd();
+    let ten: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    let fifteen: String = (1..=15).map(|i| format!("line {i}\n")).collect();
+
+    // Fable's branch, two commits; its abandoned branch; a teammate's.
+    repo.commit(wt, h(0.5), "t@t", "feat: a", &[("a.rs", &ten)]);
+    repo.commit(wt, h(1.5), "t@t", "feat: more a", &[("a.rs", &fifteen)]);
+    // More on the same branch that the squash did not take — and the
+    // branch is still checked out, so that is work in flight.
+    repo.commit(wt, h(1.8), "t@t", "feat: d", &[("d.rs", "1\n2\n3\n4\n")]);
+    repo.commit(wt2, h(1.0), "t@t", "feat: b", &[("b.rs", "1\n2\n3\n4\n5\n6\n7\n")]);
+    // feat/b's worktree is gone: the branch is abandoned, not in flight.
+    repo.git(&["worktree", "remove", "--force", wt2]);
+    repo.commit(wt3, h(1.0), "mate@x", "feat: c", &[("c.rs", "1\n2\n3\n4\n5\n")]);
+    // The squash, on main, as the merging account, while Opus works.
+    repo.commit(main, h(3.5), "noreply@github.com", "feat: a (#1)", &[("a.rs", &fifteen)]);
+    // The main checkout moves to a branch where a.rs is gone.
+    repo.git(&["checkout", "-q", "-b", "feat/other"]);
+    repo.git(&["rm", "-q", "a.rs"]);
+    repo.commit(main, h(4.5), "t@t", "chore: drop a", &[]);
+
+    // A second repository: its main line has only its first commit, from
+    // long before; the work goes to another branch.
+    let lake = TestRepo::new_dated("lake", "main", now - chrono::Duration::days(200));
+    lake.git(&["checkout", "-q", "-b", "sandbox"]);
+    lake.commit(lake.cwd(), h(5.5), "t@t", "feat: lake", &[("l.py", "x = 1\n")]);
+
+    let reply = |id: &str, model: &str, cwd: &str| serde_json::json!({
+        "cwd": cwd, "effort": "max",
+        "message": {"id": id, "model": model, "usage": {"output_tokens": 100},
+            "content": [{"type": "text", "text": "working"}]}});
+    let (agent, fable) = seed_agent_and_session(&kernel, "claude_code", "fable").await;
+    let (_, opus) = seed_agent_and_session(&kernel, "claude_code", "opus").await;
+    let (_, laker) = seed_agent_and_session(&kernel, "claude_code", "lake").await;
+    log_tool_message_at(&kernel, &fable, &agent, reply("f1", "claude-fable-5", wt), h(0.0)).await;
+    log_tool_message_at(&kernel, &fable, &agent, reply("f2", "claude-fable-5-1", wt), h(2.0)).await;
+    log_tool_message_at(&kernel, &opus, &agent, reply("o1", "claude-opus-5", main), h(3.0)).await;
+    log_tool_message_at(&kernel, &opus, &agent, reply("o2", "claude-opus-5", main), h(4.9)).await;
+    log_tool_message_at(&kernel, &laker, &agent, reply("l1", "claude-fable-5", lake.cwd()), h(5.0)).await;
+    log_tool_message_at(&kernel, &laker, &agent, reply("l2", "claude-fable-5", lake.cwd()), h(6.0)).await;
+
+    let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
+    let fable_run = runs.iter().find(|r| r.session.ends_with("/fable")).expect("fable run");
+    assert_eq!(fable_run.model, "fable", "two point releases, one family, one run");
+    assert_eq!(fable_run.messages, 2);
+    assert_eq!(fable_run.minutes, 5, "two hours apart is one gap, capped at the live threshold");
+
+    let c = superx_mod_ui::compare::compare(&runs, &std::collections::HashMap::new()).await;
+    let row = |m: &str| c.deviations.iter().find(|d| d.model == m);
+    let f = row("fable").expect("fable row");
+    assert_eq!(f.added, 15, "the squash, once — not once per checkout");
+    assert_eq!(f.alive, 15, "blamed at main, not at the branch the checkout has out");
+    assert_eq!(f.commits, 1);
+    assert_eq!(f.abandoned_lines, 7, "fable's abandoned branch; not the teammate's");
+    assert_eq!(f.abandoned_commits, 1);
+    assert_eq!(f.in_flight_lines, 4, "on a branch still checked out: not landed, not abandoned");
+    assert!(row("opus").is_none_or(|o| o.added == 0), "merging it did not make it opus's");
+    assert_eq!(c.unjudged.len(), 1, "{:?}", c.unjudged.iter().map(|u| &u.repo).collect::<Vec<_>>());
+    assert_eq!(c.unjudged[0].repo, "lake");
+    assert!(c.repos.iter().all(|r| r.repo == "superx"), "one repository row, not one per checkout");
+}
+
+/// A merged branch is deleted — here every one is — and with it the only
+/// record of when its work was done (#415 review). Its commits are still
+/// in the reflog of the checkout that made them, so its squash is credited
+/// by when the branch was written, not by when it merged: the model that
+/// wrote it, not the one running when it landed. The amend's leftover, in
+/// that reflog too, is nobody's abandoned work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_squash_whose_branch_is_gone_is_credited_to_who_wrote_it() {
+    let kernel = fresh_kernel().await;
+    let now = chrono::Utc::now();
+    let t0 = now - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let repo = TestRepo::new_dated("superx", "main", t0 - chrono::Duration::hours(1));
+    let wt = repo.worktree("wt", "feat/a");
+    let main = repo.cwd();
+    let ten: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    let fifteen: String = (1..=15).map(|i| format!("line {i}\n")).collect();
+
+    // Fable writes the branch, then amends it.
+    repo.commit(wt, h(1.0), "t@t", "feat: a", &[("a.rs", &ten)]);
+    std::fs::write(std::path::Path::new(wt).join("a.rs"), &fifteen).expect("amend");
+    repo.git(&["-C", wt, "commit", "-q", "-a", "--amend", "--no-edit"]);
+    // The squash lands on main as the merging account, while Opus works.
+    repo.commit(main, h(3.5), "noreply@github.com", "feat: a (#1)", &[("a.rs", &fifteen)]);
+    // The checkout moves on and the branch is deleted, as merged branches are.
+    repo.git(&["-C", wt, "checkout", "-q", "--detach"]);
+    repo.git(&["branch", "-q", "-D", "feat/a"]);
+
+    let reply = |id: &str, model: &str, cwd: &str| serde_json::json!({
+        "cwd": cwd, "message": {"id": id, "model": model, "usage": {"output_tokens": 100},
+            "content": [{"type": "text", "text": "working"}]}});
+    let (agent, fable) = seed_agent_and_session(&kernel, "claude_code", "fable").await;
+    let (_, opus) = seed_agent_and_session(&kernel, "claude_code", "opus").await;
+    log_tool_message_at(&kernel, &fable, &agent, reply("f1", "claude-fable-5", wt), h(0.5)).await;
+    log_tool_message_at(&kernel, &fable, &agent, reply("f2", "claude-fable-5", wt), h(1.5)).await;
+    log_tool_message_at(&kernel, &opus, &agent, reply("o1", "claude-opus-5", main), h(3.0)).await;
+    log_tool_message_at(&kernel, &opus, &agent, reply("o2", "claude-opus-5", main), h(4.0)).await;
+
+    let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
+    let c = superx_mod_ui::compare::compare(&runs, &std::collections::HashMap::new()).await;
+    let row = |m: &str| c.deviations.iter().find(|d| d.model == m);
+    let f = row("fable").expect("fable wrote the branch");
+    assert_eq!((f.added, f.commits), (15, 1), "the squash, by when the branch was written");
+    assert_eq!(f.abandoned_lines, 0, "the amend's leftover is no abandoned work");
+    assert!(row("opus").is_none_or(|o| o.added == 0), "merging it did not make it opus's");
+}
+
+/// A repository is judged where its work lands (#415 review). Its host's
+/// default branch took one teammate's commit and none of ours: that is
+/// still not where our work lands, and one commit by anyone no longer
+/// flips every branch of ours to "never landed". Named by the operator,
+/// the branch that does take it is judged; a name git cannot resolve is
+/// said, not dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repository_is_judged_where_its_work_lands() {
+    let kernel = fresh_kernel().await;
+    let now = chrono::Utc::now();
+    let t0 = now - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let lake = TestRepo::new_dated("lake", "main", now - chrono::Duration::days(200));
+    lake.commit(lake.cwd(), h(2.0), "mate@x", "docs: readme", &[("README", "y\n")]);
+    lake.git(&["checkout", "-q", "-b", "sandbox"]);
+    lake.commit(lake.cwd(), h(2.2), "t@t", "feat: lake", &[("l.py", "a = 1\nb = 2\n")]);
+
+    let (agent, s) = seed_agent_and_session(&kernel, "claude_code", "lake").await;
+    for (id, at) in [("l1", h(1.5)), ("l2", h(2.5))] {
+        log_tool_message_at(&kernel, &s, &agent, serde_json::json!({
+            "cwd": lake.cwd(), "message": {"id": id, "model": "claude-fable-5", "usage": {"output_tokens": 10},
+                "content": [{"type": "text", "text": "."}]}}), at).await;
+    }
+    let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
+    let refs = |pairs: &[(&str, &str)]| pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+
+    let c = superx_mod_ui::compare::compare(&runs, &refs(&[])).await;
+    assert_eq!(c.unjudged.len(), 1, "a teammate's commit does not make main where our work lands");
+    assert_eq!((c.unjudged[0].off_mainline_commits, c.unjudged[0].unresolved), (1, false));
+
+    let c = superx_mod_ui::compare::compare(&runs, &refs(&[("lake", "sandbox")])).await;
+    assert!(c.unjudged.is_empty(), "{:?}", c.unjudged.iter().map(|u| &u.repo).collect::<Vec<_>>());
+    let fable = c.deviations.iter().find(|d| d.model == "fable").expect("judged on sandbox");
+    assert_eq!((fable.added, fable.commits), (2, 1));
+
+    let c = superx_mod_ui::compare::compare(&runs, &refs(&[("lake", "origin/nope")])).await;
+    assert_eq!(c.unjudged.len(), 1);
+    assert!(c.unjudged[0].unresolved, "a ref that does not resolve is said");
 }

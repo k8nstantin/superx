@@ -97,10 +97,10 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
               </div>
             </Group>
             <SimpleGrid cols={2} spacing="xs" mb="sm">
-              <Counter label="Files touched" value={s?.files_touched} />
+              <Counter label="Files changed" value={s?.files_touched} tip="files the agents wrote in the repositories — a read is not a change, and the agents' scratch is not the work" />
               <Counter label="Edits" value={s?.writes_window} />
-              <Counter label="New files" value={s?.files_created} tip="a file whose oldest event in the range created it" />
-              <Counter label="Existing files" value={s?.files_modified} />
+              <Counter label="New files" value={s?.files_created} tip="a file this range created, as the tool's result says" />
+              <Counter label="Existing files" value={s?.files_modified} tip="a file that was there and this range changed" />
             </SimpleGrid>
             {makeRatio != null && (
               <div>
@@ -118,11 +118,11 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 4 }}>
           <Panel title="Languages" scope="range" range={range} h="100%">
-            <BarList rows={s?.languages ?? []} mono empty="no files edited in this range" />
+            <BarList rows={s?.languages} mono empty="no files edited in this range" />
             <Text size="sm" fw={600} mt="md" mb="xs">
               Projects
             </Text>
-            <BarList rows={s?.projects ?? []} color="var(--mantine-color-pelican-3)" mono />
+            <BarList rows={s?.projects} color="var(--mantine-color-pelican-3)" mono />
           </Panel>
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 4 }}>
@@ -138,7 +138,7 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
             <Text size="sm" fw={600} mb="xs">
               Commands
             </Text>
-            <BarList rows={s?.commands ?? []} color="var(--mantine-color-pelican-6)" mono empty="no shell calls in this range" />
+            <BarList rows={s?.commands} color="var(--mantine-color-pelican-6)" mono empty="no shell calls in this range" />
           </Panel>
         </Grid.Col>
       </Grid>
@@ -151,14 +151,14 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
             title="Shipped"
             scope="range"
             range={range}
-            note="commits, pushes and PRs read from the shell · lines as git reported them at commit"
+            note="commits, pushes and PRs the shell's output says happened · lines as the repositories report them"
             h="100%"
           >
             <SimpleGrid cols={{ base: 3, md: 6 }} spacing="xs">
-              <Counter label="Commits" value={s?.commits} tone={OK} tip="git commit calls in the range" />
-              <Counter label="Pushes" value={s?.pushes} tip="git push calls" />
-              <Counter label="PRs opened" value={s?.prs_opened} tip="gh pr create calls" />
-              <Counter label="PRs merged" value={s?.prs_merged} tone={OK} tip="gh pr merge calls" />
+              <Counter label="Commits" value={s?.commits} tone={OK} tip="commits made — a refused call, or one with nothing to commit, is not one" />
+              <Counter label="Pushes" value={s?.pushes} tip="pushes git did not reject" />
+              <Counter label="PRs opened" value={s?.prs_opened} tip="pull requests gh printed the address of" />
+              <Counter label="PRs merged" value={s?.prs_merged} tone={OK} tip="merges gh did not report refused" />
               <div>
                 <Text size="xs" c="dimmed" tt="uppercase" style={{ letterSpacing: 0.4 }}>
                   Landed on main
@@ -225,7 +225,15 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 8 }}>
-          <Panel title="Code churn — added against replaced" scope="range" range={range} note={`${long ? 'per day' : 'per hour'} · solid: the transcript's edits · faint: what landed on main`} h="100%">
+          <Panel title="Code churn — added against replaced" scope="range" range={range} note={`${long ? 'per day' : 'per hour'} · your time · solid: the transcript's edits · faint: what landed on main`} h="100%">
+            {buckets.length === 0 && (
+              <Text size="xs" c="dimmed" mb="xs">
+                Nothing to plot. The solid series counts Write and Edit tool calls, and an agent
+                working through the shell — a heredoc, <code>sed</code>, a script — edits files
+                without either one, so the transcript never sees it (#383). An empty chart here
+                usually means the work happened, not that it did not.
+              </Text>
+            )}
             <EChart
               height={210}
               option={{
@@ -273,9 +281,9 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
                     : 'edits whose work a later edit threw away — a flip-flop counts twice'
                 }
               />
-              <Counter label="Thrash files" value={s?.thrash_files} tip={`files touched ${s?.revisit_at ?? 3} or more times in this range`} />
-              <Counter label="Tokens / line" value={tokensPerLine} tip="output tokens spent per line of code that survived" />
-              <Counter label="Tests / 100 lines" value={testsPer100 == null ? null : String(testsPer100)} />
+              <Counter label="Thrash files" value={s?.thrash_files} tip={`files written ${s?.revisit_at ?? 3} or more times in this range`} />
+              <Counter label="Tokens / line" value={tokensPerLine} tip="output tokens per line added in this range — not per line that survived; the model comparison measures that" />
+              <Counter label="Test runs / 100 lines" value={testsPer100 == null ? null : String(testsPer100)} tip="test-suite runs per hundred lines added — runs, not tests" />
             </SimpleGrid>
             {s?.top_repeat && (
               <Tooltip label="the same command line, over and over — the shape of fighting something" withArrow>
@@ -300,12 +308,12 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 7 }}>
           <Panel title="Hottest files" scope="range" range={range} note="most-touched paths" h="100%">
-            <BarList rows={s?.files ?? []} mono shorten={baseName} />
+            <BarList rows={s?.files} mono shorten={baseName} />
           </Panel>
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 5 }}>
           <Panel title="Where the work happened" scope="range" range={range} note="directories" h="100%">
-            <BarList rows={s?.dirs ?? []} color="var(--mantine-color-pelican-3)" mono />
+            <BarList rows={s?.dirs} color="var(--mantine-color-pelican-3)" mono />
             <Group gap="xl" mt="md">
               <Counter label="Thinking tokens" value={s?.thinking_tokens} />
               <Counter label="Tool calls" value={s?.tools_window} />

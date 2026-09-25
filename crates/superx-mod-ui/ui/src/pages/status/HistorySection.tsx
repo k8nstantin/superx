@@ -16,7 +16,7 @@ export function HistorySection({ s, i, range }: { s: StatsSummary | undefined; i
   return (
     <>
       {days.length > 0 && (
-        <Panel title="The work calendar" scope="all" range={range} note="messages by the day they were written — the agent's own clock" mb="md">
+        <Panel title="The work calendar" scope="all" range={range} note="messages by the day they were written, on your clock" mb="md">
           <EChart
             height={190}
             option={{
@@ -52,7 +52,7 @@ export function HistorySection({ s, i, range }: { s: StatsSummary | undefined; i
 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 7 }}>
-          <Panel title="When the agents work" scope="all" range={range} note="hour of day × day of week" h="100%">
+          <Panel title="When the agents work" scope="all" range={range} note="hour of day × day of week · your time" h="100%">
             <EChart
               height={240}
               option={{
@@ -104,7 +104,7 @@ export function HistorySection({ s, i, range }: { s: StatsSummary | undefined; i
 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 7 }}>
-          <Panel title="Activity — events per minute" scope="all" range={range} note="the newest two thousand events" h="100%">
+          <Panel title="Activity — events per minute" scope="live" range={null} note="the newest two thousand events, whatever the range · minutes with none are not drawn" h="100%">
             <EChart
               height={200}
               option={{

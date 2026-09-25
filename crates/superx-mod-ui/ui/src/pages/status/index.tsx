@@ -182,7 +182,7 @@ export default function StatusPage() {
         <Annunciator s={stale ? undefined : s} i={i} status={status.data} jump={jump} />
       </Section>
       <Section id="deck" title="Flight deck" blurb="who is in the air right now, and how each one is flying">
-        <FlightDeck s={s} i={i} loading={stats.isFetching && !s} />
+        <FlightDeck s={s} i={i} status={status.data} loading={stats.isFetching && !s} />
       </Section>
       <Section id="gauges" title="Gauges" blurb="the primary instruments — attitude, heading, whether the work holds">
         <Gauges s={stale ? undefined : s} i={i} range={range} />

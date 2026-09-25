@@ -4,8 +4,6 @@ import type { StatusResponse } from './generated/StatusResponse'
 import type { AgentView } from './generated/AgentView'
 import type { SessionView } from './generated/SessionView'
 import type { SseEvent } from './generated/SseEvent'
-import type { ActionView } from './generated/ActionView'
-import type { ChartsSummary } from './generated/ChartsSummary'
 import type { StatsSummary } from './generated/StatsSummary'
 import type { InsightsSummary } from './generated/InsightsSummary'
 import type { CompareSummary } from './generated/CompareSummary'
@@ -42,11 +40,12 @@ export const fetchSessionActivity = (id: string, limit = 500, before?: string, q
   get<SseEvent[]>(`/api/sessions/${id}/activity?limit=${limit}${feedArgs(before, q)}`)
 export const fetchActivity = (limit = 500, before?: string, q?: string) =>
   get<SseEvent[]>(`/api/activity?limit=${limit}${feedArgs(before, q)}`)
-export const fetchActions = (limit = 50) => get<ActionView[]>(`/api/actions?limit=${limit}`)
-export const fetchCharts = () => get<ChartsSummary>('/api/charts/summary')
+/// The viewer's offset from UTC in minutes east, so the page's hours and
+/// days are the viewer's own (#415 review).
+const viewerOffset = () => -new Date().getTimezoneOffset()
 export const fetchStats = (range = 'window') =>
-  get<StatsSummary>(`/api/stats?range=${encodeURIComponent(range)}`)
-export const fetchInsights = () => get<InsightsSummary>('/api/insights')
+  get<StatsSummary>(`/api/stats?range=${encodeURIComponent(range)}&tz=${viewerOffset()}`)
+export const fetchInsights = () => get<InsightsSummary>(`/api/insights?tz=${viewerOffset()}`)
 /// What each model's work threw away (#406). Read from git rather than
 /// the transcript, and cached server-side for minutes — it moves when
 /// commits land, not when the page polls.

@@ -2,7 +2,7 @@ import { SimpleGrid } from '@mantine/core'
 import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { OK, PELICAN } from '../../EChart'
-import { BANDS, CANCEL, FAIL, Gauge, HIGH_GOOD, LOW_GOOD, fmtCompact, n, pct } from './parts'
+import { BANDS, CANCEL, FAIL, fmtCompact, Gauge, HIGH_GOOD, LOW_GOOD, n, pct, TOOLS_GOOD, steering } from './parts'
 
 // The six-pack (#367): the primary instruments, as dials with banded
 // arcs. Attitude is churn, heading is who directed the rewrites, and
@@ -26,14 +26,7 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
   // Steering: replaced lines when the transcript can see them, else
   // edits — a shell edit's size is unknown but who asked for it is not
   // (#388). Without the fallback this gauge went dark for a whole day.
-  const directedLines = n(s?.churn_directed)
-  const selfLines = n(s?.churn_self)
-  const directedEdits = n(s?.edits_directed)
-  const selfEdits = n(s?.edits_self)
-  const inLines = directedLines + selfLines > 0
-  const directed = inLines ? directedLines : directedEdits
-  const self = inLines ? selfLines : selfEdits
-  const onCourse = pct(directed, directed + self)
+  const { lines: inLines, directed, self, onCourse } = steering(s)
 
   const passed = n(s?.tests_passed)
   const failedTests = n(s?.tests_failed)
@@ -50,7 +43,7 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
 
   const coverage = s ? Math.round((n(s.active_hours_24h) * 100) / 24) : null
 
-  const rangeNote = range === 'window' ? 'this window' : range ? `last ${range}` : ''
+  const rangeNote = range === 'window' ? 'this window' : range === 'all' ? 'all history' : range ? `the last ${range}` : ''
 
   return (
     <SimpleGrid cols={{ base: 2, sm: 3, lg: 6 }} spacing="xs" mb="md">
@@ -65,7 +58,9 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
               ? `landed on main: ${fmtCompact(landedAdded)} added · ${fmtCompact(landedRemoved)} removed`
               : unknown > 0
                 ? `${fmtCompact(added)} added · ${unknown} edits of unknown size`
-                : 'no code moved'
+                : s
+                  ? 'no code moved'
+                  : 'reading…'
         }
         tip={`replaced ÷ (added + replaced) over ${rangeNote}. 0% is all new code; past ${BANDS.churnBad}% the window spent itself rewriting. From the transcript when it can see what was replaced, else from what landed on main as git reports it.`}
       />
@@ -76,7 +71,9 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
         sub={
           s && onCourse != null
             ? `${fmtCompact(directed)} directed · ${fmtCompact(self)} self${inLines ? '' : ' · edits'}`
-            : 'nothing rewritten'
+            : s
+              ? 'nothing rewritten'
+              : 'reading…'
         }
         tip="share of the rewriting that followed a human instruction — replaced lines where the transcript can see them, else edits. Low means the agents are rewriting themselves with nobody steering."
       />
@@ -84,14 +81,14 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
         label="Tests green"
         value={s ? pass : null}
         bands={HIGH_GOOD}
-        sub={s && pass != null ? `${fmtCompact(passed)} passed · ${fmtCompact(failedTests)} failed` : 'no tally read'}
+        sub={!s ? 'reading…' : pass != null ? `${fmtCompact(passed)} passed · ${fmtCompact(failedTests)} failed` : 'no tally read'}
         tip="pass rate read out of what the test runners printed"
       />
       <Gauge
         label="Tools OK"
         value={s ? toolsOk : null}
-        bands={HIGH_GOOD}
-        sub={s && toolsOk != null ? `${failed} of ${scored} calls failed` : 'no calls scored'}
+        bands={TOOLS_GOOD}
+        sub={!s ? 'reading…' : toolsOk != null ? `${failed} of ${scored} calls failed` : 'no calls scored'}
         tip="tool calls that did not come back an error"
       />
       <Gauge

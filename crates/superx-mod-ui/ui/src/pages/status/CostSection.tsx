@@ -67,13 +67,13 @@ export function CostSection({ s, i, range }: { s: StatsSummary | undefined; i: I
             </SimpleGrid>
             {n(e?.outside_reads) > 0 && (
               <Text size="xs" c="orange.4" mb={4}>
-                {fmtCompact(e?.outside_reads)} file reads came from outside the directory the agent was working in.
+                {fmtCompact(e?.outside_reads)} file reads came from outside the repository the agent was working in.
               </Text>
             )}
             {n(e?.secret_hits) > 0 ? (
               <Card withBorder bg="dark.8" p="xs">
                 <Text size="sm" c="red.4" fw={600}>
-                  {String(e?.secret_hits)} tool result{n(e?.secret_hits) === 1 ? '' : 's'} carried credential-shaped content into a prompt
+                  {String(e?.secret_hits)} credential-shaped string{n(e?.secret_hits) === 1 ? '' : 's'} went to the vendor — in a tool&apos;s output, a command or a file written
                 </Text>
                 <Text size="xs" c="dimmed">
                   {(e?.secret_paths ?? []).slice(0, 8).join(' · ') || 'path not recorded'}

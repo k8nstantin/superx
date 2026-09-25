@@ -30,8 +30,9 @@ attachments: bigint,
  */
 outside_reads: bigint, 
 /**
- * Tool results whose content matched a secret shape (keys,
- * tokens, private-key headers) and therefore went into a prompt.
+ * Credential-shaped strings (keys, tokens, private-key blocks) that
+ * went to the vendor: in a tool's output, a command, or a file the
+ * agent wrote.
  */
 secret_hits: bigint, 
 /**

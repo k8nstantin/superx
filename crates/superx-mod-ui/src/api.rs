@@ -80,24 +80,6 @@ pub struct SessionView {
 
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
-pub struct ActionView {
-    pub event: String,
-    pub summary: String,
-    pub agent_id: Option<String>,
-    pub valid_from: String,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ChartsSummary {
-    pub events_per_minute: Vec<TimeCount>,
-    pub per_agent: Vec<NameCount>,
-    pub message_roles: Vec<NameCount>,
-    pub boot_durations: Vec<TimeCount>,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
 pub struct TimeCount {
     pub t: String,
     pub value: i64,
@@ -173,8 +155,16 @@ pub struct StatsSummary {
     pub messages_last_hour: i64,
     /// Output tokens in the last hour — the burn rate.
     pub tokens_last_hour: i64,
-    /// How many of the last 24 hours saw any activity at all.
+    /// How many of the last 24 hours saw any activity at all, on the
+    /// agent's clock.
     pub active_hours_24h: i64,
+    /// Which of them, as UTC `YYYY-MM-DDTHH` keys, oldest first — so the
+    /// coverage strip lights the hours that worked, not the first N (#413).
+    pub active_hours: Vec<String>,
+    /// Agent-clock hours of the RANGE that saw any activity (#413): the
+    /// denominator for every per-hour rate over the range. Rates used to
+    /// divide the range's total by the last 24 hours' count.
+    pub active_hours_range: i64,
 
     // ── what kind of work the window actually was ─────────────────
     /// Shell calls that ran a test suite.
@@ -185,19 +175,24 @@ pub struct StatsSummary {
     pub git_ops: i64,
 
     // ── what shipped (#381) — outcomes beside the effort ──────────
-    /// `git commit` calls.
+    /// Commits made — `git commit` calls whose output did not say there
+    /// was nothing to commit, and that were not refused (#412).
     pub commits: i64,
-    /// `git push` calls.
+    /// Pushes git did not reject.
     pub pushes: i64,
-    /// `gh pr create` calls.
+    /// Pull requests `gh pr create` printed the address of.
     pub prs_opened: i64,
-    /// `gh pr merge` calls.
+    /// `gh pr merge` calls whose output did not report a refusal.
     pub prs_merged: i64,
     /// Lines git reported committed — the `insertions(+)` and
-    /// `deletions(-)` a commit prints. Churn as the repository saw it,
-    /// however the edits were made; `0` when every commit ran quiet.
+    /// `deletions(-)` under a commit's own `[branch hash]` line. Churn as
+    /// the repository saw it, however the edits were made.
     pub committed_added: i64,
     pub committed_removed: i64,
+    /// How many of `commits` printed that line (#412). `git commit -q`
+    /// prints none, so the committed lines cover only these; fewer than
+    /// `commits` and the figure is partial, none and it is unknown.
+    pub commits_with_stat: i64,
     /// What landed on the repositories' main lines in the range, as the
     /// repositories themselves report it (#386).
     pub landed: Landed,
@@ -241,15 +236,6 @@ pub struct StatsSummary {
     pub bright_line_paths: Vec<String>,
     /// Model × reasoning level against outcome, biggest sample first.
     pub model_effort: Vec<ModelEffortStat>,
-    /// Each model's outcomes bucket by bucket — is it getting better or
-    /// worse, and is the difference between two of them real (#403)?
-    pub model_quality: Vec<ModelQualityPoint>,
-    /// Each model's outcomes per repository, for the only comparison
-    /// that holds the work roughly constant (#403).
-    pub model_repos: Vec<ModelRepoStat>,
-    /// How much of each model's landed work is still in the tree —
-    /// rework measured from the repository, not the transcript (#405).
-    pub model_survival: Vec<ModelSurvival>,
     /// How scattered each session was between your turns (#406).
     pub focus: Vec<FocusStat>,
     /// The same content written to several paths — one artifact, many
@@ -368,7 +354,11 @@ pub struct StatsSummary {
     /// above is the plain event count from #308 — this is the
     /// breakdown, so it carries its own name.)
     pub compaction_sessions: Vec<CompactionStat>,
-    pub compaction_total_ms: i64,
+    /// Wall-clock the compactions cost, when the transcript carried it.
+    /// `None` when compactions happened but none was timed: the timing
+    /// rides `compact_boundary` system lines, which capture does not keep
+    /// as messages (#373) — unknown, not zero (#413).
+    pub compaction_total_ms: Option<i64>,
     /// What left this machine and what the vendor retained.
     pub exposure: Exposure,
 }
@@ -667,8 +657,9 @@ pub struct Exposure {
     /// Files read from OUTSIDE the repo the session was working in —
     /// the exposure you did not ask for.
     pub outside_reads: i64,
-    /// Tool results whose content matched a secret shape (keys,
-    /// tokens, private-key headers) and therefore went into a prompt.
+    /// Credential-shaped strings (keys, tokens, private-key blocks) that
+    /// went to the vendor: in a tool's output, a command, or a file the
+    /// agent wrote.
     pub secret_hits: i64,
     /// The paths those hits came from, deduplicated.
     pub secret_paths: Vec<String>,
@@ -776,61 +767,6 @@ pub struct IntensityPoint {
     pub out_tokens: i64,
 }
 
-/// One model's outcomes in one bucket of time (#403).
-///
-/// Counts, not rates: a rate without its denominator cannot be tested,
-/// and the whole point of this series is to say when a difference
-/// between two models is real and when it is noise. The page computes
-/// the intervals from these.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ModelQualityPoint {
-    pub model: String,
-    pub t: String,
-    pub messages: i64,
-    pub tool_calls: i64,
-    pub tool_failures: i64,
-    pub tests_passed: i64,
-    pub tests_failed: i64,
-    pub interventions: i64,
-    pub denials: i64,
-    /// The prompt this model carried, summed and counted so an average
-    /// falls out, and the largest it reached (#407). Filling a window
-    /// to do a small thing is paid for on every turn after.
-    pub context_sum: i64,
-    pub context_n: i64,
-    pub context_max: i64,
-    /// The agent's own words: admitting the work was wrong, and saying
-    /// it is doing it again. Its assessment, not a guess at yours, and
-    /// the half of the record no vendor publishes (#406).
-    pub admissions: i64,
-    pub redo_talk: i64,
-    /// Your turns that lost patience, credited to whatever was running.
-    /// One person writes them all, so the style is a constant and a
-    /// difference between models is the models.
-    pub escalations: i64,
-    pub lines_added: i64,
-    pub out_tokens: i64,
-}
-
-/// One model's outcomes in one repository (#403). Models do different
-/// work at different times, so a pooled comparison compares tasks as
-/// much as models. Where two of them worked the same repository, this
-/// is the closest thing to like for like the transcript can offer.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ModelRepoStat {
-    pub model: String,
-    pub repo: String,
-    pub messages: i64,
-    pub tool_calls: i64,
-    pub tool_failures: i64,
-    pub tests_passed: i64,
-    pub tests_failed: i64,
-    pub lines_added: i64,
-    pub out_tokens: i64,
-}
-
 /// How scattered one session was (#406).
 ///
 /// Between two of your turns the agent should be doing one thing. The
@@ -860,34 +796,6 @@ pub struct DuplicateWrite {
     /// The paths that received the same content, newest naming first.
     pub paths: Vec<String>,
     pub copies: i64,
-}
-
-/// How much of one model's landed work is still there (#405).
-///
-/// The rework measure with no blind spot. The transcript cannot see
-/// what a shell edit replaced, so lines WRITTEN are undercounted —
-/// but git knows exactly what landed on a main line, and blame knows
-/// exactly how much of it is left. Both sides come from the
-/// repository, so the ratio holds whatever tools the agent used.
-///
-/// A commit is credited to whichever model was working that repository
-/// when it landed. Newer work has had less time to be replaced, so the
-/// median age rides beside every row and the page compares only work
-/// old enough to have been at risk.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ModelSurvival {
-    pub model: String,
-    /// Commits credited to it, and the lines they added.
-    pub commits: i64,
-    pub landed: i64,
-    /// Of those lines, how many blame still finds in the tree.
-    pub alive: i64,
-    /// Days since the median commit — the recency caveat, in a number.
-    pub median_age_days: i64,
-    /// The oldest and newest commit credited, in days.
-    pub oldest_days: i64,
-    pub newest_days: i64,
 }
 
 /// One (model, reasoning level) pair against what it produced (#391).
@@ -1121,36 +1029,56 @@ pub struct SseEvent {
     pub valid_from: String,
 }
 
-/// One model's stint inside one session (#406), aggregated inside the
-/// engine. No message payload crosses the wire: every field is a sum,
-/// an indexed edge lookup or a grouped count, so the walk is uncapped
-/// without being expensive.
+/// One model's stint inside one session (#406, #414): a run of
+/// consecutive replies by one model FAMILY, on the agent's clock.
 ///
 /// A session is not one model — the operator switches mid-session —
-/// so the run, not the session, is the unit that owns a span.
+/// so the run, not the session, is the unit that owns a span. And a
+/// run is contiguous: a session that went fable → opus → fable is three
+/// runs, where one span per model overlapped the other and left every
+/// commit in between ambiguous.
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct ModelRun {
     pub session: String,
+    /// The model family (`fable`, `opus`): point releases of one model
+    /// are the same choice from the operator's side (#408, #414).
     pub model: String,
-    /// The checkouts this session worked in, heaviest first.
-    pub cwds: Vec<String>,
-    /// RFC3339 bounds of the stint, so a commit can be bracketed.
+    /// RFC3339 bounds of the run on the agent's clock, so a commit can
+    /// be bracketed. Capture time put every run backfilled on first
+    /// contact inside the minutes of the backfill (#414).
     pub first: String,
     pub last: String,
-    /// Wall-clock minutes the stint spanned.
+    /// Minutes the run was WORKING: the gaps between its replies, each
+    /// capped at the live-session threshold (#414). Wall-clock first to
+    /// last counted the idle days in between.
     pub minutes: i64,
+    /// Replies, once each (#409).
     pub messages: i64,
     pub out_tokens: i64,
-    /// The operator's own turns inside the span (`role = 'user'`), and
-    /// the two kinds worth counting separately.
+    /// The operator's own turns while this run was the one answering
+    /// (`role = 'user'`), and the two kinds worth counting separately —
+    /// matched as words, so "against" is not "again" (#414).
     pub operator_turns: i64,
     pub redo_asks: i64,
     pub escalations: i64,
-    /// Tokens carried in the prompt per turn: fresh input plus
+    /// Tokens carried in the prompt per reply: fresh input plus
     /// everything read back from cache.
     pub context_avg: i64,
     pub context_peak: i64,
+    /// What the run spent in each directory, so a comparison over
+    /// repositories leaves out what was spent outside them (#414).
+    pub work: Vec<RunWork>,
+}
+
+/// A run's spend in one working directory (#414).
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct RunWork {
+    pub cwd: String,
+    pub replies: i64,
+    pub out_tokens: i64,
+    pub minutes: i64,
 }
 
 /// One direction of model switch (#406), and what the incoming model
@@ -1234,7 +1162,8 @@ pub struct Deviation {
     /// The bill actually paid: tokens over the lines still standing.
     pub tokens_per_line_kept: i64,
     /// Days since the median credited commit — the confounder, shown
-    /// so it can be checked before anything is ranked.
+    /// so it can be checked before anything is ranked. -1 when nothing
+    /// was credited.
     pub median_age_days: i64,
     /// Tokens carried in the prompt per turn, and the largest seen.
     pub context_avg: i64,
@@ -1268,6 +1197,9 @@ pub struct Deviation {
     /// abandoned. The one number that says how much of the week the
     /// repository never saw.
     pub abandoned_pct: i64,
+    /// Lines on branches a checkout still has out (#414): not landed yet,
+    /// and not abandoned either — kept out of `abandoned_lines`.
+    pub in_flight_lines: i64,
 }
 
 /// One repository, one model (#406) — so a repo that went badly after a
@@ -1293,5 +1225,25 @@ pub struct CompareSummary {
     pub deviations: Vec<Deviation>,
     /// Per repository and model, biggest first.
     pub repos: Vec<RepoModel>,
+    /// Repositories the comparison could not judge, and why (#414).
+    pub unjudged: Vec<UnjudgedRepo>,
     pub computed_at: String,
+}
+
+/// A repository left out of the comparison (#414). Its main line took none
+/// of this machine's work in the period while its other branches took
+/// plenty, so nothing can be said about what landed there: counting it
+/// would call all of its work "never landed". `superx ui mainline <repo>
+/// <ref>` names the branch the work actually lands on (#415 review).
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct UnjudgedRepo {
+    pub repo: String,
+    /// The ref read as its main line.
+    pub mainline: String,
+    /// Commits made off the main line in the period, by this machine.
+    pub off_mainline_commits: i64,
+    /// The ref could not be read at all: named for this repository, it does
+    /// not resolve (#415 review).
+    pub unresolved: bool,
 }

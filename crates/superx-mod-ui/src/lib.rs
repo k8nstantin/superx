@@ -20,6 +20,7 @@ use superx_kernel::{
 };
 
 pub mod activity;
+pub mod checkout;
 pub mod compare;
 pub mod api;
 pub mod insights;
@@ -153,6 +154,67 @@ pub async fn resolved_cache_secs(kernel: &Kernel) -> u64 {
     }
 }
 
+/// The ref each repository's work actually lands on, where it is not what
+/// `origin/HEAD` says (#414): an object `{repository name: ref}` on the ui
+/// module's registry entity — `{"gryphon-data-lake": "origin/sandbox"}`
+/// for a repository whose default branch is a dormant placeholder.
+pub const MAINLINE_REFS_PARAM: &str = "attr_ui_mainline_refs";
+
+/// What `superx ui` takes.
+const CLI_USAGE: &str = "usage: superx ui url | superx ui mainline [<repo> <ref> | <repo> --unset]";
+
+/// `superx ui mainline`: the overrides in force; `<repo> <ref>` records
+/// that `repo`'s work lands on `ref` — `origin/sandbox` where the host's
+/// default branch is not where anything merges; `<repo> --unset` returns it
+/// to `origin/HEAD`. The operator's decision, recorded in the substrate: no
+/// rule in code can know it (#415 review).
+async fn mainline_cli(kernel: &Kernel, args: &[String]) -> Result<String> {
+    let mut refs = resolved_mainline_refs(kernel).await;
+    let change = match args {
+        [] => false,
+        [repo, flag] if flag == "--unset" => refs.remove(repo).is_some(),
+        [repo, r] if !r.starts_with('-') => refs.insert(repo.clone(), r.clone()).as_ref() != Some(r),
+        _ => return Err(KernelError::Module(CLI_USAGE.into())),
+    };
+    if change {
+        let Some(entity) = kernel.find_module_by_name(NodeKind::KernelModule, MODULE_NAME).await? else {
+            return Err(KernelError::Module("the ui module is not registered on this instance".into()));
+        };
+        let mut map = superx_kernel::types::Object::new();
+        for (repo, r) in &refs {
+            map.insert(repo.clone(), Value::String(r.clone()));
+        }
+        kernel.set_parameter(entity, MAINLINE_REFS_PARAM, Value::Object(map)).await?;
+    }
+    let mut rows: Vec<(&String, &String)> = refs.iter().collect();
+    rows.sort();
+    Ok(if rows.is_empty() {
+        "no main-line overrides: every repository reads origin/HEAD\n".to_string()
+    } else {
+        rows.iter().map(|(repo, r)| format!("{repo}\t{r}\n")).collect()
+    })
+}
+
+/// Resolve the main-line overrides; none when the parameter is unset.
+pub async fn resolved_mainline_refs(kernel: &Kernel) -> std::collections::HashMap<String, String> {
+    let Ok(Some(entity)) = kernel
+        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
+        .await
+    else {
+        return std::collections::HashMap::new();
+    };
+    match kernel.get_parameter(entity, MAINLINE_REFS_PARAM).await {
+        Ok(Some(Value::Object(o))) => o
+            .iter()
+            .filter_map(|(k, v)| match v {
+                Value::String(r) if !r.is_empty() => Some((k.clone(), r.clone())),
+                _ => None,
+            })
+            .collect(),
+        _ => std::collections::HashMap::new(),
+    }
+}
+
 /// Resolve the context-window size: parameter on the module entity,
 /// else default.
 pub async fn resolved_context_window(kernel: &Kernel) -> i64 {
@@ -204,11 +266,13 @@ impl KernelModule for UiModule {
         true // exports/downloads land here
     }
 
-    /// `superx ui url` — where the dashboard lives.
+    /// `superx ui url` — where the dashboard lives. `superx ui mainline` —
+    /// the branch each repository's work lands on (#415 review).
     async fn cli(&self, kernel: &Kernel, args: &[String]) -> Result<String> {
         match args.first().map(String::as_str) {
             Some("url") | None => Ok(format!("{}\n", resolved_url(kernel).await)),
-            _ => Err(KernelError::Module("usage: superx ui url".into())),
+            Some("mainline") => mainline_cli(kernel, &args[1..]).await,
+            _ => Err(KernelError::Module(CLI_USAGE.into())),
         }
     }
 }

@@ -1,6 +1,8 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Badge, Card, Group, SimpleGrid, Text, Title, Tooltip } from '@mantine/core'
 import { CANCEL, EChart, FAIL, GRID_LINE, INK, INK_MUTED, MONO, OK, TRACK, UNKNOWN } from '../../EChart'
+import type { LiveSession } from '../../generated/LiveSession'
+import type { StatusResponse } from '../../generated/StatusResponse'
 
 // The cockpit's parts (#367). Every instrument on the Status page is
 // built from these, so a number renders one way, a scope reads one
@@ -68,10 +70,36 @@ export function fmtMs(ms: number | bigint | null | undefined): string {
   return `${Math.round(v / 1000)}s`
 }
 
+/// A median in minutes, where the payload says -1 for no data (#413):
+/// 0 is a real median under a minute, not an absence.
+export function fmtMins(mins: number | bigint | null | undefined): string {
+  if (mins == null || Number(mins) < 0) return '—'
+  return Number(mins) === 0 ? '<1m' : fmtMs(Number(mins) * 60_000)
+}
+
+/// The same for a median in seconds.
+export function fmtSecs(secs: number | bigint | null | undefined): string {
+  if (secs == null || Number(secs) < 0) return '—'
+  return fmtMs(Number(secs) * 1000)
+}
+
 export const pct = (part: number, whole: number): number | null =>
   whole > 0 ? Math.round((part * 100) / whole) : null
 
 export const baseName = (p: string) => p.split('/').slice(-2).join('/')
+
+type Count = number | bigint | null | undefined
+/// Who asked for the rewrites (#388, #413): replaced lines when the
+/// transcript can see them, else edits — one reading for every gauge, tile
+/// and row that shows it. Both shares come from one rounding, so "on
+/// course" and "unasked" always sum to 100 (#415 review).
+export function steering(x: { churn_directed?: Count; churn_self?: Count; edits_directed?: Count; edits_self?: Count } | undefined) {
+  const lines = n(x?.churn_directed) + n(x?.churn_self) > 0
+  const directed = lines ? n(x?.churn_directed) : n(x?.edits_directed)
+  const self = lines ? n(x?.churn_self) : n(x?.edits_self)
+  const unasked = pct(self, directed + self)
+  return { lines, directed, self, unasked, onCourse: unasked == null ? null : 100 - unasked }
+}
 
 // ── the bands every gauge and lamp reads from ─────────────────────
 // Render-layer thresholds, stated once. The Rust side carries the
@@ -120,6 +148,26 @@ export function lowGood(v: number | null, warn: number, bad: number): Tone {
   if (v == null) return 'none'
   return v >= bad ? 'bad' : v >= warn ? 'warn' : 'ok'
 }
+/// Is the capture module stopped? That is the failure the lag instruments
+/// exist to show (#413).
+export function captureDown(status: StatusResponse | undefined): boolean {
+  return (status?.modules ?? []).some((m) => m.name === 'capture' && m.lifecycle !== 'active')
+}
+/// How current capture is — one rule for every instrument that shows it
+/// (#413, #415 review). The age of the newest captured event is lag only
+/// while something is in the air: over an idle machine there is nothing to
+/// capture, and old news is quiet, not a fault. Capture that is not
+/// running is a fault whatever the age.
+export function captureTone(lag: number | null, anythingLive: boolean, down: boolean): Tone {
+  if (down) return 'bad'
+  if (lag == null) return 'none'
+  return anythingLive ? lowGood(lag, BANDS.lagWarn, BANDS.lagBad) : 'ok'
+}
+/// A live session circling (#350): rewriting itself with nobody asking, or
+/// back on the same files — one rule for the Circling lamp, the flight deck
+/// and the deviations tile.
+export const isCircling = (l: LiveSession) =>
+  n(l.self_churn_pct) >= BANDS.selfChurnBad || n(l.files_revisited) >= BANDS.revisitedBad
 /// High is good: pass rates, directed share, cache hit.
 export function highGood(v: number | null, bad: number, ok: number): Tone {
   if (v == null) return 'none'
@@ -376,12 +424,20 @@ export function BarList({
   shorten,
   empty = 'nothing in this range',
 }: {
-  rows: { name: string; value: number | bigint }[]
+  /// `undefined` while the answer is still being read — an empty list
+  /// is a claim ("nothing in this range"), and it is not true yet.
+  rows: { name: string; value: number | bigint }[] | undefined
   color?: string
   mono?: boolean
   shorten?: (s: string) => string
   empty?: string
 }) {
+  if (rows == null)
+    return (
+      <Text size="xs" c="dimmed">
+        reading…
+      </Text>
+    )
   if (rows.length === 0)
     return (
       <Text size="xs" c="dimmed">
@@ -513,6 +569,14 @@ export const LOW_GOOD: [number, string][] = [
   [BANDS.churnBad / 100, CANCEL],
   [1, FAIL],
 ]
+/// Bands for the tool-success dial, read off the same failure thresholds
+/// the Tool failures lamp uses (#413) — the dial read green at a rate the
+/// lamp already called amber.
+export const TOOLS_GOOD: [number, string][] = [
+  [(100 - BANDS.toolFailBad) / 100, FAIL],
+  [(100 - BANDS.toolFailWarn) / 100, CANCEL],
+  [1, OK],
+]
 /// Bands for a dial where high is good.
 export const HIGH_GOOD: [number, string][] = [
   [BANDS.passBad / 100, FAIL],
@@ -587,16 +651,26 @@ export function Lamp({
 }
 
 /// A 24-segment clock: which hours of the last day saw work.
-export function CoverageStrip({ hours }: { hours: number | bigint | null | undefined }) {
-  const lit = n(hours)
+/// The last 24 hours, oldest on the left, lit where any work happened
+/// (#413). It used to light the first N segments, so twelve hours of
+/// work read as the morning whichever twelve they were. `hours` are the
+/// payload's UTC `YYYY-MM-DDTHH` keys.
+export function CoverageStrip({ hours, now }: { hours: string[] | null | undefined; now: number }) {
+  const worked = new Set(hours ?? [])
+  const top = Math.floor(now / 3_600_000)
   return (
     <Group gap={2} mt={6} wrap="nowrap">
-      {Array.from({ length: 24 }, (_, i) => (
-        <div
-          key={i}
-          style={{ flex: 1, height: 8, borderRadius: 2, background: i < lit ? 'var(--mantine-color-pelican-4)' : TRACK }}
-        />
-      ))}
+      {Array.from({ length: 24 }, (_, i) => {
+        const at = new Date((top - 23 + i) * 3_600_000)
+        const key = at.toISOString().slice(0, 13)
+        return (
+          <Tooltip key={key} label={at.toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })} withArrow>
+            <div
+              style={{ flex: 1, height: 8, borderRadius: 2, background: worked.has(key) ? 'var(--mantine-color-pelican-4)' : TRACK }}
+            />
+          </Tooltip>
+        )
+      })}
     </Group>
   )
 }

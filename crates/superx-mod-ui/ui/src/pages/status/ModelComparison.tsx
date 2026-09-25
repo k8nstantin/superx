@@ -34,72 +34,10 @@ const THROWN = '#e66767'
 const IDENT = ['#B833E8', '#c98500', '#3987e5']
 const MIN_ADDED = 5000
 
-/// The model FAMILY. Point releases of one model are the same choice
-/// from the operator's side — you reach for Fable or you reach for
-/// Opus — and splitting them dilutes the comparison and lets a thin
-/// recent point release distort a rate. The full table keeps the exact
-/// versions; the charts compare families.
-function family(model: string): string {
-  const m = model.replace(/^claude-/, '')
-  const hit = ['fable', 'opus', 'sonnet', 'haiku'].find((f) => m.startsWith(f))
-  return hit ?? m
-}
-
-/// Fold versions into families. Every rate is recomputed from the
-/// SUMMED numerator and denominator — averaging two rates would weigh
-/// a 900-line stint the same as a 40,000-line one.
-function byFamily(rows: Row[]): Row[] {
-  const acc = new Map<string, Row>()
-  for (const r of rows) {
-    const k = family(r.model)
-    const p = acc.get(k)
-    if (!p) {
-      acc.set(k, { ...r, model: k })
-      continue
-    }
-    p.commits = n(p.commits) + n(r.commits)
-    p.added = n(p.added) + n(r.added)
-    p.alive = n(p.alive) + n(r.alive)
-    p.removed = n(p.removed) + n(r.removed)
-    p.thrown = n(p.thrown) + n(r.thrown)
-    p.out_tokens = n(p.out_tokens) + n(r.out_tokens)
-    p.messages = n(p.messages) + n(r.messages)
-    p.runs = n(p.runs) + n(r.runs)
-    p.minutes = n(p.minutes) + n(r.minutes)
-    p.minutes_thrown = n(p.minutes_thrown) + n(r.minutes_thrown)
-    p.tokens_thrown = n(p.tokens_thrown) + n(r.tokens_thrown)
-    p.rework_commits = n(p.rework_commits) + n(r.rework_commits)
-    p.thrash_files = n(p.thrash_files) + n(r.thrash_files)
-    p.operator_turns = n(p.operator_turns) + n(r.operator_turns)
-    p.corrections = n(p.corrections) + n(r.corrections)
-    p.context_peak = Math.max(n(p.context_peak), n(r.context_peak))
-    // Context is per turn, so it weights by messages.
-    p.context_avg =
-      n(p.messages) > 0
-        ? Math.round(
-            (n(p.context_avg) * (n(p.messages) - n(r.messages)) + n(r.context_avg) * n(r.messages)) /
-              n(p.messages),
-          )
-        : n(p.context_avg)
-    p.median_age_days = Math.max(n(p.median_age_days), n(r.median_age_days))
-  }
-  // Recompute every rate from the totals now that they are summed.
-  return [...acc.values()].map((p) => ({
-    ...p,
-    survived_pct: n(p.added) > 0 ? Math.round((100 * n(p.alive)) / n(p.added)) : 0,
-    removed_per_100_added: n(p.added) > 0 ? Math.round((100 * n(p.removed)) / n(p.added)) : 0,
-    rework_pct: n(p.commits) > 0 ? Math.round((100 * n(p.rework_commits)) / n(p.commits)) : 0,
-    thrash_per_100_commits:
-      n(p.commits) > 0 ? Math.round((100 * n(p.thrash_files)) / n(p.commits)) : 0,
-    corrections_per_100:
-      n(p.operator_turns) > 0 ? Math.round((100 * n(p.corrections)) / n(p.operator_turns)) : 0,
-    tokens_per_line_landed: n(p.added) > 0 ? Math.round(n(p.out_tokens) / n(p.added)) : 0,
-    tokens_per_line_kept: n(p.alive) > 0 ? Math.round(n(p.out_tokens) / n(p.alive)) : 0,
-    alive_per_mtok:
-      n(p.out_tokens) > 0 ? Math.round((n(p.alive) * 1_000_000) / n(p.out_tokens)) : 0,
-    alive_per_hour: n(p.minutes) > 0 ? Math.round((n(p.alive) * 60) / n(p.minutes)) : 0,
-  }))
-}
+// Families are folded on the server (#414): every row is one family, and
+// every rate and median in it was computed from that family's own totals.
+// Re-folding here dropped the never-landed figures of every family with
+// more than one version.
 
 type Metric = {
   title: string
@@ -124,7 +62,7 @@ function metrics(): Metric[] {
     { title: 'Files returned to 3+ times', note: 'per 100 commits', good: 'low', pick: (d) => n(d.thrash_per_100_commits) },
     { title: 'Times you put it back on course', note: 'per 100 of your turns', good: 'low', pick: (d) => n(d.corrections_per_100) },
     { title: 'Lines still in the tree', note: 'the actual output', good: 'high', fmt: fmtCompact, pick: (d) => n(d.alive) },
-    { title: 'Age of the work', note: 'days — the confounder, check it', good: 'high', fmt: (v) => `${v}d`, pick: (d) => n(d.median_age_days) },
+    { title: 'Age of the work', note: 'days — the confounder, check it', good: 'high', fmt: (v) => (v < 0 ? '—' : `${v}d`), pick: (d) => n(d.median_age_days) },
     { title: 'Written but never landed', note: 'share of everything it wrote', good: 'low', fmt: (v) => `${v}%`, pick: (d) => n(d.abandoned_pct) },
     { title: 'Commits on abandoned branches', note: 'deleted or never merged', good: 'low', pick: (d) => n(d.abandoned_commits) },
   ]
@@ -133,7 +71,10 @@ function metrics(): Metric[] {
 /// One small multiple: a bar per model, sorted so the best is on top
 /// once ECharts flips the category axis, and tinted by whether being
 /// high here is good or bad.
-function mini(rows: Row[], m: Metric) {
+function mini(all: Row[], m: Metric) {
+  // A negative value is the payload's "no data" (-1), never a reading: no
+  // metric here can go below zero. It is left out, not drawn left of zero.
+  const rows = all.filter((r) => m.pick(r) >= 0)
   const sorted = [...rows].sort((a, b) => (m.good === 'high' ? m.pick(a) - m.pick(b) : m.pick(b) - m.pick(a)))
   const best = m.good === 'high' ? Math.max(...rows.map(m.pick)) : Math.min(...rows.map(m.pick))
   return {
@@ -613,9 +554,31 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
       </Panel>
     )
   }
-  const fams = byFamily(rows)
+  const fams = rows
   const v = verdict(fams)
-  const hand = (c.handoffs ?? []).filter((h) => n(h.commits) > 0)
+  const repos = (c.repos ?? [])
+    .map((r) => ({ repo: r.repo, model: r.model, added: n(r.added), alive: n(r.alive), survived_pct: n(r.survived_pct) }))
+    .filter((r) => r.added >= 1000)
+    .slice(0, 12)
+  // Only switches that produced commits can say anything about what the
+  // incoming family then did.
+  const hand = (c.handoffs ?? [])
+    .map((h) => ({ from: h.from, to: h.to, switches: n(h.switches), commits: n(h.commits), added: n(h.added), alive: n(h.alive), survived_pct: n(h.survived_pct) }))
+    .filter((h) => h.commits > 0)
+  // Does work written just after a takeover survive better or worse than
+  // the incoming family's own average? Read from the rows, not asserted —
+  // and a tie is a tie: near 100% survival it is the common case, and
+  // counting it as "below" announced a loss that was not there (#415
+  // review).
+  const versusOwn = (h: (typeof hand)[number]) => {
+    const own = fams.find((f) => f.model === h.to)
+    return own == null ? null : Math.sign(h.survived_pct - n(own.survived_pct))
+  }
+  const aboveOwn = hand.filter((h) => versusOwn(h) === 1).length
+  const levelOwn = hand.filter((h) => versusOwn(h) === 0).length
+  const belowOwn = hand.filter((h) => versusOwn(h) === -1).length
+  const unjudged = c.unjudged ?? []
+
   const ms = metrics()
 
   const switchChart = {
@@ -629,7 +592,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
     },
     yAxis: {
       type: 'category',
-      data: hand.map((h) => `${h.from.replace('claude-', '')} → ${h.to.replace('claude-', '')}`),
+      data: hand.map((h) => `${h.from} → ${h.to}`),
       axisLabel: { color: INK, fontSize: 10 },
       axisLine: { lineStyle: { color: GRID_LINE } },
     },
@@ -644,7 +607,6 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
     }],
   }
 
-  const repos = (c.repos ?? []).filter((r) => n(r.added) >= 1000).slice(0, 12)
   const repoChart = {
     tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
     grid: { left: 210, right: 80, top: 10, bottom: 42 },
@@ -830,14 +792,19 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
           <EChart option={switchChart} height={40 + hand.length * 42} />
           <Text size="xs" c="dimmed" mt={4}>
             The account being tested is that a budget runs out, another model takes over, and what it
-            does then gets thrown away. That is not what this shows: code written in the first hours
-            after a takeover survives ABOVE each model&apos;s own average. The damage is in long
-            unbroken runs, which makes run length the thing to control, not who picks the work up.
+            does then gets thrown away. Of {hand.length} switch direction{hand.length === 1 ? '' : 's'}, what the
+            incoming family wrote in its first three hours survives above its own average in {aboveOwn}, level
+            with it in {levelOwn} and below it in {belowOwn}
+            {belowOwn === 0
+              ? ' — the handover is not where the work is lost.'
+              : belowOwn === hand.length
+                ? ' — in every one: what follows a takeover is thrown away more than usual.'
+                : '.'}
           </Text>
         </Panel>
       )}
 
-      <Panel title="The comparison, in full" scope="all" range={null} note="by exact version, so a point release can still be inspected">
+      <Panel title="The comparison, in full" scope="all" range={null} note="point releases folded — reaching for Fable or Opus is the choice actually made">
         <Table striped withTableBorder fz="xs" horizontalSpacing="xs">
           <Table.Thead>
             <Table.Tr>
@@ -855,7 +822,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
-            {rows.map((r) => {
+            {fams.map((r) => {
               const thin = n(r.added) < MIN_ADDED
               return (
                 <Table.Tr key={r.model} opacity={thin ? 0.55 : 1}>
@@ -871,18 +838,42 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
                   <Table.Td ta="right" c={n(r.abandoned_pct) >= 50 ? THROWN : undefined}>
                     {fmtCompact(n(r.abandoned_lines))} · {n(r.abandoned_pct)}%
                   </Table.Td>
-                  <Table.Td ta="right">{n(r.median_age_days)}d</Table.Td>
+                  <Table.Td ta="right">{n(r.median_age_days) < 0 ? '—' : `${n(r.median_age_days)}d`}</Table.Td>
                 </Table.Tr>
               )
             })}
           </Table.Tbody>
         </Table>
         <Text size="xs" c="dimmed" mt="xs">
-          Two measures do NOT separate these models and are in the grid so that can be seen rather
-          than assumed: how often you have to correct, and how often a file is returned to. What
-          separates them is what the work is worth afterwards, and how much token and clock time it
-          took to get there.
+          Hours are working hours — the gaps between a run&apos;s replies, each capped at the live
+          threshold — and tokens are counted once per reply, over the work done in the repositories
+          judged here. Corrections and files returned to are in the grid beside what the work was
+          worth; read them side by side rather than as a verdict.
         </Text>
+        {fams.some((r) => n(r.in_flight_lines) > 0) && (
+          <Text size="xs" c="dimmed" mt="xs">
+            In flight, and not counted as never landed:{' '}
+            {fams
+              .filter((r) => n(r.in_flight_lines) > 0)
+              .map((r) => `${r.model} ${fmtCompact(n(r.in_flight_lines))} lines`)
+              .join(' · ')}{' '}
+            on branches a checkout still has out.
+          </Text>
+        )}
+        {unjudged.length > 0 && (
+          <Text size="xs" c="yellow.5" mt="xs">
+            Not judged:{' '}
+            {unjudged
+              .map((u) =>
+                u.unresolved
+                  ? `${u.repo} (its main line ${u.mainline} does not resolve in git)`
+                  : `${u.repo} (its main line ${u.mainline} took none of this machine's commits in the period while ${n(u.off_mainline_commits)} went elsewhere)`,
+              )
+              .join('; ')}
+            . Counting it would call all of its work never landed; <code>superx ui mainline &lt;repo&gt; &lt;ref&gt;</code>{' '}
+            names the branch a repository&apos;s work lands on.
+          </Text>
+        )}
       </Panel>
     </>
   )
