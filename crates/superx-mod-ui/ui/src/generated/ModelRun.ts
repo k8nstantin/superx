@@ -18,14 +18,6 @@ export type ModelRun = { session: string,
  */
 model: string, 
 /**
- * The exact version most of the run's replies named.
- */
-version: string, 
-/**
- * The checkouts this run worked in, heaviest first.
- */
-cwds: Array<string>, 
-/**
  * RFC3339 bounds of the run on the agent's clock, so a commit can
  * be bracketed. Capture time put every run backfilled on first
  * contact inside the minutes of the backfill (#414).

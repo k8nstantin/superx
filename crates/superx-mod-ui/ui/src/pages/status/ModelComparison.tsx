@@ -62,7 +62,7 @@ function metrics(): Metric[] {
     { title: 'Files returned to 3+ times', note: 'per 100 commits', good: 'low', pick: (d) => n(d.thrash_per_100_commits) },
     { title: 'Times you put it back on course', note: 'per 100 of your turns', good: 'low', pick: (d) => n(d.corrections_per_100) },
     { title: 'Lines still in the tree', note: 'the actual output', good: 'high', fmt: fmtCompact, pick: (d) => n(d.alive) },
-    { title: 'Age of the work', note: 'days — the confounder, check it', good: 'high', fmt: (v) => `${v}d`, pick: (d) => n(d.median_age_days) },
+    { title: 'Age of the work', note: 'days — the confounder, check it', good: 'high', fmt: (v) => (v < 0 ? '—' : `${v}d`), pick: (d) => n(d.median_age_days) },
     { title: 'Written but never landed', note: 'share of everything it wrote', good: 'low', fmt: (v) => `${v}%`, pick: (d) => n(d.abandoned_pct) },
     { title: 'Commits on abandoned branches', note: 'deleted or never merged', good: 'low', pick: (d) => n(d.abandoned_commits) },
   ]
@@ -71,7 +71,10 @@ function metrics(): Metric[] {
 /// One small multiple: a bar per model, sorted so the best is on top
 /// once ECharts flips the category axis, and tinted by whether being
 /// high here is good or bad.
-function mini(rows: Row[], m: Metric) {
+function mini(all: Row[], m: Metric) {
+  // A negative value is the payload's "no data" (-1), never a reading: no
+  // metric here can go below zero. It is left out, not drawn left of zero.
+  const rows = all.filter((r) => m.pick(r) >= 0)
   const sorted = [...rows].sort((a, b) => (m.good === 'high' ? m.pick(a) - m.pick(b) : m.pick(b) - m.pick(a)))
   const best = m.good === 'high' ? Math.max(...rows.map(m.pick)) : Math.min(...rows.map(m.pick))
   return {
@@ -835,7 +838,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
                   <Table.Td ta="right" c={n(r.abandoned_pct) >= 50 ? THROWN : undefined}>
                     {fmtCompact(n(r.abandoned_lines))} · {n(r.abandoned_pct)}%
                   </Table.Td>
-                  <Table.Td ta="right">{n(r.median_age_days)}d</Table.Td>
+                  <Table.Td ta="right">{n(r.median_age_days) < 0 ? '—' : `${n(r.median_age_days)}d`}</Table.Td>
                 </Table.Tr>
               )
             })}

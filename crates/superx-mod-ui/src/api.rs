@@ -798,14 +798,6 @@ pub struct DuplicateWrite {
     pub copies: i64,
 }
 
-/// How much of one model's landed work is still there (#405).
-///
-/// The rework measure with no blind spot. The transcript cannot see
-/// what a shell edit replaced, so lines WRITTEN are undercounted —
-/// but git knows exactly what landed on a main line, and blame knows
-/// exactly how much of it is left. Both sides come from the
-/// repository, so the ratio holds whatever tools the agent used.
-///
 /// One (model, reasoning level) pair against what it produced (#391).
 /// The operator switches both together, so two separate tables cannot
 /// say which of them moved the outcome — the pair is the key, and the
@@ -1052,10 +1044,6 @@ pub struct ModelRun {
     /// The model family (`fable`, `opus`): point releases of one model
     /// are the same choice from the operator's side (#408, #414).
     pub model: String,
-    /// The exact version most of the run's replies named.
-    pub version: String,
-    /// The checkouts this run worked in, heaviest first.
-    pub cwds: Vec<String>,
     /// RFC3339 bounds of the run on the agent's clock, so a commit can
     /// be bracketed. Capture time put every run backfilled on first
     /// contact inside the minutes of the backfill (#414).
@@ -1174,7 +1162,8 @@ pub struct Deviation {
     /// The bill actually paid: tokens over the lines still standing.
     pub tokens_per_line_kept: i64,
     /// Days since the median credited commit — the confounder, shown
-    /// so it can be checked before anything is ranked.
+    /// so it can be checked before anything is ranked. -1 when nothing
+    /// was credited.
     pub median_age_days: i64,
     /// Tokens carried in the prompt per turn, and the largest seen.
     pub context_avg: i64,

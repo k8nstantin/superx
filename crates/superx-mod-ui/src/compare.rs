@@ -384,7 +384,9 @@ fn deviation(model: String, a: &DevAcc, sp: &HashMap<&str, SpendAcc>) -> Deviati
         tokens_thrown: if a.added > 0 { s.out_tokens.saturating_mul(thrown) / a.added } else { 0 },
         tokens_per_line_landed: if a.added > 0 { s.out_tokens / a.added } else { 0 },
         tokens_per_line_kept: if a.alive > 0 { s.out_tokens / a.alive } else { 0 },
-        median_age_days: ages.get(ages.len() / 2).copied().unwrap_or(0),
+        // -1 for none landed, as every median on the page (#415 review):
+        // "0d" read as work written today.
+        median_age_days: ages.get(ages.len() / 2).copied().unwrap_or(-1),
         context_avg: if s.context_msgs > 0 { s.context_weighted / s.context_msgs } else { 0 },
         context_peak: s.context_peak,
         minutes: s.minutes,

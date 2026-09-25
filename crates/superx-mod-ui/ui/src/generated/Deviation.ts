@@ -67,7 +67,8 @@ tokens_thrown: bigint, tokens_per_line_landed: bigint,
 tokens_per_line_kept: bigint, 
 /**
  * Days since the median credited commit — the confounder, shown
- * so it can be checked before anything is ranked.
+ * so it can be checked before anything is ranked. -1 when nothing
+ * was credited.
  */
 median_age_days: bigint, 
 /**

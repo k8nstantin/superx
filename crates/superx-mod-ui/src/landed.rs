@@ -61,17 +61,6 @@ pub(crate) async fn main_ref(dir: &Path) -> String {
     "HEAD".to_string()
 }
 
-/// The repository root a working directory belongs to, if it is one.
-pub async fn toplevel(dir: &Path) -> Option<String> {
-    if !dir.is_dir() {
-        return None;
-    }
-    git(dir, &["rev-parse", "--show-toplevel"])
-        .await
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// The repository's name: the directory holding `.git` — for a
 /// worktree, the main checkout's, so worktrees of one repo read as one.
 pub(crate) fn repo_name(common_git_dir: &str, toplevel: &str) -> String {
@@ -290,13 +279,22 @@ fn parse_versions(out: &str) -> HashMap<(String, String), String> {
             commit = hash.trim().to_string();
             continue;
         }
-        let Some(meta) = line.strip_prefix(':') else { continue };
-        let Some((head, path)) = meta.split_once('\t') else { continue };
-        let Some(blob) = head.split_whitespace().nth(3) else { continue };
+        let Some((path, blob)) = raw_entry(line) else { continue };
         // Newest first, so a later insert is an older writer.
         versions.insert((path.to_string(), blob.to_string()), commit.clone());
     }
     versions
+}
+
+/// One line of a `--raw` diff or log: the path, and the blob it leaves
+/// that path at. A deletion leaves none — its all-zero blob matched every
+/// other deletion of the same path, so a branch's abandoned deletion read
+/// as landed through an unrelated main-line one (#415 review). One reader
+/// for both halves of the lookup, so they cannot drift apart.
+fn raw_entry(line: &str) -> Option<(&str, &str)> {
+    let (head, path) = line.strip_prefix(':')?.split_once('\t')?;
+    let blob = head.split_whitespace().nth(3)?;
+    (!blob.bytes().all(|b| b == b'0')).then_some((path, blob))
 }
 
 /// The main line a repository's work lands on: the operator's
@@ -374,10 +372,7 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
         if let Some(base) = git(dir, &["merge-base", mainline, tip]).await {
             let base = base.trim().to_string();
             if let Some(diff) = git(dir, &["diff", "--raw", "--no-abbrev", "--no-renames", &base, tip]).await {
-                for line in diff.lines() {
-                    let Some(meta) = line.strip_prefix(':') else { continue };
-                    let Some((head, path)) = meta.split_once('\t') else { continue };
-                    let Some(blob) = head.split_whitespace().nth(3) else { continue };
+                for (path, blob) in diff.lines().filter_map(raw_entry) {
                     if let Some(via) = versions.get(&(path.to_string(), blob.to_string())) {
                         landed_file.insert(path.to_string(), via.clone());
                     }
@@ -449,4 +444,20 @@ fn skip_for_survival(path: &str) -> bool {
             path.rsplit('.').next(),
             Some("png" | "jpg" | "jpeg" | "ico" | "woff" | "woff2" | "svg" | "pdf")
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_deletion_leaves_no_blob_to_match() {
+        let zeros = "0".repeat(40);
+        let (old, new) = ("1".repeat(40), "2".repeat(40));
+        let deleted = format!(":100644 000000 {old} {zeros} D\tsrc/gone.rs");
+        let added = format!(":000000 100644 {zeros} {new} A\tsrc/new.rs");
+        assert_eq!(raw_entry(&deleted), None, "every deletion shares the null blob");
+        assert_eq!(raw_entry(&added), Some(("src/new.rs", new.as_str())));
+        assert_eq!(raw_entry("\u{1}abc123"), None);
+    }
 }

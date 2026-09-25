@@ -38,11 +38,6 @@ use superx_kernel::{Kernel, Result};
 
 use crate::api::{ModelRun, RunWork};
 
-/// Working directories kept per run. A run is normally one checkout;
-/// the cap catches the occasional wanderer without letting one run claim
-/// every repository on the machine.
-const CWDS_PER_RUN: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
-
 /// The model family: `claude-opus-5-5` is `opus`, `claude-fable-5-1` is
 /// `fable`, `gemini-3.1-pro` is `gemini` (#408, #414). Point releases of
 /// one model are one choice from the operator's side, and splitting them
@@ -208,11 +203,9 @@ pub async fn session_runs(
 
 /// One run from its replies, oldest first.
 fn build_run(session: &str, fam: &str, replies: &[Reply], idle_secs: i64) -> ModelRun {
-    let mut versions: HashMap<&str, i64> = HashMap::new();
     let mut work: HashMap<String, RunWork> = HashMap::new();
     let (mut out_tokens, mut ctx_sum, mut ctx_n, mut ctx_peak, mut secs) = (0i64, 0i64, 0i64, 0i64, 0i64);
     for (i, r) in replies.iter().enumerate() {
-        *versions.entry(r.model.as_str()).or_insert(0) += 1;
         // The gap before a reply was spent on it — up to the threshold.
         let gap = if i == 0 {
             0
@@ -248,17 +241,9 @@ fn build_run(session: &str, fam: &str, replies: &[Reply], idle_secs: i64) -> Mod
         })
         .collect();
     work.sort_by(|a, b| b.replies.cmp(&a.replies).then(a.cwd.cmp(&b.cwd)));
-    let mut cwds: Vec<String> = work.iter().map(|w| w.cwd.clone()).collect();
-    cwds.truncate(CWDS_PER_RUN);
-    let version = versions
-        .iter()
-        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
-        .map_or_else(|| fam.to_string(), |(v, _)| (*v).to_string());
     ModelRun {
         session: session.to_string(),
         model: fam.to_string(),
-        version,
-        cwds,
         first: replies.first().map(|r| r.at.to_rfc3339()).unwrap_or_default(),
         last: replies.last().map(|r| r.at.to_rfc3339()).unwrap_or_default(),
         minutes: secs / 60,

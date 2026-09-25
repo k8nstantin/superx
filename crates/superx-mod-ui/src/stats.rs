@@ -1903,16 +1903,10 @@ fn branch_derived(b: &BranchAgg) -> BranchDerived {
     // in a hundred calls read as 100, and zeroed the tool-success
     // component for any branch above a 1% failure rate.
     let failures_per_100 = pct(b.tool_failures, b.tool_calls);
-    // -1 for NO data. `median` returns 0 for an empty slice, and a
-    // branch where everything was overwritten inside a minute also
-    // medians to 0 — so 0 was rendering as a dash on precisely the
-    // worst branch, while the blend docked it 10 points (#354 review).
-    let survival_p50_mins = if b.survivals.is_empty() {
-        -1
-    } else {
-        let mut survivals = b.survivals.clone();
-        median(&mut survivals)
-    };
+    // No data is not 0: a branch where everything was overwritten inside
+    // a minute medians to 0, and 0 used to render as a dash on precisely
+    // the worst branch, while the blend docked it 10 points (#354 review).
+    let survival_p50_mins = median(&mut b.survivals.clone());
     let mut gaps = b.verify_gaps.clone();
 
     let mut parts: Vec<(i64, i64)> = Vec::new();
@@ -1939,7 +1933,7 @@ fn branch_derived(b: &BranchAgg) -> BranchDerived {
         test_pass_pct,
         failures_per_100,
         survival_p50_mins,
-        edit_to_verify_p50_secs: if gaps.is_empty() { -1 } else { median(&mut gaps) },
+        edit_to_verify_p50_secs: median(&mut gaps),
         quality_pct: if weight == 0 {
             -1
         } else {
@@ -1949,9 +1943,16 @@ fn branch_derived(b: &BranchAgg) -> BranchDerived {
 }
 
 /// The middle value, or zero for nothing (#340).
+/// What a median of nothing reads as: no data, which the page renders
+/// as a dash (#413). Never 0 — the page renders 0 as "under a minute".
+const NO_DATA: i64 = -1;
+
+/// The middle value, or [`NO_DATA`] for an empty sample — one guard for
+/// every median on the page, where seven sites each wrote their own
+/// (#415 review).
 fn median(v: &mut [i64]) -> i64 {
     if v.is_empty() {
-        return 0;
+        return NO_DATA;
     }
     v.sort_unstable();
     v[v.len() / 2]
@@ -2618,6 +2619,16 @@ fn judge_shell(
             events.push((when, GateEvent::Audited));
         }
     }
+    // The lines a commit's own output says it committed (#381) — read
+    // here, where every shell call is judged once whichever of call and
+    // output the walk met first.
+    if commits(cmd) {
+        if let Some((ins, del)) = commit_shortstat(out) {
+            code.committed_added += ins;
+            code.committed_removed += del;
+            code.commits_with_stat += 1;
+        }
+    }
     // What the output said about shipping — a PR number, a commit hash —
     // for the live row (#381).
     let detail_text = shipping_detail(out);
@@ -2953,9 +2964,6 @@ pub async fn stats_for_range_capped(
     // happens with interleaved sidechains. Without this the text is
     // stashed forever and silently dropped.
     let mut shell_calls: HashSet<String> = HashSet::new();
-    // Commit calls whose output is still to come — it carries the
-    // shortstat (#381).
-    let mut commit_calls: HashSet<String> = HashSet::new();
     // tool_use_id → what the call changed, read off its result (#410).
     let mut pending_diffs: HashMap<String, RecordedDiff> = HashMap::new();
     // Calls that were refused and never ran (#412).
@@ -3525,7 +3533,6 @@ pub async fn stats_for_range_capped(
                             }
                             // Now the tool is known: score its output
                             // if — and only if — it was a shell call.
-                            let cmd_opt = block.get("input").and_then(obj).and_then(|i| get_str(i, "command"));
                             // What the shell printed, kept for the gates and
                             // the shipping events, which count only what the
                             // output says happened (#412).
@@ -3542,13 +3549,6 @@ pub async fn stats_for_range_capped(
                                             &mut code, &branch_pair, &agent_name, &effort, &me_key,
                                             d,
                                         );
-                                        if cmd_opt.is_some_and(commits) {
-                                            if let Some((ins, del)) = commit_shortstat(&text) {
-                                                code.committed_added += ins;
-                                                code.committed_removed += del;
-                                                code.commits_with_stat += 1;
-                                            }
-                                        }
                                     }
                                     // Output already seen but the tool
                                     // was not a shell: drop it.
@@ -3557,9 +3557,6 @@ pub async fn stats_for_range_capped(
                                     // that this id is worth scoring.
                                     None if SHELL_TOOLS.contains(&name.as_str()) => {
                                         shell_calls.insert(id.to_string());
-                                        if cmd_opt.is_some_and(commits) {
-                                            commit_calls.insert(id.to_string());
-                                        }
                                     }
                                     None => {}
                                 }
@@ -3682,9 +3679,13 @@ pub async fn stats_for_range_capped(
                                 // Only a change to the work counts as file work
                                 // (#412): a read is not a write, and the agent's
                                 // scratchpad is not the product.
-                                let work = WRITE_TOOLS.contains(&name.as_str())
-                                    && applied
-                                    && touched_path(input).is_some_and(|p| is_work_path(p, &checkouts));
+                                // Derived once: every instrument below reads
+                                // this, so none can drop the filter (#415
+                                // review).
+                                let work_path = touched_path(input).filter(|p| {
+                                    WRITE_TOOLS.contains(&name.as_str()) && applied && is_work_path(p, &checkouts)
+                                });
+                                let work = work_path.is_some();
                                 let (n, replaced) = match (&recorded, work) {
                                     (_, false) => (0, 0),
                                     (Some(d), true) => (d.added, d.removed),
@@ -3783,7 +3784,7 @@ pub async fn stats_for_range_capped(
                                             b.edits_self += 1;
                                         }
                                     }
-                                    if let Some(pth) = touched_path(input).filter(|_| work) {
+                                    if let Some(pth) = work_path {
                                         b.files.insert(pth.to_string());
                                         // Only a real write OWNS a path.
                                         // Unguarded, every Read mapped
@@ -3814,7 +3815,7 @@ pub async fn stats_for_range_capped(
                                             r.edits_self += 1;
                                         }
                                     }
-                                    if let Some(pth) = touched_path(input).filter(|_| work) {
+                                    if let Some(pth) = work_path {
                                         r.files.insert(pth.to_string());
                                     }
                                 }
@@ -3843,7 +3844,7 @@ pub async fn stats_for_range_capped(
                                             .or_default();
                                         cell.added += n;
                                         cell.removed += replaced;
-                                        if let Some(pth) = touched_path(input).filter(|_| work) {
+                                        if let Some(pth) = work_path {
                                             cell.files.insert(pth.to_string());
                                         }
                                     }
@@ -3853,7 +3854,7 @@ pub async fn stats_for_range_capped(
                                 // walk is newest-first, so the last
                                 // value written wins — and that is the
                                 // oldest event for the path (#340).
-                                if let Some(pth) = touched_path(input).filter(|_| work) {
+                                if let Some(pth) = work_path {
                                     // Created, as the result says it was — every
                                     // Write used to count as a new file, and one in
                                     // four overwrote one that was there (#410).
@@ -3871,7 +3872,7 @@ pub async fn stats_for_range_capped(
                                         .entry(superx_ops::record_uuid(&m.session))
                                         .or_default()
                                         .push((when, GateEvent::Wrote));
-                                    if let Some(pth) = touched_path(input).filter(|_| work) {
+                                    if let Some(pth) = work_path {
                                         note_bright_line(&mut code, pth);
                                     }
                                 }
@@ -3910,7 +3911,7 @@ pub async fn stats_for_range_capped(
                                     // Which files, and how often each —
                                     // a path written three times is
                                     // rework of rework (#350).
-                                    if let Some(pth) = touched_path(input).filter(|_| work) {
+                                    if let Some(pth) = work_path {
                                         *l.path_hits.entry(pth.to_string()).or_insert(0) += 1;
                                         if l.files_now.len() < LIVE_FILES
                                             && !l.files_now.iter().any(|f| f == pth)
@@ -3925,7 +3926,7 @@ pub async fn stats_for_range_capped(
                                     mm.lines_added += n;
                                     mm.lines_removed += replaced;
                                 }
-                                if let Some(path) = touched_path(input).filter(|_| work) {
+                                if let Some(path) = work_path {
                                     let seen = code.removed_text.entry(path.to_string()).or_default();
                                     // How long did this text live?
                                     // `removed_at` holds when a LATER
@@ -4002,7 +4003,7 @@ pub async fn stats_for_range_capped(
                                 code.lines_removed += replaced;
 
                                 // The file this call touched.
-                                if let Some(path) = touched_path(input).filter(|_| work) {
+                                if let Some(path) = work_path {
                                     // Which of your instructions was this
                                     // answering, and was it the only thing
                                     // being answered (#406)?
@@ -4349,13 +4350,6 @@ pub async fn stats_for_range_capped(
                                         judge_shell(&mut code, &sid, at, &cmd, text, failed);
                                     }
                                 }
-                                if commit_calls.remove(id) {
-                                    if let Some((ins, del)) = commit_shortstat(text) {
-                                        code.committed_added += ins;
-                                        code.committed_removed += del;
-                                        code.commits_with_stat += 1;
-                                    }
-                                }
                             }
 
                             match call_names.remove(id) {
@@ -4623,7 +4617,7 @@ pub async fn stats_for_range_capped(
     }
     // -1 for NO data, so 0 can mean what it says (#413): a median under a
     // minute used to render as "no session had two turns".
-    let autonomy_p50_mins = if turn_gaps.is_empty() { -1 } else { median(&mut turn_gaps) };
+    let autonomy_p50_mins = median(&mut turn_gaps);
 
     // A file whose oldest event in the window was a full Write was
     // created here; anything else already existed.
@@ -4686,8 +4680,8 @@ pub async fn stats_for_range_capped(
     } else {
         Some(compaction_sessions.iter().map(|c| c.total_ms).sum())
     };
-    let edit_to_verify_p50_secs = if verify_gaps.is_empty() { -1 } else { median(&mut verify_gaps) };
-    let survival_p50_mins = if code.survivals.is_empty() { -1 } else { median(&mut code.survivals) };
+    let edit_to_verify_p50_secs = median(&mut verify_gaps);
+    let survival_p50_mins = median(&mut code.survivals);
 
     // Per-agent productivity, most productive first (#337).
     let mut agent_stats: Vec<_> = code
@@ -4705,7 +4699,7 @@ pub async fn stats_for_range_capped(
             reverts: a.reverts,
             repos: a.repos.len() as i64,
             repo_switches: a.repo_switches,
-            edit_to_verify_p50_secs: if a.verify_gaps.is_empty() { -1 } else { median(&mut a.verify_gaps) },
+            edit_to_verify_p50_secs: median(&mut a.verify_gaps),
             compactions: a.compactions,
             compaction_ms: a.compaction_ms,
             churn_directed: a.churn_directed,
@@ -4743,11 +4737,6 @@ pub async fn stats_for_range_capped(
         since
     };
     let landed = crate::landed::landed(&code.cwds, landed_since, clock).await;
-
-    // How much of each model's landed work is still there (#405)? Git
-    // says what landed and blame says what is left, so the ratio has
-    // none of the transcript's blind spots. A commit is credited to
-    // whichever model was working that directory as it landed.
 
     Ok(StatsSummary {
         landed,
@@ -4911,10 +4900,7 @@ pub async fn stats_for_range_capped(
                 .repos
                 .iter()
                 .map(|(name, r)| RepoStat {
-                    survival_p50_mins: match code.repo_survivals.get(name) {
-                        Some(v) if !v.is_empty() => median(&mut v.clone()),
-                        _ => -1,
-                    },
+                    survival_p50_mins: code.repo_survivals.get(name).map_or(NO_DATA, |v| median(&mut v.clone())),
                     files_created: repo_created.get(name).copied().unwrap_or(0),
                     name: name.clone(),
                     branch: r.branch.clone(),
