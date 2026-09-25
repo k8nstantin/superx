@@ -333,8 +333,9 @@ fn shell_inspects(cmd: &str) -> bool {
 }
 
 /// Paths an inspecting call read, so a `cat` counts as exposure the
-/// way a `Read` does. Path-shaped tokens only — something with a slash
-/// that is not a flag or a URL — resolved against `cwd` when relative.
+/// way a `Read` does. Path-shaped operands only — something with a slash
+/// that is not a flag, a URL, a glob or a pattern — resolved against the
+/// directory the stage runs in when relative.
 fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
     for (raw, here) in stages_in_place(cmd, cwd) {
@@ -343,17 +344,9 @@ fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
         if is_noise(&label) || !stage_inspects(&label, &stage) {
             continue;
         }
-        // git and gh take refs and ranges as arguments — `main...HEAD` is
-        // no file. Their paths are the words after `--`.
-        let words: Vec<&str> = stage.split_whitespace().skip(1).collect();
-        let args: &[&str] = if label.starts_with("git ") || label.starts_with("gh ") {
-            words.iter().position(|w| *w == "--").map_or(&[][..], |i| &words[i + 1..])
-        } else {
-            &words
-        };
-        for w in args {
-            let w = w.trim_matches(|c| c == '\'' || c == '"' || c == ',' || c == ';');
-            if w.starts_with('-') || !w.contains('/') || w.contains("://") || w.contains('*') {
+        for w in operands(&raw, &label) {
+            let w = w.trim_matches(|c| c == ',' || c == ';' || c == '(' || c == ')');
+            if !w.contains('/') || w.contains("://") || w.chars().any(|c| NOT_IN_A_PATH.contains(&c)) {
                 continue;
             }
             let path = if w.starts_with('/') || w.starts_with('~') {
@@ -371,6 +364,144 @@ fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
                 return out;
             }
         }
+    }
+    out
+}
+
+/// Characters a pattern, a glob or an unexpanded word carries and the
+/// paths these agents read never do: `sed -n '/^fn x/,/^}/p'` is no file.
+const NOT_IN_A_PATH: [char; 12] = ['*', '?', '^', '$', '|', '\\', '[', ']', '{', '}', '`', '\n'];
+
+/// Programs whose first operand is a pattern or a program, not a file.
+/// Read as a path, `grep -v '/generated/'` was a read outside the
+/// repository: 37 false outside reads in a week of this machine's shells.
+const PATTERN_FIRST: [&str; 8] = ["grep", "egrep", "fgrep", "rg", "ag", "sed", "awk", "jq"];
+
+/// How many words after `flag` are its value, for a program whose first
+/// operand is its pattern — and whether the flag carried the pattern (or
+/// a file of them), which leaves every operand a file. `grep -v` takes no
+/// value; `awk -v` does.
+fn pattern_flag(label: &str, flag: &str) -> (usize, bool) {
+    match (label, flag) {
+        (_, "-e" | "--regexp" | "--expression" | "-f" | "--file" | "--from-file") => (1, true),
+        ("rg", "--files") => (0, true),
+        ("grep" | "egrep" | "fgrep" | "rg" | "ag",
+         "-A" | "-B" | "-C" | "-m" | "--max-count" | "--context" | "--after-context" | "--before-context") => (1, false),
+        ("grep" | "egrep" | "fgrep", "-d" | "-D" | "--include" | "--exclude" | "--exclude-dir") => (1, false),
+        ("rg", "-g" | "--glob" | "--iglob" | "-t" | "--type" | "-T" | "--type-not" | "-j" | "-M" | "-d"
+            | "--max-depth") => (1, false),
+        ("ag", "-G" | "-g" | "--ignore" | "--depth") => (1, false),
+        ("awk", "-F" | "-v") => (1, false),
+        ("sed", "-l") => (1, false),
+        ("jq", "--arg" | "--argjson" | "--slurpfile" | "--rawfile") => (2, false),
+        ("jq", "--indent") => (1, false),
+        _ => {
+            // `--regexp=…`: the pattern, attached.
+            let carried = ["--regexp=", "--expression=", "--file=", "--from-file="]
+                .iter()
+                .any(|f| flag.starts_with(f));
+            (0, carried)
+        }
+    }
+}
+
+/// The operands of an inspecting stage: its words as the shell splits
+/// them, with redirections, the program and whatever stood before it set
+/// aside, and flags dropped. git and gh take refs and ranges —
+/// `origin/main...HEAD` is no file — so theirs are the words after `--`.
+/// A search or an editor takes its pattern first, unless a flag carried
+/// it.
+fn operands(raw: &str, label: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut target_next = false;
+    for (w, quoted) in shell_words(raw) {
+        if target_next {
+            target_next = false;
+            continue;
+        }
+        if !quoted && is_redirection(&w) {
+            target_next = bare_redirection(&w);
+            continue;
+        }
+        words.push(w);
+    }
+    let Some(program) = words.iter().position(|w| {
+        let w = w.trim_matches(|c| c == '(' || c == ')' || c == '{' || c == '}');
+        !w.is_empty() && !w.contains('=') && !WRAPPERS.contains(&w)
+    }) else {
+        return Vec::new();
+    };
+    let args = &words[program + 1..];
+    if label.starts_with("git ") || label.starts_with("gh ") {
+        return args.iter().position(|w| w == "--").map(|i| args[i + 1..].to_vec()).unwrap_or_default();
+    }
+    let pattern_first = PATTERN_FIRST.contains(&label);
+    let mut pattern_taken = !pattern_first
+        || args.iter().any(|w| w.starts_with('-') && pattern_flag(label, w).1);
+    let mut out = Vec::new();
+    let mut skip = 0usize;
+    for w in args {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        if w.starts_with('-') && w.len() > 1 {
+            if pattern_first {
+                skip = pattern_flag(label, w).0;
+            }
+            continue;
+        }
+        if !pattern_taken {
+            pattern_taken = true;
+            continue;
+        }
+        out.push(w.clone());
+    }
+    out
+}
+
+/// A stage's words as the shell splits them: quotes group and are
+/// removed, a backslash escapes outside single quotes. Each word says
+/// whether any of it was quoted — a quoted `>` is text, not a redirection.
+fn shell_words(stage: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut single, mut double) = (false, false);
+    let (mut started, mut quoted) = (false, false);
+    let mut chars = stage.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => {
+                single = !single;
+                started = true;
+                quoted = true;
+            }
+            '"' if !single => {
+                double = !double;
+                started = true;
+                quoted = true;
+            }
+            '\\' if !single => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                    started = true;
+                }
+            }
+            c if c.is_whitespace() && !single && !double => {
+                if started {
+                    out.push((std::mem::take(&mut cur), quoted));
+                }
+                started = false;
+                quoted = false;
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push((cur, quoted));
     }
     out
 }
@@ -1077,20 +1208,29 @@ fn strip_redirections(stage: &str) -> String {
             target_next = false;
             continue;
         }
-        let redirection = w.contains(">&")
-            || w.contains("&>")
-            || w.starts_with('>')
-            || w.starts_with('<')
-            || w.starts_with("2>")
-            || w.starts_with("1>")
-            || w == "&";
-        if redirection {
-            target_next = matches!(w, ">" | ">>" | "<" | "1>" | "1>>" | "2>" | "2>>" | "&>" | "&>>");
+        if is_redirection(w) {
+            target_next = bare_redirection(w);
             continue;
         }
         out.push(w);
     }
     out.join(" ")
+}
+
+/// A redirection word: an operator, with or without its target attached.
+fn is_redirection(w: &str) -> bool {
+    w.contains(">&")
+        || w.contains("&>")
+        || w.starts_with('>')
+        || w.starts_with('<')
+        || w.starts_with("2>")
+        || w.starts_with("1>")
+        || w == "&"
+}
+
+/// An operator whose target is the NEXT word: `> out.txt`.
+fn bare_redirection(w: &str) -> bool {
+    matches!(w, ">" | ">>" | "<" | "1>" | "1>>" | "2>" | "2>>" | "&>" | "&>>")
 }
 
 /// Shell noise that is not the program: grouping, env prefixes, and

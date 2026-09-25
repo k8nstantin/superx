@@ -3300,8 +3300,17 @@ async fn a_shell_call_reads_and_writes_where_it_stands() {
         // …a range is not a path, the words after `--` are…
         ("r2", "git diff origin/main...HEAD"),
         ("r3", "git log --oneline -- src/lib.rs"),
-        // …and `cd` moves a read out of the repository.
+        // …`cd` moves a read out of the repository…
         ("r4", "cd /etc && cat ssh/sshd_config"),
+        // …and a pattern, a program or a flag's value is no file: `/^fn`
+        // and `/` would each have been a read outside the repository.
+        ("r6", "sed -n '/^fn x/,/^}/p' src/lib.rs"),
+        ("r7", "grep -n -v '/generated/' ui/app.ts"),
+        ("r8", "awk -F / '/src/' src/main.rs | grep -v '/dist/'"),
+        // A quoted path is one path, spaces and all; a brace expansion
+        // names files the line does not spell.
+        ("r9", "cat \"/opt/My Files/notes.txt\""),
+        ("r10", "head -5 src/{a,b}.rs"),
     ] {
         log_tool_message(&kernel, &session, &agent, shell(id, cmd)).await;
     }
@@ -3315,9 +3324,10 @@ async fn a_shell_call_reads_and_writes_where_it_stands() {
     assert!(names.iter().any(|n| n.ends_with("/ui/app.ts")), "{names:?}");
     assert!(names.iter().any(|n| n.ends_with("/superx/top.rs")), "the subshell's cd ended: {names:?}");
     assert!(names.iter().all(|n| !n.contains("scratchpad") && !n.ends_with("/ui/top.rs")), "{names:?}");
-    assert_eq!(s.exposure.files_read, 3,
-        "README (twice, one path), src/lib.rs and sshd_config; never `origin/main...HEAD`");
-    assert_eq!(s.exposure.outside_reads, 1, "the cat after `cd /etc`");
+    assert_eq!(s.exposure.files_read, 6,
+        "README (twice, one path), src/lib.rs (twice), sshd_config, ui/app.ts, src/main.rs and \
+         the notes; never `origin/main...HEAD`, a pattern, a separator or a brace expansion");
+    assert_eq!(s.exposure.outside_reads, 2, "the cat after `cd /etc` and the notes, and nothing else");
 }
 
 /// One call writing two files from two heredocs wrote two texts, not one
