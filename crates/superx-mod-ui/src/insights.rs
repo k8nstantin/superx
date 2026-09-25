@@ -51,16 +51,30 @@ fn is_failure(event: &str) -> bool {
     matches!(event, "module_failed" | "module_start_failed" | "module_start_abandoned")
 }
 
-/// Gemini stores `input`/`output`/`cached`; Claude Code stores the four
-/// `*_input_tokens` counters. One query covers both — a missing field
-/// coalesces to 0 rather than dropping the row.
+/// Gemini stores `input`/`output`/`cached`/`thoughts`; Claude Code stores
+/// the four `*_input_tokens` counters. One query covers both — a missing
+/// field coalesces to 0 rather than dropping the row.
+///
+/// Once per REPLY (#409): Claude Code repeats a reply's usage on every
+/// line it writes for it, and Gemini re-emits a record as it streams, so
+/// the inner query keeps one value per reply before the outer one sums.
+/// Gemini's `input` includes what it read from cache, and its `output`
+/// excludes its `thoughts` — both are adjusted to read like Claude's.
 const TOKENS_QUERY: &str = "SELECT
-        math::sum(raw.message.usage.input_tokens ?? raw.tokens.input ?? 0) AS input,
-        math::sum(raw.message.usage.output_tokens ?? raw.tokens.output ?? 0) AS output,
-        math::sum(raw.message.usage.cache_read_input_tokens ?? raw.tokens.cached ?? 0)
-            AS cache_read,
-        math::sum(raw.message.usage.cache_creation_input_tokens ?? 0) AS cache_write
-     FROM message GROUP ALL";
+        math::sum(input) AS input, math::sum(output) AS output,
+        math::sum(cache_read) AS cache_read, math::sum(cache_write) AS cache_write
+     FROM (
+        SELECT (raw.message.id ?? raw.id ?? id) AS k,
+            math::max(raw.message.usage.input_tokens
+                ?? ((raw.tokens.input ?? 0) - (raw.tokens.cached ?? 0))) AS input,
+            math::max(raw.message.usage.output_tokens
+                ?? ((raw.tokens.output ?? 0) + (raw.tokens.thoughts ?? 0))) AS output,
+            math::max(raw.message.usage.cache_read_input_tokens ?? raw.tokens.cached ?? 0)
+                AS cache_read,
+            math::max(raw.message.usage.cache_creation_input_tokens ?? 0) AS cache_write
+        FROM message WHERE raw.message.usage != NONE OR raw.tokens != NONE
+        GROUP BY k
+     ) GROUP ALL";
 
 fn obj(v: &Value) -> Option<&Object> {
     match v {
@@ -211,18 +225,24 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
     };
 
     // ── which models did the work ───────────────────────────────────
+    // Replies, not lines (#409): a model that thinks and calls tools in
+    // one reply writes more lines per reply, so counting lines tilted the
+    // split toward it. `<synthetic>` is the runtime's own marker, not a
+    // model (#367).
     let mut models: Vec<NameCount> = rows(
         kernel,
-        "SELECT raw.message.model ?? raw.model AS model, count() AS value
-         FROM message WHERE raw.message.model != NONE OR raw.model != NONE
-         GROUP BY model",
+        "SELECT model, count() AS value FROM (
+            SELECT (raw.message.model ?? raw.model) AS model, (raw.message.id ?? raw.id ?? id) AS k
+            FROM message WHERE raw.message.model != NONE OR raw.model != NONE
+            GROUP BY model, k
+         ) GROUP BY model",
     )
     .await?
     .iter()
     .filter_map(obj)
     .filter_map(|o| {
         Some(NameCount {
-            name: get_str(o, "model")?.to_string(),
+            name: get_str(o, "model").filter(|m| !m.starts_with('<'))?.to_string(),
             value: get_int(o, "value"),
         })
     })
@@ -241,24 +261,42 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
         };
         agent_name.insert(superx_ops::record_uuid(&a.entity_id), name);
     }
+    let agent_of = |o: &Object| match o.get("agent") {
+        Some(Value::RecordId(r)) => superx_ops::record_uuid(r),
+        _ => String::new(),
+    };
+    // Output once per reply (#409); the message count stays a count of
+    // captured rows, which is what the calendar above counts too.
+    let mut output_of: HashMap<String, i64> = HashMap::new();
+    for o in rows(
+        kernel,
+        "SELECT agent, math::sum(o) AS output FROM (
+            SELECT agent, (raw.message.id ?? raw.id ?? id) AS k,
+                math::max(raw.message.usage.output_tokens
+                    ?? ((raw.tokens.output ?? 0) + (raw.tokens.thoughts ?? 0))) AS o
+            FROM message WHERE raw.message.usage != NONE OR raw.tokens != NONE
+            GROUP BY agent, k
+         ) GROUP BY agent",
+    )
+    .await?
+    .iter()
+    .filter_map(obj)
+    {
+        output_of.insert(agent_of(o), get_int(o, "output"));
+    }
     let mut per_agent: Vec<AgentSplit> = rows(
         kernel,
-        "SELECT agent, count() AS messages,
-                math::sum(raw.message.usage.output_tokens ?? raw.tokens.output ?? 0) AS output
-         FROM message GROUP BY agent",
+        "SELECT agent, count() AS messages FROM message GROUP BY agent",
     )
     .await?
     .iter()
     .filter_map(obj)
     .map(|o| {
-        let uuid = match o.get("agent") {
-            Some(Value::RecordId(r)) => superx_ops::record_uuid(r),
-            _ => String::new(),
-        };
+        let uuid = agent_of(o);
         AgentSplit {
             name: agent_name.get(&uuid).cloned().unwrap_or_else(|| "unattributed".into()),
             messages: get_int(o, "messages"),
-            output_tokens: get_int(o, "output"),
+            output_tokens: output_of.get(&uuid).copied().unwrap_or(0),
         }
     })
     .collect();

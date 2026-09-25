@@ -14,8 +14,7 @@ use superx_kernel::types::{Object, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
-    BurnPoint, DuplicateWrite, FocusStat, IntensityPoint, ModelEffortStat, ModelQualityPoint,
-    ModelRepoStat,
+    BurnPoint, DuplicateWrite, FocusStat, IntensityPoint, ModelEffortStat,
     AgentStat, BranchStat, ChurnPoint, CompactionStat, EffortStat, Exposure, HourRate, LiveSession, ModelStat, NameCount, QualityPoint, RepoStat, SessionSpan, SessionStat, SlowOp, StatsSummary, TimeCount, ToolOutcome, WorkCell,
 };
 
@@ -33,25 +32,6 @@ const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 /// Tools that inspect rather than change (issue #308).
 const READ_TOOLS: &[&str] = &["Read", "Glob", "Grep", "NotebookRead"];
 
-/// Phrases an agent uses when it is admitting the work was wrong.
-/// Its own assessment, which is cheaper and sharper than guessing at
-/// the operator's mood — and it is the half of the record that no
-/// vendor publishes (#406).
-const ADMISSIONS: [&str; 12] = [
-    "my error",
-    "my mistake",
-    "my fault",
-    "i was wrong",
-    "i should have",
-    "i shouldn't have",
-    "worse than i thought",
-    "wrong branch",
-    "i broke",
-    "i missed",
-    "died again",
-    "failed again",
-];
-
 /// How the operator actually redirects work that has gone off course.
 ///
 /// These are not guesses. They were counted over 1,533 of this
@@ -65,7 +45,7 @@ const ADMISSIONS: [&str; 12] = [
 /// The turn is the operator's; the CAUSE is the agent leaving the
 /// instruction. This is the only place that leaving is written down,
 /// which is what makes it worth counting (#406).
-pub(crate) const CORRECTIONS: [&str; 18] = [
+pub(crate) const CORRECTIONS: [&str; 20] = [
     "again",
     "stop",
     "wrong",
@@ -77,7 +57,12 @@ pub(crate) const CORRECTIONS: [&str; 18] = [
     "throw",
     "i said",
     "i told you",
-    "deviat",
+    // Whole words since #414: the stem `deviat` matched "deviation", and
+    // every one of its hits was the operator talking about the Deviations
+    // band, not about the agent deviating.
+    "deviate",
+    "deviated",
+    "deviating",
     "start over",
     "from scratch",
     "revert",
@@ -86,55 +71,28 @@ pub(crate) const CORRECTIONS: [&str; 18] = [
     "fix it",
 ];
 
-/// Phrases that mean the work is being done again rather than done —
-/// the agent's own account of it, kept for the transcript-side walk.
-pub(crate) const REDO_TALK: [&str; 6] = [
-    "third attempt",
-    "second attempt",
-    "try again",
-    "start over",
-    "from scratch",
-    "rewriting it",
-];
-
 /// What plain contempt looks like in the operator's turns. One person
 /// writes them all, so their style is a constant and a difference
 /// between models is the models (#406). `fuck` alone lands in 20.4% of
 /// this operator's turns, so it is the loudest signal in the corpus.
+/// Matched as the START of a word, so "fucking" counts and "rashit" does
+/// not.
 pub(crate) const ESCALATIONS: [&str; 6] = ["fuck", "shit", "wtf", "damn", "useless", "garbage"];
 
-fn says_any(text: &str, markers: &[&str]) -> bool {
-    let low = text.to_ascii_lowercase();
-    markers.iter().any(|m| low.contains(m))
-}
-
-/// Where a reading happened: the bucket of time, and the repository.
-/// One parameter rather than two, so the helpers that carry it stay
-/// within their argument budget (#403).
-struct Slice<'a> {
-    bucket: &'a str,
-    repo: Option<&'a String>,
-}
-
-/// Add to both of a model's slices at once (#403): the bucket of time
-/// it happened in, and the repository it happened to. Each site that
-/// already attributes to `model_effort` gains one line.
-macro_rules! model_slice {
-    ($code:expr, $model:expr, $bucket:expr, $repo:expr, $field:ident += $n:expr) => {{
-        let n = $n;
-        $code
-            .model_time
-            .entry(($model.to_string(), $bucket.to_string()))
-            .or_default()
-            .$field += n;
-        if let Some(r) = $repo {
-            $code
-                .model_repo
-                .entry(($model.to_string(), r.clone()))
-                .or_default()
-                .$field += n;
-        }
-    }};
+/// Does `text` carry one of `markers` as a word (#414)? A marker must
+/// start where a word starts, and — unless `stem` — end where it ends.
+/// A plain substring test read "against" as "again" and "following" as
+/// "follow": 24 of 66 and 8 of 14 of those hits on the operator's own
+/// turns were not corrections at all.
+pub(crate) fn says_word(text: &str, markers: &[&str], stem: bool) -> bool {
+    let low = text.to_lowercase();
+    let bounded = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+    markers.iter().any(|m| {
+        low.match_indices(m).any(|(i, _)| {
+            bounded(low[..i].chars().next_back())
+                && (stem || bounded(low[i + m.len()..].chars().next()))
+        })
+    })
 }
 
 fn obj(v: &Value) -> Option<&Object> {
@@ -156,6 +114,82 @@ fn get_int(o: &Object, key: &str) -> i64 {
         Some(Value::Number(n)) => n.to_int().unwrap_or(0),
         _ => 0,
     }
+}
+
+/// The reply a row belongs to (#409). Claude Code writes one line per
+/// content block of a reply — thinking, text, each tool call — and every
+/// one of them repeats the reply's `usage` under the same `message.id`.
+/// Gemini re-emits a record as it streams, fuller each time, under the
+/// same `id`. Either way, a reply is counted once, not once per row.
+fn reply_key(raw: &Object) -> Option<String> {
+    raw.get("message")
+        .and_then(obj)
+        .and_then(|m| get_str(m, "id"))
+        .or_else(|| get_str(raw, "id"))
+        .map(str::to_string)
+}
+
+/// The key a reply's rows share, in SurrealQL — the engine-side twin of
+/// [`reply_key`] (#409). A row with neither id is its own reply.
+pub(crate) const REPLY_KEY_SQL: &str = "(raw.message.id ?? raw.id ?? id)";
+
+/// A reply's output tokens, in SurrealQL, the way [`reply_usage`] reads
+/// them: Claude's `output_tokens`, else Gemini's `output` plus its
+/// `thoughts`. Every term is parenthesised — `??` binds tighter than `+`.
+pub(crate) const OUT_TOKENS_SQL: &str =
+    "(raw.message.usage.output_tokens ?? ((raw.tokens.output ?? 0) + (raw.tokens.thoughts ?? 0)))";
+
+/// One reply's token counters, in one shape for both agents (#409).
+///
+/// Claude Code's `output_tokens` already includes the reasoning it
+/// reports under `output_tokens_details.thinking_tokens`; Gemini
+/// reports its `thoughts` beside `output`, so the two are added to read
+/// the same way. Gemini's `input` includes what it served from cache,
+/// so fresh input is the difference.
+#[derive(Clone, Copy, Default)]
+struct ReplyUsage {
+    out: i64,
+    thinking: i64,
+    input: i64,
+    cache_write: i64,
+    cache_read: i64,
+    /// The whole prompt this reply was answering.
+    context: i64,
+}
+
+fn reply_usage(raw: &Object) -> Option<ReplyUsage> {
+    if let Some(u) = raw
+        .get("message")
+        .and_then(obj)
+        .and_then(|m| m.get("usage"))
+        .and_then(obj)
+    {
+        let input = get_int(u, "input_tokens");
+        let cache_write = get_int(u, "cache_creation_input_tokens");
+        let cache_read = get_int(u, "cache_read_input_tokens");
+        return Some(ReplyUsage {
+            out: get_int(u, "output_tokens"),
+            thinking: u
+                .get("output_tokens_details")
+                .and_then(obj)
+                .map_or(0, |d| get_int(d, "thinking_tokens")),
+            input,
+            cache_write,
+            cache_read,
+            context: input + cache_write + cache_read,
+        });
+    }
+    let t = raw.get("tokens").and_then(obj)?;
+    let cached = get_int(t, "cached");
+    let prompt = get_int(t, "input");
+    Some(ReplyUsage {
+        out: get_int(t, "output") + get_int(t, "thoughts"),
+        thinking: get_int(t, "thoughts"),
+        input: (prompt - cached).max(0),
+        cache_write: 0,
+        cache_read: cached,
+        context: prompt + get_int(t, "tool"),
+    })
 }
 
 /// The file a tool call touched: `file_path` for the file tools,
@@ -311,11 +345,6 @@ fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
     }
     out
 }
-
-/// Points kept per working directory when tracking which model was
-/// there — enough to place a commit, bounded so a long range cannot
-/// grow it without limit (#405).
-const MODEL_TIMELINE: usize = 4_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
 /// Sessions and duplicate artifacts named on the page, at most (#406).
 const FOCUS_ROWS: usize = 12; // skill-allow: §9-const — render-layer cap
@@ -1029,10 +1058,6 @@ struct CodeAgg {
     seen_sessions: HashSet<String>,
     /// (model, effort) → outcomes (#391).
     model_effort: HashMap<(String, String), ModelEffortAgg>,
-    /// (model, bucket) → outcomes over time, and (model, repo) →
-    /// outcomes per repository (#403).
-    model_time: BTreeMap<(String, String), ModelSliceAgg>,
-    model_repo: BTreeMap<(String, String), ModelSliceAgg>,
     /// (session, window between your turns) → the distinct directories
     /// worked in it. One instruction should mean one thing (#406).
     focus: HashMap<(String, usize), HashSet<String>>,
@@ -1044,23 +1069,17 @@ struct CodeAgg {
     session_branches: HashMap<String, HashSet<String>>,
     /// Branches opened in the range.
     branches_opened: i64,
-    /// Every working directory's model timeline: when, and which. A
-    /// commit is credited to whoever was working there as it landed
-    /// (#405).
-    cwd_models: BTreeMap<String, Vec<(chrono::DateTime<chrono::Utc>, String)>>,
-    /// session → the pair it was running. An interruption, a refusal or
-    /// a tool result names no model — they ride the user's turn or the
-    /// result line — so attributing them to the message's own pair
-    /// attributed them to nothing, and every pair reported that nobody
-    /// had ever had to step in. The walk is newest-first, so the first
-    /// pair seen for a session is the one it is running now.
-    session_pair: HashMap<String, (String, String)>,
-    /// session → (denials, interruptions) seen BEFORE its pair was
-    /// known. The walk is newest-first, so a session stopped on its
-    /// last breath is met before anything that names what it was
-    /// running; these are held and drained when the pair appears, the
-    /// same way a tool result is held for its call.
+    /// session → (denials, interruptions) met since its last reply that
+    /// named a pair. An interruption or a refusal names no model — it
+    /// rides the user's turn or the result line — so it is held, the
+    /// way a tool result is held for its call, and drained into the
+    /// next older reply that names one: the reply that was stopped
+    /// (#391, #413).
     pending_steps: HashMap<String, (i64, i64)>,
+    /// Agent-clock hours that saw any row of the range (#413) — the
+    /// denominator every per-hour rate on the page needs, instead of
+    /// the last day's hours whatever the range.
+    active_hours: HashSet<String>,
     /// session → (time, is_write) events, reduced after the walk into
     /// how long a write waited for its verification.
     verify_events: HashMap<String, Vec<(chrono::DateTime<chrono::Utc>, bool)>>,
@@ -1410,34 +1429,6 @@ enum GateEvent {
 /// Two separate tables cannot answer "does thinking harder pay" when
 /// the model and the level change together, which is how they are
 /// actually switched — the pair has to be one key.
-/// One model's outcomes in one slice — a bucket of time, or a
-/// repository (#403). The same counters either way, because the
-/// question is the same and only the slicing differs.
-#[derive(Default)]
-struct ModelSliceAgg {
-    messages: i64,
-    /// The prompt a model carried, summed and counted so an average
-    /// falls out, plus the largest it ever grew (#407). A model that
-    /// fills its window to do a small thing is paying for the window
-    /// on every turn.
-    context_sum: i64,
-    context_n: i64,
-    context_max: i64,
-    /// The agent saying the work was wrong, and saying it is doing it
-    /// again; and the operator losing patience (#406).
-    admissions: i64,
-    redo_talk: i64,
-    escalations: i64,
-    tool_calls: i64,
-    tool_failures: i64,
-    tests_passed: i64,
-    tests_failed: i64,
-    interventions: i64,
-    denials: i64,
-    lines_added: i64,
-    out_tokens: i64,
-}
-
 #[derive(Default)]
 struct ModelEffortAgg {
     sessions: HashSet<String>,
@@ -1825,7 +1816,6 @@ fn attribute_quality(
     agent_name: &Option<String>,
     effort: &Option<String>,
     me_key: &Option<(String, String)>,
-    at: &Slice<'_>,
     (passed, failed, errors): (i64, i64, i64),
 ) {
     if passed == 0 && failed == 0 && errors == 0 {
@@ -1852,14 +1842,11 @@ fn attribute_quality(
         ea.tests_passed += passed;
         ea.tests_failed += failed;
     }
-    // The pair the operator actually switches (#391), and the model's
-    // own slices over time and per repository (#403).
+    // The pair the operator actually switches (#391).
     if let Some(k) = me_key {
         let me = code.model_effort.entry(k.clone()).or_default();
         me.tests_passed += passed;
         me.tests_failed += failed;
-        model_slice!(code, k.0, at.bucket, at.repo, tests_passed += passed);
-        model_slice!(code, k.0, at.bucket, at.repo, tests_failed += failed);
     }
 }
 
@@ -1875,6 +1862,38 @@ fn note_bright_line(code: &mut CodeAgg, path: &str) {
 /// One in-engine `count() GROUP ALL` over a table.
 async fn count_rows(kernel: &Kernel, query: &'static str) -> Result<i64> {
     let rows: Vec<Value> = kernel.db().query(query).await?.take(0)?;
+    Ok(rows.first().and_then(|r| obj(r).map(|o| get_int(o, "c"))).unwrap_or(0))
+}
+
+/// Output tokens, one count per reply (#409), over every row or over the
+/// rows emitted after `since` on the agent's clock.
+///
+/// A reply's rows share a key — Claude Code's `message.id`, Gemini's
+/// record `id` — and each carries the reply's whole usage, so the engine
+/// takes one value per key before it sums. Summing the rows counted a
+/// Claude reply two to four times over. A row with neither key is its
+/// own reply.
+async fn reply_output_tokens(
+    kernel: &Kernel,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<i64> {
+    let window = if since.is_some() {
+        "AND valid_from > $cut AND (emitted_at ?? valid_from) > $cut"
+    } else {
+        ""
+    };
+    let query = format!(
+        "SELECT math::sum(o) AS c FROM (\
+             SELECT {REPLY_KEY_SQL} AS k, math::max({OUT_TOKENS_SQL}) AS o FROM message \
+             WHERE (raw.message.usage != NONE OR raw.tokens != NONE) {window} \
+             GROUP BY k\
+         ) GROUP ALL"
+    );
+    let mut q = kernel.db().query(query);
+    if let Some(cut) = since {
+        q = q.bind(("cut", cut));
+    }
+    let rows: Vec<Value> = q.await?.take(0)?;
     Ok(rows.first().and_then(|r| obj(r).map(|o| get_int(o, "c"))).unwrap_or(0))
 }
 
@@ -1919,27 +1938,22 @@ pub async fn stats_for_range_capped(
     let events_total =
         count_rows(kernel, "SELECT count() AS c FROM telemetry_stream GROUP ALL").await?;
     let messages_total = count_rows(kernel, "SELECT count() AS c FROM message GROUP ALL").await?;
-    let rows: Vec<Value> = kernel
-        .db()
-        .query(
-            "SELECT math::sum(raw.message.usage.output_tokens ?? raw.tokens.output ?? 0) \
-                 AS c FROM message GROUP ALL",
-        )
-        .await?
-        .take(0)?;
-    let output_tokens_total = rows
-        .first()
-        .and_then(|r| obj(r).map(|o| get_int(o, "c")))
-        .unwrap_or(0);
+    let output_tokens_total = reply_output_tokens(kernel, None).await?;
 
     // Active sessions: distinct sessions with a message inside the
     // activity threshold (parameter on the ui entity; default matches
-    // the Sessions page's liveness window).
+    // the Sessions page's liveness window) — on the agent's clock, as the
+    // live list is. `valid_from` stays as the cheap indexed bound: a row
+    // is never captured before it was written (#413).
     let active_secs = resolved_active_secs(kernel).await;
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(active_secs);
     let rows: Vec<Value> = kernel
         .db()
-        .query("SELECT session FROM message WHERE valid_from > $cutoff GROUP BY session")
+        .query(
+            "SELECT session FROM message \
+             WHERE valid_from > $cutoff AND (emitted_at ?? valid_from) > $cutoff \
+             GROUP BY session",
+        )
         .bind(("cutoff", cutoff))
         .await?
         .take(0)?;
@@ -2058,7 +2072,19 @@ pub async fn stats_for_range_capped(
     // Commit calls whose output is still to come — it carries the
     // shortstat (#381).
     let mut commit_calls: HashSet<String> = HashSet::new();
+    // Replies already met (#409). A reply's usage rides every line Claude
+    // Code writes for it, and a Gemini record is re-emitted, fuller each
+    // time, as it streams. The walk is newest-first, so the first row met
+    // for a reply is its last line, or its fullest emission.
+    let mut seen_replies: HashSet<String> = HashSet::new();
     for m in &msgs {
+        let reply = m.raw.as_ref().and_then(reply_key);
+        let fresh_reply = reply.as_ref().is_none_or(|k| seen_replies.insert(k.clone()));
+        // An older, shorter emission of a Gemini record already read in
+        // full. A Claude line is never skipped: each carries its own block.
+        if !fresh_reply && m.raw.as_ref().is_some_and(|r| r.get("message").is_none()) {
+            continue;
+        }
         let sid = superx_ops::record_uuid(&m.session);
         let agg = per_session.entry(sid).or_default();
         agg.messages += 1;
@@ -2072,17 +2098,16 @@ pub async fn stats_for_range_capped(
         // (insights.rs already reads it this way) (#340).
         let when = m.emitted_at.unwrap_or(m.valid_from);
         code.instants.push(when);
-        let minute: u32 = m
-            .valid_from
-            .format("%M")
-            .to_string()
-            .parse()
-            .unwrap_or(0);
+        // Hour AND minute from the agent's clock: the minute used to come
+        // from the capture clock, so a backfill folded a whole hour of
+        // sessions into one five-minute bucket (#413).
+        let minute = chrono::Timelike::minute(&when);
         let bucket5 = format!("{}-{}", when.format("%Y-%m-%dT%H"), minute / 5);
         code.concurrency
             .entry(bucket5)
             .or_default()
             .insert(superx_ops::record_uuid(&m.session));
+        code.active_hours.insert(when.format("%Y-%m-%dT%H").to_string());
 
         let Some(raw) = &m.raw else { continue };
 
@@ -2093,7 +2118,9 @@ pub async fn stats_for_range_capped(
         // the real effort on an older message — the same trap `branch`
         // sidesteps below (#344 review).
         let effort = get_str(raw, "effort").filter(|e| !e.is_empty()).map(str::to_string);
-        if let Some(e) = &effort {
+        // A reply, not a line: one reply is several lines, and more of
+        // them for a model that thinks and calls tools in one go (#409).
+        if let Some(e) = effort.as_ref().filter(|_| fresh_reply) {
             code.efforts.entry(e.clone()).or_default().messages += 1;
         }
         let hour_key = when.format("%Y-%m-%dT%H").to_string();
@@ -2199,13 +2226,15 @@ pub async fn stats_for_range_capped(
         // `<synthetic>` is Claude Code's marker for a line the runtime
         // wrote itself; it sat in the model comparison and on the live
         // panel as if something had been prompted (#367). Not a model.
+        // Gemini names its model on the record itself (#409).
         let model_opt = raw
             .get("message")
             .and_then(obj)
             .and_then(|m| get_str(m, "model"))
+            .or_else(|| get_str(raw, "model"))
             .filter(|m| !m.is_empty() && !m.starts_with('<'))
             .map(str::to_string);
-        if let Some(known) = &model_opt {
+        if let Some(known) = model_opt.as_ref().filter(|_| fresh_reply) {
             code.models.entry(known.clone()).or_default().messages += 1;
         }
         // How many fronts were open in this bucket (#395). The repo
@@ -2247,11 +2276,16 @@ pub async fn stats_for_range_capped(
         let me_key = model_opt.clone().zip(effort.clone());
         let sid_here = superx_ops::record_uuid(&m.session);
         if let Some(k) = &me_key {
-            let first = !code.session_pair.contains_key(&sid_here);
-            code.session_pair.entry(sid_here.clone()).or_insert_with(|| k.clone());
-            let held = if first { code.pending_steps.remove(&sid_here) } else { None };
+            // Refusals and interruptions met since the last pair belong
+            // to THIS one: the walk is newest-first, so the next older
+            // reply is the one whose call was refused or stopped. Handing
+            // them to the session's newest pair gave a model switched in
+            // later every step taken before it (#413).
+            let held = code.pending_steps.remove(&sid_here);
             let me = code.model_effort.entry(k.clone()).or_default();
-            me.messages += 1;
+            if fresh_reply {
+                me.messages += 1;
+            }
             me.sessions.insert(sid_here.clone());
             if let Some((d, i)) = held {
                 me.denials += d;
@@ -2281,61 +2315,20 @@ pub async fn stats_for_range_capped(
             when.format("%Y-%m-%dT%H").to_string()
         };
         let repo_key = get_str(raw, "cwd").map(|c| c.rsplit('/').next().unwrap_or(c).to_string());
-        // The model's own slices: this message, in this bucket, on this
-        // repository (#403), and what was said in it (#406).
-        if let Some(k) = &me_key {
-            model_slice!(code, k.0, bucket, repo_key.as_ref(), messages += 1);
-            if m.role == "assistant" && !m.content.is_empty() {
-                if says_any(&m.content, &ADMISSIONS) {
-                    model_slice!(code, k.0, bucket, repo_key.as_ref(), admissions += 1);
-                }
-                if says_any(&m.content, &REDO_TALK) {
-                    model_slice!(code, k.0, bucket, repo_key.as_ref(), redo_talk += 1);
-                }
-            }
-        }
-        // The operator's frustration belongs to whatever was running,
-        // not to their own turn, which names no model (#406).
-        if m.role == "user" && !m.content.is_empty() && says_any(&m.content, &ESCALATIONS) {
-            if let Some(k) = code.session_pair.get(&sid_here).cloned() {
-                model_slice!(code, k.0, bucket, repo_key.as_ref(), escalations += 1);
-            }
-        }
-
         // Being stopped or refused belongs to whatever the session was
         // running, not to the message that carries the flag — that one
-        // names no model (#391).
+        // names no model (#391). It is held for the next older reply
+        // that names a pair, which is the one that was stopped (#413).
         if get_str(raw, "toolDenialKind").is_some()
             || raw.get("interruptedMessageId").is_some()
             || raw.get("userFeedback").is_some()
         {
             let denied = get_str(raw, "toolDenialKind").is_some();
-            match code.session_pair.get(&sid_here).cloned() {
-                Some(k) => {
-                    if denied {
-                        model_slice!(code, k.0, bucket, repo_key.as_ref(), denials += 1);
-                    } else {
-                        model_slice!(code, k.0, bucket, repo_key.as_ref(), interventions += 1);
-                    }
-                    let me = code.model_effort.entry(k).or_default();
-                    if denied {
-                        me.denials += 1;
-                    } else {
-                        me.interventions += 1;
-                    }
-                }
-                // The pair comes later in the walk. Hold it for whatever
-                // this session turns out to have been running; a session
-                // that never names one keeps it unattributed, which is
-                // the honest answer.
-                None => {
-                    let e = code.pending_steps.entry(sid_here.clone()).or_insert((0, 0));
-                    if denied {
-                        e.0 += 1;
-                    } else {
-                        e.1 += 1;
-                    }
-                }
+            let e = code.pending_steps.entry(sid_here.clone()).or_insert((0, 0));
+            if denied {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
             }
         }
         // Per-agent productivity (#337). Sessions are `agent/uuid`,
@@ -2364,12 +2357,6 @@ pub async fn stats_for_range_capped(
         }
         if let Some(c) = get_str(raw, "cwd") {
             code.cwds.insert(c.to_string());
-            if let Some(m) = &model_opt {
-                let seen = code.cwd_models.entry(c.to_string()).or_default();
-                if seen.len() < MODEL_TIMELINE {
-                    seen.push((when, m.clone()));
-                }
-            }
         }
         let branch_key =
             get_str(raw, "gitBranch").filter(|b| !b.is_empty()).map(str::to_string);
@@ -2479,116 +2466,77 @@ pub async fn stats_for_range_capped(
                 a.compaction_ms += get_int(cm, "durationMs");
             }
         }
-        // Claude-style usage + blocks: raw.message.{usage, content[]}.
-        if let Some(Value::Object(msg)) = raw.get("message") {
-            if let Some(Value::Object(usage)) = msg.get("usage") {
-                let out = get_int(usage, "output_tokens");
-                code.live
-                    .entry(superx_ops::record_uuid(&m.session))
-                    .or_default()
-                    .out_tokens += out;
-                agg.out_tokens += out;
-                code.out_tokens += out;
-                // Spent with nobody steering (#391).
-                if !steered {
-                    code.unattended_out += out;
-                }
-                if let Some(k) = &me_key {
-                    model_slice!(code, k.0, bucket, repo_key.as_ref(), out_tokens += out);
-                    let me = code.model_effort.entry(k.clone()).or_default();
-                    me.out_tokens += out;
-                    me.thinking_tokens += usage
-                        .get("output_tokens_details")
-                        .and_then(obj)
-                        .map_or(0, |d| get_int(d, "thinking_tokens"));
-                }
-                if let Some(an) = &agent_name {
-                    code.agents.entry(an.clone()).or_default().out_tokens += out;
-                }
-                if let Some(known) = &model_opt {
-                    code.models.entry(known.clone()).or_default().out_tokens += out;
-                }
-                if let Some(e) = &effort {
-                    let ea = code.efforts.entry(e.clone()).or_default();
-                    ea.out_tokens += out;
-                    if let Some(Value::Object(details)) = usage.get("output_tokens_details") {
-                        ea.thinking_tokens += get_int(details, "thinking_tokens");
-                    }
-                }
-                if let Some(rk) = &repo_key {
-                    code.repos.entry(rk.clone()).or_default().out_tokens += out;
-                    if let Some(an) = &agent_name {
-                        code.cells
-                            .entry((an.clone(), rk.clone(), bucket.clone()))
-                            .or_default()
-                            .out_tokens += out;
-                    }
-                }
-                if let Some(key) = &branch_pair {
-                    code.branches.entry(key.clone()).or_default().out_tokens += out;
-                }
-                if let Some(Value::Object(details)) = usage.get("output_tokens_details") {
-                    let th = get_int(details, "thinking_tokens");
-                    code.thinking += th;
-                    // Per session (#350): idle-because-reasoning reads
-                    // differently from idle-because-blocked.
-                    code.live
-                        .entry(superx_ops::record_uuid(&m.session))
-                        .or_default()
-                        .thinking_tokens += th;
-                }
-                // What left this machine (#337). `input_tokens` is the
-                // prompt sent fresh this turn; cache CREATION is the
-                // content the vendor wrote to its own store to reuse;
-                // cache READS are that stored content being served
-                // back. Together they are the transmitted volume.
-                let inp = get_int(usage, "input_tokens");
-                let cw = get_int(usage, "cache_creation_input_tokens");
-                let cr = get_int(usage, "cache_read_input_tokens");
-                // WHEN the money went (#391), in the same buckets the
-                // churn chart uses.
-                {
-                    let th = usage
-                        .get("output_tokens_details")
-                        .and_then(obj)
-                        .map_or(0, |d| get_int(d, "thinking_tokens"));
-                    code.intensity.entry(hour_key.clone()).or_default().out_tokens += out;
-                    // What the prompt weighed on this turn (#407).
-                    let ctx = get_int(usage, "input_tokens")
-                        + get_int(usage, "cache_read_input_tokens")
-                        + get_int(usage, "cache_creation_input_tokens");
-                    if ctx > 0 {
-                        if let Some(k) = &me_key {
-                            model_slice!(code, k.0, bucket, repo_key.as_ref(), context_sum += ctx);
-                            model_slice!(code, k.0, bucket, repo_key.as_ref(), context_n += 1);
-                            let e = code
-                                .model_time
-                                .entry((k.0.clone(), bucket.clone()))
-                                .or_default();
-                            e.context_max = e.context_max.max(ctx);
-                        }
-                    }
-                    let b = code.burn.entry(hour_key.clone()).or_insert((0, 0, 0, 0));
-                    b.0 += out;
-                    b.1 += th;
-                    b.2 += inp + cw;
-                    b.3 += cr;
-                }
-                code.in_tokens += inp;
-                code.cache_write += cw;
-                code.cache_read += cr;
-                // Context pressure (#367): the same sum the Sessions
-                // page reads off the newest usage-bearing message.
-                if inp + cw + cr > 0 {
-                    let l = code.live.entry(superx_ops::record_uuid(&m.session)).or_default();
-                    if l.context_tokens.is_none() {
-                        l.context_tokens = Some(inp + cw + cr);
-                    }
-                }
-                if let Some(an) = &agent_name {
-                    code.agents.entry(an.clone()).or_default().in_tokens += inp + cw;
+        // What this reply spent — once per reply, whichever agent wrote
+        // it (#409). The walk used to add the usage of every LINE, and a
+        // reply is two to four lines in Claude Code's transcript.
+        if let Some(u) = reply_usage(raw).filter(|_| fresh_reply) {
+            let out = u.out;
+            {
+                let l = code.live.entry(superx_ops::record_uuid(&m.session)).or_default();
+                l.out_tokens += out;
+                // Per session (#350): idle-because-reasoning reads
+                // differently from idle-because-blocked.
+                l.thinking_tokens += u.thinking;
+                // Context pressure (#367): the prompt behind the newest
+                // reply — first sighting wins, the walk being newest-first.
+                if l.context_tokens.is_none() && u.context > 0 {
+                    l.context_tokens = Some(u.context);
                 }
             }
+            agg.out_tokens += out;
+            code.out_tokens += out;
+            code.thinking += u.thinking;
+            // Spent with nobody steering (#391).
+            if !steered {
+                code.unattended_out += out;
+            }
+            if let Some(k) = &me_key {
+                let me = code.model_effort.entry(k.clone()).or_default();
+                me.out_tokens += out;
+                me.thinking_tokens += u.thinking;
+            }
+            if let Some(an) = &agent_name {
+                let a = code.agents.entry(an.clone()).or_default();
+                a.out_tokens += out;
+                a.in_tokens += u.input + u.cache_write;
+            }
+            if let Some(known) = &model_opt {
+                code.models.entry(known.clone()).or_default().out_tokens += out;
+            }
+            if let Some(e) = &effort {
+                let ea = code.efforts.entry(e.clone()).or_default();
+                ea.out_tokens += out;
+                ea.thinking_tokens += u.thinking;
+            }
+            if let Some(rk) = &repo_key {
+                code.repos.entry(rk.clone()).or_default().out_tokens += out;
+                if let Some(an) = &agent_name {
+                    code.cells
+                        .entry((an.clone(), rk.clone(), bucket.clone()))
+                        .or_default()
+                        .out_tokens += out;
+                }
+            }
+            if let Some(key) = &branch_pair {
+                code.branches.entry(key.clone()).or_default().out_tokens += out;
+            }
+            // WHEN the money went (#391), in the same buckets the churn
+            // chart uses. What left this machine (#337): `input` is the
+            // prompt sent fresh this turn; cache CREATION is what the
+            // vendor wrote to its own store to reuse; cache READS are
+            // that content served back. Together, the transmitted volume.
+            code.intensity.entry(hour_key.clone()).or_default().out_tokens += out;
+            let b = code.burn.entry(hour_key.clone()).or_insert((0, 0, 0, 0));
+            b.0 += out;
+            b.1 += u.thinking;
+            b.2 += u.input + u.cache_write;
+            b.3 += u.cache_read;
+            code.in_tokens += u.input;
+            code.cache_write += u.cache_write;
+            code.cache_read += u.cache_read;
+        }
+        // Claude-style blocks: raw.message.content[].
+        if let Some(Value::Object(msg)) = raw.get("message") {
             if let Some(Value::Array(blocks)) = msg.get("content") {
                 for b in blocks.iter() {
                     let Some(block) = obj(b) else { continue };
@@ -2629,7 +2577,6 @@ pub async fn stats_for_range_capped(
                                         }
                                         if let Some(k) = &me_key {
                                             code.model_effort.entry(k.clone()).or_default().tool_failures += 1;
-                                            model_slice!(code, k.0, bucket, repo_key.as_ref(), tool_failures += 1);
                                         }
                                         if let Some(key) = &branch_pair {
                                             code.branches
@@ -2674,7 +2621,7 @@ pub async fn stats_for_range_capped(
                                         let d = score_output(&text, &mut code, &hour_key);
                                         attribute_quality(
                                             &mut code, &branch_pair, &agent_name, &effort, &me_key,
-                                            &Slice { bucket: &bucket, repo: repo_key.as_ref() }, d,
+                                            d,
                                         );
                                         if cmd_opt.is_some_and(commits) {
                                             if let Some((ins, del)) = shortstat(&text) {
@@ -2731,7 +2678,6 @@ pub async fn stats_for_range_capped(
                             code.by_hour.entry(hour_of_day).or_insert((0, 0)).0 += 1;
                             if let Some(k) = &me_key {
                                 code.model_effort.entry(k.clone()).or_default().tool_calls += 1;
-                                model_slice!(code, k.0, bucket, repo_key.as_ref(), tool_calls += 1);
                             }
                             // Instrument the call itself (#308).
                             if name.starts_with("mcp__") {
@@ -2852,7 +2798,6 @@ pub async fn stats_for_range_capped(
                                     ea.lines_removed += replaced;
                                 }
                                 if let Some(k) = &me_key {
-                                    model_slice!(code, k.0, bucket, repo_key.as_ref(), lines_added += n);
                                     let me = code.model_effort.entry(k.clone()).or_default();
                                     me.lines_added += n;
                                     me.lines_removed += replaced;
@@ -3455,7 +3400,7 @@ pub async fn stats_for_range_capped(
                                     // The call already went by and it
                                     // was a shell: score immediately.
                                     let d = score_output(text, &mut code, &hour_key);
-                                    attribute_quality(&mut code, &branch_pair, &agent_name, &effort, &me_key, &Slice { bucket: &bucket, repo: repo_key.as_ref() }, d);
+                                    attribute_quality(&mut code, &branch_pair, &agent_name, &effort, &me_key, d);
                                 } else {
                                     pending_output.insert(id.to_string(), text.to_string());
                                 }
@@ -3502,19 +3447,10 @@ pub async fn stats_for_range_capped(
                 }
             }
         }
-        // Gemini-style: raw.tokens.output + raw.toolCalls[].
-        if let Some(Value::Object(toks)) = raw.get("tokens") {
-            agg.out_tokens += get_int(toks, "output");
-            // Gemini reports `total`, else input + cached (#367).
-            let total = get_int(toks, "total");
-            let ctx = if total > 0 { total } else { get_int(toks, "input") + get_int(toks, "cached") };
-            if ctx > 0 {
-                let l = code.live.entry(superx_ops::record_uuid(&m.session)).or_default();
-                if l.context_tokens.is_none() {
-                    l.context_tokens = Some(ctx);
-                }
-            }
-        }
+        // Gemini-style tool calls: raw.toolCalls[]. Its tokens are read
+        // with Claude's, above, by `reply_usage` (#409): they used to
+        // reach the per-session figure and nothing else, and its `total`
+        // — which includes what it wrote — stood in for its context.
         if let Some(Value::Array(calls)) = raw.get("toolCalls") {
             for c in calls.iter() {
                 let Some(call) = obj(c) else { continue };
@@ -3643,25 +3579,26 @@ pub async fn stats_for_range_capped(
     }
 
     // ── 24×7 instruments: engine-side, cheap, whole-history ──────
-    let messages_last_hour = count_rows(
-        kernel,
-        "SELECT count() AS c FROM message WHERE valid_from > time::now() - 1h GROUP ALL",
-    )
-    .await
-    .unwrap_or(0);
-    let tokens_last_hour = {
+    // Every one on the agent's clock (#413). On the capture clock a
+    // backfill read as a burst "this hour", and coverage collapsed into
+    // the hour of the restart.
+    let hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+    let messages_last_hour = {
         let rows: Vec<Value> = kernel
             .db()
             .query(
-                "SELECT math::sum(raw.message.usage.output_tokens ?? raw.tokens.output ?? 0) \
-                 AS c FROM message WHERE valid_from > time::now() - 1h GROUP ALL",
+                "SELECT count() AS c FROM message \
+                 WHERE valid_from > $cut AND (emitted_at ?? valid_from) > $cut GROUP ALL",
             )
+            .bind(("cut", hour_ago))
             .await?
             .take(0)?;
         rows.first().and_then(|r| obj(r).map(|o| get_int(o, "c"))).unwrap_or(0)
     };
-    // Clock coverage: how many of the last 24 hours saw any activity.
-    let active_hours_24h = {
+    let tokens_last_hour = reply_output_tokens(kernel, Some(hour_ago)).await?;
+    // Clock coverage: which of the last 24 hours saw any activity.
+    let day_ago = chrono::Utc::now() - chrono::Duration::hours(24);
+    let active_hours_list: Vec<String> = {
         let rows: Vec<Value> = kernel
             .db()
             .query(
@@ -3669,13 +3606,20 @@ pub async fn stats_for_range_capped(
                 // window the same clock hour occurs twice, and
                 // collapsing them caps a round-the-clock operator
                 // below 24 (review of #311).
-                "SELECT time::format(valid_from, '%Y-%m-%dT%H') AS h FROM message \
-                 WHERE valid_from > time::now() - 24h GROUP BY h",
+                "SELECT time::format(emitted_at ?? valid_from, '%Y-%m-%dT%H') AS h FROM message \
+                 WHERE valid_from > $cut AND (emitted_at ?? valid_from) > $cut GROUP BY h",
             )
+            .bind(("cut", day_ago))
             .await?
             .take(0)?;
-        rows.len() as i64
+        let mut hours: Vec<String> = rows
+            .iter()
+            .filter_map(|r| obj(r).and_then(|o| get_str(o, "h")).map(str::to_string))
+            .collect();
+        hours.sort();
+        hours
     };
+    let active_hours_24h = active_hours_list.len() as i64;
 
     // ── post-walk reductions (#340) ──────────────────────────────
     // Each write waits for the next verification in its session. The
@@ -4100,29 +4044,6 @@ pub async fn stats_for_range_capped(
         prs_ungated,
         bright_line_writes: code.bright_line.values().sum(),
         bright_line_paths: code.bright_line.keys().take(BRIGHT_LINE_SHOWN).cloned().collect(),
-        model_quality: code
-            .model_time
-            .iter()
-            .map(|((model, t), a)| ModelQualityPoint {
-                model: model.clone(),
-                t: t.clone(),
-                messages: a.messages,
-                tool_calls: a.tool_calls,
-                tool_failures: a.tool_failures,
-                tests_passed: a.tests_passed,
-                tests_failed: a.tests_failed,
-                interventions: a.interventions,
-                denials: a.denials,
-                context_sum: a.context_sum,
-                context_n: a.context_n,
-                context_max: a.context_max,
-                admissions: a.admissions,
-                redo_talk: a.redo_talk,
-                escalations: a.escalations,
-                lines_added: a.lines_added,
-                out_tokens: a.out_tokens,
-            })
-            .collect(),
         // How scattered each session was between your turns (#406).
         focus: {
             let mut per: HashMap<String, Vec<i64>> = HashMap::new();
@@ -4163,25 +4084,6 @@ pub async fn stats_for_range_capped(
             v
         },
         branches_opened: code.branches_opened,
-        model_repos: {
-            let mut v: Vec<ModelRepoStat> = code
-                .model_repo
-                .iter()
-                .map(|((model, repo), a)| ModelRepoStat {
-                    model: model.clone(),
-                    repo: repo.clone(),
-                    messages: a.messages,
-                    tool_calls: a.tool_calls,
-                    tool_failures: a.tool_failures,
-                    tests_passed: a.tests_passed,
-                    tests_failed: a.tests_failed,
-                    lines_added: a.lines_added,
-                    out_tokens: a.out_tokens,
-                })
-                .collect();
-            v.sort_by_key(|r| std::cmp::Reverse(r.tool_calls));
-            v
-        },
         human_turns: human_turn_count,
         autonomy_p50_mins,
         unattended_out_tokens: code.unattended_out,

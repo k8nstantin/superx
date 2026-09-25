@@ -241,12 +241,6 @@ pub struct StatsSummary {
     pub bright_line_paths: Vec<String>,
     /// Model × reasoning level against outcome, biggest sample first.
     pub model_effort: Vec<ModelEffortStat>,
-    /// Each model's outcomes bucket by bucket — is it getting better or
-    /// worse, and is the difference between two of them real (#403)?
-    pub model_quality: Vec<ModelQualityPoint>,
-    /// Each model's outcomes per repository, for the only comparison
-    /// that holds the work roughly constant (#403).
-    pub model_repos: Vec<ModelRepoStat>,
     /// How scattered each session was between your turns (#406).
     pub focus: Vec<FocusStat>,
     /// The same content written to several paths — one artifact, many
@@ -770,61 +764,6 @@ pub struct IntensityPoint {
     pub repos: i64,
     pub lines_added: i64,
     pub lines_removed: i64,
-    pub out_tokens: i64,
-}
-
-/// One model's outcomes in one bucket of time (#403).
-///
-/// Counts, not rates: a rate without its denominator cannot be tested,
-/// and the whole point of this series is to say when a difference
-/// between two models is real and when it is noise. The page computes
-/// the intervals from these.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ModelQualityPoint {
-    pub model: String,
-    pub t: String,
-    pub messages: i64,
-    pub tool_calls: i64,
-    pub tool_failures: i64,
-    pub tests_passed: i64,
-    pub tests_failed: i64,
-    pub interventions: i64,
-    pub denials: i64,
-    /// The prompt this model carried, summed and counted so an average
-    /// falls out, and the largest it reached (#407). Filling a window
-    /// to do a small thing is paid for on every turn after.
-    pub context_sum: i64,
-    pub context_n: i64,
-    pub context_max: i64,
-    /// The agent's own words: admitting the work was wrong, and saying
-    /// it is doing it again. Its assessment, not a guess at yours, and
-    /// the half of the record no vendor publishes (#406).
-    pub admissions: i64,
-    pub redo_talk: i64,
-    /// Your turns that lost patience, credited to whatever was running.
-    /// One person writes them all, so the style is a constant and a
-    /// difference between models is the models.
-    pub escalations: i64,
-    pub lines_added: i64,
-    pub out_tokens: i64,
-}
-
-/// One model's outcomes in one repository (#403). Models do different
-/// work at different times, so a pooled comparison compares tasks as
-/// much as models. Where two of them worked the same repository, this
-/// is the closest thing to like for like the transcript can offer.
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ModelRepoStat {
-    pub model: String,
-    pub repo: String,
-    pub messages: i64,
-    pub tool_calls: i64,
-    pub tool_failures: i64,
-    pub tests_passed: i64,
-    pub tests_failed: i64,
-    pub lines_added: i64,
     pub out_tokens: i64,
 }
 

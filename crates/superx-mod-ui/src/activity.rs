@@ -447,13 +447,19 @@ pub async fn session_token_stats(
     kernel: &Kernel,
     session: RecordId,
 ) -> Result<(Option<i64>, Option<i64>)> {
+    // Once per reply (#409): a reply's usage rides every line Claude Code
+    // writes for it, and Gemini re-emits a record as it streams.
     let rows: Vec<Value> = kernel
         .db()
-        .query(
-            "SELECT math::sum(raw.message.usage.output_tokens ?? raw.tokens.output ?? 0) \
-                 AS toks \
-             FROM message WHERE session = $sess GROUP ALL",
-        )
+        .query(format!(
+            "SELECT math::sum(o) AS toks FROM (\
+                 SELECT {key} AS k, math::max({out}) AS o FROM message \
+                 WHERE session = $sess AND (raw.message.usage != NONE OR raw.tokens != NONE) \
+                 GROUP BY k\
+             ) GROUP ALL",
+            key = crate::stats::REPLY_KEY_SQL,
+            out = crate::stats::OUT_TOKENS_SQL,
+        ))
         .bind(("sess", session.clone()))
         .await?
         .take(0)?;
@@ -483,13 +489,11 @@ pub async fn session_token_stats(
                 + int_of(&cu, "cache_creation_input_tokens");
             return (n > 0).then_some(n);
         }
+        // Gemini's prompt is its `input` (cache included) plus tool
+        // context; its `total` also counts what it wrote, so it is not
+        // the prompt (#409).
         if let Some(gu) = obj_of(row, "gu") {
-            let total = int_of(&gu, "total");
-            let n = if total > 0 {
-                total
-            } else {
-                int_of(&gu, "input") + int_of(&gu, "cached")
-            };
+            let n = int_of(&gu, "input") + int_of(&gu, "tool");
             return (n > 0).then_some(n);
         }
         None

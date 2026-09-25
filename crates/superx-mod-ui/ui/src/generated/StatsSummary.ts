@@ -13,8 +13,6 @@ import type { IntensityPoint } from "./IntensityPoint";
 import type { Landed } from "./Landed";
 import type { LiveSession } from "./LiveSession";
 import type { ModelEffortStat } from "./ModelEffortStat";
-import type { ModelQualityPoint } from "./ModelQualityPoint";
-import type { ModelRepoStat } from "./ModelRepoStat";
 import type { ModelStat } from "./ModelStat";
 import type { NameCount } from "./NameCount";
 import type { QualityPoint } from "./QualityPoint";
@@ -213,16 +211,6 @@ bright_line_paths: Array<string>,
  * Model × reasoning level against outcome, biggest sample first.
  */
 model_effort: Array<ModelEffortStat>, 
-/**
- * Each model's outcomes bucket by bucket — is it getting better or
- * worse, and is the difference between two of them real (#403)?
- */
-model_quality: Array<ModelQualityPoint>, 
-/**
- * Each model's outcomes per repository, for the only comparison
- * that holds the work roughly constant (#403).
- */
-model_repos: Array<ModelRepoStat>, 
 /**
  * How scattered each session was between your turns (#406).
  */

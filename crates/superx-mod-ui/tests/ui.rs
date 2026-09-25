@@ -459,10 +459,12 @@ async fn insights_summary_reads_what_nothing_read_before() {
         })))
         .await
         .expect("cc msg");
+    // Gemini's `input` INCLUDES what it read from cache (#409): 110 in,
+    // 100 of them cached, is 10 sent fresh.
     kernel
         .log_message(msg(serde_json::json!({
             "model": "gemini-2.5-pro",
-            "tokens": {"input": 10, "output": 5, "cached": 100}
+            "tokens": {"input": 110, "output": 5, "cached": 100}
         })))
         .await
         .expect("gemini msg");
@@ -2802,13 +2804,13 @@ async fn every_age_travels_as_the_moment_it_is_measured_from() {
     assert!((row.idle_secs - drift).abs() < 120, "idle {} against {drift}", row.idle_secs);
 }
 
-/// Is one model better than another (#403)? The page can only answer
-/// that from counts, sliced two ways: over time, because within one
-/// model the day-to-day swing turned out larger than any gap between
-/// two of them, and per repository, because models do different work
-/// and a pooled comparison compares tasks as much as models.
+/// Is one model better than another (#403)? Outcomes land on the model
+/// and reasoning level that MADE the call — a result line names no model
+/// — and the tokens ride beside them, so cost and quality compare on the
+/// same rows. (The time and repository slices #403 added had no reader
+/// on the page and were removed in #413.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn model_quality_is_sliced_by_time_and_by_repository() {
+async fn outcomes_land_on_the_model_that_made_the_call() {
     let kernel = fresh_kernel().await;
     let agent = kernel.create_entity("node_agent").await.expect("agent");
     let session = kernel.create_entity("node_session").await.expect("session");
@@ -2822,38 +2824,105 @@ async fn model_quality_is_sliced_by_time_and_by_repository() {
             {"type": "tool_result", "tool_use_id": id, "is_error": failed,
              "content": "test result: ok. 4 passed; 1 failed; 0 ignored"}]}});
 
-    // Two models, the same repository, in the same hour: one call each,
-    // one of them failing.
     log_tool_message_at(&kernel, &session, &agent, call("claude-opus-5", "/w/shared", "a"), now).await;
     log_tool_message_at(&kernel, &session, &agent, result("a", true), now).await;
     log_tool_message_at(&kernel, &session, &agent, call("claude-fable-5", "/w/shared", "b"), now).await;
     log_tool_message_at(&kernel, &session, &agent, result("b", false), now).await;
-    // And one model alone in another repository, an hour earlier.
     let before = now - chrono::Duration::hours(2);
     log_tool_message_at(&kernel, &session, &agent, call("claude-opus-5", "/w/alone", "c"), before).await;
     log_tool_message_at(&kernel, &session, &agent, result("c", false), before).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    let pair = |m: &str| s.model_effort.iter().find(|p| p.model == m && p.effort == "max").expect(m);
+    let opus = pair("claude-opus-5");
+    assert_eq!((opus.tool_calls, opus.tool_failures), (2, 1));
+    let fable = pair("claude-fable-5");
+    assert_eq!((fable.tool_calls, fable.tool_failures), (1, 0));
+    assert!(opus.tests_passed > 0 && fable.tests_passed > 0, "tests reach the pair that ran them");
+    assert_eq!(s.model_effort.iter().map(|p| p.out_tokens).sum::<i64>(), s.out_tokens_window);
+}
 
-    // Over time: opus appears in both buckets, fable in one.
-    let opus: Vec<_> = s.model_quality.iter().filter(|p| p.model == "claude-opus-5").collect();
-    assert_eq!(opus.len(), 2, "two buckets: {:?}", opus.iter().map(|p| &p.t).collect::<Vec<_>>());
-    assert_eq!(opus.iter().map(|p| p.tool_calls).sum::<i64>(), 2);
-    assert_eq!(opus.iter().map(|p| p.tool_failures).sum::<i64>(), 1);
-    let fable: Vec<_> = s.model_quality.iter().filter(|p| p.model == "claude-fable-5").collect();
-    assert_eq!(fable.len(), 1);
-    assert_eq!((fable[0].tool_calls, fable[0].tool_failures), (1, 0));
+/// A reply is counted once, however many lines carry it (#409). Claude
+/// Code writes one line per content block — thinking, text, each tool
+/// call — and repeats the reply's whole `usage` on every one, under the
+/// same `message.id`. Gemini re-emits a record as it streams, fuller
+/// each time, under the same `id`. Every token figure summed rows, so a
+/// three-block reply cost three times what it did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reply_split_across_lines_is_counted_once() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "split").await;
+    let usage = serde_json::json!({
+        "input_tokens": 10, "cache_creation_input_tokens": 50,
+        "cache_read_input_tokens": 1_000, "output_tokens": 100,
+        "output_tokens_details": {"thinking_tokens": 40}
+    });
+    // One reply, three lines, in the order Claude Code writes them.
+    for block in [
+        serde_json::json!({"type": "thinking", "thinking": "…"}),
+        serde_json::json!({"type": "text", "text": "Reading the file."}),
+        serde_json::json!({"type": "tool_use", "id": "t1", "name": "Read",
+                           "input": {"file_path": "/w/a.rs"}}),
+    ] {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "effort": "max",
+            "message": {"id": "msg_A", "model": "claude-opus-5", "usage": usage,
+                        "content": [block]}
+        })).await;
+    }
+    // A second, one-line reply.
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "effort": "max",
+        "message": {"id": "msg_B", "model": "claude-opus-5",
+                    "usage": {"output_tokens": 20, "input_tokens": 5},
+                    "content": [{"type": "text", "text": "Done."}]}
+    })).await;
+    // A Gemini record emitted twice as it streamed: the newer is fuller.
+    let (gagent, gsession) = seed_agent_and_session(&kernel, "gemini_cli", "g").await;
+    for (out, thoughts) in [(5, 0), (7, 3)] {
+        log_tool_message(&kernel, &gsession, &gagent, serde_json::json!({
+            "id": "g-1", "type": "gemini", "model": "gemini-3.1-pro",
+            "tokens": {"input": 400, "output": out, "cached": 100, "thoughts": thoughts,
+                       "tool": 0, "total": 400 + out + thoughts}
+        })).await;
+    }
 
-    // Per repository: the shared one carries both models, so a like-for
-    // -like comparison is possible there and nowhere else.
-    let shared: Vec<_> = s.model_repos.iter().filter(|r| r.repo == "shared").collect();
-    assert_eq!(shared.len(), 2, "{:?}", shared.iter().map(|r| &r.model).collect::<Vec<_>>());
-    let alone: Vec<_> = s.model_repos.iter().filter(|r| r.repo == "alone").collect();
-    assert_eq!(alone.len(), 1);
-    assert_eq!(alone[0].model, "claude-opus-5");
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.out_tokens_window, 100 + 20 + 10, "each reply once; Gemini output + thoughts");
+    assert_eq!(s.output_tokens_total, 130, "the engine-side total agrees");
+    assert_eq!(s.tokens_last_hour, 130);
+    assert_eq!(s.thinking_tokens, 40 + 3);
+    assert_eq!(s.exposure.input_tokens, 10 + 5 + 300, "Gemini input less what it read from cache");
+    assert_eq!(s.exposure.cache_read_tokens, 1_000 + 100);
+    assert_eq!(s.exposure.cache_write_tokens, 50);
+    let opus = s.models.iter().find(|m| m.name == "claude-opus-5").expect("opus row");
+    assert_eq!((opus.messages, opus.out_tokens), (2, 120), "two replies, not four lines");
+    let gem = s.models.iter().find(|m| m.name == "gemini-3.1-pro").expect("gemini names its model");
+    assert_eq!((gem.messages, gem.out_tokens), (1, 10));
+    let pair = s.model_effort.iter().find(|p| p.model == "claude-opus-5").expect("pair");
+    assert_eq!((pair.messages, pair.out_tokens, pair.thinking_tokens), (2, 120, 40));
+    assert_eq!(s.tools_window, 1, "the Read, once");
+    let burn: i64 = s.burn.iter().map(|b| b.out).sum();
+    assert_eq!(burn, 130, "the burn series counts replies too");
 
-    // Tests reach the slices too, so a pass rate can be compared.
-    assert!(s.model_quality.iter().map(|p| p.tests_passed).sum::<i64>() > 0);
-    // And the tokens, so cost rides beside quality.
-    assert_eq!(s.model_quality.iter().map(|p| p.out_tokens).sum::<i64>(), s.out_tokens_window);
+    let (_, out) = superx_mod_ui::activity::session_token_stats(&kernel, session.clone())
+        .await
+        .expect("session tokens");
+    assert_eq!(out, Some(120), "the Sessions page counts replies");
+    let (ctx, gout) = superx_mod_ui::activity::session_token_stats(&kernel, gsession)
+        .await
+        .expect("gemini session tokens");
+    assert_eq!(gout, Some(10));
+    assert_eq!(ctx, Some(400), "Gemini's prompt is its input, not its total");
+
+    let i = superx_mod_ui::insights::insights_summary(&kernel).await.expect("insights");
+    assert_eq!(i.tokens.output, 130);
+    assert_eq!(i.tokens.input, 315);
+    assert_eq!(i.tokens.cache_read, 1_100);
+    assert_eq!(i.tokens.cache_write, 50);
+    let replies = |name: &str| i.models.iter().find(|m| m.name == name).map(|m| m.value);
+    assert_eq!(replies("claude-opus-5"), Some(2));
+    assert_eq!(replies("gemini-3.1-pro"), Some(1));
+    let claude = i.per_agent.iter().find(|a| a.name == "claude_code").expect("agent row");
+    assert_eq!((claude.messages, claude.output_tokens), (4, 120), "rows captured; output per reply");
 }
