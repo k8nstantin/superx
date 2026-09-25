@@ -1644,7 +1644,7 @@ fn looks_like_secret(text: &str) -> bool {
     fn token(c: char) -> bool {
         c.is_ascii_alphanumeric() || c == '_' || c == '-'
     }
-    (text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----"))
+    pem_private_key(text)
         || body("AKIA", 16, |c| c.is_ascii_uppercase() || c.is_ascii_digit())
         || body("ghp_", 36, |c| c.is_ascii_alphanumeric())
         || body("github_pat_", 22, token)
@@ -1652,6 +1652,23 @@ fn looks_like_secret(text: &str) -> bool {
         || body("sk-ant-", 20, token)
         // Atlassian API tokens (#413): one went by in a command unflagged.
         || body("ATATT", 30, |c| token(c) || c == '=')
+}
+
+/// A private key is a PEM block: a line that ends `PRIVATE KEY-----`
+/// after a `-----BEGIN `, then a line of base64 (#413). Naming the two
+/// markers anywhere in a text — as the scanner's own source does — is
+/// not one. A `Read` result carries a line number and a tab before each
+/// line, so the body is read after the last tab.
+fn pem_private_key(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    lines.windows(2).any(|w| {
+        let head = w[0].trim_end();
+        let body = w[1].rsplit('\t').next().unwrap_or("").trim();
+        head.contains("-----BEGIN ")
+            && head.ends_with("PRIVATE KEY-----")
+            && body.len() >= 40
+            && body.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    })
 }
 
 /// Outcomes attributable to one reasoning level (#337).

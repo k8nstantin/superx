@@ -1462,7 +1462,7 @@ async fn productivity_and_exposure_are_measured_per_agent() {
         "message": {"model": "claude-fable-5", "content": [
             {"type": "tool_result", "tool_use_id": "r1", "content": "fn main() {}"},
             {"type": "tool_result", "tool_use_id": "r2",
-                "content": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blb\n"}]}})).await;
+                "content": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n"}]}})).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
 
@@ -3359,7 +3359,15 @@ async fn a_secret_is_a_shape_and_commands_are_scanned() {
             {"type": "tool_use", "id": "r", "name": "Read", "input": {"file_path": "/w/superx/stats.rs"}}]}})).await;
     log_tool_message(&kernel, &session, &agent, serde_json::json!({
         "message": {"content": [{"type": "tool_result", "tool_use_id": "r",
-            "content": "text.contains(\"AKIA\") || text.contains(\"ghp_\")"}]}})).await;
+            "content": "text.contains(\"AKIA\") || text.contains(\"ghp_\")\n\
+                        text.contains(\"-----BEGIN \") && text.contains(\"PRIVATE KEY-----\")"}]}})).await;
+    // A real key block, as a Read result carries it: numbered lines.
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx", "message": {"content": [
+            {"type": "tool_use", "id": "k", "name": "Read", "input": {"file_path": "/w/superx/id_rsa"}}]}})).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "k",
+            "content": format!("     1\t-----BEGIN RSA PRIVATE KEY-----\n     2\t{}", "MIIEowIBAAKCAQEA7bq98s1hd3kqQeLJ0n4YVmZ8xRk4dL0oPq2sT5uVwXyZ")}]}})).await;
     // A command carrying something shaped like a real token.
     let token = format!("ATATT3x{}", "Fq9Zb2Kd".repeat(6));
     log_tool_message(&kernel, &session, &agent, serde_json::json!({
@@ -3368,9 +3376,10 @@ async fn a_secret_is_a_shape_and_commands_are_scanned() {
              "input": {"command": format!("curl -u me:{token} https://example.atlassian.net")}}]}})).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
-    assert_eq!(s.exposure.secret_hits, 1, "the command's token; not the source that names prefixes");
-    assert_eq!(s.exposure.secret_paths.len(), 1);
-    assert!(s.exposure.secret_paths[0].starts_with("Bash input in"), "{:?}", s.exposure.secret_paths);
+    assert_eq!(s.exposure.secret_hits, 2, "the command's token and the key block; not the source that names the markers");
+    assert_eq!(s.exposure.secret_paths.len(), 2, "{:?}", s.exposure.secret_paths);
+    assert!(s.exposure.secret_paths.iter().any(|p| p.starts_with("Bash input in")), "{:?}", s.exposure.secret_paths);
+    assert!(s.exposure.secret_paths.iter().any(|p| p.ends_with("id_rsa")), "{:?}", s.exposure.secret_paths);
 }
 
 /// The model comparison reads git as the work actually moved (#414).
