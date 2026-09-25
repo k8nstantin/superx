@@ -1,7 +1,7 @@
 import { Group, SimpleGrid, Table, Text, Tooltip } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { MONO } from '../../EChart'
-import { BANDS, CANCEL, Counter, FAIL, Panel, Stat, n, pct } from './parts'
+import { BANDS, CANCEL, Counter, FAIL, Panel, Stat, n, pct, steering, isCircling } from './parts'
 
 // Deviations (#392). The page measures what the agents did, and since
 // #385 what they shipped. This band is what they got WRONG, and what
@@ -26,14 +26,7 @@ export function DeviationsSection({ s, range }: { s: StatsSummary | undefined; r
   const bright = n(s?.bright_line_writes)
   const paths = s?.bright_line_paths ?? []
   const blind = n(s?.replaced_unknown) > 0
-  // Lines when the transcript can see what was replaced, else edits —
-  // one rule for every unasked reading on the page (#413).
-  const selfLines = n(s?.churn_self)
-  const directedLines = n(s?.churn_directed)
-  const unasked =
-    selfLines + directedLines > 0
-      ? pct(selfLines, selfLines + directedLines)
-      : pct(n(s?.edits_self), n(s?.edits_self) + n(s?.edits_directed))
+  const { unasked } = steering(s)
 
   const scored = (s?.tool_outcomes ?? []).reduce((a, t) => a + n(t.ok) + n(t.failed) + n(t.cancelled), 0)
   const failed = (s?.tool_outcomes ?? []).reduce((a, t) => a + n(t.failed), 0)
@@ -230,7 +223,7 @@ export function DeviationsSection({ s, range }: { s: StatsSummary | undefined; r
           />
           <Counter
             label="Circling"
-            value={(s?.live ?? []).filter((l) => n(l.self_churn_pct) >= BANDS.selfChurnBad || n(l.files_revisited) >= BANDS.revisitedBad).length}
+            value={(s?.live ?? []).filter(isCircling).length}
             tip={`live sessions rewriting themselves (${BANDS.selfChurnBad}% or more unasked) or back on ${BANDS.revisitedBad}+ files written ${s?.revisit_at ?? 3} or more times — the same rule as the Circling lamp`}
           />
         </SimpleGrid>

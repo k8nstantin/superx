@@ -1,7 +1,7 @@
 import { Grid, Group, SimpleGrid, Table, Text, Tooltip } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
-import { CANCEL, Counter, FAIL, OK, Panel, Stat, fmtCompact, fmtMins, n, pct } from './parts'
+import { CANCEL, Counter, FAIL, OK, Panel, Stat, fmtCompact, fmtMins, n, pct, steering } from './parts'
 
 // Productivity (#391). Every other band counts effort — lines, tokens,
 // calls, tests. This one divides effort by outcome, and measures the
@@ -125,7 +125,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
             title="Burn over time — output tokens by repository"
             scope="range"
             range={range}
-            note={long ? 'per day · UTC' : 'per hour · UTC'}
+            note={long ? 'per day · your time' : 'per hour · your time'}
             h="100%"
           >
             {buckets.length === 0 ? (
@@ -199,7 +199,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
         title="How hard it was working — fronts open, and what moved"
         scope="range"
         range={range}
-        note={`${long ? 'per day' : 'per hour'} · UTC · peak ${n(s?.peak_sessions)} session${n(s?.peak_sessions) === 1 ? '' : 's'} and ${n(s?.peak_repos)} repositor${n(s?.peak_repos) === 1 ? 'y' : 'ies'} at once`}
+        note={`${long ? 'per day' : 'per hour'} · your time · peak ${n(s?.peak_sessions)} session${n(s?.peak_sessions) === 1 ? '' : 's'} and ${n(s?.peak_repos)} repositor${n(s?.peak_repos) === 1 ? 'y' : 'ies'} at once`}
         mb="md"
       >
         {(s?.intensity?.length ?? 0) === 0 ? (
@@ -394,7 +394,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                     const tests = n(p.tests_passed) + n(p.tests_failed)
                     const passPct = pct(n(p.tests_passed), tests)
                     const failRate = pct(n(p.tool_failures), n(p.tool_calls))
-                    const unasked = pct(n(p.edits_self), n(p.edits_directed) + n(p.edits_self))
+                    const { unasked } = steering(p)
                     const perLine = n(p.lines_added) > 0 ? Math.round(n(p.out_tokens) / n(p.lines_added)) : null
                     const think = pct(n(p.thinking_tokens), n(p.out_tokens))
                     // A row from a tenth of the biggest sample cannot be
@@ -428,7 +428,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                         <Table.Td ta="right">{perLine == null ? '—' : fmtCompact(perLine)}</Table.Td>
                         <Table.Td ta="right">{tests === 0 ? '—' : `${passPct}%`}</Table.Td>
                         <Table.Td ta="right">{n(p.tool_calls) === 0 ? '—' : `${failRate}%`}</Table.Td>
-                        <Table.Td ta="right">{n(p.edits_directed) + n(p.edits_self) === 0 ? '—' : `${unasked}%`}</Table.Td>
+                        <Table.Td ta="right">{unasked == null ? '—' : `${unasked}%`}</Table.Td>
                         <Table.Td ta="right">{n(p.interventions) + n(p.denials)}</Table.Td>
                       </Table.Tr>
                     )

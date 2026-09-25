@@ -3,7 +3,7 @@ import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import type { StatusResponse } from '../../generated/StatusResponse'
 import { AXIS, CHART_COLORS, EChart, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
-import { BANDS, Panel, Stat, ageOf, fmtAge, fmtBytes, fmtCompact, n, pct, useNow } from './parts'
+import { Panel, Stat, ageOf, captureDown, captureTone, fmtAge, fmtBytes, fmtCompact, n, pct, useNow } from './parts'
 
 // The OS itself (#367): module health read off the lifecycle stream,
 // substrate totals, and what capture spends itself on. The registry
@@ -43,18 +43,15 @@ export function SystemsSection({
         <Stat
           label="Events this hour"
           value={i ? fmtCompact(i.events_last_hour) : '…'}
-          sub={i ? `newest ${lag == null ? '—' : fmtAge(lag)} ago` : ''}
-          // Old news over an idle machine is quiet, not a fault — the rule
-          // the Warnings lamp and the flight deck follow (#413).
-          tone={
-            lag == null || ((s?.live?.length ?? 0) === 0 && lag >= BANDS.lagWarn)
-              ? 'none'
-              : lag >= BANDS.lagBad
-                ? 'bad'
-                : lag >= BANDS.lagWarn
-                  ? 'warn'
-                  : 'ok'
+          sub={
+            captureDown(status)
+              ? 'the capture module is not active'
+              : i
+                ? `newest ${lag == null ? '—' : fmtAge(lag)} ago`
+                : ''
           }
+          // The Warnings lamp's and the flight deck's rule, shared (#413).
+          tone={captureTone(lag, (s?.live?.length ?? 0) > 0, captureDown(status))}
         />
       </SimpleGrid>
 

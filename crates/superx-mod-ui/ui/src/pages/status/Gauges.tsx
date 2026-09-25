@@ -2,7 +2,7 @@ import { SimpleGrid } from '@mantine/core'
 import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { OK, PELICAN } from '../../EChart'
-import { BANDS, CANCEL, FAIL, fmtCompact, Gauge, HIGH_GOOD, LOW_GOOD, n, pct, TOOLS_GOOD } from './parts'
+import { BANDS, CANCEL, FAIL, fmtCompact, Gauge, HIGH_GOOD, LOW_GOOD, n, pct, TOOLS_GOOD, steering } from './parts'
 
 // The six-pack (#367): the primary instruments, as dials with banded
 // arcs. Attitude is churn, heading is who directed the rewrites, and
@@ -26,14 +26,7 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
   // Steering: replaced lines when the transcript can see them, else
   // edits — a shell edit's size is unknown but who asked for it is not
   // (#388). Without the fallback this gauge went dark for a whole day.
-  const directedLines = n(s?.churn_directed)
-  const selfLines = n(s?.churn_self)
-  const directedEdits = n(s?.edits_directed)
-  const selfEdits = n(s?.edits_self)
-  const inLines = directedLines + selfLines > 0
-  const directed = inLines ? directedLines : directedEdits
-  const self = inLines ? selfLines : selfEdits
-  const onCourse = pct(directed, directed + self)
+  const { lines: inLines, directed, self, onCourse } = steering(s)
 
   const passed = n(s?.tests_passed)
   const failedTests = n(s?.tests_failed)

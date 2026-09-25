@@ -1,6 +1,8 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Badge, Card, Group, SimpleGrid, Text, Title, Tooltip } from '@mantine/core'
 import { CANCEL, EChart, FAIL, GRID_LINE, INK, INK_MUTED, MONO, OK, TRACK, UNKNOWN } from '../../EChart'
+import type { LiveSession } from '../../generated/LiveSession'
+import type { StatusResponse } from '../../generated/StatusResponse'
 
 // The cockpit's parts (#367). Every instrument on the Status page is
 // built from these, so a number renders one way, a scope reads one
@@ -86,6 +88,19 @@ export const pct = (part: number, whole: number): number | null =>
 
 export const baseName = (p: string) => p.split('/').slice(-2).join('/')
 
+type Count = number | bigint | null | undefined
+/// Who asked for the rewrites (#388, #413): replaced lines when the
+/// transcript can see them, else edits — one reading for every gauge, tile
+/// and row that shows it. Both shares come from one rounding, so "on
+/// course" and "unasked" always sum to 100 (#415 review).
+export function steering(x: { churn_directed?: Count; churn_self?: Count; edits_directed?: Count; edits_self?: Count } | undefined) {
+  const lines = n(x?.churn_directed) + n(x?.churn_self) > 0
+  const directed = lines ? n(x?.churn_directed) : n(x?.edits_directed)
+  const self = lines ? n(x?.churn_self) : n(x?.edits_self)
+  const unasked = pct(self, directed + self)
+  return { lines, directed, self, unasked, onCourse: unasked == null ? null : 100 - unasked }
+}
+
 // ── the bands every gauge and lamp reads from ─────────────────────
 // Render-layer thresholds, stated once. The Rust side carries the
 // analysis constants (STEERING_MINUTES, DURABLE_MINS, REVISIT_AT);
@@ -133,6 +148,26 @@ export function lowGood(v: number | null, warn: number, bad: number): Tone {
   if (v == null) return 'none'
   return v >= bad ? 'bad' : v >= warn ? 'warn' : 'ok'
 }
+/// Is the capture module stopped? That is the failure the lag instruments
+/// exist to show (#413).
+export function captureDown(status: StatusResponse | undefined): boolean {
+  return (status?.modules ?? []).some((m) => m.name === 'capture' && m.lifecycle !== 'active')
+}
+/// How current capture is — one rule for every instrument that shows it
+/// (#413, #415 review). The age of the newest captured event is lag only
+/// while something is in the air: over an idle machine there is nothing to
+/// capture, and old news is quiet, not a fault. Capture that is not
+/// running is a fault whatever the age.
+export function captureTone(lag: number | null, anythingLive: boolean, down: boolean): Tone {
+  if (down) return 'bad'
+  if (lag == null) return 'none'
+  return anythingLive ? lowGood(lag, BANDS.lagWarn, BANDS.lagBad) : 'ok'
+}
+/// A live session circling (#350): rewriting itself with nobody asking, or
+/// back on the same files — one rule for the Circling lamp, the flight deck
+/// and the deviations tile.
+export const isCircling = (l: LiveSession) =>
+  n(l.self_churn_pct) >= BANDS.selfChurnBad || n(l.files_revisited) >= BANDS.revisitedBad
 /// High is good: pass rates, directed share, cache hit.
 export function highGood(v: number | null, bad: number, ok: number): Tone {
   if (v == null) return 'none'

@@ -2420,7 +2420,7 @@ async fn every_range_but_the_window_admits_its_row_cap() {
             "message": {"model": "claude-opus-5", "content": []}})).await;
     }
     let s = |range: &'static str, cap: u32| {
-        superx_mod_ui::stats::stats_for_range_capped(&kernel, 2, range, cap)
+        superx_mod_ui::stats::stats_for_range_capped(&kernel, 2, range, cap, chrono::Offset::fix(&chrono::Utc))
     };
     assert!(s("all", 2).await.expect("all").truncated, "three rows, cap two: a sample");
     assert!(s("24h", 2).await.expect("24h").truncated);
@@ -3709,6 +3709,52 @@ async fn unknown_reads_unknown_and_a_short_median_reads_short() {
     assert_eq!(s.autonomy_p50_mins, 0, "under a minute is 0, not the -1 of no data");
     assert_eq!(s.survival_p50_mins, -1, "nothing was rewritten: no data");
     assert!(s.active_hours_range >= 1);
+}
+
+/// Coverage counts the 24 clock hours the strip draws (#415 review): this
+/// hour and the 23 before it. A message a second before the first of them
+/// is under 24 hours old and sits in a 25th bucket, which let the tile read
+/// 25/24.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_counts_the_hours_the_strip_draws() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "cov").await;
+    let now = chrono::Utc::now();
+    let this_hour = now - chrono::Duration::seconds(now.timestamp().rem_euclid(3600));
+    for at in [now, this_hour - chrono::Duration::hours(23) - chrono::Duration::seconds(1)] {
+        log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+            "message": {"content": [{"type": "text", "text": "."}]}}), at).await;
+    }
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.active_hours_24h, 1, "{:?}", s.active_hours);
+}
+
+/// The page's hours and days are the viewer's (#415 review): at UTC−4 a
+/// reply written at 01:30 UTC ran at 21:30 the evening before, and every
+/// chart that buckets by hour or day — the burn series, the hour × weekday
+/// heatmap, the work calendar — says so, as the Sortie log already did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hours_and_days_are_the_viewers() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "tz").await;
+    let now = chrono::Utc::now();
+    let mut at = now.date_naive().and_hms_opt(1, 30, 0).expect("01:30").and_utc();
+    if at > now {
+        at -= chrono::Duration::days(1);
+    }
+    log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+        "message": {"id": "r", "model": "claude-opus-5", "usage": {"output_tokens": 5},
+            "content": [{"type": "text", "text": "."}]}}), at).await;
+    let clock = chrono::FixedOffset::west_opt(4 * 3600).expect("UTC-4");
+    let local = at.with_timezone(&clock);
+
+    let s = superx_mod_ui::stats::stats_for_range_on(&kernel, 500, "24h", clock).await.expect("stats");
+    let hour = local.format("%Y-%m-%dT%H").to_string();
+    assert!(s.burn.iter().any(|b| b.t == hour && b.out == 5), "{hour} in {:?}", s.burn.iter().map(|b| &b.t).collect::<Vec<_>>());
+    let i = superx_mod_ui::insights::insights_summary_on(&kernel, clock).await.expect("insights");
+    assert_eq!(i.hour_weekday.iter().map(|c| c.hour).collect::<Vec<_>>(), vec![21]);
+    let day = local.format("%Y-%m-%d").to_string();
+    assert_eq!(i.events_per_day.iter().map(|d| d.t.clone()).collect::<Vec<_>>(), vec![day]);
 }
 
 /// A refusal belongs to the model that made the refused call, even after

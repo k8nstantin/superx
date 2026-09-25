@@ -2,7 +2,7 @@ import { Badge, Grid, Group, Progress, Table, Text, Tooltip } from '@mantine/cor
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
 import { sessionColor } from '../../Feed'
-import { BANDS, Churn, FAIL, OK, Panel, fmtAge, fmtCompact, fmtMs, fmtSecs, n, pct } from './parts'
+import { BANDS, Churn, FAIL, OK, Panel, fmtAge, fmtCompact, fmtMs, fmtSecs, n, pct, steering } from './parts'
 import { openSession } from '../../route'
 
 // Who flew what (#367): agents, reasoning levels, models, branches and
@@ -81,11 +81,7 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                   const del = n(a.lines_removed)
                   const churn = pct(del, add + del)
                   const cost = add > 0 ? Math.round((n(a.in_tokens) + n(a.out_tokens)) / add) : null
-                  // Lines, else edits (#388).
-                  const unasked =
-                    n(a.churn_directed) + n(a.churn_self) > 0
-                      ? pct(n(a.churn_self), n(a.churn_directed) + n(a.churn_self))
-                      : pct(n(a.edits_self), n(a.edits_directed) + n(a.edits_self))
+                  const { unasked } = steering(a)
                   const tests = n(a.tests_passed) + n(a.tests_failed)
                   const passPct = pct(n(a.tests_passed), tests)
                   return (
@@ -433,7 +429,7 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 7 }}>
-          <Panel title="Where the work went" scope="range" range={range} note={`lines written per agent, per repo, per ${long ? 'day' : 'hour'} · UTC`} h="100%">
+          <Panel title="Where the work went" scope="range" range={range} note={`lines written per agent, per repo, per ${long ? 'day' : 'hour'} · your time`} h="100%">
             {cells.length === 0 ? (
               <Text size="xs" c="dimmed">no code written in this range</Text>
             ) : (

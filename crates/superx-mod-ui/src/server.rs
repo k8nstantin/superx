@@ -514,6 +514,23 @@ async fn api_session_activity(
 #[derive(serde::Deserialize)]
 struct RangeQuery {
     range: Option<String>,
+    /// The viewer's offset from UTC, in minutes east (#415 review).
+    tz: Option<i32>,
+}
+
+/// The viewer's clock, for the hours and days the page buckets by: the
+/// offset its browser reports, in minutes east of UTC. Absent or out of
+/// range, UTC — a stale bookmark still renders.
+fn viewer_clock(tz: Option<i32>) -> chrono::FixedOffset {
+    tz.and_then(|m| m.checked_mul(60))
+        .and_then(chrono::FixedOffset::east_opt)
+        .unwrap_or_else(|| chrono::Offset::fix(&chrono::Utc))
+}
+
+/// The viewer's offset alone — for the endpoints that take nothing else.
+#[derive(serde::Deserialize)]
+struct ClockQuery {
+    tz: Option<i32>,
 }
 
 async fn api_stats(
@@ -532,12 +549,13 @@ async fn api_stats(
     } else {
         "window".to_string()
     };
+    let clock = viewer_clock(q.tz);
     let ttl = crate::resolved_cache_secs(kernel).await;
-    let key = format!("stats:{range}:{window}");
+    let key = format!("stats:{range}:{window}:{}", clock.local_minus_utc());
     if let Some(body) = state.cached(&key, ttl) {
         return json_body(body);
     }
-    match crate::stats::stats_for_range(kernel, window, &range).await {
+    match crate::stats::stats_for_range_on(kernel, window, &range, clock).await {
         Ok(s) => match serde_json::to_string(&s) {
             Ok(body) => {
                 state.remember(&key, &body);
@@ -552,10 +570,26 @@ async fn api_stats(
 /// Deep statistics (issue #237) — all-history aggregates computed in
 /// the engine. Separate from `/api/stats` so the live tiles keep their
 /// fast refresh while these poll lazily.
-async fn api_insights(State(state): State<AppState>) -> Response<InsightsSummary> {
-    match crate::insights::insights_summary(&state.kernel).await {
-        Ok(s) => Response::ok(s),
-        Err(e) => Response::err(e.to_string()),
+async fn api_insights(State(state): State<AppState>, Query(q): Query<ClockQuery>) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    // Whole-history, and seconds to compute (#415 review): held for the
+    // same while as the Status page's own figures, so two pilots — or two
+    // tabs — pay for it once.
+    let clock = viewer_clock(q.tz);
+    let ttl = crate::resolved_cache_secs(&state.kernel).await;
+    let key = format!("insights:{}", clock.local_minus_utc());
+    if let Some(body) = state.cached(&key, ttl) {
+        return json_body(body);
+    }
+    match crate::insights::insights_summary_on(&state.kernel, clock).await {
+        Ok(s) => match serde_json::to_string(&s) {
+            Ok(body) => {
+                state.remember(&key, &body);
+                json_body(body)
+            }
+            Err(e) => err_response(&e.to_string()).into_response(),
+        },
+        Err(e) => err_response(&e.to_string()).into_response(),
     }
 }
 
@@ -722,6 +756,16 @@ impl<T: serde::Serialize> axum::response::IntoResponse for Response<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_viewers_clock_is_what_the_browser_reports_else_utc() {
+        let utc = chrono::Offset::fix(&chrono::Utc);
+        assert_eq!(viewer_clock(Some(-240)), chrono::FixedOffset::west_opt(4 * 3600).expect("UTC-4"));
+        assert_eq!(viewer_clock(Some(330)), chrono::FixedOffset::east_opt(330 * 60).expect("UTC+5:30"));
+        assert_eq!(viewer_clock(None), utc);
+        assert_eq!(viewer_clock(Some(100_000)), utc, "past a day is no offset");
+        assert_eq!(viewer_clock(Some(i32::MAX)), utc, "and never overflows");
+    }
 
     async fn get(path: &str) -> axum::response::Response {
         static_assets(path.parse::<axum::http::Uri>().expect("uri")).await

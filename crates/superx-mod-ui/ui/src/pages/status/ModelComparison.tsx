@@ -563,11 +563,17 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
     .map((h) => ({ from: h.from, to: h.to, switches: n(h.switches), commits: n(h.commits), added: n(h.added), alive: n(h.alive), survived_pct: n(h.survived_pct) }))
     .filter((h) => h.commits > 0)
   // Does work written just after a takeover survive better or worse than
-  // the incoming family's own average? Read from the rows, not asserted.
-  const aboveOwn = hand.filter((h) => {
+  // the incoming family's own average? Read from the rows, not asserted —
+  // and a tie is a tie: near 100% survival it is the common case, and
+  // counting it as "below" announced a loss that was not there (#415
+  // review).
+  const versusOwn = (h: (typeof hand)[number]) => {
     const own = fams.find((f) => f.model === h.to)
-    return own != null && h.survived_pct > n(own.survived_pct)
-  }).length
+    return own == null ? null : Math.sign(h.survived_pct - n(own.survived_pct))
+  }
+  const aboveOwn = hand.filter((h) => versusOwn(h) === 1).length
+  const levelOwn = hand.filter((h) => versusOwn(h) === 0).length
+  const belowOwn = hand.filter((h) => versusOwn(h) === -1).length
   const unjudged = c.unjudged ?? []
 
   const ms = metrics()
@@ -783,13 +789,14 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
           <EChart option={switchChart} height={40 + hand.length * 42} />
           <Text size="xs" c="dimmed" mt={4}>
             The account being tested is that a budget runs out, another model takes over, and what it
-            does then gets thrown away. In {aboveOwn} of {hand.length} switch direction{hand.length === 1 ? '' : 's'},
-            what the incoming family wrote in its first three hours survives above its own average
-            {aboveOwn === hand.length
+            does then gets thrown away. Of {hand.length} switch direction{hand.length === 1 ? '' : 's'}, what the
+            incoming family wrote in its first three hours survives above its own average in {aboveOwn}, level
+            with it in {levelOwn} and below it in {belowOwn}
+            {belowOwn === 0
               ? ' — the handover is not where the work is lost.'
-              : aboveOwn === 0
-                ? ' — in none does it: what follows a takeover is thrown away more than usual.'
-                : '; in the rest it survives below it.'}
+              : belowOwn === hand.length
+                ? ' — in every one: what follows a takeover is thrown away more than usual.'
+                : '.'}
           </Text>
         </Panel>
       )}

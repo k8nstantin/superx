@@ -2774,7 +2774,24 @@ pub async fn stats_summary(kernel: &Kernel, window: u32) -> Result<StatsSummary>
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
 pub async fn stats_for_range(kernel: &Kernel, window: u32, range: &str) -> Result<StatsSummary> {
-    stats_for_range_capped(kernel, window, range, RANGE_ROW_CAP).await
+    stats_for_range_capped(kernel, window, range, RANGE_ROW_CAP, chrono::Offset::fix(&chrono::Utc)).await
+}
+
+/// [`stats_for_range`] on the viewer's `clock` (#415 review): every hour
+/// and day a chart buckets by is the viewer's, so the hour-of-day chart
+/// and the Sortie log agree about when a session ran. Instants, ages and
+/// range membership are the same on every clock.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn stats_for_range_on(
+    kernel: &Kernel,
+    window: u32,
+    range: &str,
+    clock: chrono::FixedOffset,
+) -> Result<StatsSummary> {
+    stats_for_range_capped(kernel, window, range, RANGE_ROW_CAP, clock).await
 }
 
 /// [`stats_for_range`] with the time-bounded ranges' row cap as a
@@ -2790,6 +2807,7 @@ pub async fn stats_for_range_capped(
     window: u32,
     range: &str,
     row_cap: u32,
+    clock: chrono::FixedOffset,
 ) -> Result<StatsSummary> {
     // ── cheap in-engine totals ──────────────────────────────────────
     let events_total =
@@ -2975,6 +2993,9 @@ pub async fn stats_for_range_capped(
         // backfill. `emitted_at` is when the work happened
         // (insights.rs already reads it this way) (#340).
         let when = m.emitted_at.unwrap_or(m.valid_from);
+        // The same moment on the viewer's clock, for every hour and day a
+        // chart buckets by.
+        let local = when.with_timezone(&clock);
         code.instants.push(when);
         // Hour AND minute from the agent's clock: the minute used to come
         // from the capture clock, so a backfill folded a whole hour of
@@ -2985,7 +3006,7 @@ pub async fn stats_for_range_capped(
             .entry(bucket5)
             .or_default()
             .insert(superx_ops::record_uuid(&m.session));
-        code.active_hours.insert(when.format("%Y-%m-%dT%H").to_string());
+        code.active_hours.insert(local.format("%Y-%m-%dT%H").to_string());
 
         let Some(raw) = &m.raw else { continue };
 
@@ -3001,12 +3022,12 @@ pub async fn stats_for_range_capped(
         if let Some(e) = effort.as_ref().filter(|_| fresh_reply) {
             code.efforts.entry(e.clone()).or_default().messages += 1;
         }
-        let hour_key = when.format("%Y-%m-%dT%H").to_string();
+        let hour_key = local.format("%Y-%m-%dT%H").to_string();
         // On `when`, not `valid_from`: the failure-by-hour-of-day series
         // (#328, first drawn in #369) put every backfilled call into the
         // hour of the backfill — one bar at 09 for six days of work
         // (#372).
-        let hour_of_day = i64::from(chrono::Timelike::hour(&when));
+        let hour_of_day = i64::from(chrono::Timelike::hour(&local));
         // Was anyone steering when this message happened? Hoisted from
         // the write path so the token accounting can ask it too (#391):
         // the same ten-minute window, one computation per message.
@@ -3188,9 +3209,9 @@ pub async fn stats_for_range_capped(
         // ones, folded HERE so the payload stays bounded however many
         // agent/repo pairs exist (#340).
         let bucket = if fold_days {
-            when.format("%Y-%m-%d").to_string()
+            local.format("%Y-%m-%d").to_string()
         } else {
-            when.format("%Y-%m-%dT%H").to_string()
+            local.format("%Y-%m-%dT%H").to_string()
         };
         // The repository this row was written in, and the branch that
         // checkout was on at the time — both read from git (#411). The
@@ -3686,7 +3707,7 @@ pub async fn stats_for_range_capped(
                                         .replaced_unknown += 1;
                                 }
                                 if n > 0 || replaced > 0 {
-                                    let hour = when.format("%Y-%m-%dT%H").to_string();
+                                    let hour = local.format("%Y-%m-%dT%H").to_string();
                                     let slot = code.churn.entry(hour.clone()).or_insert((0, 0));
                                     slot.0 += n;
                                     slot.1 += replaced;
@@ -4096,7 +4117,7 @@ pub async fn stats_for_range_capped(
                                             }
                                             let sid = superx_ops::record_uuid(&m.session);
                                             if n > 0 {
-                                                let hour = when.format("%Y-%m-%dT%H").to_string();
+                                                let hour = local.format("%Y-%m-%dT%H").to_string();
                                                 code.churn.entry(hour.clone()).or_insert((0, 0)).0 += n;
                                                 code.intensity.entry(hour).or_default().added += n;
                                                 if let Some(e) = &effort {
@@ -4473,13 +4494,14 @@ pub async fn stats_for_range_capped(
     let mut per_minute: std::collections::BTreeMap<String, i64> = Default::default();
     let mut boots = Vec::new();
     for e in &events {
+        let local = e.valid_from.with_timezone(&clock);
         *per_minute
-            .entry(e.valid_from.format("%Y-%m-%dT%H:%M").to_string())
+            .entry(local.format("%Y-%m-%dT%H:%M").to_string())
             .or_insert(0) += 1;
         if e.lifecycle_event == "boot_complete" {
             if let Value::Object(o) = &e.payload {
                 boots.push(TimeCount {
-                    t: e.valid_from.format("%m-%d %H:%M").to_string(),
+                    t: local.format("%m-%d %H:%M").to_string(),
                     value: get_int(o, "duration_ms"),
                 });
             }
@@ -4525,8 +4547,15 @@ pub async fn stats_for_range_capped(
         rows.first().and_then(|r| obj(r).map(|o| get_int(o, "c"))).unwrap_or(0)
     };
     let tokens_last_hour = reply_output_tokens(kernel, Some(hour_ago)).await?;
-    // Clock coverage: which of the last 24 hours saw any activity.
-    let day_ago = chrono::Utc::now() - chrono::Duration::hours(24);
+    // Clock coverage: which of the last 24 CLOCK hours — this one and the
+    // 23 before it, the buckets the strip draws — saw any activity. A cut
+    // 24 hours back reached into a 25th bucket, so the tile could read
+    // 25/24 and the gauge 104% (#415 review).
+    let now = chrono::Utc::now();
+    let this_hour = now
+        - chrono::Duration::seconds(now.timestamp().rem_euclid(3600))
+        - chrono::Duration::nanoseconds(i64::from(now.timestamp_subsec_nanos()));
+    let day_ago = this_hour - chrono::Duration::hours(23);
     let active_hours_list: Vec<String> = {
         let rows: Vec<Value> = kernel
             .db()
@@ -4713,7 +4742,7 @@ pub async fn stats_for_range_capped(
     } else {
         since
     };
-    let landed = crate::landed::landed(&code.cwds, landed_since).await;
+    let landed = crate::landed::landed(&code.cwds, landed_since, clock).await;
 
     // How much of each model's landed work is still there (#405)? Git
     // says what landed and blame says what is left, so the ratio has
@@ -5200,7 +5229,8 @@ pub async fn stats_for_range_capped(
                 .collect();
             // Every live session, not the busiest eight: the Waiting,
             // Circling and Context lamps read this list, and a ninth live
-            // session lit none of them (#413). The panel shows the top rows.
+            // session lit none of them (#413). The panel lists them all,
+            // busiest first — who is in the air is the question it answers.
             v.sort_by(|a, b| b.messages.cmp(&a.messages).then(a.identity.cmp(&b.identity)));
             v
         },

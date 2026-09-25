@@ -52,38 +52,6 @@ fn is_failure(event: &str) -> bool {
     matches!(event, "module_failed" | "module_start_failed" | "module_start_abandoned")
 }
 
-/// Gemini stores `input`/`output`/`cached`/`thoughts`; Claude Code stores
-/// the four `*_input_tokens` counters. One query covers both — a missing
-/// field coalesces to 0 rather than dropping the row.
-///
-/// Once per REPLY (#409): Claude Code repeats a reply's usage on every
-/// line it writes for it, and Gemini re-emits a record as it streams, so
-/// the inner query keeps one value per reply before the outer one sums.
-/// Gemini's `input` includes what it read from cache, and its `output`
-/// excludes its `thoughts` — both are adjusted to read like Claude's. The
-/// reply key and the output formula are [`crate::stats`]'s, so every token
-/// total on the page moves together (#415 review).
-fn tokens_query() -> String {
-    format!(
-        "SELECT
-            math::sum(input) AS input, math::sum(output) AS output,
-            math::sum(cache_read) AS cache_read, math::sum(cache_write) AS cache_write
-         FROM (
-            SELECT {key} AS k,
-                math::max(raw.message.usage.input_tokens
-                    ?? ((raw.tokens.input ?? 0) - (raw.tokens.cached ?? 0))) AS input,
-                math::max({out}) AS output,
-                math::max(raw.message.usage.cache_read_input_tokens ?? raw.tokens.cached ?? 0)
-                    AS cache_read,
-                math::max(raw.message.usage.cache_creation_input_tokens ?? 0) AS cache_write
-            FROM message WHERE raw.message.usage != NONE OR raw.tokens != NONE
-            GROUP BY k
-         ) GROUP ALL",
-        key = REPLY_KEY_SQL,
-        out = OUT_TOKENS_SQL,
-    )
-}
-
 fn obj(v: &Value) -> Option<&Object> {
     match v {
         Value::Object(o) => Some(o),
@@ -183,48 +151,90 @@ async fn table_stats(kernel: &Kernel) -> Result<Vec<TableStat>> {
 }
 
 pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
-    // ── the work calendar ───────────────────────────────────────────
+    insights_summary_on(kernel, chrono::Offset::fix(&chrono::Utc)).await
+}
+
+/// [`insights_summary`] with its days and hours on the viewer's `clock`
+/// (#415 review), as the Status page's own charts are.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) -> Result<InsightsSummary> {
+    // ── one pass over the messages ──────────────────────────────────
+    // The calendar, the week's rhythm, the token totals, the models and the
+    // agents all count REPLIES (#409, #415 review), and each used to re-read
+    // the whole message table to fold them: six passes, ten of the fourteen
+    // seconds this took on a 37k-row replay, polled every minute — and as
+    // capture landed rows between them, two token totals of one page
+    // disagreed. One pass folds the rows into replies; the rest read that.
+    //
+    // A reply's lines share its key, its agent and its model, so folding on
+    // all three is folding on the key. Claude Code repeats a reply's usage
+    // on every line, and Gemini re-emits a record as it streams, so each
+    // counter keeps its reply's largest value. Gemini's `input` includes
+    // what it read from cache, and its `output` excludes its `thoughts` —
+    // both adjusted to read like Claude's. A row with no usage folds to
+    // zeros and still counts as a message.
+    //
     // By the AGENT'S clock, not ours: `emitted_at` is the source's own
-    // timestamp, `valid_from` merely when capture first saw the row.
-    // Bucketing on the latter draws the ingest run — a few days — and
-    // hides months of real history (issue #239).
-    let events_per_day = rows(
-        kernel,
-        "SELECT time::format(emitted_at ?? valid_from, '%Y-%m-%d') AS t, count() AS value
-         FROM message GROUP BY t ORDER BY t",
-    )
-    .await?
-    .iter()
-    .filter_map(obj)
-    .filter_map(|o| {
-        Some(TimeCount {
-            t: get_str(o, "t")?.to_string(),
-            value: get_int(o, "value"),
+    // timestamp, `valid_from` merely when capture first saw the row, and
+    // bucketing on the latter draws the ingest run (#239) — shifted by the
+    // viewer's offset from UTC, so the days and hours are the viewer's.
+    let shift = clock.local_minus_utc();
+    let at = if shift >= 0 { format!("(at + {shift}s)") } else { format!("(at - {}s)", -shift) };
+    let mut res = kernel
+        .db()
+        .query(format!(
+            "LET $r = (SELECT agent, (raw.message.model ?? raw.model) AS model, {REPLY_KEY_SQL} AS k,
+                    time::min(emitted_at ?? valid_from) AS at,
+                    math::max(raw.message.usage.input_tokens
+                        ?? ((raw.tokens.input ?? 0) - (raw.tokens.cached ?? 0))) AS input,
+                    math::max({OUT_TOKENS_SQL} ?? 0) AS output,
+                    math::max(raw.message.usage.cache_read_input_tokens ?? raw.tokens.cached ?? 0) AS cache_read,
+                    math::max(raw.message.usage.cache_creation_input_tokens ?? 0) AS cache_write
+                FROM message GROUP BY agent, model, k);
+             SELECT time::format({at}, '%Y-%m-%d') AS t, count() AS value FROM $r GROUP BY t ORDER BY t;
+             SELECT time::hour({at}) AS hour, time::wday({at}) AS weekday, count() AS value
+                FROM $r GROUP BY hour, weekday;
+             SELECT math::sum(input) AS input, math::sum(output) AS output,
+                    math::sum(cache_read) AS cache_read, math::sum(cache_write) AS cache_write
+                FROM $r GROUP ALL;
+             SELECT model, count() AS value FROM $r WHERE model != NONE GROUP BY model;
+             SELECT agent, count() AS messages, math::sum(output) AS output FROM $r GROUP BY agent;"
+        ))
+        .await?;
+    let days: Vec<Value> = res.take(1)?;
+    let cells: Vec<Value> = res.take(2)?;
+    let totals: Vec<Value> = res.take(3)?;
+    let by_model: Vec<Value> = res.take(4)?;
+    let by_agent: Vec<Value> = res.take(5)?;
+
+    // ── the work calendar ───────────────────────────────────────────
+    let events_per_day = days
+        .iter()
+        .filter_map(obj)
+        .filter_map(|o| {
+            Some(TimeCount {
+                t: get_str(o, "t")?.to_string(),
+                value: get_int(o, "value"),
+            })
         })
-    })
-    .collect();
+        .collect();
 
     // ── the week's rhythm: hour × weekday, same clock as above ──────
-    let hour_weekday = rows(
-        kernel,
-        "SELECT time::hour(emitted_at ?? valid_from) AS hour,
-                time::wday(emitted_at ?? valid_from) AS weekday,
-                count() AS value
-         FROM message GROUP BY hour, weekday",
-    )
-    .await?
-    .iter()
-    .filter_map(obj)
-    .map(|o| HeatCell {
-        hour: get_int(o, "hour"),
-        weekday: get_int(o, "weekday"),
-        value: get_int(o, "value"),
-    })
-    .collect();
+    let hour_weekday = cells
+        .iter()
+        .filter_map(obj)
+        .map(|o| HeatCell {
+            hour: get_int(o, "hour"),
+            weekday: get_int(o, "weekday"),
+            value: get_int(o, "value"),
+        })
+        .collect();
 
     // ── token economics ─────────────────────────────────────────────
-    let t = rows(kernel, tokens_query()).await?;
-    let t = t.first().and_then(obj);
+    let t = totals.first().and_then(obj);
     let tokens = TokenTotals {
         input: t.map_or(0, |o| get_int(o, "input")),
         output: t.map_or(0, |o| get_int(o, "output")),
@@ -237,26 +247,16 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
     // one reply writes more lines per reply, so counting lines tilted the
     // split toward it. `<synthetic>` is the runtime's own marker, not a
     // model (#367).
-    let mut models: Vec<NameCount> = rows(
-        kernel,
-        format!(
-            "SELECT model, count() AS value FROM (
-                SELECT (raw.message.model ?? raw.model) AS model, {REPLY_KEY_SQL} AS k
-                FROM message WHERE raw.message.model != NONE OR raw.model != NONE
-                GROUP BY model, k
-             ) GROUP BY model"
-        ),
-    )
-    .await?
-    .iter()
-    .filter_map(obj)
-    .filter_map(|o| {
-        Some(NameCount {
-            name: get_str(o, "model").filter(|m| !m.starts_with('<'))?.to_string(),
-            value: get_int(o, "value"),
+    let mut models: Vec<NameCount> = by_model
+        .iter()
+        .filter_map(obj)
+        .filter_map(|o| {
+            Some(NameCount {
+                name: get_str(o, "model").filter(|m| !m.starts_with('<'))?.to_string(),
+                value: get_int(o, "value"),
+            })
         })
-    })
-    .collect();
+        .collect();
     models.sort_by_key(|m| std::cmp::Reverse(m.value));
 
     // ── per agent: message.agent is indexed and, until now, unread ──
@@ -275,48 +275,18 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
         Some(Value::RecordId(r)) => superx_ops::record_uuid(r),
         _ => String::new(),
     };
-    // Output once per reply (#409); the message count stays a count of
-    // captured rows, which is what the calendar above counts too.
-    let mut output_of: HashMap<String, i64> = HashMap::new();
-    for o in rows(
-        kernel,
-        format!(
-            "SELECT agent, math::sum(o) AS output FROM (
-                SELECT agent, {REPLY_KEY_SQL} AS k, math::max({OUT_TOKENS_SQL}) AS o
-                FROM message WHERE raw.message.usage != NONE OR raw.tokens != NONE
-                GROUP BY agent, k
-             ) GROUP BY agent"
-        ),
-    )
-    .await?
-    .iter()
-    .filter_map(obj)
-    {
-        output_of.insert(agent_of(o), get_int(o, "output"));
-    }
     // Replies, once each, as every "messages" on the page (#415 review):
     // counted in rows, Claude's three lines a reply out-weighed Gemini's
     // one record in "who did the work".
-    let mut per_agent: Vec<AgentSplit> = rows(
-        kernel,
-        format!(
-            "SELECT agent, count() AS messages FROM (
-                SELECT agent, {REPLY_KEY_SQL} AS k FROM message GROUP BY agent, k
-             ) GROUP BY agent"
-        ),
-    )
-    .await?
-    .iter()
-    .filter_map(obj)
-    .map(|o| {
-        let uuid = agent_of(o);
-        AgentSplit {
-            name: agent_name.get(&uuid).cloned().unwrap_or_else(|| "unattributed".into()),
+    let mut per_agent: Vec<AgentSplit> = by_agent
+        .iter()
+        .filter_map(obj)
+        .map(|o| AgentSplit {
+            name: agent_name.get(&agent_of(o)).cloned().unwrap_or_else(|| "unattributed".into()),
             messages: get_int(o, "messages"),
-            output_tokens: output_of.get(&uuid).copied().unwrap_or(0),
-        }
-    })
-    .collect();
+            output_tokens: get_int(o, "output"),
+        })
+        .collect();
     per_agent.sort_by_key(|a| std::cmp::Reverse(a.messages));
 
     // ── what capture actually spends itself on ──────────────────────

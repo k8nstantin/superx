@@ -2,7 +2,7 @@ import { SimpleGrid } from '@mantine/core'
 import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import type { StatusResponse } from '../../generated/StatusResponse'
-import { BANDS, Lamp, ageOf, fmtAge, fmtCompact, lowGood, n, pct, useNow, type Tone } from './parts'
+import { BANDS, Lamp, ageOf, captureDown, captureTone, fmtAge, fmtCompact, lowGood, n, pct, useNow, type Tone, isCircling } from './parts'
 
 // The annunciator panel (#367): a row of lamps that stay dark until
 // something is wrong. A pilot does not read twelve numbers to learn
@@ -28,9 +28,7 @@ export function Annunciator({
   const failRate = pct(failed, scored)
 
   const live = s?.live ?? []
-  const circling = live.filter(
-    (l) => n(l.self_churn_pct) >= BANDS.selfChurnBad || n(l.files_revisited) >= BANDS.revisitedBad,
-  ).length
+  const circling = live.filter(isCircling).length
   const nearCeiling = live.filter((l) => l.context_pct != null && n(l.context_pct) >= BANDS.contextWarn).length
   const atCeiling = live.filter((l) => l.context_pct != null && n(l.context_pct) >= BANDS.contextBad).length
 
@@ -54,16 +52,10 @@ export function Annunciator({
   // meant an empty room. It reads as a fault only when something WAS
   // running and its events have stopped arriving, or when the capture
   // module is not active. Otherwise the machine is simply quiet.
-  const captureDown = (status?.modules ?? []).some(
-    (m) => m.name === 'capture' && m.lifecycle !== 'active',
-  )
+  const down = captureDown(status)
   const anythingLive = live.length > 0
-  const lagTone = captureDown
-    ? 'bad'
-    : anythingLive
-      ? lowGood(lag, BANDS.lagWarn, BANDS.lagBad)
-      : 'ok'
-  const quiet = !captureDown && !anythingLive && lag != null && lag >= BANDS.lagWarn
+  const lagTone = captureTone(lag, anythingLive, down)
+  const quiet = !down && !anythingLive && lag != null && lag >= BANDS.lagWarn
 
   const loading = !s
   const v = (x: number | bigint | null | undefined) => (loading ? '…' : fmtCompact(x))
@@ -71,9 +63,9 @@ export function Annunciator({
   return (
     <SimpleGrid cols={{ base: 2, sm: 4, lg: 7 }} spacing="xs" mb="md">
       <Lamp
-        label={captureDown ? 'Capture stopped' : 'Last captured'}
+        label={down ? 'Capture stopped' : 'Last captured'}
         value={
-          captureDown
+          down
             ? 'down'
             : quiet
               ? 'quiet'
@@ -87,7 +79,7 @@ export function Annunciator({
         sub={
           !i
             ? ''
-            : captureDown
+            : down
               ? 'the capture module is not active'
               : quiet
                 ? `nothing running · newest ${fmtAge(lag ?? 0)} old`

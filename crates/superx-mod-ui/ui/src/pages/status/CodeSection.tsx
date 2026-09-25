@@ -225,7 +225,7 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 8 }}>
-          <Panel title="Code churn — added against replaced" scope="range" range={range} note={`${long ? 'per day' : 'per hour'} · UTC · solid: the transcript's edits · faint: what landed on main`} h="100%">
+          <Panel title="Code churn — added against replaced" scope="range" range={range} note={`${long ? 'per day' : 'per hour'} · your time · solid: the transcript's edits · faint: what landed on main`} h="100%">
             {buckets.length === 0 && (
               <Text size="xs" c="dimmed" mb="xs">
                 Nothing to plot. The solid series counts Write and Edit tool calls, and an agent

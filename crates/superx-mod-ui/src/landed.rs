@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 use tokio::process::Command;
 
 use crate::api::{ChurnPoint, Landed, LandedRepo};
@@ -89,8 +89,9 @@ pub(crate) fn repo_name(common_git_dir: &str, toplevel: &str) -> String {
 }
 
 /// What landed on the main line of every repository the given working
-/// directories belong to, since `since` (all history when `None`).
-pub async fn landed(cwds: &HashSet<String>, since: Option<DateTime<Utc>>) -> Landed {
+/// directories belong to, since `since` (all history when `None`), in
+/// hours on the viewer's `clock`.
+pub async fn landed(cwds: &HashSet<String>, since: Option<DateTime<Utc>>, clock: FixedOffset) -> Landed {
     let mut landed = Landed::default();
     // One repository per common git dir: worktrees fold into their repo.
     let mut repos: BTreeMap<String, String> = BTreeMap::new();
@@ -152,7 +153,9 @@ pub async fn landed(cwds: &HashSet<String>, since: Option<DateTime<Utc>>) -> Lan
                     .nth(1)
                     .and_then(|t| t.trim().parse::<i64>().ok())
                     .and_then(|t| Utc.timestamp_opt(t, 0).single())
-                    .map(|d| d.format("%Y-%m-%dT%H").to_string());
+                    // On the viewer's clock, as the transcript's series it
+                    // is drawn against (#415 review).
+                    .map(|d| d.with_timezone(&clock).format("%Y-%m-%dT%H").to_string());
                 continue;
             }
             let mut parts = line.split('\t');

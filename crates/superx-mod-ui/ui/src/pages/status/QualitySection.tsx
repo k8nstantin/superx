@@ -1,7 +1,7 @@
 import { Grid, Group, SimpleGrid, Table, Text } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
-import { BANDS, CANCEL, Counter, FAIL, Meter, OK, Panel, Stat, UNKNOWN, fmtAge, fmtCompact, fmtMins, fmtMs, fmtSecs, n, pct, rangeLabel } from './parts'
+import { BANDS, CANCEL, Counter, FAIL, Meter, OK, Panel, Stat, UNKNOWN, fmtAge, fmtCompact, fmtMins, fmtMs, fmtSecs, n, pct, rangeLabel, steering } from './parts'
 import { openSession } from '../../route'
 
 // Did it hold (#367): what the commands reported, when it went wrong,
@@ -15,11 +15,8 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
 
   // Lines when the transcript can see what was replaced, else edits
   // (#388) — the panel must not go dark on a day of shell edits.
-  const inLines = n(s?.churn_directed) + n(s?.churn_self) > 0
-  const cd = inLines ? n(s?.churn_directed) : n(s?.edits_directed)
-  const cs = inLines ? n(s?.churn_self) : n(s?.edits_self)
+  const { lines: inLines, directed: cd, self: cs, onCourse: directedPct } = steering(s)
   const unit = inLines ? 'replaced lines' : 'edits'
-  const directedPct = pct(cd, cd + cs)
   const churnCause =
     directedPct == null
       ? ''
@@ -85,7 +82,7 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 8 }}>
-          <Panel title="Quality over time" scope="range" range={range} note={`tests and tool failures per hour · UTC · ${note}`} h="100%">
+          <Panel title="Quality over time" scope="range" range={range} note={`tests and tool failures per hour · your time · ${note}`} h="100%">
             <EChart
               height={200}
               option={{
@@ -195,7 +192,7 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
           </Panel>
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 5 }}>
-          <Panel title="When it goes wrong" scope="range" range={range} note="failure rate by hour of day · UTC" h="100%">
+          <Panel title="When it goes wrong" scope="range" range={range} note="failure rate by hour of day · your time" h="100%">
             {byHour.length === 0 ? (
               <Text size="xs" c="dimmed">
                 no tool calls in this range
