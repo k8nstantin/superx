@@ -3132,7 +3132,54 @@ async fn a_reply_split_across_lines_is_counted_once() {
     assert_eq!(replies("claude-opus-5"), Some(2));
     assert_eq!(replies("gemini-3.1-pro"), Some(1));
     let claude = i.per_agent.iter().find(|a| a.name == "claude_code").expect("agent row");
-    assert_eq!((claude.messages, claude.output_tokens), (4, 120), "rows captured; output per reply");
+    assert_eq!((claude.messages, claude.output_tokens), (2, 120), "replies, as every other count; output per reply");
+}
+
+/// Every "Msgs" on the page counts the same thing (#415 review): a reply
+/// once, however many lines Claude Code wrote for it, and every other row
+/// as itself. The model table counted replies while the repo, branch,
+/// live, agent, top-session and timeline rows counted lines, 3.45 to a
+/// reply, under the same label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_msgs_counts_a_reply_once() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "msgs").await;
+    // A prompt, as Claude Code writes one.
+    kernel.log_message(superx_kernel::NewMessage {
+        session: session.clone(), agent: agent.clone(), role: "user".into(), content: "go".into(),
+        raw: Some(superx_kernel::message::json_to_object(&serde_json::json!({
+            "type": "user", "origin": {"kind": "human"}, "cwd": repo.cwd(),
+            "message": {"role": "user", "content": "go"}}))),
+        seq: None, emitted_at: Some(chrono::Utc::now()),
+    }).await.expect("prompt");
+    for block in [
+        serde_json::json!({"type": "thinking", "thinking": "…"}),
+        serde_json::json!({"type": "text", "text": "Reading."}),
+        serde_json::json!({"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": repo.file("a.rs")}}),
+    ] {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "cwd": repo.cwd(),
+            "message": {"id": "msg_A", "model": "claude-opus-5", "usage": {"output_tokens": 9}, "content": [block]}
+        })).await;
+    }
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": repo.cwd(),
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "fn a() {}"}]}
+    })).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    // The prompt, the reply and the tool's result.
+    assert_eq!(s.messages_last_hour, 3);
+    assert_eq!(s.live[0].messages, 3);
+    assert_eq!(s.top_sessions[0].messages, 3);
+    assert_eq!(s.timeline[0].messages, 3);
+    let claude = s.agent_stats.iter().find(|a| a.name == "claude_code").expect("agent");
+    assert_eq!(claude.messages, 3);
+    assert_eq!(s.repos[0].messages, 3);
+    assert_eq!(s.branches[0].messages, 3);
+    let i = superx_mod_ui::insights::insights_summary(&kernel).await.expect("insights");
+    assert_eq!(i.per_agent.iter().find(|a| a.name == "claude_code").map(|a| a.messages), Some(3));
 }
 
 /// Lines come from the diff Claude Code recorded, not from the call's

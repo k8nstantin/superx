@@ -38,7 +38,7 @@ export function SystemsSection({
         <Stat label="Agents" value={s ? String(s.agents) : '…'} tip="agents the OS has discovered" />
         <Stat label="Sessions" value={fmtCompact(s?.sessions_total)} sub={s ? `${s.sessions_active} live` : ''} />
         <Stat label="Events captured" value={fmtCompact(s?.events_total)} sub="all time" />
-        <Stat label="Messages" value={fmtCompact(s?.messages_total)} sub="all time" />
+        <Stat label="Message rows" value={fmtCompact(s?.messages_total)} sub="stored, all time" />
         <Stat label="Output tokens" value={fmtCompact(s?.output_tokens_total)} sub="all sessions" />
         <Stat
           label="Events this hour"

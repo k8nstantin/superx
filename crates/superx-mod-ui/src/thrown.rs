@@ -111,14 +111,15 @@ pub async fn session_runs(
 ) -> Result<Vec<ModelRun>> {
     let rows: Vec<Value> = kernel
         .db()
-        .query(
+        .query(format!(
             "SELECT (emitted_at ?? valid_from) AS at, (raw.message.model ?? raw.model) AS model, \
-                 (raw.message.id ?? raw.id ?? id) AS k, raw.cwd AS cwd, \
+                 {} AS k, raw.cwd AS cwd, \
                  raw.message.usage AS cu, raw.tokens AS gu, valid_from \
              FROM message WHERE session = $sess \
                  AND (raw.message.model != NONE OR raw.model != NONE) \
              ORDER BY valid_from ASC",
-        )
+            crate::stats::REPLY_KEY_SQL
+        ))
         .bind(("sess", session.clone()))
         .await?
         .take(0)?;

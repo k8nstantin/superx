@@ -15,6 +15,7 @@ use superx_kernel::{Kernel, Result};
 use crate::api::{
     AgentSplit, HeatCell, InsightsSummary, ModuleHealth, NameCount, TimeCount, TokenTotals, TableStat,
 };
+use crate::stats::{OUT_TOKENS_SQL, REPLY_KEY_SQL};
 
 /// Newest `module_active` events scanned for per-module startup cost —
 /// one row per module per boot, so this covers many boots.
@@ -59,22 +60,29 @@ fn is_failure(event: &str) -> bool {
 /// line it writes for it, and Gemini re-emits a record as it streams, so
 /// the inner query keeps one value per reply before the outer one sums.
 /// Gemini's `input` includes what it read from cache, and its `output`
-/// excludes its `thoughts` — both are adjusted to read like Claude's.
-const TOKENS_QUERY: &str = "SELECT
-        math::sum(input) AS input, math::sum(output) AS output,
-        math::sum(cache_read) AS cache_read, math::sum(cache_write) AS cache_write
-     FROM (
-        SELECT (raw.message.id ?? raw.id ?? id) AS k,
-            math::max(raw.message.usage.input_tokens
-                ?? ((raw.tokens.input ?? 0) - (raw.tokens.cached ?? 0))) AS input,
-            math::max(raw.message.usage.output_tokens
-                ?? ((raw.tokens.output ?? 0) + (raw.tokens.thoughts ?? 0))) AS output,
-            math::max(raw.message.usage.cache_read_input_tokens ?? raw.tokens.cached ?? 0)
-                AS cache_read,
-            math::max(raw.message.usage.cache_creation_input_tokens ?? 0) AS cache_write
-        FROM message WHERE raw.message.usage != NONE OR raw.tokens != NONE
-        GROUP BY k
-     ) GROUP ALL";
+/// excludes its `thoughts` — both are adjusted to read like Claude's. The
+/// reply key and the output formula are [`crate::stats`]'s, so every token
+/// total on the page moves together (#415 review).
+fn tokens_query() -> String {
+    format!(
+        "SELECT
+            math::sum(input) AS input, math::sum(output) AS output,
+            math::sum(cache_read) AS cache_read, math::sum(cache_write) AS cache_write
+         FROM (
+            SELECT {key} AS k,
+                math::max(raw.message.usage.input_tokens
+                    ?? ((raw.tokens.input ?? 0) - (raw.tokens.cached ?? 0))) AS input,
+                math::max({out}) AS output,
+                math::max(raw.message.usage.cache_read_input_tokens ?? raw.tokens.cached ?? 0)
+                    AS cache_read,
+                math::max(raw.message.usage.cache_creation_input_tokens ?? 0) AS cache_write
+            FROM message WHERE raw.message.usage != NONE OR raw.tokens != NONE
+            GROUP BY k
+         ) GROUP ALL",
+        key = REPLY_KEY_SQL,
+        out = OUT_TOKENS_SQL,
+    )
+}
 
 fn obj(v: &Value) -> Option<&Object> {
     match v {
@@ -97,8 +105,8 @@ fn get_int(o: &Object, key: &str) -> i64 {
     }
 }
 
-async fn rows(kernel: &Kernel, query: &'static str) -> Result<Vec<Value>> {
-    Ok(kernel.db().query(query).await?.take(0)?)
+async fn rows(kernel: &Kernel, query: impl Into<String>) -> Result<Vec<Value>> {
+    Ok(kernel.db().query(query.into()).await?.take(0)?)
 }
 
 /// Everything the Status page's deep panels need, in one pass.
@@ -215,7 +223,7 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
     .collect();
 
     // ── token economics ─────────────────────────────────────────────
-    let t = rows(kernel, TOKENS_QUERY).await?;
+    let t = rows(kernel, tokens_query()).await?;
     let t = t.first().and_then(obj);
     let tokens = TokenTotals {
         input: t.map_or(0, |o| get_int(o, "input")),
@@ -231,11 +239,13 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
     // model (#367).
     let mut models: Vec<NameCount> = rows(
         kernel,
-        "SELECT model, count() AS value FROM (
-            SELECT (raw.message.model ?? raw.model) AS model, (raw.message.id ?? raw.id ?? id) AS k
-            FROM message WHERE raw.message.model != NONE OR raw.model != NONE
-            GROUP BY model, k
-         ) GROUP BY model",
+        format!(
+            "SELECT model, count() AS value FROM (
+                SELECT (raw.message.model ?? raw.model) AS model, {REPLY_KEY_SQL} AS k
+                FROM message WHERE raw.message.model != NONE OR raw.model != NONE
+                GROUP BY model, k
+             ) GROUP BY model"
+        ),
     )
     .await?
     .iter()
@@ -270,13 +280,13 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
     let mut output_of: HashMap<String, i64> = HashMap::new();
     for o in rows(
         kernel,
-        "SELECT agent, math::sum(o) AS output FROM (
-            SELECT agent, (raw.message.id ?? raw.id ?? id) AS k,
-                math::max(raw.message.usage.output_tokens
-                    ?? ((raw.tokens.output ?? 0) + (raw.tokens.thoughts ?? 0))) AS o
-            FROM message WHERE raw.message.usage != NONE OR raw.tokens != NONE
-            GROUP BY agent, k
-         ) GROUP BY agent",
+        format!(
+            "SELECT agent, math::sum(o) AS output FROM (
+                SELECT agent, {REPLY_KEY_SQL} AS k, math::max({OUT_TOKENS_SQL}) AS o
+                FROM message WHERE raw.message.usage != NONE OR raw.tokens != NONE
+                GROUP BY agent, k
+             ) GROUP BY agent"
+        ),
     )
     .await?
     .iter()
@@ -284,9 +294,16 @@ pub async fn insights_summary(kernel: &Kernel) -> Result<InsightsSummary> {
     {
         output_of.insert(agent_of(o), get_int(o, "output"));
     }
+    // Replies, once each, as every "messages" on the page (#415 review):
+    // counted in rows, Claude's three lines a reply out-weighed Gemini's
+    // one record in "who did the work".
     let mut per_agent: Vec<AgentSplit> = rows(
         kernel,
-        "SELECT agent, count() AS messages FROM message GROUP BY agent",
+        format!(
+            "SELECT agent, count() AS messages FROM (
+                SELECT agent, {REPLY_KEY_SQL} AS k FROM message GROUP BY agent, k
+             ) GROUP BY agent"
+        ),
     )
     .await?
     .iter()

@@ -2960,8 +2960,12 @@ pub async fn stats_for_range_capped(
             continue;
         }
         let sid = superx_ops::record_uuid(&m.session);
+        // A message is a reply, once, whatever number of lines Claude Code
+        // wrote for it — every "Msgs" on the page counts the same thing
+        // (#409, #415 review). A row that is no reply is its own message.
+        let one = i64::from(fresh_reply);
         let agg = per_session.entry(sid).or_default();
-        agg.messages += 1;
+        agg.messages += one;
         // Shape of the working day (#324): when messages landed, and
         // how many sessions were live at once.
         // The AGENT'S clock, not ours. `valid_from` is when
@@ -3029,7 +3033,7 @@ pub async fn stats_for_range_capped(
             if when > entry.1 {
                 entry.1 = when;
             }
-            entry.4 += 1;
+            entry.4 += one;
         }
 
         // Live state (#325): newest-first, so the first sighting of a
@@ -3037,7 +3041,7 @@ pub async fn stats_for_range_capped(
         {
             let sid = superx_ops::record_uuid(&m.session);
             let l = code.live.entry(sid).or_default();
-            l.messages += 1;
+            l.messages += one;
             if l.newest.is_none() {
                 l.newest = Some(when);
                 l.agent = superx_ops::record_uuid(&m.agent);
@@ -3218,7 +3222,7 @@ pub async fn stats_for_range_capped(
         let agent_name = agent_of.get(&sid_now).cloned();
         if let Some(an) = &agent_name {
             let a = code.agents.entry(an.clone()).or_default();
-            a.messages += 1;
+            a.messages += one;
             a.sessions.insert(sid_now.clone());
         }
         // Which repo the agent was standing in (#308, #325), and which
@@ -3266,7 +3270,7 @@ pub async fn stats_for_range_capped(
                 code.cells
                     .entry((an.clone(), rk.clone(), bucket.clone()))
                     .or_default()
-                    .messages += 1;
+                    .messages += one;
             }
             // Crossing repos mid-session. The walk is newest-first, so
             // this counts the same boundaries from the other side —
@@ -3286,7 +3290,7 @@ pub async fn stats_for_range_capped(
                 _ => {}
             }
             let r = code.repos.entry(rk.clone()).or_default();
-            r.messages += 1;
+            r.messages += one;
             r.agents.insert(superx_ops::record_uuid(&m.agent));
             if r.last_active.is_none_or(|prev| when > prev) {
                 r.last_active = Some(when);
@@ -3303,7 +3307,7 @@ pub async fn stats_for_range_capped(
                 // session is on now.
                 code.session_branch.entry(sid_now.clone()).or_insert_with(|| key.clone());
                 let b = code.branches.entry(key).or_default();
-                b.messages += 1;
+                b.messages += one;
                 b.sessions.insert(sid_now.clone());
                 b.agents.insert(superx_ops::record_uuid(&m.agent));
                 if b.last_active.is_none_or(|prev| when > prev) {
@@ -4505,12 +4509,16 @@ pub async fn stats_for_range_capped(
     // the hour of the restart.
     let hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
     let messages_last_hour = {
+        // Replies, once each, as every other "messages" on the page (#415
+        // review).
         let rows: Vec<Value> = kernel
             .db()
-            .query(
-                "SELECT count() AS c FROM message \
-                 WHERE valid_from > $cut AND (emitted_at ?? valid_from) > $cut GROUP ALL",
-            )
+            .query(format!(
+                "SELECT count() AS c FROM (\
+                     SELECT {REPLY_KEY_SQL} AS k FROM message \
+                     WHERE valid_from > $cut AND (emitted_at ?? valid_from) > $cut GROUP BY k\
+                 ) GROUP ALL"
+            ))
             .bind(("cut", hour_ago))
             .await?
             .take(0)?;
