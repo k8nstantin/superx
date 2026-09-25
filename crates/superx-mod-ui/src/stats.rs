@@ -4267,7 +4267,9 @@ pub async fn stats_for_range_capped(
             pts
         },
         reverts: code.reverts,
-        thrash_files: code.files.values().filter(|&&n| n >= 3).count() as i64,
+        // The same threshold the page states (#413): it read a literal 3
+        // beside a `revisit_at` that could drift from it.
+        thrash_files: code.files.values().filter(|&&n| n >= REVISIT_AT).count() as i64,
         out_tokens_window: code.out_tokens,
         top_repeat: top_n(code.command_lines, 1)
             .into_iter()

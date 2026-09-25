@@ -39,7 +39,8 @@ export function Annunciator({
   // of minutes on top of that, and the ball is in your court.
   const waiting = live.filter((l) => l.awaiting && (ageOf(l.last_seen_at, now) ?? n(l.idle_secs)) >= BANDS.awaitingSecs).length
 
-  const modulesDown = (status?.modules ?? []).filter((m) => m.lifecycle !== 'active').length
+  // A module the operator disabled is not down (#413).
+  const modulesDown = (status?.modules ?? []).filter((m) => m.lifecycle !== 'active' && m.lifecycle !== 'disabled').length
   const moduleFailures = (i?.module_health ?? []).reduce((a, h) => a + n(h.failures_recent), 0)
 
   // Aged here, not on the server: this panel refreshes once a minute

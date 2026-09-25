@@ -2,7 +2,7 @@ import { SimpleGrid } from '@mantine/core'
 import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { OK, PELICAN } from '../../EChart'
-import { BANDS, CANCEL, FAIL, Gauge, HIGH_GOOD, LOW_GOOD, fmtCompact, n, pct } from './parts'
+import { BANDS, CANCEL, FAIL, fmtCompact, Gauge, HIGH_GOOD, LOW_GOOD, n, pct, TOOLS_GOOD } from './parts'
 
 // The six-pack (#367): the primary instruments, as dials with banded
 // arcs. Attitude is churn, heading is who directed the rewrites, and
@@ -50,7 +50,7 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
 
   const coverage = s ? Math.round((n(s.active_hours_24h) * 100) / 24) : null
 
-  const rangeNote = range === 'window' ? 'this window' : range ? `last ${range}` : ''
+  const rangeNote = range === 'window' ? 'this window' : range === 'all' ? 'all history' : range ? `the last ${range}` : ''
 
   return (
     <SimpleGrid cols={{ base: 2, sm: 3, lg: 6 }} spacing="xs" mb="md">
@@ -90,7 +90,7 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
       <Gauge
         label="Tools OK"
         value={s ? toolsOk : null}
-        bands={HIGH_GOOD}
+        bands={TOOLS_GOOD}
         sub={s && toolsOk != null ? `${failed} of ${scored} calls failed` : 'no calls scored'}
         tip="tool calls that did not come back an error"
       />

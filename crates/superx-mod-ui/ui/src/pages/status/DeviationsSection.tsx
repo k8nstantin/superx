@@ -1,7 +1,7 @@
 import { Group, SimpleGrid, Table, Text, Tooltip } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { MONO } from '../../EChart'
-import { CANCEL, Counter, FAIL, Panel, Stat, n, pct } from './parts'
+import { BANDS, CANCEL, Counter, FAIL, Panel, Stat, n, pct } from './parts'
 
 // Deviations (#392). The page measures what the agents did, and since
 // #385 what they shipped. This band is what they got WRONG, and what
@@ -26,6 +26,14 @@ export function DeviationsSection({ s, range }: { s: StatsSummary | undefined; r
   const bright = n(s?.bright_line_writes)
   const paths = s?.bright_line_paths ?? []
   const blind = n(s?.replaced_unknown) > 0
+  // Lines when the transcript can see what was replaced, else edits —
+  // one rule for every unasked reading on the page (#413).
+  const selfLines = n(s?.churn_self)
+  const directedLines = n(s?.churn_directed)
+  const unasked =
+    selfLines + directedLines > 0
+      ? pct(selfLines, selfLines + directedLines)
+      : pct(n(s?.edits_self), n(s?.edits_self) + n(s?.edits_directed))
 
   const scored = (s?.tool_outcomes ?? []).reduce((a, t) => a + n(t.ok) + n(t.failed) + n(t.cancelled), 0)
   const failed = (s?.tool_outcomes ?? []).reduce((a, t) => a + n(t.failed), 0)
@@ -52,14 +60,14 @@ export function DeviationsSection({ s, range }: { s: StatsSummary | undefined; r
                   : 'tests, clippy and the audit'
             }
             tone={ungated > 0 ? 'bad' : gated > 0 ? 'ok' : undefined}
-            tip="a pull request counts as gated when tests, clippy and the skill audit all ran in that session after its last write. One opened by a session that changed nothing is neither gated nor ungated — there was nothing to check — so the two need not sum to the number opened."
+            tip="a pull request counts as gated when tests, clippy and the skill audit all PASSED in that session after its last write — passed as their own output shows it: a failing tally, a compiler error or an audit failure is a gate not passed. One opened by a session that changed nothing is neither gated nor ungated — there was nothing to check — so the two need not sum to the number opened."
           />
           <Stat
             label="Opened ungated"
             value={ungated === 0 ? '0' : String(ungated)}
-            sub={ungated > 0 ? 'a gate was skipped' : 'no gate skipped'}
+            sub={ungated > 0 ? 'a gate was skipped or failed' : 'no gate skipped or failed'}
             tone={ungated > 0 ? 'bad' : 'ok'}
-            tip="written, then a pull request opened with at least one of the three checks missing since that write"
+            tip="written, then a pull request opened with at least one of the three checks not passed since that write"
           />
           <Stat
             label="Bright line"
@@ -212,15 +220,19 @@ export function DeviationsSection({ s, range }: { s: StatsSummary | undefined; r
                 : 'edits whose work a later edit threw away'
             }
           />
-          <Counter label="Thrash files" value={s?.thrash_files} tone={n(s?.thrash_files) > 0 ? CANCEL : undefined} tip={`files touched ${s?.revisit_at ?? 3} or more times`} />
-          <Counter label="Secrets sent" value={s?.exposure?.secret_hits} tone={n(s?.exposure?.secret_hits) > 0 ? FAIL : undefined} tip="tool output that looked like a credential and went into the next prompt" />
-          <Counter label="Outside reads" value={s?.exposure?.outside_reads} tone={n(s?.exposure?.outside_reads) > 0 ? CANCEL : undefined} tip="files read from beyond the directory the agent was working in" />
+          <Counter label="Thrash files" value={s?.thrash_files} tone={n(s?.thrash_files) > 0 ? CANCEL : undefined} tip={`files written ${s?.revisit_at ?? 3} or more times`} />
+          <Counter label="Secrets sent" value={s?.exposure?.secret_hits} tone={n(s?.exposure?.secret_hits) > 0 ? FAIL : undefined} tip="something shaped like a credential in a tool's output, or in a command or file the agent wrote — either way it went to the vendor" />
+          <Counter label="Outside reads" value={s?.exposure?.outside_reads} tone={n(s?.exposure?.outside_reads) > 0 ? CANCEL : undefined} tip="files read from outside the repository the agent was working in" />
           <Counter
             label="Unasked rewrites"
-            value={n(s?.edits_directed) + n(s?.edits_self) === 0 ? '—' : `${pct(n(s?.edits_self), n(s?.edits_directed) + n(s?.edits_self))}%`}
-            tip="share of rewrites with nobody steering — the agent going back over its own work"
+            value={unasked == null ? '—' : `${unasked}%`}
+            tip="share of rewrites with nobody steering — the agent going back over its own work. Lines when the transcript can see what was replaced, else edits: the same reading as On course and Why the churn"
           />
-          <Counter label="Circling" value={(s?.live ?? []).filter((l) => n(l.files_revisited) > 0).length} tip="live sessions coming back to the same files" />
+          <Counter
+            label="Circling"
+            value={(s?.live ?? []).filter((l) => n(l.self_churn_pct) >= BANDS.selfChurnBad || n(l.files_revisited) >= BANDS.revisitedBad).length}
+            tip={`live sessions rewriting themselves (${BANDS.selfChurnBad}% or more unasked) or back on ${BANDS.revisitedBad}+ files written ${s?.revisit_at ?? 3} or more times — the same rule as the Circling lamp`}
+          />
         </SimpleGrid>
         <Text size="xs" c="dimmed" mt="sm">
           An omission — asked for three things, delivered two — is not here, and cannot be, until the ask is recorded

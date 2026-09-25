@@ -34,72 +34,10 @@ const THROWN = '#e66767'
 const IDENT = ['#B833E8', '#c98500', '#3987e5']
 const MIN_ADDED = 5000
 
-/// The model FAMILY. Point releases of one model are the same choice
-/// from the operator's side — you reach for Fable or you reach for
-/// Opus — and splitting them dilutes the comparison and lets a thin
-/// recent point release distort a rate. The full table keeps the exact
-/// versions; the charts compare families.
-function family(model: string): string {
-  const m = model.replace(/^claude-/, '')
-  const hit = ['fable', 'opus', 'sonnet', 'haiku'].find((f) => m.startsWith(f))
-  return hit ?? m
-}
-
-/// Fold versions into families. Every rate is recomputed from the
-/// SUMMED numerator and denominator — averaging two rates would weigh
-/// a 900-line stint the same as a 40,000-line one.
-function byFamily(rows: Row[]): Row[] {
-  const acc = new Map<string, Row>()
-  for (const r of rows) {
-    const k = family(r.model)
-    const p = acc.get(k)
-    if (!p) {
-      acc.set(k, { ...r, model: k })
-      continue
-    }
-    p.commits = n(p.commits) + n(r.commits)
-    p.added = n(p.added) + n(r.added)
-    p.alive = n(p.alive) + n(r.alive)
-    p.removed = n(p.removed) + n(r.removed)
-    p.thrown = n(p.thrown) + n(r.thrown)
-    p.out_tokens = n(p.out_tokens) + n(r.out_tokens)
-    p.messages = n(p.messages) + n(r.messages)
-    p.runs = n(p.runs) + n(r.runs)
-    p.minutes = n(p.minutes) + n(r.minutes)
-    p.minutes_thrown = n(p.minutes_thrown) + n(r.minutes_thrown)
-    p.tokens_thrown = n(p.tokens_thrown) + n(r.tokens_thrown)
-    p.rework_commits = n(p.rework_commits) + n(r.rework_commits)
-    p.thrash_files = n(p.thrash_files) + n(r.thrash_files)
-    p.operator_turns = n(p.operator_turns) + n(r.operator_turns)
-    p.corrections = n(p.corrections) + n(r.corrections)
-    p.context_peak = Math.max(n(p.context_peak), n(r.context_peak))
-    // Context is per turn, so it weights by messages.
-    p.context_avg =
-      n(p.messages) > 0
-        ? Math.round(
-            (n(p.context_avg) * (n(p.messages) - n(r.messages)) + n(r.context_avg) * n(r.messages)) /
-              n(p.messages),
-          )
-        : n(p.context_avg)
-    p.median_age_days = Math.max(n(p.median_age_days), n(r.median_age_days))
-  }
-  // Recompute every rate from the totals now that they are summed.
-  return [...acc.values()].map((p) => ({
-    ...p,
-    survived_pct: n(p.added) > 0 ? Math.round((100 * n(p.alive)) / n(p.added)) : 0,
-    removed_per_100_added: n(p.added) > 0 ? Math.round((100 * n(p.removed)) / n(p.added)) : 0,
-    rework_pct: n(p.commits) > 0 ? Math.round((100 * n(p.rework_commits)) / n(p.commits)) : 0,
-    thrash_per_100_commits:
-      n(p.commits) > 0 ? Math.round((100 * n(p.thrash_files)) / n(p.commits)) : 0,
-    corrections_per_100:
-      n(p.operator_turns) > 0 ? Math.round((100 * n(p.corrections)) / n(p.operator_turns)) : 0,
-    tokens_per_line_landed: n(p.added) > 0 ? Math.round(n(p.out_tokens) / n(p.added)) : 0,
-    tokens_per_line_kept: n(p.alive) > 0 ? Math.round(n(p.out_tokens) / n(p.alive)) : 0,
-    alive_per_mtok:
-      n(p.out_tokens) > 0 ? Math.round((n(p.alive) * 1_000_000) / n(p.out_tokens)) : 0,
-    alive_per_hour: n(p.minutes) > 0 ? Math.round((n(p.alive) * 60) / n(p.minutes)) : 0,
-  }))
-}
+// Families are folded on the server (#414): every row is one family, and
+// every rate and median in it was computed from that family's own totals.
+// Re-folding here dropped the never-landed figures of every family with
+// more than one version.
 
 type Metric = {
   title: string
@@ -613,55 +551,24 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
       </Panel>
     )
   }
-  const fams = byFamily(rows)
+  const fams = rows
   const v = verdict(fams)
-  // Per repository, folded to families like everything else. Two point
-  // releases working the same checkout are one choice, not two.
-  const repoFam = (() => {
-    const acc = new Map<string, { repo: string; model: string; added: number; alive: number }>()
-    for (const r of c.repos ?? []) {
-      const k = `${r.repo}|${family(r.model)}`
-      const p = acc.get(k)
-      if (p) {
-        p.added += n(r.added)
-        p.alive += n(r.alive)
-      } else {
-        acc.set(k, { repo: r.repo, model: family(r.model), added: n(r.added), alive: n(r.alive) })
-      }
-    }
-    return [...acc.values()]
-      .map((r) => ({ ...r, survived_pct: r.added > 0 ? Math.round((100 * r.alive) / r.added) : 0 }))
-      .sort((a, b) => b.added - a.added)
-  })()
-  const repos = repoFam.filter((r) => r.added >= 1000).slice(0, 12)
-
-  // Handoffs between FAMILIES. A fable-5 to fable-5-1 change is a point
-  // release, not a decision to switch model, so folding removes it from
-  // the count rather than reporting it as a switch nobody made.
-  const handFam = (() => {
-    const acc = new Map<string, { from: string; to: string; switches: number; commits: number; added: number; alive: number }>()
-    for (const h of c.handoffs ?? []) {
-      const from = family(h.from)
-      const to = family(h.to)
-      if (from === to) continue
-      const k = `${from}|${to}`
-      const p = acc.get(k)
-      if (p) {
-        p.switches += n(h.switches)
-        p.commits += n(h.commits)
-        p.added += n(h.added)
-        p.alive += n(h.alive)
-      } else {
-        acc.set(k, { from, to, switches: n(h.switches), commits: n(h.commits), added: n(h.added), alive: n(h.alive) })
-      }
-    }
-    return [...acc.values()]
-      .map((h) => ({ ...h, survived_pct: h.added > 0 ? Math.round((100 * h.alive) / h.added) : 0 }))
-      .sort((a, b) => b.switches - a.switches)
-  })()
+  const repos = (c.repos ?? [])
+    .map((r) => ({ repo: r.repo, model: r.model, added: n(r.added), alive: n(r.alive), survived_pct: n(r.survived_pct) }))
+    .filter((r) => r.added >= 1000)
+    .slice(0, 12)
   // Only switches that produced commits can say anything about what the
   // incoming family then did.
-  const hand = handFam.filter((h) => h.commits > 0)
+  const hand = (c.handoffs ?? [])
+    .map((h) => ({ from: h.from, to: h.to, switches: n(h.switches), commits: n(h.commits), added: n(h.added), alive: n(h.alive), survived_pct: n(h.survived_pct) }))
+    .filter((h) => h.commits > 0)
+  // Does work written just after a takeover survive better or worse than
+  // the incoming family's own average? Read from the rows, not asserted.
+  const aboveOwn = hand.filter((h) => {
+    const own = fams.find((f) => f.model === h.to)
+    return own != null && h.survived_pct > n(own.survived_pct)
+  }).length
+  const unjudged = c.unjudged ?? []
 
   const ms = metrics()
 
@@ -876,9 +783,13 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
           <EChart option={switchChart} height={40 + hand.length * 42} />
           <Text size="xs" c="dimmed" mt={4}>
             The account being tested is that a budget runs out, another model takes over, and what it
-            does then gets thrown away. That is not what this shows: code written in the first hours
-            after a takeover survives ABOVE each model&apos;s own average. The damage is in long
-            unbroken runs, which makes run length the thing to control, not who picks the work up.
+            does then gets thrown away. In {aboveOwn} of {hand.length} switch direction{hand.length === 1 ? '' : 's'},
+            what the incoming family wrote in its first three hours survives above its own average
+            {aboveOwn === hand.length
+              ? ' — the handover is not where the work is lost.'
+              : aboveOwn === 0
+                ? ' — in none does it: what follows a takeover is thrown away more than usual.'
+                : '; in the rest it survives below it.'}
           </Text>
         </Panel>
       )}
@@ -924,11 +835,19 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
           </Table.Tbody>
         </Table>
         <Text size="xs" c="dimmed" mt="xs">
-          Two measures do NOT separate these models and are in the grid so that can be seen rather
-          than assumed: how often you have to correct, and how often a file is returned to. What
-          separates them is what the work is worth afterwards, and how much token and clock time it
-          took to get there.
+          Hours are working hours — the gaps between a run&apos;s replies, each capped at the live
+          threshold — and tokens are counted once per reply, over the work done in the repositories
+          judged here. Corrections and files returned to are in the grid beside what the work was
+          worth; read them side by side rather than as a verdict.
         </Text>
+        {unjudged.length > 0 && (
+          <Text size="xs" c="yellow.5" mt="xs">
+            Not judged:{' '}
+            {unjudged.map((u) => `${u.repo} (its main line ${u.mainline} took no commit in the period while ${n(u.off_mainline_commits)} were made elsewhere)`).join('; ')}
+            . Counting it would call all of its work never landed; <code>attr_ui_mainline_refs</code> names
+            the branch a repository&apos;s work lands on.
+          </Text>
+        )}
       </Panel>
     </>
   )

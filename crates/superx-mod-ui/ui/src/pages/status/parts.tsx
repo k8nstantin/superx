@@ -68,6 +68,19 @@ export function fmtMs(ms: number | bigint | null | undefined): string {
   return `${Math.round(v / 1000)}s`
 }
 
+/// A median in minutes, where the payload says -1 for no data (#413):
+/// 0 is a real median under a minute, not an absence.
+export function fmtMins(mins: number | bigint | null | undefined): string {
+  if (mins == null || Number(mins) < 0) return '—'
+  return Number(mins) === 0 ? '<1m' : fmtMs(Number(mins) * 60_000)
+}
+
+/// The same for a median in seconds.
+export function fmtSecs(secs: number | bigint | null | undefined): string {
+  if (secs == null || Number(secs) < 0) return '—'
+  return fmtMs(Number(secs) * 1000)
+}
+
 export const pct = (part: number, whole: number): number | null =>
   whole > 0 ? Math.round((part * 100) / whole) : null
 
@@ -513,6 +526,14 @@ export const LOW_GOOD: [number, string][] = [
   [BANDS.churnBad / 100, CANCEL],
   [1, FAIL],
 ]
+/// Bands for the tool-success dial, read off the same failure thresholds
+/// the Tool failures lamp uses (#413) — the dial read green at a rate the
+/// lamp already called amber.
+export const TOOLS_GOOD: [number, string][] = [
+  [(100 - BANDS.toolFailBad) / 100, FAIL],
+  [(100 - BANDS.toolFailWarn) / 100, CANCEL],
+  [1, OK],
+]
 /// Bands for a dial where high is good.
 export const HIGH_GOOD: [number, string][] = [
   [BANDS.passBad / 100, FAIL],
@@ -587,16 +608,26 @@ export function Lamp({
 }
 
 /// A 24-segment clock: which hours of the last day saw work.
-export function CoverageStrip({ hours }: { hours: number | bigint | null | undefined }) {
-  const lit = n(hours)
+/// The last 24 hours, oldest on the left, lit where any work happened
+/// (#413). It used to light the first N segments, so twelve hours of
+/// work read as the morning whichever twelve they were. `hours` are the
+/// payload's UTC `YYYY-MM-DDTHH` keys.
+export function CoverageStrip({ hours, now }: { hours: string[] | null | undefined; now: number }) {
+  const worked = new Set(hours ?? [])
+  const top = Math.floor(now / 3_600_000)
   return (
     <Group gap={2} mt={6} wrap="nowrap">
-      {Array.from({ length: 24 }, (_, i) => (
-        <div
-          key={i}
-          style={{ flex: 1, height: 8, borderRadius: 2, background: i < lit ? 'var(--mantine-color-pelican-4)' : TRACK }}
-        />
-      ))}
+      {Array.from({ length: 24 }, (_, i) => {
+        const at = new Date((top - 23 + i) * 3_600_000)
+        const key = at.toISOString().slice(0, 13)
+        return (
+          <Tooltip key={key} label={at.toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })} withArrow>
+            <div
+              style={{ flex: 1, height: 8, borderRadius: 2, background: worked.has(key) ? 'var(--mantine-color-pelican-4)' : TRACK }}
+            />
+          </Tooltip>
+        )
+      })}
     </Group>
   )
 }

@@ -44,7 +44,17 @@ export function SystemsSection({
           label="Events this hour"
           value={i ? fmtCompact(i.events_last_hour) : '…'}
           sub={i ? `newest ${lag == null ? '—' : fmtAge(lag)} ago` : ''}
-          tone={lag == null ? 'none' : lag >= BANDS.lagBad ? 'bad' : lag >= BANDS.lagWarn ? 'warn' : 'ok'}
+          // Old news over an idle machine is quiet, not a fault — the rule
+          // the Warnings lamp and the flight deck follow (#413).
+          tone={
+            lag == null || ((s?.live?.length ?? 0) === 0 && lag >= BANDS.lagWarn)
+              ? 'none'
+              : lag >= BANDS.lagBad
+                ? 'bad'
+                : lag >= BANDS.lagWarn
+                  ? 'warn'
+                  : 'ok'
+          }
         />
       </SimpleGrid>
 

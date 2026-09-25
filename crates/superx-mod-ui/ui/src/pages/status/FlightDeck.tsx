@@ -118,7 +118,7 @@ export function FlightDeck({
               hours worked
             </Text>
           </Group>
-          <CoverageStrip hours={s?.active_hours_24h} />
+          <CoverageStrip hours={s?.active_hours} now={now} />
         </Card>
       </SimpleGrid>
 
@@ -126,7 +126,7 @@ export function FlightDeck({
         title="Running now"
         scope="live"
         range={null}
-        note="sessions with a message in the last five minutes · busiest first · click one to open its feed"
+        note="sessions with a message in the last five minutes · busiest first · figures cover the selected range · click one to open its feed"
         mb="md"
       >
         {live.length === 0 ? (
