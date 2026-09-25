@@ -153,24 +153,49 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
         let rc = &repos[key];
         let dir = std::path::Path::new(&rc.dir);
         let mainline = crate::landed::mainline_of(dir, &rc.name, mainlines).await;
-        let Some(work) = crate::landed::repo_work(dir, &mainline, Some(rc.earliest)).await else { continue };
+        let Some(work) = crate::landed::repo_work(dir, &mainline, Some(rc.earliest)).await else {
+            // git cannot read that main line at all — a ref named for this
+            // repository that does not resolve. Said, not dropped (#415
+            // review).
+            unjudged.push(UnjudgedRepo {
+                repo: rc.name.clone(),
+                mainline,
+                off_mainline_commits: 0,
+                unresolved: true,
+            });
+            continue;
+        };
         let ours = |author: &str| work.identity.as_deref() == Some(author);
 
-        // A main line that took nothing while this machine's branches took
-        // plenty is not where the work lands: say so, judge nothing.
-        // Branch commits only: one known from a reflog alone may be an
-        // amend's or a rebase's leftover.
+        // Branch work, per file: which main-line commit landed it (#414).
+        let mut shares: HashMap<&str, Vec<(DateTime<Utc>, i64)>> = HashMap::new();
+        for c in work.off_mainline.iter().filter(|c| ours(&c.author) && c.added() + c.removed() <= BULK_COMMIT) {
+            for (path, added, removed) in &c.files {
+                if let Some(via) = work.landed_via.get(&(c.hash.clone(), path.clone())) {
+                    shares.entry(via.as_str()).or_default().push((c.at, (added + removed).max(1)));
+                }
+            }
+        }
+
+        // A main line that took none of THIS machine's work while its
+        // branches took plenty is not where the work lands: say so, judge
+        // nothing. Anyone's commit used to count, so one teammate's commit
+        // to a dormant main flipped every branch of ours to "never landed"
+        // (#415 review). Branch commits only: one known from a reflog alone
+        // may be an amend's or a rebase's leftover.
         let off_ours = work.dormant_off.unwrap_or_else(|| {
             work.off_mainline
                 .iter()
                 .filter(|c| ours(&c.author) && !work.recovered.contains(&c.hash))
                 .count() as i64
         });
-        if work.landed.is_empty() && off_ours > 0 {
+        let landed_ours = work.landed.iter().any(|c| ours(&c.author) || shares.contains_key(c.hash.as_str()));
+        if !landed_ours && off_ours > 0 {
             unjudged.push(UnjudgedRepo {
                 repo: rc.name.clone(),
                 mainline,
                 off_mainline_commits: off_ours,
+                unresolved: false,
             });
             continue;
         }
@@ -196,23 +221,19 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
                 .map(|(_, from, to)| (from.clone(), to.clone()))
         };
 
-        // Branch work: per file, landed by a main-line commit or not.
-        let mut shares: HashMap<&str, Vec<(DateTime<Utc>, i64)>> = HashMap::new();
-        for c in work.off_mainline.iter().filter(|c| ours(&c.author)) {
-            if c.added() + c.removed() > BULK_COMMIT {
+        // Branch work that did not land: in flight, or thrown away. A commit
+        // known only from a reflog says when landed work was done, and
+        // nothing else (#415 review).
+        for c in work.off_mainline.iter().filter(|c| ours(&c.author) && c.added() + c.removed() <= BULK_COMMIT) {
+            if work.recovered.contains(&c.hash) {
                 continue;
             }
-            // A commit known only from a reflog says when landed work was
-            // done, and nothing else (#415 review).
-            let recovered = work.recovered.contains(&c.hash);
-            let mut never = 0i64;
-            for (path, added, removed) in &c.files {
-                match work.landed_via.get(&(c.hash.clone(), path.clone())) {
-                    Some(via) => shares.entry(via.as_str()).or_default().push((c.at, (added + removed).max(1))),
-                    None if !recovered => never += added,
-                    None => {}
-                }
-            }
+            let never: i64 = c
+                .files
+                .iter()
+                .filter(|(path, _, _)| !work.landed_via.contains_key(&(c.hash.clone(), path.clone())))
+                .map(|(_, added, _)| added)
+                .sum();
             if never > 0 {
                 if let Some(fam) = credit(&rc.claims, c.at) {
                     let e = dev.entry(fam.to_string()).or_default();

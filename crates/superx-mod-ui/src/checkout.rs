@@ -171,7 +171,7 @@ async fn read_checkout(toplevel: String, common: String) -> Checkout {
     let reflog = git(dir, &["reflog", "show", "--date=unix", "--format=%gd%x09%gs", "HEAD"])
         .await
         .unwrap_or_default();
-    let (moves, first_from) = parse_moves(&reflog, &remotes);
+    let (moves, first_from) = parse_moves(&reflog, &remotes, current.as_deref());
     Checkout {
         repo: repo_name(&common, &toplevel),
         toplevel,
@@ -181,10 +181,21 @@ async fn read_checkout(toplevel: String, common: String) -> Checkout {
     }
 }
 
+/// One reflog entry that moved HEAD, as its text reads.
+struct RawMove {
+    at: DateTime<Utc>,
+    from: Option<String>,
+    to: Option<String>,
+    /// A `checkout: moving from … to …` entry, whose `from` says what HEAD
+    /// was really on.
+    checkout: bool,
+}
+
 /// HEAD moves from a `%gd\t%gs` reflog listing, oldest first, and the
-/// branch the oldest one moved FROM.
-fn parse_moves(reflog: &str, remotes: &[String]) -> (Moves, Option<String>) {
-    let mut moves: Vec<(DateTime<Utc>, Option<String>, Option<String>)> = Vec::new();
+/// branch the oldest one moved FROM. `current` is the branch HEAD is on
+/// now, `None` when detached.
+fn parse_moves(reflog: &str, remotes: &[String], current: Option<&str>) -> (Moves, Option<String>) {
+    let mut moves: Vec<RawMove> = Vec::new();
     for line in reflog.lines() {
         let Some((selector, subject)) = line.split_once('\t') else { continue };
         let Some(at) = selector
@@ -197,21 +208,39 @@ fn parse_moves(reflog: &str, remotes: &[String]) -> (Moves, Option<String>) {
         };
         if let Some(rest) = subject.strip_prefix("checkout: moving from ") {
             if let Some((from, to)) = rest.rsplit_once(" to ") {
-                moves.push((at, branch_name(from, remotes), branch_name(to, remotes)));
+                moves.push(RawMove { at, from: branch_name(from, remotes), to: branch_name(to, remotes), checkout: true });
+            }
+        } else if let Some(rest) = subject.strip_prefix("Branch: renamed refs/heads/") {
+            // `git branch -m`: the branch HEAD is on takes a new name, and
+            // the work after it belongs to the new one (#415 review).
+            if let Some((old, new)) = rest.split_once(" to refs/heads/") {
+                moves.push(RawMove { at, from: Some(old.to_string()), to: Some(new.trim().to_string()), checkout: false });
             }
         } else if let Some(idx) = subject.find("returning to refs/heads/") {
             // `rebase (finish)` / `rebase (abort)`: back on the branch.
             let b = &subject[idx + "returning to refs/heads/".len()..];
-            moves.push((at, None, Some(b.trim().to_string())));
+            moves.push(RawMove { at, from: None, to: Some(b.trim().to_string()), checkout: false });
         } else if subject.starts_with("rebase") && subject.contains("(start): checkout ") {
             // A rebase runs on a detached HEAD until it returns.
-            moves.push((at, None, None));
+            moves.push(RawMove { at, from: None, to: None, checkout: false });
         }
     }
     // The listing is newest first.
     moves.reverse();
-    let first_from = moves.first().and_then(|m| m.1.clone());
-    (moves.into_iter().map(|(at, _, to)| (at, to)).collect(), first_from)
+    // Where a checkout LANDED is what the next checkout moved away from:
+    // git names a branch there only if HEAD was on one. `checkout v1.0`
+    // names a tag and `checkout --detach main` a branch, and both left
+    // HEAD detached (#415 review). The newest move landed where HEAD is now.
+    let landed: Vec<Option<String>> = (0..moves.len())
+        .map(|i| match moves.get(i + 1) {
+            Some(next) if next.checkout => next.from.clone(),
+            Some(_) => moves[i].to.clone(),
+            None if moves[i].checkout => current.map(str::to_string),
+            None => moves[i].to.clone(),
+        })
+        .collect();
+    let first_from = moves.first().and_then(|m| m.from.clone());
+    (moves.into_iter().zip(landed).map(|(m, to)| (m.at, to)).collect(), first_from)
 }
 
 /// A reflog endpoint as a branch, or `None` when it detached HEAD: a
@@ -237,7 +266,7 @@ mod tests {
                       HEAD@{300}\tcheckout: moving from feat/a to 0123abcd\n\
                       HEAD@{200}\tcheckout: moving from main to feat/a\n\
                       HEAD@{100}\tcommit: first\n";
-        let (moves, first_from) = parse_moves(reflog, &["origin".to_string()]);
+        let (moves, first_from) = parse_moves(reflog, &["origin".to_string()], None);
         let c = Checkout {
             toplevel: "/r".into(),
             repo: "r".into(),
@@ -260,11 +289,38 @@ mod tests {
     }
 
     #[test]
+    fn a_tag_or_a_detach_is_no_branch_and_a_rename_moves_the_work() {
+        // As git writes it, newest first: a tag checked out, back to main,
+        // `checkout --detach main`, a new branch, renamed, then main again.
+        let reflog = "HEAD@{800}\tcheckout: moving from new to main\n\
+                      HEAD@{700}\tBranch: renamed refs/heads/old to refs/heads/new\n\
+                      HEAD@{600}\tcheckout: moving from ab5f977e55cdf36d73abaf9227dd77d847f42ecc to old\n\
+                      HEAD@{500}\tcheckout: moving from main to main\n\
+                      HEAD@{400}\tcheckout: moving from 2c452e9412411ab0fb9d58c113554bb78db970f4 to main\n\
+                      HEAD@{300}\tcheckout: moving from main to v1.0\n";
+        let (moves, first_from) = parse_moves(reflog, &[], Some("main"));
+        let c = Checkout {
+            toplevel: "/r".into(),
+            repo: "r".into(),
+            common: "/r/.git".into(),
+            initial: first_from,
+            moves,
+        };
+        assert_eq!(c.branch_at(t(250)).as_deref(), Some("main"));
+        assert_eq!(c.branch_at(t(350)), None, "a tag checked out detaches HEAD");
+        assert_eq!(c.branch_at(t(450)).as_deref(), Some("main"));
+        assert_eq!(c.branch_at(t(550)), None, "--detach names a branch and leaves it");
+        assert_eq!(c.branch_at(t(650)).as_deref(), Some("old"));
+        assert_eq!(c.branch_at(t(750)).as_deref(), Some("new"), "renamed: the work is the new name's");
+        assert_eq!(c.branch_at(t(850)).as_deref(), Some("main"));
+    }
+
+    #[test]
     fn a_rebase_detaches_and_returns() {
         let reflog = "HEAD@{30}\trebase (finish): returning to refs/heads/feat/b\n\
                       HEAD@{20}\trebase (start): checkout main\n\
                       HEAD@{10}\tcheckout: moving from main to feat/b\n";
-        let (moves, first_from) = parse_moves(reflog, &[]);
+        let (moves, first_from) = parse_moves(reflog, &[], Some("feat/b"));
         let c = Checkout {
             toplevel: "/r".into(),
             repo: "r".into(),

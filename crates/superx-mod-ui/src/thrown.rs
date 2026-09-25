@@ -39,12 +39,23 @@ use superx_kernel::{Kernel, Result};
 use crate::api::{ModelRun, RunWork};
 
 /// The model family: `claude-opus-5-5` is `opus`, `claude-fable-5-1` is
-/// `fable`, `gemini-3.1-pro` is `gemini` (#408, #414). Point releases of
-/// one model are one choice from the operator's side, and splitting them
-/// lets a thin recent release distort a rate. The family is the first
-/// word of the name that is not the vendor's and not a version number.
+/// `fable` (#408, #414). Point releases of one model are one choice from
+/// the operator's side, and splitting them lets a thin recent release
+/// distort a rate. The family is the first word of the name that is not
+/// the vendor's and not a version number — and for Gemini, whose names
+/// put the tier after the version, the tier: `gemini-3.1-pro` is
+/// `gemini-pro`, `gemini-2.5-flash-lite` is `gemini-flash`. Folding every
+/// tier into `gemini` hid the fallback from Pro to Flash that a spent quota
+/// forces, which is the handover this comparison is here to test (#415
+/// review).
 #[must_use]
 pub fn family(model: &str) -> String {
+    if let Some(rest) = model.strip_prefix("gemini-") {
+        let tier = rest
+            .split('-')
+            .find(|seg| seg.chars().next().is_some_and(|c| c.is_ascii_alphabetic()));
+        return tier.map_or_else(|| "gemini".to_string(), |t| format!("gemini-{t}"));
+    }
     let rest = model.strip_prefix("claude-").unwrap_or(model);
     rest.split('-')
         .find(|seg| seg.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
@@ -386,7 +397,10 @@ mod tests {
         assert_eq!(family("claude-fable-5"), "fable");
         assert_eq!(family("claude-3-5-sonnet-20241022"), "sonnet");
         assert_eq!(family("claude-haiku-4-5-20251001"), "haiku");
-        assert_eq!(family("gemini-3.1-pro-preview"), "gemini");
+        assert_eq!(family("gemini-3.1-pro-preview"), "gemini-pro");
+        assert_eq!(family("gemini-2.5-flash"), "gemini-flash");
+        assert_eq!(family("gemini-2.5-flash-lite"), "gemini-flash", "a lighter flash is still the flash tier");
+        assert_eq!(family("gemini-3"), "gemini");
     }
 
     #[test]

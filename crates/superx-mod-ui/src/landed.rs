@@ -26,6 +26,9 @@ const LANDED_REPOS: usize = 8; // skill-allow: §9-const — read-path bound, no
 /// work, not on the alphabet (#414).
 const SURVIVAL_FILES: usize = 4_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
+/// Blames run at once: each is a git process of its own.
+const BLAMES_AT_ONCE: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
+
 /// A git call slower than this is abandoned and counted unreadable.
 const GIT_TIMEOUT_MS: u64 = 4_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
@@ -79,40 +82,40 @@ pub(crate) fn repo_name(common_git_dir: &str, toplevel: &str) -> String {
 
 /// What landed on the main line of every repository the given working
 /// directories belong to, since `since` (all history when `None`), in
-/// hours on the viewer's `clock`.
-pub async fn landed(cwds: &HashSet<String>, since: Option<DateTime<Utc>>, clock: FixedOffset) -> Landed {
+/// hours on the viewer's `clock`. `checkouts` are the walk's, already read
+/// from git: asking again cost two git calls a directory, every request
+/// (#415 review). `mainlines` are the operator's `attr_ui_mainline_refs`,
+/// the same the model comparison reads — so the page has one answer to
+/// "what landed".
+pub async fn landed(
+    cwds: &HashSet<String>,
+    checkouts: &crate::checkout::Checkouts,
+    since: Option<DateTime<Utc>>,
+    clock: FixedOffset,
+    mainlines: &HashMap<String, String>,
+) -> Landed {
     let mut landed = Landed::default();
     // One repository per common git dir: worktrees fold into their repo.
-    let mut repos: BTreeMap<String, String> = BTreeMap::new();
+    let mut repos: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut cwds: Vec<&String> = cwds.iter().collect();
     cwds.sort();
     for cwd in cwds {
-        let p = Path::new(cwd);
-        if !p.is_dir() {
-            landed.unreadable += 1;
-            continue;
-        }
-        let Some(top) = git(p, &["rev-parse", "--show-toplevel"]).await else {
-            landed.unreadable += 1;
-            continue;
-        };
-        let Some(common) = git(p, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await
-        else {
+        let Some(co) = checkouts.of(cwd) else {
             landed.unreadable += 1;
             continue;
         };
         repos
-            .entry(common.trim().to_string())
-            .or_insert_with(|| top.trim().to_string());
+            .entry(co.common.clone())
+            .or_insert_with(|| (co.toplevel.clone(), co.repo.clone()));
         if repos.len() >= LANDED_REPOS {
             break;
         }
     }
     let since_s = since.map(|s| s.to_rfc3339());
     let mut series: BTreeMap<String, (i64, i64)> = BTreeMap::new();
-    for (common, top) in repos {
+    for (top, name) in repos.into_values() {
         let dir = Path::new(&top);
-        let branch = main_ref(dir).await;
+        let branch = mainline_of(dir, &name, mainlines).await;
         // First-parent on the main line counts what LANDED, once — not a
         // branch's commits and their squash both. `-m` diffs a merge
         // commit against its first parent so merged work is counted too.
@@ -127,7 +130,7 @@ pub async fn landed(cwds: &HashSet<String>, since: Option<DateTime<Utc>>, clock:
             continue;
         };
         let mut repo = LandedRepo {
-            name: repo_name(&common, &top),
+            name,
             branch: branch.clone(),
             commits: 0,
             added: 0,
@@ -483,19 +486,54 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
         }
     }
 
-    // What is still there, per landed commit, blamed at the main line.
-    let mut files: Vec<&str> = work
+    // What is still there, per landed commit, blamed at the main line — only
+    // where it can count (#415 review). A file the main line no longer has
+    // holds nothing, and a file no creditable commit touched credits no one:
+    // blaming every file any main-line commit touched cost 2,204 blames, 30
+    // seconds, on one repository, 1,397 of them for files long gone. The
+    // commits that can be credited are this machine's, the squashes of its
+    // branches, and the rest made as the account that clicked merge.
+    let present: HashSet<String> = git(dir, &["ls-tree", "-r", "--name-only", mainline])
+        .await
+        .map(|o| o.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    let via: HashSet<&str> = work.landed_via.values().map(String::as_str).collect();
+    let mergers: HashSet<&str> = work
         .landed
         .iter()
-        .flat_map(|c| c.files.iter().map(|f| f.0.as_str()))
-        .filter(|f| !skip_for_survival(f))
+        .filter(|c| via.contains(c.hash.as_str()))
+        .map(|c| c.author.as_str())
+        .collect();
+    let creditable = |c: &&WorkCommit| {
+        work.identity.as_deref() == Some(c.author.as_str())
+            || via.contains(c.hash.as_str())
+            || mergers.contains(c.author.as_str())
+    };
+    let mut files: Vec<String> = work
+        .landed
+        .iter()
+        .filter(creditable)
+        .flat_map(|c| c.files.iter().map(|f| f.0.clone()))
+        .filter(|f| !skip_for_survival(f) && present.contains(f))
         .collect();
     files.sort_unstable();
     files.dedup();
-    for file in files.into_iter().take(SURVIVAL_FILES) {
-        let Some(blame) = git(dir, &["blame", "--line-porcelain", mainline, "--", file]).await else {
-            continue; // not in the main line's tree any more: nothing left
-        };
+    files.truncate(SURVIVAL_FILES);
+    // Several at a time: each blame is a git process of its own.
+    let mut queue = files.into_iter();
+    let mut running: tokio::task::JoinSet<Option<String>> = tokio::task::JoinSet::new();
+    let blame = |running: &mut tokio::task::JoinSet<Option<String>>, file: String| {
+        let (dir, mainline) = (dir.to_path_buf(), mainline.to_string());
+        running.spawn(async move { git(&dir, &["blame", "--line-porcelain", &mainline, "--", &file]).await });
+    };
+    for file in queue.by_ref().take(BLAMES_AT_ONCE) {
+        blame(&mut running, file);
+    }
+    while let Some(done) = running.join_next().await {
+        if let Some(file) = queue.next() {
+            blame(&mut running, file);
+        }
+        let Ok(Some(blame)) = done else { continue };
         for line in blame.lines() {
             // A porcelain header opens with the commit and three
             // numbers; everything else is content.

@@ -1230,11 +1230,11 @@ pub struct CompareSummary {
     pub computed_at: String,
 }
 
-/// A repository left out of the comparison (#414). Its main line took no
-/// commit in the period while its other branches took many, so nothing
-/// can be said about what landed there: counting it would call all of
-/// its work "never landed". `attr_ui_mainline_refs` names the branch the
-/// work actually lands on.
+/// A repository left out of the comparison (#414). Its main line took none
+/// of this machine's work in the period while its other branches took
+/// plenty, so nothing can be said about what landed there: counting it
+/// would call all of its work "never landed". `superx ui mainline <repo>
+/// <ref>` names the branch the work actually lands on (#415 review).
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct UnjudgedRepo {
@@ -1243,4 +1243,7 @@ pub struct UnjudgedRepo {
     pub mainline: String,
     /// Commits made off the main line in the period, by this machine.
     pub off_mainline_commits: i64,
+    /// The ref could not be read at all: named for this repository, it does
+    /// not resolve (#415 review).
+    pub unresolved: bool,
 }

@@ -80,6 +80,23 @@ async fn ui_cli_reports_url_and_usage() {
         .await
         .expect_err("usage");
     assert!(err.to_string().contains("usage: superx ui url"));
+
+    // The branch a repository's work lands on, recorded by the operator
+    // (#415 review) — and read back by the comparison and by "landed".
+    let cli = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    let none = UiModule.cli(&kernel, &cli(&["mainline"])).await.expect("list");
+    assert!(none.contains("no main-line overrides"), "{none}");
+    let set = UiModule
+        .cli(&kernel, &cli(&["mainline", "gryphon-data-lake", "origin/sandbox"]))
+        .await
+        .expect("set");
+    assert_eq!(set, "gryphon-data-lake\torigin/sandbox\n");
+    let refs = superx_mod_ui::resolved_mainline_refs(&kernel).await;
+    assert_eq!(refs.get("gryphon-data-lake").map(String::as_str), Some("origin/sandbox"));
+    let unset = UiModule.cli(&kernel, &cli(&["mainline", "gryphon-data-lake", "--unset"])).await.expect("unset");
+    assert!(unset.contains("no main-line overrides"), "{unset}");
+    assert!(superx_mod_ui::resolved_mainline_refs(&kernel).await.is_empty());
+    assert!(UiModule.cli(&kernel, &cli(&["mainline", "only-a-repo"])).await.is_err(), "a repo needs a ref");
 }
 
 #[test]
@@ -3993,4 +4010,44 @@ async fn a_squash_whose_branch_is_gone_is_credited_to_who_wrote_it() {
     assert_eq!((f.added, f.commits), (15, 1), "the squash, by when the branch was written");
     assert_eq!(f.abandoned_lines, 0, "the amend's leftover is no abandoned work");
     assert!(row("opus").is_none_or(|o| o.added == 0), "merging it did not make it opus's");
+}
+
+/// A repository is judged where its work lands (#415 review). Its host's
+/// default branch took one teammate's commit and none of ours: that is
+/// still not where our work lands, and one commit by anyone no longer
+/// flips every branch of ours to "never landed". Named by the operator,
+/// the branch that does take it is judged; a name git cannot resolve is
+/// said, not dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repository_is_judged_where_its_work_lands() {
+    let kernel = fresh_kernel().await;
+    let now = chrono::Utc::now();
+    let t0 = now - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let lake = TestRepo::new_dated("lake", "main", now - chrono::Duration::days(200));
+    lake.commit(lake.cwd(), h(2.0), "mate@x", "docs: readme", &[("README", "y\n")]);
+    lake.git(&["checkout", "-q", "-b", "sandbox"]);
+    lake.commit(lake.cwd(), h(2.2), "t@t", "feat: lake", &[("l.py", "a = 1\nb = 2\n")]);
+
+    let (agent, s) = seed_agent_and_session(&kernel, "claude_code", "lake").await;
+    for (id, at) in [("l1", h(1.5)), ("l2", h(2.5))] {
+        log_tool_message_at(&kernel, &s, &agent, serde_json::json!({
+            "cwd": lake.cwd(), "message": {"id": id, "model": "claude-fable-5", "usage": {"output_tokens": 10},
+                "content": [{"type": "text", "text": "."}]}}), at).await;
+    }
+    let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
+    let refs = |pairs: &[(&str, &str)]| pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+
+    let c = superx_mod_ui::compare::compare(&runs, &refs(&[])).await;
+    assert_eq!(c.unjudged.len(), 1, "a teammate's commit does not make main where our work lands");
+    assert_eq!((c.unjudged[0].off_mainline_commits, c.unjudged[0].unresolved), (1, false));
+
+    let c = superx_mod_ui::compare::compare(&runs, &refs(&[("lake", "sandbox")])).await;
+    assert!(c.unjudged.is_empty(), "{:?}", c.unjudged.iter().map(|u| &u.repo).collect::<Vec<_>>());
+    let fable = c.deviations.iter().find(|d| d.model == "fable").expect("judged on sandbox");
+    assert_eq!((fable.added, fable.commits), (2, 1));
+
+    let c = superx_mod_ui::compare::compare(&runs, &refs(&[("lake", "origin/nope")])).await;
+    assert_eq!(c.unjudged.len(), 1);
+    assert!(c.unjudged[0].unresolved, "a ref that does not resolve is said");
 }

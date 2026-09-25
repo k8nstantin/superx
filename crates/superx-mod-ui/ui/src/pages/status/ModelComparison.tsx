@@ -863,9 +863,15 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
         {unjudged.length > 0 && (
           <Text size="xs" c="yellow.5" mt="xs">
             Not judged:{' '}
-            {unjudged.map((u) => `${u.repo} (its main line ${u.mainline} took no commit in the period while ${n(u.off_mainline_commits)} were made elsewhere)`).join('; ')}
-            . Counting it would call all of its work never landed; <code>attr_ui_mainline_refs</code> names
-            the branch a repository&apos;s work lands on.
+            {unjudged
+              .map((u) =>
+                u.unresolved
+                  ? `${u.repo} (its main line ${u.mainline} does not resolve in git)`
+                  : `${u.repo} (its main line ${u.mainline} took none of this machine's commits in the period while ${n(u.off_mainline_commits)} went elsewhere)`,
+              )
+              .join('; ')}
+            . Counting it would call all of its work never landed; <code>superx ui mainline &lt;repo&gt; &lt;ref&gt;</code>{' '}
+            names the branch a repository&apos;s work lands on.
           </Text>
         )}
       </Panel>

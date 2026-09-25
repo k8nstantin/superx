@@ -17,10 +17,6 @@ use crate::api::{
 };
 use crate::stats::{OUT_TOKENS_SQL, REPLY_KEY_SQL};
 
-/// Newest `module_active` events scanned for per-module startup cost —
-/// one row per module per boot, so this covers many boots.
-const STARTUP_SCAN: u32 = 400; // skill-allow: §9-const — aggregation page bound
-
 /// The "is capture alive?" window.
 const RECENT_SECS: i64 = 3600; // skill-allow: §9-const — display window for the capture-lag tile
 
@@ -35,18 +31,12 @@ const HEALTH_RECENT_SECS: i64 = 86_400; // skill-allow: §9-const — display wi
 /// text a failure carries. `payload.error` is NONE on every other
 /// event, and NONE is simply not a string.
 const HEALTH_QUERY: &str = "SELECT payload.name AS name, lifecycle_event AS event,
-        payload.error AS error, valid_from
+        payload.error AS error, payload.startup_duration_ms AS startup_ms, valid_from
      FROM telemetry_stream
      WHERE lifecycle_event IN ['module_starting', 'module_started', 'module_active',
         'module_stopped', 'module_failed', 'module_start_failed', 'module_start_abandoned',
         'module_disabled', 'module_provisioned']
      ORDER BY valid_from DESC LIMIT $limit";
-
-/// Every failure a module has ever logged, in the engine.
-const FAILURES_QUERY: &str = "SELECT payload.name AS name, count() AS value
-     FROM telemetry_stream
-     WHERE lifecycle_event IN ['module_failed', 'module_start_failed', 'module_start_abandoned']
-     GROUP BY name";
 
 fn is_failure(event: &str) -> bool {
     matches!(event, "module_failed" | "module_start_failed" | "module_start_abandoned")
@@ -71,10 +61,6 @@ fn get_int(o: &Object, key: &str) -> i64 {
         Some(Value::Number(n)) => n.to_int().unwrap_or(0),
         _ => 0,
     }
-}
-
-async fn rows(kernel: &Kernel, query: impl Into<String>) -> Result<Vec<Value>> {
-    Ok(kernel.db().query(query.into()).await?.take(0)?)
 }
 
 /// Everything the Status page's deep panels need, in one pass.
@@ -289,76 +275,56 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
         .collect();
     per_agent.sort_by_key(|a| std::cmp::Reverse(a.messages));
 
-    // ── what capture actually spends itself on ──────────────────────
-    let mut event_kinds: Vec<NameCount> = rows(
-        kernel,
-        "SELECT lifecycle_event AS name, count() AS value
-         FROM telemetry_stream GROUP BY name",
-    )
-    .await?
-    .iter()
-    .filter_map(obj)
-    .filter_map(|o| {
-        Some(NameCount {
-            name: get_str(o, "name")?.to_string(),
-            value: get_int(o, "value"),
-        })
-    })
-    .collect();
-    event_kinds.sort_by_key(|k| std::cmp::Reverse(k.value));
-
-    // ── per-module startup cost: newest reading per module ──────────
-    let startup: Vec<Value> = kernel
+    // ── the telemetry stream, in two passes (#415 review) ───────────
+    // Six queries each read the whole stream: 4.4 of the 9 seconds this
+    // took on a replay. One grouped pass says what capture spends itself
+    // on, whether it is alive, how busy the last hour was and how often each
+    // module ever failed; one bounded scan of module lifecycle events says
+    // how each module is and what it cost to start.
+    let now = chrono::Utc::now();
+    let cutoff = now - chrono::Duration::seconds(RECENT_SECS);
+    let groups: Vec<Value> = kernel
         .db()
         .query(
-            // valid_from stays in the projection: the engine requires
-            // the ordering idiom to be selected.
-            "SELECT payload.name AS name, payload.startup_duration_ms AS value, valid_from
-             FROM telemetry_stream WHERE lifecycle_event = 'module_active'
-             ORDER BY valid_from DESC LIMIT $limit",
+            // `count(cond)` counts the rows where `cond` holds.
+            "SELECT lifecycle_event AS kind, payload.name AS name, count() AS n,
+                    time::max(valid_from) AS newest, count(valid_from > $cutoff) AS recent
+             FROM telemetry_stream GROUP BY kind, name",
         )
-        .bind(("limit", STARTUP_SCAN))
-        .await?
-        .take(0)?;
-    let mut seen: Vec<NameCount> = Vec::new();
-    for row in startup.iter().filter_map(obj) {
-        let Some(name) = get_str(row, "name") else { continue };
-        if seen.iter().any(|s| s.name == name) {
-            continue; // newest wins — the rows arrive newest-first
-        }
-        seen.push(NameCount {
-            name: name.to_string(),
-            value: get_int(row, "value"),
-        });
-    }
-    seen.sort_by_key(|s| std::cmp::Reverse(s.value));
-    let module_startup = seen;
-
-    // ── is capture alive? ───────────────────────────────────────────
-    let newest: Vec<Value> = kernel
-        .db()
-        .query("SELECT valid_from FROM telemetry_stream ORDER BY valid_from DESC LIMIT 1")
-        .await?
-        .take(0)?;
-    let last_event_at_dt = newest.first().and_then(obj).and_then(|o| match o.get("valid_from") {
-        Some(Value::Datetime(d)) => Some(**d),
-        _ => None,
-    });
-    let last_event_secs = last_event_at_dt.map(|d| (chrono::Utc::now() - d).num_seconds().max(0));
-    let last_event_at = last_event_at_dt.map(|d| d.to_rfc3339());
-    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(RECENT_SECS);
-    let recent: Vec<Value> = kernel
-        .db()
-        .query("SELECT count() AS c FROM telemetry_stream WHERE valid_from > $cutoff GROUP ALL")
         .bind(("cutoff", cutoff))
         .await?
         .take(0)?;
-    let events_last_hour = recent.first().and_then(obj).map_or(0, |o| get_int(o, "c"));
+    let mut kinds: HashMap<String, i64> = HashMap::new();
+    let mut failures_total: HashMap<String, i64> = HashMap::new();
+    let mut last_event_at_dt: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut events_last_hour = 0i64;
+    for g in groups.iter().filter_map(obj) {
+        let Some(kind) = get_str(g, "kind") else { continue };
+        let n = get_int(g, "n");
+        *kinds.entry(kind.to_string()).or_insert(0) += n;
+        events_last_hour += get_int(g, "recent");
+        if let Some(Value::Datetime(d)) = g.get("newest") {
+            last_event_at_dt = Some(last_event_at_dt.map_or(**d, |t| t.max(**d)));
+        }
+        if is_failure(kind) {
+            if let Some(name) = get_str(g, "name") {
+                *failures_total.entry(name.to_string()).or_insert(0) += n;
+            }
+        }
+    }
 
-    // ── module health: what happened to each module (#367) ──────────
-    let now = chrono::Utc::now();
+    // ── what capture actually spends itself on ──────────────────────
+    let mut event_kinds: Vec<NameCount> = kinds.into_iter().map(|(name, value)| NameCount { name, value }).collect();
+    event_kinds.sort_by(|a, b| b.value.cmp(&a.value).then(a.name.cmp(&b.name)));
+
+    // ── is capture alive? ───────────────────────────────────────────
+    let last_event_secs = last_event_at_dt.map(|d| (now - d).num_seconds().max(0));
+    let last_event_at = last_event_at_dt.map(|d| d.to_rfc3339());
+
+    // ── module health and startup cost: what happened to each (#367) ─
     let recent_cut = now - chrono::Duration::seconds(HEALTH_RECENT_SECS);
     let mut health: Vec<ModuleHealth> = Vec::new();
+    let mut module_startup: Vec<NameCount> = Vec::new();
     let lifecycle: Vec<Value> = kernel
         .db()
         .query(HEALTH_QUERY)
@@ -373,6 +339,11 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
             Some(Value::Datetime(d)) => **d,
             _ => continue,
         };
+        // Newest-first: a module's first `module_active` is its latest
+        // boot's startup cost.
+        if event == "module_active" && !module_startup.iter().any(|s| s.name == name) {
+            module_startup.push(NameCount { name: name.to_string(), value: get_int(row, "startup_ms") });
+        }
         let idx = match health.iter().position(|h| h.name == name) {
             Some(i) => i,
             None => {
@@ -398,15 +369,14 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
             }
         }
     }
-    for row in rows(kernel, FAILURES_QUERY).await?.iter().filter_map(obj) {
-        let Some(name) = get_str(row, "name") else { continue };
-        let total = get_int(row, "value");
+    module_startup.sort_by_key(|s| std::cmp::Reverse(s.value));
+    for (name, total) in failures_total {
         match health.iter_mut().find(|h| h.name == name) {
             Some(h) => h.failures_total = total,
             // Failed beyond the scan and never seen since: still a
             // module with a history worth showing.
             None => health.push(ModuleHealth {
-                name: name.to_string(),
+                name,
                 last_event: String::new(),
                 last_event_secs: -1,
                 last_event_at: None,

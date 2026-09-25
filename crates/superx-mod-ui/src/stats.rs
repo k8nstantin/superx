@@ -4751,7 +4751,8 @@ pub async fn stats_for_range_capped(
     } else {
         since
     };
-    let landed = crate::landed::landed(&code.cwds, landed_since, clock).await;
+    let mainlines = crate::resolved_mainline_refs(kernel).await;
+    let landed = crate::landed::landed(&code.cwds, &checkouts, landed_since, clock, &mainlines).await;
 
     Ok(StatsSummary {
         landed,
