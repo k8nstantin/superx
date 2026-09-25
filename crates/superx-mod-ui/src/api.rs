@@ -657,8 +657,9 @@ pub struct Exposure {
     /// Files read from OUTSIDE the repo the session was working in —
     /// the exposure you did not ask for.
     pub outside_reads: i64,
-    /// Tool results whose content matched a secret shape (keys,
-    /// tokens, private-key headers) and therefore went into a prompt.
+    /// Credential-shaped strings (keys, tokens, private-key blocks) that
+    /// went to the vendor: in a tool's output, a command, or a file the
+    /// agent wrote.
     pub secret_hits: i64,
     /// The paths those hits came from, deduplicated.
     pub secret_paths: Vec<String>,

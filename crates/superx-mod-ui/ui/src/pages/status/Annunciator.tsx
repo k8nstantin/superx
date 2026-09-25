@@ -187,16 +187,16 @@ export function Annunciator({
         label="Secrets sent"
         value={v(s?.exposure?.secret_hits)}
         tone={loading ? 'none' : count(s?.exposure?.secret_hits, true)}
-        sub="in prompts"
-        tip="tool results whose content matched a credential shape and therefore went into a prompt. Anything sent cannot be recalled."
+        sub="went to the vendor"
+        tip="credential-shaped text in a tool's output, or in a command or file the agent wrote — either way it went to the vendor. Anything sent cannot be recalled."
         onClick={() => jump('cost')}
       />
       <Lamp
         label="Outside reads"
         value={v(s?.exposure?.outside_reads)}
         tone={loading ? 'none' : count(s?.exposure?.outside_reads)}
-        sub="beyond the working dir"
-        tip="file reads from outside the directory the agent was working in — exposure nobody asked for"
+        sub="outside the repository"
+        tip="file reads from outside the repository the agent was working in — exposure nobody asked for"
         onClick={() => jump('cost')}
       />
       <Lamp

@@ -389,12 +389,20 @@ export function BarList({
   shorten,
   empty = 'nothing in this range',
 }: {
-  rows: { name: string; value: number | bigint }[]
+  /// `undefined` while the answer is still being read — an empty list
+  /// is a claim ("nothing in this range"), and it is not true yet.
+  rows: { name: string; value: number | bigint }[] | undefined
   color?: string
   mono?: boolean
   shorten?: (s: string) => string
   empty?: string
 }) {
+  if (rows == null)
+    return (
+      <Text size="xs" c="dimmed">
+        reading…
+      </Text>
+    )
   if (rows.length === 0)
     return (
       <Text size="xs" c="dimmed">

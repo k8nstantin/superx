@@ -337,22 +337,33 @@ fn shell_inspects(cmd: &str) -> bool {
 /// that is not a flag or a URL — resolved against `cwd` when relative.
 fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
-    for (label, stage) in labelled_stages(cmd) {
+    for (raw, here) in stages_in_place(cmd, cwd) {
+        let stage = strip_redirections(&raw);
+        let Some(label) = stage_label(&stage) else { continue };
         if is_noise(&label) || !stage_inspects(&label, &stage) {
             continue;
         }
-        for w in stage.split_whitespace().skip(1) {
+        // git and gh take refs and ranges as arguments — `main...HEAD` is
+        // no file. Their paths are the words after `--`.
+        let words: Vec<&str> = stage.split_whitespace().skip(1).collect();
+        let args: &[&str] = if label.starts_with("git ") || label.starts_with("gh ") {
+            words.iter().position(|w| *w == "--").map_or(&[][..], |i| &words[i + 1..])
+        } else {
+            &words
+        };
+        for w in args {
             let w = w.trim_matches(|c| c == '\'' || c == '"' || c == ',' || c == ';');
             if w.starts_with('-') || !w.contains('/') || w.contains("://") || w.contains('*') {
                 continue;
             }
             let path = if w.starts_with('/') || w.starts_with('~') {
                 w.to_string()
-            } else if let Some(c) = cwd {
-                format!("{}/{}", c.trim_end_matches('/'), w.trim_start_matches("./"))
+            } else if let Some(c) = here.as_deref() {
+                format!("{}/{}", c.trim_end_matches('/'), w)
             } else {
                 continue;
             };
+            let path = normalize(&path);
             if !out.contains(&path) {
                 out.push(path);
             }
@@ -362,6 +373,104 @@ fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
         }
     }
     out
+}
+
+/// A path as the filesystem would resolve its `.` and `..`, without
+/// touching the filesystem: `repo/src/../README.md` is `repo/README.md`.
+fn normalize(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if out.last().is_some_and(|s| *s != "..") {
+                    out.pop();
+                } else if !absolute {
+                    out.push("..");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    let joined = out.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// Where a `cd` (or `pushd`) stage moves the command, if this stage is
+/// one: `Some(Some(dir))` for a place it can name, `Some(None)` for one it
+/// cannot — a variable, `-`, home — after which relative paths are
+/// unknown rather than resolved against the wrong directory. `None` when
+/// the stage is not a move at all.
+fn cd_to(stage: &str, here: Option<&str>) -> Option<Option<String>> {
+    let words: Vec<&str> = stage
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c| c == '(' || c == ')' || c == '{' || c == '}'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    match words.first().copied() {
+        Some("cd" | "pushd") => {}
+        Some("popd") => return Some(None),
+        _ => return None,
+    }
+    let Some(arg) = words[1..].iter().find(|w| !w.starts_with('-') || **w == "-") else {
+        return Some(None);
+    };
+    let arg = arg.trim_matches(|c| c == '\'' || c == '"');
+    if arg == "-" || arg.starts_with('~') || arg.contains('$') || arg.contains('`') {
+        return Some(None);
+    }
+    let path = if arg.starts_with('/') {
+        arg.to_string()
+    } else if let Some(h) = here {
+        format!("{}/{}", h.trim_end_matches('/'), arg)
+    } else {
+        return Some(None);
+    };
+    Some(Some(normalize(&path)))
+}
+
+/// Each stage of a command with the directory it runs in (#412). A `cd`
+/// moves every stage after it; one inside `( … )` moves only the rest of
+/// its subshell, so `(cd ui && npm run build) && cat > src/x.rs` writes
+/// beside the session again. Reading every path against the transcript's
+/// `cwd` filed `cd /tmp/x && cat > f` as a file of the repository. The
+/// `cd` stages themselves are not returned.
+fn stages_in_place(cmd: &str, cwd: Option<&str>) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut here: Option<String> = cwd.map(str::to_string);
+    let mut outer: Vec<Option<String>> = Vec::new();
+    for stage in split_stages(&strip_heredocs(cmd)) {
+        let t = stage.trim();
+        for _ in 0..t.chars().take_while(|&c| c == '(').count() {
+            outer.push(here.clone());
+        }
+        let closes = t.chars().rev().take_while(|&c| c == ')').count();
+        match cd_to(&stage, here.as_deref()) {
+            Some(next) => here = next,
+            None => out.push((stage, here.clone())),
+        }
+        for _ in 0..closes {
+            if let Some(prev) = outer.pop() {
+                here = prev;
+            }
+        }
+    }
+    out
+}
+
+/// Does this stage open a heredoc — `<<EOF`, `<<'EOF'`, `<<-"EOF"`? The
+/// same reading [`heredocs`] and [`strip_heredocs`] make of a line.
+fn opens_heredoc(stage: &str) -> bool {
+    stage.find("<<").is_some_and(|pos| {
+        let raw = stage[pos + 2..].trim_start_matches('-').split_whitespace().next().unwrap_or("");
+        let delim = raw.trim_matches(|c| c == '\'' || c == '"');
+        !delim.is_empty() && delim.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Sessions and duplicate artifacts named on the page, at most (#406).
@@ -403,9 +512,9 @@ struct ShellWrite {
     /// than editing it in place. The created/modified split reads this
     /// the way it reads a whole-file `Write` (#388).
     whole_file: bool,
-    /// The shape of the text it wrote, where the call carried it — so
-    /// the same content landing in two files is visible (#406).
-    shape: Option<u64>,
+    /// Each file written whole, with the shape of the text written into
+    /// it — so the same content landing in two files is visible (#406).
+    shapes: Vec<(String, u64)>,
     /// It wrote without naming a file: `git apply`, `patch`.
     pathless: bool,
 }
@@ -416,6 +525,7 @@ impl ShellWrite {
     /// write to the work nor a read of it.
     fn into_work(mut self, checkouts: &crate::checkout::Checkouts) -> Option<Self> {
         self.paths.retain(|p| is_work_path(p, checkouts));
+        self.shapes.retain(|(p, _)| is_work_path(p, checkouts));
         (self.pathless || !self.paths.is_empty()).then_some(self)
     }
 }
@@ -466,7 +576,7 @@ fn written_path(w: &str, cwd: Option<&str>) -> Option<String> {
     let path = if w.starts_with('/') || w.starts_with('~') {
         w.to_string()
     } else if w.contains('/') || w.contains('.') {
-        format!("{}/{}", cwd?.trim_end_matches('/'), w.trim_start_matches("./"))
+        format!("{}/{}", cwd?.trim_end_matches('/'), w)
     } else {
         return None;
     };
@@ -476,7 +586,7 @@ fn written_path(w: &str, cwd: Option<&str>) -> Option<String> {
     if path.starts_with("/dev/") {
         return None;
     }
-    Some(path)
+    Some(normalize(&path))
 }
 
 /// The files a stage's `>` / `>>` / `&>` redirections write. `2>` is a
@@ -550,54 +660,50 @@ fn note_path(paths: &mut Vec<String>, p: String) {
 /// a heredoc into a file — and are otherwise unknown.
 fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
     let mut paths: Vec<String> = Vec::new();
+    let mut shapes: Vec<(String, u64)> = Vec::new();
     let mut added = 0i64;
     let mut wrote = false;
     let mut whole_file = false;
-    let mut shape = None;
-    // Heredocs first: their bodies say what was written, and where.
-    for (line, body) in heredocs(cmd) {
-        for stage in split_stages(&line) {
-            if !stage.contains("<<") {
-                continue;
-            }
-            let stripped = strip_redirections(&stage);
-            let Some(label) = stage_label(&stripped) else { continue };
-            let targets = redirection_targets(&stage, cwd);
-            if label == "cat" && !targets.is_empty() {
-                // `cat > file <<EOF`: the file IS the body.
+    // The heredoc bodies, in the order their stages open them.
+    let mut docs = heredocs(cmd).into_iter().map(|(_, body)| body);
+    for (stage, here) in stages_in_place(cmd, cwd) {
+        let at = here.as_deref();
+        let body = if opens_heredoc(&stage) { docs.next() } else { None };
+        let stripped = strip_redirections(&stage);
+        let Some(label) = stage_label(&stripped) else { continue };
+        let targets = redirection_targets(&stage, at);
+        if let Some(body) = &body {
+            // `cat > file <<EOF` and `tee file <<EOF`: the file IS the body.
+            let written: Vec<String> = match label.as_str() {
+                "cat" => targets.clone(),
+                "tee" => stripped.split_whitespace().skip(1).filter_map(|w| written_path(w, at)).collect(),
+                _ => Vec::new(),
+            };
+            if !written.is_empty() {
                 added += line_count(body.trim_end_matches('\n'));
                 wrote = true;
                 whole_file = true;
-                shape = shape.or_else(|| snippet_key(&body));
-                for t in targets {
-                    note_path(&mut paths, t);
-                }
-            } else if label == "tee" {
-                added += line_count(body.trim_end_matches('\n'));
-                wrote = true;
-                whole_file = true;
-                shape = shape.or_else(|| snippet_key(&body));
-                for w in stripped.split_whitespace().skip(1) {
-                    if let Some(p) = written_path(w, cwd) {
-                        note_path(&mut paths, p);
+                // Each file keeps its OWN body's shape: one call writing
+                // four different files is not one text in four places.
+                let key = snippet_key(body);
+                for t in written {
+                    if let Some(k) = key {
+                        shapes.push((t.clone(), k));
                     }
+                    note_path(&mut paths, t);
                 }
             } else if STDIN_INTERPRETERS.contains(&label.as_str())
                 && stripped.split_whitespace().any(|w| w == "-")
-                && script_writes(&body)
+                && script_writes(body)
             {
                 wrote = true;
-                for p in script_paths(&body, cwd) {
+                for p in script_paths(body, at) {
                     note_path(&mut paths, p);
                 }
             }
         }
-    }
-    // Then every stage: redirections, in-place editors, copying programs.
-    for stage in split_stages(&strip_heredocs(cmd)) {
-        let stripped = strip_redirections(&stage);
-        let Some(label) = stage_label(&stripped) else { continue };
-        for t in redirection_targets(&stage, cwd) {
+        // Redirections, in-place editors, copying programs.
+        for t in targets {
             wrote = true;
             note_path(&mut paths, t);
         }
@@ -606,19 +712,19 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
             // `sed -i`, `awk -i inplace`, `perl -i`: the file is the last
             // path.
             wrote = true;
-            if let Some(p) = words.iter().rev().find_map(|w| written_path(w, cwd)) {
+            if let Some(p) = words.iter().rev().find_map(|w| written_path(w, at)) {
                 note_path(&mut paths, p);
             }
         } else if WRITE_PROGRAMS.contains(&label.as_str()) {
             wrote = true;
             if matches!(label.as_str(), "cp" | "mv" | "install") {
                 // The destination is the file changed.
-                if let Some(p) = words.iter().rev().find_map(|w| written_path(w, cwd)) {
+                if let Some(p) = words.iter().rev().find_map(|w| written_path(w, at)) {
                     note_path(&mut paths, p);
                 }
             } else {
                 for w in words.iter().skip(1) {
-                    if let Some(p) = written_path(w, cwd) {
+                    if let Some(p) = written_path(w, at) {
                         note_path(&mut paths, p);
                     }
                 }
@@ -631,7 +737,7 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
     // is still a write; one that names only files outside the work is
     // the caller's to drop (#412).
     let pathless = paths.is_empty();
-    wrote.then_some(ShellWrite { paths, added, whole_file, shape, pathless })
+    wrote.then_some(ShellWrite { paths, added, whole_file, shapes, pathless })
 }
 
 /// What a shell stage SHIPPED (#381): outcomes, where every other
@@ -784,7 +890,14 @@ fn echoed_exit(text: &str, names: &[&str]) -> Option<bool> {
     for line in text.lines() {
         let low = line.to_ascii_lowercase();
         for name in names {
-            let Some(i) = low.find(name) else { continue };
+            // A word start: `latest=1` is not `test=1`.
+            let Some(i) = low
+                .match_indices(name)
+                .map(|(i, _)| i)
+                .find(|&i| low[..i].chars().next_back().is_none_or(|c| !c.is_ascii_alphanumeric()))
+            else {
+                continue;
+            };
             let rest = low[i + name.len()..].trim_start_matches(['_', ' ']);
             let rest = rest.strip_prefix("exit").unwrap_or(rest).trim_start();
             let Some(code) = rest.strip_prefix('=') else { continue };
@@ -810,9 +923,13 @@ fn gate_passed(gate: Gate, text: Option<&str>) -> bool {
     });
     match gate {
         Gate::Test => {
+            // A run whose output was sent to a file says so by the exit
+            // code it echoed (`TEST_EXIT=0`), as these sessions do.
+            let echoed = echoed_exit(text, &["test"]);
             !errored
                 && !text.contains("test result: FAILED")
-                && text.contains("test result: ok")
+                && echoed != Some(false)
+                && (text.contains("test result: ok") || echoed == Some(true))
         }
         Gate::Lint => {
             !errored && echoed_exit(text, &["clippy"]).unwrap_or_else(|| text.contains("Finished"))
@@ -1838,9 +1955,12 @@ struct LiveAgg {
 /// blocks arrive in.
 fn doing_rank(state: &str) -> u8 {
     match state {
-        "verifying" => 3,
-        "writing" => 2,
-        "reading" => 1,
+        "verifying" => 4,
+        "writing" => 3,
+        "reading" => 2,
+        // A call that is none of those — a fetch, a browser, an MCP tool:
+        // the session is working, not thinking (#415 QA).
+        "working" => 1,
         _ => 0,
     }
 }
@@ -2952,6 +3072,7 @@ pub async fn stats_for_range_capped(
                                 if l.doing_reply.is_none() {
                                     l.doing_reply = Some(reply.clone().unwrap_or_default());
                                 }
+                                claim_doing(l, reply.as_deref(), "working");
                             }
                             let entry = outcomes.entry(name.clone()).or_default();
                             entry.calls += 1;
@@ -3660,8 +3781,8 @@ pub async fn stats_for_range_capped(
                                                         .map_or(0, |t| t.partition_point(|h| *h <= when));
                                                     code.focus.entry((sid.clone(), win)).or_default().insert(dir);
                                                 }
-                                                if let Some(shape) = w.shape {
-                                                    let seen = code.written_shapes.entry(shape).or_default();
+                                                for (_, shape) in w.shapes.iter().filter(|(p, _)| p == path) {
+                                                    let seen = code.written_shapes.entry(*shape).or_default();
                                                     if !seen.iter().any(|p| p == path) && seen.len() < DUP_PATHS {
                                                         seen.push(path.clone());
                                                     }

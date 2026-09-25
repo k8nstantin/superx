@@ -118,11 +118,11 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 4 }}>
           <Panel title="Languages" scope="range" range={range} h="100%">
-            <BarList rows={s?.languages ?? []} mono empty="no files edited in this range" />
+            <BarList rows={s?.languages} mono empty="no files edited in this range" />
             <Text size="sm" fw={600} mt="md" mb="xs">
               Projects
             </Text>
-            <BarList rows={s?.projects ?? []} color="var(--mantine-color-pelican-3)" mono />
+            <BarList rows={s?.projects} color="var(--mantine-color-pelican-3)" mono />
           </Panel>
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 4 }}>
@@ -138,7 +138,7 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
             <Text size="sm" fw={600} mb="xs">
               Commands
             </Text>
-            <BarList rows={s?.commands ?? []} color="var(--mantine-color-pelican-6)" mono empty="no shell calls in this range" />
+            <BarList rows={s?.commands} color="var(--mantine-color-pelican-6)" mono empty="no shell calls in this range" />
           </Panel>
         </Grid.Col>
       </Grid>
@@ -308,12 +308,12 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 7 }}>
           <Panel title="Hottest files" scope="range" range={range} note="most-touched paths" h="100%">
-            <BarList rows={s?.files ?? []} mono shorten={baseName} />
+            <BarList rows={s?.files} mono shorten={baseName} />
           </Panel>
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 5 }}>
           <Panel title="Where the work happened" scope="range" range={range} note="directories" h="100%">
-            <BarList rows={s?.dirs ?? []} color="var(--mantine-color-pelican-3)" mono />
+            <BarList rows={s?.dirs} color="var(--mantine-color-pelican-3)" mono />
             <Group gap="xl" mt="md">
               <Counter label="Thinking tokens" value={s?.thinking_tokens} />
               <Counter label="Tool calls" value={s?.tools_window} />

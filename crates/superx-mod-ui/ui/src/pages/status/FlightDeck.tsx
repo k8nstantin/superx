@@ -14,6 +14,7 @@ const DOING_COLOR: Record<string, string> = {
   writing: 'teal',
   verifying: 'blue',
   reading: 'cyan',
+  working: 'indigo',
   thinking: 'grape',
   quiet: 'gray',
 }

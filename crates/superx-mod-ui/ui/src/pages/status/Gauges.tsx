@@ -65,7 +65,9 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
               ? `landed on main: ${fmtCompact(landedAdded)} added · ${fmtCompact(landedRemoved)} removed`
               : unknown > 0
                 ? `${fmtCompact(added)} added · ${unknown} edits of unknown size`
-                : 'no code moved'
+                : s
+                  ? 'no code moved'
+                  : 'reading…'
         }
         tip={`replaced ÷ (added + replaced) over ${rangeNote}. 0% is all new code; past ${BANDS.churnBad}% the window spent itself rewriting. From the transcript when it can see what was replaced, else from what landed on main as git reports it.`}
       />
@@ -76,7 +78,9 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
         sub={
           s && onCourse != null
             ? `${fmtCompact(directed)} directed · ${fmtCompact(self)} self${inLines ? '' : ' · edits'}`
-            : 'nothing rewritten'
+            : s
+              ? 'nothing rewritten'
+              : 'reading…'
         }
         tip="share of the rewriting that followed a human instruction — replaced lines where the transcript can see them, else edits. Low means the agents are rewriting themselves with nobody steering."
       />
@@ -84,14 +88,14 @@ export function Gauges({ s, i, range }: { s: StatsSummary | undefined; i: Insigh
         label="Tests green"
         value={s ? pass : null}
         bands={HIGH_GOOD}
-        sub={s && pass != null ? `${fmtCompact(passed)} passed · ${fmtCompact(failedTests)} failed` : 'no tally read'}
+        sub={!s ? 'reading…' : pass != null ? `${fmtCompact(passed)} passed · ${fmtCompact(failedTests)} failed` : 'no tally read'}
         tip="pass rate read out of what the test runners printed"
       />
       <Gauge
         label="Tools OK"
         value={s ? toolsOk : null}
         bands={TOOLS_GOOD}
-        sub={s && toolsOk != null ? `${failed} of ${scored} calls failed` : 'no calls scored'}
+        sub={!s ? 'reading…' : toolsOk != null ? `${failed} of ${scored} calls failed` : 'no calls scored'}
         tip="tool calls that did not come back an error"
       />
       <Gauge

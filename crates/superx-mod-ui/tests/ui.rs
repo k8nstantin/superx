@@ -3272,6 +3272,122 @@ async fn the_walk_reads_what_a_call_actually_did() {
     assert!(s.files.iter().all(|f| !f.name.contains("scratchpad")), "{:?}", s.files);
 }
 
+/// A shell call reads and writes where it STANDS (#412): a `cd` moves the
+/// rest of its chain, one inside `( … )` only the rest of its subshell;
+/// `..` resolves as the filesystem would; and a git range is no file.
+/// Every path used to resolve against the transcript's `cwd`, so a heredoc
+/// written after `cd` into the scratchpad was a repository file, and a
+/// `cat` after `cd /etc` read inside the repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_call_reads_and_writes_where_it_stands() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    repo.sub("ui");
+    repo.sub("src");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "cd").await;
+    let shell = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    for (id, cmd) in [
+        // Into the scratchpad, by `cd`: no file of the repository.
+        ("w1", "cd /private/tmp/claude-1/scratchpad && cat > notes.md <<'EOF'\nnotes\nEOF"),
+        // Into a subdirectory, by `cd`: the file is there.
+        ("w2", "cd ui && cat > app.ts <<'EOF'\nexport const a = 1;\nEOF"),
+        // A subshell's `cd` ends with the subshell.
+        ("w3", "(cd ui && npm run build) && cat > top.rs <<'EOF'\nfn top() {}\nEOF"),
+        // Reads: `..` resolves to the README a Read names below…
+        ("r1", "cat src/../README"),
+        // …a range is not a path, the words after `--` are…
+        ("r2", "git diff origin/main...HEAD"),
+        ("r3", "git log --oneline -- src/lib.rs"),
+        // …and `cd` moves a read out of the repository.
+        ("r4", "cd /etc && cat ssh/sshd_config"),
+    ] {
+        log_tool_message(&kernel, &session, &agent, shell(id, cmd)).await;
+    }
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "r5", "name": "Read", "input": {"file_path": repo.file("README")}}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.writes_window, 2, "ui/app.ts and top.rs; the scratchpad note is not work");
+    let names: Vec<&str> = s.files.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.iter().any(|n| n.ends_with("/ui/app.ts")), "{names:?}");
+    assert!(names.iter().any(|n| n.ends_with("/superx/top.rs")), "the subshell's cd ended: {names:?}");
+    assert!(names.iter().all(|n| !n.contains("scratchpad") && !n.ends_with("/ui/top.rs")), "{names:?}");
+    assert_eq!(s.exposure.files_read, 3,
+        "README (twice, one path), src/lib.rs and sshd_config; never `origin/main...HEAD`");
+    assert_eq!(s.exposure.outside_reads, 1, "the cat after `cd /etc`");
+}
+
+/// One call writing two files from two heredocs wrote two texts, not one
+/// text twice (#406); the same text written into a second file IS a copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_heredoc_is_its_own_files_text() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "dup").await;
+    let shell = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    log_tool_message(&kernel, &session, &agent, shell("a",
+        "cat > a.rs <<'A'\nfn alpha() { one(); }\nA\ncat > b.rs <<'B'\nfn beta() { two(); }\nB")).await;
+    log_tool_message(&kernel, &session, &agent, shell("c",
+        "cat > c.rs <<'EOF'\nfn alpha() { one(); }\nEOF")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.duplicates.len(), 1, "{:?}", s.duplicates);
+    let mut paths: Vec<&str> = s.duplicates[0].paths.iter().map(String::as_str).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec![repo.file("a.rs"), repo.file("c.rs")], "b.rs holds another text");
+    assert_eq!(s.lines_added, 3);
+}
+
+/// A gate whose output went to a file is read by the exit code the
+/// session echoed for it (#412): `TEST_EXIT=0` passes and `TEST_EXIT=101`
+/// fails — and `latest=1` is no test's exit code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gate_run_into_a_file_is_read_by_the_exit_it_echoed() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let now = chrono::Utc::now();
+    let at = |mins: i64| now - chrono::Duration::minutes(mins);
+    let write = |id: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Write",
+             "input": {"file_path": repo.file("a.rs"), "content": "fn a() {}"}}]}});
+    let shell = |id: &str, cmd: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let out = |id: &str, text: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}});
+    for (tag, tested) in [("ok", "TEST_EXIT=0\nlatest=1"), ("red", "TEST_EXIT=101")] {
+        let session = kernel.create_entity("node_session").await.expect("session");
+        log_tool_message_at(&kernel, &session, &agent, write(&format!("{tag}0")), at(50)).await;
+        for (i, (cmd, printed)) in [
+            ("cargo test --workspace > /tmp/t.log 2>&1; echo TEST_EXIT=$?", tested),
+            ("cargo clippy --workspace -- -D warnings >/dev/null 2>&1; echo CLIPPY=$?", "CLIPPY=0"),
+            ("python3 tools/skill_audit.py | tail -1", "✅ SKILL AUDIT CLEAN"),
+            ("gh pr create --base main", "https://github.com/o/superx/pull/7"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("{tag}{}", i + 1);
+            let mins = 40 - i as i64;
+            log_tool_message_at(&kernel, &session, &agent, shell(&id, cmd), at(mins)).await;
+            log_tool_message_at(&kernel, &session, &agent, out(&id, printed),
+                at(mins) + chrono::Duration::seconds(5)).await;
+        }
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.prs_opened, 2);
+    assert_eq!(s.prs_gated, 1, "the run that echoed TEST_EXIT=0");
+    assert_eq!(s.prs_ungated, 1, "the run that echoed TEST_EXIT=101");
+}
+
 /// What a live session is doing is what its NEWEST tool call is doing
 /// (#413) — not the strongest thing it did anywhere in the range.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3288,9 +3404,21 @@ async fn a_live_session_is_doing_what_its_newest_call_does() {
     log_tool_message_at(&kernel, &session, &agent,
         call("r", "Read", serde_json::json!({"file_path": "/w/superx/a.rs"})), now).await;
 
+    // Another session read, then fetched a page: it is working, not
+    // thinking — a fetch, a browser or an MCP call is none of the others.
+    let (agent2, fetching) = seed_agent_and_session(&kernel, "claude_code", "fetch").await;
+    log_tool_message_at(&kernel, &fetching, &agent2,
+        call("r2", "Read", serde_json::json!({"file_path": "/w/superx/b.rs"})), now - chrono::Duration::minutes(2)).await;
+    log_tool_message_at(&kernel, &fetching, &agent2,
+        call("f", "WebFetch", serde_json::json!({"url": "https://docs.rs"})), now).await;
+
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
-    assert_eq!(s.live.len(), 1);
-    assert_eq!(s.live[0].doing, "reading", "the newest call, not the test run an hour ago");
+    assert_eq!(s.live.len(), 2);
+    let doing = |tool: &str| {
+        s.live.iter().find(|l| l.last_tool.as_deref() == Some(tool)).map(|l| l.doing.as_str())
+    };
+    assert_eq!(doing("Read"), Some("reading"), "the newest call, not the test run an hour ago");
+    assert_eq!(doing("WebFetch"), Some("working"));
 }
 
 /// Unknown is not zero (#413): compactions whose timing was never

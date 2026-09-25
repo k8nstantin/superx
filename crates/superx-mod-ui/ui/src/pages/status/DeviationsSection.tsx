@@ -107,7 +107,7 @@ export function DeviationsSection({ s, range }: { s: StatsSummary | undefined; r
       >
         {(s?.focus?.length ?? 0) === 0 ? (
           <Text size="xs" c="dimmed">
-            no session in this range did work between two of your turns.
+            {s ? 'no session in this range did work between two of your turns.' : 'reading…'}
           </Text>
         ) : (
           <Table.ScrollContainer minWidth={720}>
@@ -127,7 +127,7 @@ export function DeviationsSection({ s, range }: { s: StatsSummary | undefined; r
                   <Table.Tr key={f.identity}>
                     <Table.Td>
                       <Text size="xs" ff={MONO}>
-                        {f.identity.slice(0, 13)}
+                        {f.identity}
                       </Text>
                     </Table.Td>
                     <Table.Td>
@@ -173,7 +173,7 @@ export function DeviationsSection({ s, range }: { s: StatsSummary | undefined; r
       >
         {(s?.duplicates?.length ?? 0) === 0 ? (
           <Text size="xs" c="dimmed">
-            nothing in this range was written to two places at once.
+            {s ? 'nothing in this range was written to two places at once.' : 'reading…'}
           </Text>
         ) : (
           <>
