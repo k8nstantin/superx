@@ -352,16 +352,6 @@ fn int_of(o: &superx_kernel::types::Object, key: &str) -> i64 {
     }
 }
 
-/// Pull a nested object field out of a dynamic row.
-fn obj_of(row: &Value, key: &str) -> Option<superx_kernel::types::Object> {
-    match row {
-        Value::Object(o) => match o.get(key) {
-            Some(Value::Object(inner)) => Some(inner.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
 
 /// Rows read when looking for a session's newest real model or
 /// effort — enough to see past a run of runtime-written lines.
@@ -473,6 +463,10 @@ pub async fn session_last_emitted(
     }))
 }
 
+/// Newest replies read for a session's context, at most: enough to step
+/// past a run of `<synthetic>` or zero-usage replies.
+const CONTEXT_PROBE: u32 = 20; // skill-allow: §9-const — read-path bound, not a policy tunable
+
 pub async fn session_token_stats(
     kernel: &Kernel,
     session: RecordId,
@@ -501,32 +495,31 @@ pub async fn session_token_stats(
         })
         .filter(|&n| n > 0);
 
+    // The prompt the newest reply answered, read the way the Status page
+    // reads it (#415 review). A `<synthetic>` reply — the runtime's own
+    // stand-in for an API error — carries all-zero usage, and taking it
+    // blanked the bar; so does a reply whose usage reads zero.
     let rows: Vec<Value> = kernel
         .db()
-        .query(
-            "SELECT raw.message.usage AS cu, raw.tokens AS gu, valid_from \
+        .query(format!(
+            "SELECT raw.message.usage AS cu, raw.tokens AS gu, (emitted_at ?? valid_from) AS at \
              FROM message WHERE session = $sess \
                AND (raw.message.usage != NONE OR raw.tokens != NONE) \
-             ORDER BY valid_from DESC LIMIT 1",
-        )
+               AND (raw.message.model ?? raw.model ?? '') != '<synthetic>' \
+             ORDER BY at DESC LIMIT {CONTEXT_PROBE}"
+        ))
         .bind(("sess", session))
         .await?
         .take(0)?;
-    let context = rows.first().and_then(|row| {
-        if let Some(cu) = obj_of(row, "cu") {
-            let n = int_of(&cu, "input_tokens")
-                + int_of(&cu, "cache_read_input_tokens")
-                + int_of(&cu, "cache_creation_input_tokens");
-            return (n > 0).then_some(n);
-        }
-        // Gemini's prompt is its `input` (cache included) plus tool
-        // context; its `total` also counts what it wrote, so it is not
-        // the prompt (#409).
-        if let Some(gu) = obj_of(row, "gu") {
-            let n = int_of(&gu, "input") + int_of(&gu, "tool");
-            return (n > 0).then_some(n);
-        }
-        None
+    let context = rows.iter().find_map(|row| {
+        let Value::Object(o) = row else { return None };
+        let usage = |key: &str| match o.get(key) {
+            Some(Value::Object(u)) => Some(u),
+            _ => None,
+        };
+        crate::stats::usage_of(usage("cu"), usage("gu"))
+            .map(|u| u.context)
+            .filter(|&n| n > 0)
     });
     Ok((context, output_total))
 }

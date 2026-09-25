@@ -3135,6 +3135,32 @@ async fn a_reply_split_across_lines_is_counted_once() {
     assert_eq!((claude.messages, claude.output_tokens), (2, 120), "replies, as every other count; output per reply");
 }
 
+/// A session's context is the prompt its newest REAL reply answered (#415
+/// review): the `<synthetic>` stand-in the runtime writes for an API error
+/// carries all-zero usage, and taking it blanked the Sessions bar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_synthetic_reply_does_not_blank_the_context() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "ctx").await;
+    let now = chrono::Utc::now();
+    log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+        "message": {"id": "real", "model": "claude-opus-5", "content": [],
+            "usage": {"input_tokens": 3, "cache_read_input_tokens": 90_000,
+                      "cache_creation_input_tokens": 7, "output_tokens": 50}}}),
+        now - chrono::Duration::minutes(2)).await;
+    log_tool_message_at(&kernel, &session, &agent, serde_json::json!({
+        "message": {"id": "err", "model": "<synthetic>", "content": [],
+            "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 0, "output_tokens": 0}}}),
+        now - chrono::Duration::minutes(1)).await;
+
+    let (ctx, out) = superx_mod_ui::activity::session_token_stats(&kernel, session)
+        .await
+        .expect("session tokens");
+    assert_eq!(ctx, Some(90_010), "the real reply's prompt");
+    assert_eq!(out, Some(50));
+}
+
 /// Every "Msgs" on the page counts the same thing (#415 review): a reply
 /// once, however many lines Claude Code wrote for it, and every other row
 /// as itself. The model table counted replies while the repo, branch,
