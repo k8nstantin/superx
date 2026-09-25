@@ -80,24 +80,6 @@ pub struct SessionView {
 
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
-pub struct ActionView {
-    pub event: String,
-    pub summary: String,
-    pub agent_id: Option<String>,
-    pub valid_from: String,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
-pub struct ChartsSummary {
-    pub events_per_minute: Vec<TimeCount>,
-    pub per_agent: Vec<NameCount>,
-    pub message_roles: Vec<NameCount>,
-    pub boot_durations: Vec<TimeCount>,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
 pub struct TimeCount {
     pub t: String,
     pub value: i64,
@@ -173,8 +155,16 @@ pub struct StatsSummary {
     pub messages_last_hour: i64,
     /// Output tokens in the last hour — the burn rate.
     pub tokens_last_hour: i64,
-    /// How many of the last 24 hours saw any activity at all.
+    /// How many of the last 24 hours saw any activity at all, on the
+    /// agent's clock.
     pub active_hours_24h: i64,
+    /// Which of them, as UTC `YYYY-MM-DDTHH` keys, oldest first — so the
+    /// coverage strip lights the hours that worked, not the first N (#413).
+    pub active_hours: Vec<String>,
+    /// Agent-clock hours of the RANGE that saw any activity (#413): the
+    /// denominator for every per-hour rate over the range. Rates used to
+    /// divide the range's total by the last 24 hours' count.
+    pub active_hours_range: i64,
 
     // ── what kind of work the window actually was ─────────────────
     /// Shell calls that ran a test suite.
@@ -185,19 +175,24 @@ pub struct StatsSummary {
     pub git_ops: i64,
 
     // ── what shipped (#381) — outcomes beside the effort ──────────
-    /// `git commit` calls.
+    /// Commits made — `git commit` calls whose output did not say there
+    /// was nothing to commit, and that were not refused (#412).
     pub commits: i64,
-    /// `git push` calls.
+    /// Pushes git did not reject.
     pub pushes: i64,
-    /// `gh pr create` calls.
+    /// Pull requests `gh pr create` printed the address of.
     pub prs_opened: i64,
-    /// `gh pr merge` calls.
+    /// `gh pr merge` calls whose output did not report a refusal.
     pub prs_merged: i64,
     /// Lines git reported committed — the `insertions(+)` and
-    /// `deletions(-)` a commit prints. Churn as the repository saw it,
-    /// however the edits were made; `0` when every commit ran quiet.
+    /// `deletions(-)` under a commit's own `[branch hash]` line. Churn as
+    /// the repository saw it, however the edits were made.
     pub committed_added: i64,
     pub committed_removed: i64,
+    /// How many of `commits` printed that line (#412). `git commit -q`
+    /// prints none, so the committed lines cover only these; fewer than
+    /// `commits` and the figure is partial, none and it is unknown.
+    pub commits_with_stat: i64,
     /// What landed on the repositories' main lines in the range, as the
     /// repositories themselves report it (#386).
     pub landed: Landed,
@@ -359,7 +354,11 @@ pub struct StatsSummary {
     /// above is the plain event count from #308 — this is the
     /// breakdown, so it carries its own name.)
     pub compaction_sessions: Vec<CompactionStat>,
-    pub compaction_total_ms: i64,
+    /// Wall-clock the compactions cost, when the transcript carried it.
+    /// `None` when compactions happened but none was timed: the timing
+    /// rides `compact_boundary` system lines, which capture does not keep
+    /// as messages (#373) — unknown, not zero (#413).
+    pub compaction_total_ms: Option<i64>,
     /// What left this machine and what the vendor retained.
     pub exposure: Exposure,
 }

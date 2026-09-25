@@ -106,9 +106,21 @@ messages_last_hour: bigint,
  */
 tokens_last_hour: bigint, 
 /**
- * How many of the last 24 hours saw any activity at all.
+ * How many of the last 24 hours saw any activity at all, on the
+ * agent's clock.
  */
 active_hours_24h: bigint, 
+/**
+ * Which of them, as UTC `YYYY-MM-DDTHH` keys, oldest first — so the
+ * coverage strip lights the hours that worked, not the first N (#413).
+ */
+active_hours: Array<string>, 
+/**
+ * Agent-clock hours of the RANGE that saw any activity (#413): the
+ * denominator for every per-hour rate over the range. Rates used to
+ * divide the range's total by the last 24 hours' count.
+ */
+active_hours_range: bigint, 
 /**
  * Shell calls that ran a test suite.
  */
@@ -122,27 +134,34 @@ builds_run: bigint,
  */
 git_ops: bigint, 
 /**
- * `git commit` calls.
+ * Commits made — `git commit` calls whose output did not say there
+ * was nothing to commit, and that were not refused (#412).
  */
 commits: bigint, 
 /**
- * `git push` calls.
+ * Pushes git did not reject.
  */
 pushes: bigint, 
 /**
- * `gh pr create` calls.
+ * Pull requests `gh pr create` printed the address of.
  */
 prs_opened: bigint, 
 /**
- * `gh pr merge` calls.
+ * `gh pr merge` calls whose output did not report a refusal.
  */
 prs_merged: bigint, 
 /**
  * Lines git reported committed — the `insertions(+)` and
- * `deletions(-)` a commit prints. Churn as the repository saw it,
- * however the edits were made; `0` when every commit ran quiet.
+ * `deletions(-)` under a commit's own `[branch hash]` line. Churn as
+ * the repository saw it, however the edits were made.
  */
 committed_added: bigint, committed_removed: bigint, 
+/**
+ * How many of `commits` printed that line (#412). `git commit -q`
+ * prints none, so the committed lines cover only these; fewer than
+ * `commits` and the figure is partial, none and it is unknown.
+ */
+commits_with_stat: bigint, 
 /**
  * What landed on the repositories' main lines in the range, as the
  * repositories themselves report it (#386).
@@ -386,7 +405,14 @@ survival_p50_mins: bigint,
  * above is the plain event count from #308 — this is the
  * breakdown, so it carries its own name.)
  */
-compaction_sessions: Array<CompactionStat>, compaction_total_ms: bigint, 
+compaction_sessions: Array<CompactionStat>, 
+/**
+ * Wall-clock the compactions cost, when the transcript carried it.
+ * `None` when compactions happened but none was timed: the timing
+ * rides `compact_boundary` system lines, which capture does not keep
+ * as messages (#373) — unknown, not zero (#413).
+ */
+compaction_total_ms: bigint | null, 
 /**
  * What left this machine and what the vendor retained.
  */

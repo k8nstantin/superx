@@ -35,7 +35,7 @@ const GIT_TIMEOUT_MS: u64 = 4_000; // skill-allow: §9-const — read-path bound
 
 /// `git -C dir args…`, stdout on success, `None` on any failure or on
 /// the timeout. No shell is involved: arguments are passed as given.
-async fn git(dir: &Path, args: &[&str]) -> Option<String> {
+pub(crate) async fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let run = Command::new("git").arg("-C").arg(dir).args(args).output();
     let out = tokio::time::timeout(Duration::from_millis(GIT_TIMEOUT_MS), run)
         .await
@@ -78,7 +78,7 @@ pub async fn toplevel(dir: &Path) -> Option<String> {
 
 /// The repository's name: the directory holding `.git` — for a
 /// worktree, the main checkout's, so worktrees of one repo read as one.
-fn repo_name(common_git_dir: &str, toplevel: &str) -> String {
+pub(crate) fn repo_name(common_git_dir: &str, toplevel: &str) -> String {
     let common = Path::new(common_git_dir);
     let holder = if common.file_name().is_some_and(|n| n == ".git") {
         common.parent()

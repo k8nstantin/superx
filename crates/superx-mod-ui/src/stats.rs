@@ -297,11 +297,25 @@ fn stage_inspects(label: &str, stage: &str) -> bool {
     if !INSPECT_PROGRAMS.contains(&label) {
         return false;
     }
-    let in_place = stage
-        .split_whitespace()
-        .skip(1)
-        .any(|w| w == "-i" || w.starts_with("-i.") || w.starts_with("--in-place") || w == "inplace");
-    !in_place
+    !edits_in_place(label, stage)
+}
+
+/// Does this stage edit a file where it lies (#412)? Only the programs
+/// that can: `sed -i` (any short-option group carrying `i`, since GNU
+/// sed reads whatever follows it as the backup suffix), `sed
+/// --in-place`, gawk's `-i inplace`, and `perl -i`. The test used to
+/// apply to every inspect program, so `grep -i` — case-insensitive —
+/// counted as an edit: 81 of 5,014 shell calls in 30 days.
+fn edits_in_place(label: &str, stage: &str) -> bool {
+    let words: Vec<&str> = stage.split_whitespace().skip(1).collect();
+    let short_i = |w: &&str| w.starts_with('-') && !w.starts_with("--") && w[1..].contains('i');
+    match label {
+        "sed" => words.iter().any(|w| short_i(w) || w.starts_with("--in-place")),
+        "awk" => words.windows(2).any(|p| p[0] == "-i" && p[1] == "inplace")
+            || words.contains(&"--inplace"),
+        "perl" => words.iter().any(short_i),
+        _ => false,
+    }
 }
 
 /// A shell call that is all inspection, once the noise is set aside.
@@ -388,6 +402,18 @@ struct ShellWrite {
     /// The shape of the text it wrote, where the call carried it — so
     /// the same content landing in two files is visible (#406).
     shape: Option<u64>,
+    /// It wrote without naming a file: `git apply`, `patch`.
+    pathless: bool,
+}
+
+impl ShellWrite {
+    /// Keep only the files that are work, and say whether anything is
+    /// left to count (#412). A heredoc into the scratchpad is neither a
+    /// write to the work nor a read of it.
+    fn into_work(mut self, checkouts: &crate::checkout::Checkouts) -> Option<Self> {
+        self.paths.retain(|p| is_work_path(p, checkouts));
+        (self.pathless || !self.paths.is_empty()).then_some(self)
+    }
 }
 
 /// The heredocs in a command: the line that opened each, with its body.
@@ -440,12 +466,10 @@ fn written_path(w: &str, cwd: Option<&str>) -> Option<String> {
     } else {
         return None;
     };
-    if path.starts_with("/dev/")
-        || path.starts_with("/tmp/")
-        || path.starts_with("/private/tmp/")
-        || path.starts_with("/var/")
-        || agent_scratch(&path)
-    {
+    // A device is never a file anyone wrote. Whether a real path is WORK
+    // — in a repository, not the agent's scratch — is the caller's call,
+    // made against the checkouts the range actually worked in (#412).
+    if path.starts_with("/dev/") {
         return None;
     }
     Some(path)
@@ -574,8 +598,9 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
             note_path(&mut paths, t);
         }
         let words: Vec<&str> = stripped.split_whitespace().collect();
-        if INSPECT_PROGRAMS.contains(&label.as_str()) && !stage_inspects(&label, &stripped) {
-            // `sed -i`, `awk -i inplace`: the file is the last path.
+        if edits_in_place(&label, &stripped) {
+            // `sed -i`, `awk -i inplace`, `perl -i`: the file is the last
+            // path.
             wrote = true;
             if let Some(p) = words.iter().rev().find_map(|w| written_path(w, cwd)) {
                 note_path(&mut paths, p);
@@ -598,7 +623,11 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
             wrote = true;
         }
     }
-    wrote.then_some(ShellWrite { paths, added, whole_file, shape })
+    // A write that names no file we can read — `git apply`, `patch` —
+    // is still a write; one that names only files outside the work is
+    // the caller's to drop (#412).
+    let pathless = paths.is_empty();
+    wrote.then_some(ShellWrite { paths, added, whole_file, shape, pathless })
 }
 
 /// What a shell stage SHIPPED (#381): outcomes, where every other
@@ -673,6 +702,123 @@ fn shortstat(text: &str) -> Option<(i64, i64)> {
         found = Some((ins, del));
     }
     found
+}
+
+/// Lines a commit's OWN output says it committed (#412): the shortstat
+/// git prints right under the `[branch abc1234] subject` line of each
+/// commit. A shortstat anywhere else in the output belongs to another
+/// command of the chain — `git show --stat`, `git log --shortstat` — and
+/// `git commit -q`, which every commit of the last week ran, prints none.
+/// `None` when no commit line carried one; the page says so rather than
+/// reading zero.
+fn commit_shortstat(text: &str) -> Option<(i64, i64)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut found: Option<(i64, i64)> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let is_header = line.starts_with('[')
+            && line.find(']').is_some_and(|close| {
+                line[1..close]
+                    .split_whitespace()
+                    .last()
+                    .is_some_and(|h| h.len() >= 7 && h.chars().all(|c| c.is_ascii_hexdigit()))
+            });
+        if !is_header {
+            continue;
+        }
+        // The stat is the next line that reports one, before the next
+        // commit header.
+        if let Some((ins, del)) = lines[i + 1..]
+            .iter()
+            .take_while(|l| !l.starts_with('['))
+            .find_map(|l| shortstat(l))
+        {
+            let acc = found.get_or_insert((0, 0));
+            acc.0 += ins;
+            acc.1 += del;
+        }
+    }
+    found
+}
+
+/// Did this shipping event happen, as far as the call's output says
+/// (#412)? A refused call never gets here — it ran nothing. Failures are
+/// read from what git and gh print when they fail; a PR counts as opened
+/// only when gh printed the new PR's address.
+fn shipped(ship: Ship, text: &str) -> bool {
+    let has = |m: &str| text.contains(m);
+    match ship {
+        Ship::Commit => {
+            !(has("nothing to commit") || has("no changes added to commit") || has("nothing added to commit"))
+        }
+        Ship::Push => {
+            !(has("[rejected]") || has("[remote rejected]") || has("failed to push") || has("Everything up-to-date"))
+        }
+        Ship::PrOpened => text.contains("/pull/") && !(has("already exists") || has("create failed")),
+        Ship::PrMerged => {
+            !(has("is not mergeable")
+                || has("GraphQL:")
+                || has("was already merged")
+                || has("could not merge")
+                || has("X Pull request"))
+        }
+    }
+}
+
+/// The three gates a pull request is held to (#392).
+#[derive(Clone, Copy)]
+enum Gate {
+    Test,
+    Lint,
+    Audit,
+}
+
+/// An exit code a session echoed for itself — `CLIPPY=0`, `AUDIT_EXIT=1`,
+/// `skill_audit exit=0` — which is how these sessions report a gate whose
+/// output they piped away.
+fn echoed_exit(text: &str, names: &[&str]) -> Option<bool> {
+    let mut seen = None;
+    for line in text.lines() {
+        let low = line.to_ascii_lowercase();
+        for name in names {
+            let Some(i) = low.find(name) else { continue };
+            let rest = low[i + name.len()..].trim_start_matches(['_', ' ']);
+            let rest = rest.strip_prefix("exit").unwrap_or(rest).trim_start();
+            let Some(code) = rest.strip_prefix('=') else { continue };
+            let digits: String = code.trim_start().chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(c) = digits.parse::<i64>() {
+                seen = Some(c == 0);
+            }
+        }
+    }
+    seen
+}
+
+/// Did a gate pass, as its output shows (#412)? Exit status cannot say —
+/// these gates are routinely piped through `tail` — so the tools' own
+/// verdicts are read: a failing tally or a compiler error fails, `test
+/// result: ok`, a clean `Finished` or `SKILL AUDIT CLEAN` passes, and an
+/// output that shows neither is not counted as a pass.
+fn gate_passed(gate: Gate, text: Option<&str>) -> bool {
+    let Some(text) = text else { return false };
+    let errored = text.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("error[") || t.starts_with("error:")
+    });
+    match gate {
+        Gate::Test => {
+            !errored
+                && !text.contains("test result: FAILED")
+                && text.contains("test result: ok")
+        }
+        Gate::Lint => {
+            !errored && echoed_exit(text, &["clippy"]).unwrap_or_else(|| text.contains("Finished"))
+        }
+        Gate::Audit => {
+            !text.contains("SKILL AUDIT FAILED")
+                && (text.contains("SKILL AUDIT CLEAN")
+                    || echoed_exit(text, &["skill_audit", "audit"]) == Some(true))
+        }
+    }
 }
 
 /// What a shipping call's output said, for the live row: the PR number
@@ -801,19 +947,29 @@ fn strip_heredocs(cmd: &str) -> String {
 /// Drop redirection tokens so their targets are never mistaken for
 /// programs or subcommands.
 fn strip_redirections(stage: &str) -> String {
-    stage
-        .split_whitespace()
-        .filter(|w| {
-            !(w.contains(">&")
-                || w.contains("&>")
-                || w.starts_with('>')
-                || w.starts_with('<')
-                || w.starts_with("2>")
-                || w.starts_with("1>")
-                || *w == "&")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out: Vec<&str> = Vec::new();
+    let mut target_next = false;
+    for w in stage.split_whitespace() {
+        if target_next {
+            // The file a bare operator points at: `> out.txt`. It is
+            // written, never read, and never a program's argument (#412).
+            target_next = false;
+            continue;
+        }
+        let redirection = w.contains(">&")
+            || w.contains("&>")
+            || w.starts_with('>')
+            || w.starts_with('<')
+            || w.starts_with("2>")
+            || w.starts_with("1>")
+            || w == "&";
+        if redirection {
+            target_next = matches!(w, ">" | ">>" | "<" | "1>" | "1>>" | "2>" | "2>>" | "&>" | "&>>");
+            continue;
+        }
+        out.push(w);
+    }
+    out.join(" ")
 }
 
 /// Shell noise that is not the program: grouping, env prefixes, and
@@ -964,6 +1120,9 @@ struct CodeAgg {
     prs_merged: i64,
     committed_added: i64,
     committed_removed: i64,
+    /// Commit events whose own output carried a shortstat (#412). Fewer
+    /// than `commits` means the committed lines are partial.
+    commits_with_stat: i64,
     mcp: i64,
     web: i64,
     subagent: i64,
@@ -1341,7 +1500,7 @@ fn branch_derived(b: &BranchAgg) -> BranchDerived {
         test_pass_pct,
         failures_per_100,
         survival_p50_mins,
-        edit_to_verify_p50_secs: median(&mut gaps),
+        edit_to_verify_p50_secs: if gaps.is_empty() { -1 } else { median(&mut gaps) },
         quality_pct: if weight == 0 {
             -1
         } else {
@@ -1360,29 +1519,135 @@ fn median(v: &mut [i64]) -> i64 {
 }
 
 /// The agent's own workspace is not your material. Scratchpads, task
-/// files and agent state live outside the working directory by design;
-/// counting them buries the reads that matter. Probing 25 live
+/// files, memory and agent state live outside the repositories by
+/// design; counting them buries the work that matters. Probing 25 live
 /// transcripts, this filter took 64 flagged reads down to 6 — and all
 /// six were an agent in one repo reaching into a different one, which
 /// is precisely the signal (#338).
-fn agent_scratch(path: &str) -> bool {
+///
+/// A path inside a checkout the range worked in is never scratch, even
+/// under `.claude/`: a repository's worktrees live in
+/// `.claude/worktrees/`, and matching `/.claude/` alone threw away every
+/// shell edit made in one (#412).
+fn scratch_path(path: &str) -> bool {
     path.contains("/.claude/")
+        || path.starts_with("/tmp/")
+        || path.starts_with("/private/tmp/")
         || path.starts_with("/var/folders/")
-        || (path.contains("/claude-")
-            && (path.starts_with("/tmp/") || path.starts_with("/private/tmp/")))
+        || path.starts_with("/private/var/folders/")
+}
+
+/// Is a path the work — a file in one of the range's repositories, or
+/// at least not the agent's own scratch (#412)?
+fn is_work_path(path: &str, checkouts: &crate::checkout::Checkouts) -> bool {
+    checkouts.holding(path).is_some() || !scratch_path(path)
+}
+
+/// Did a read reach outside the repository the agent stood in (#338)?
+/// Against the checkout, not the directory: reading `../README.md` from
+/// a subdirectory is the same repository, and a read into a worktree is
+/// not the agent's scratch.
+fn reads_outside(path: &str, cwd: Option<&str>, checkouts: &crate::checkout::Checkouts) -> bool {
+    if checkouts.holding(path).is_none() && scratch_path(path) {
+        return false;
+    }
+    match (cwd.and_then(|c| checkouts.of(c)), checkouts.holding(path)) {
+        (Some(here), Some(there)) => here.common != there.common,
+        (Some(_), None) => true,
+        (None, _) => cwd.is_some_and(|c| !path.starts_with(c)),
+    }
+}
+
+/// What Claude Code recorded a file tool as having done (#410): its
+/// result carries `toolUseResult.structuredPatch` — the diff hunks it
+/// applied — and, for a Write, whether the file was created or updated.
+#[derive(Clone, Copy, Debug)]
+struct RecordedDiff {
+    added: i64,
+    removed: i64,
+    /// `Some(true)` when the call created the file.
+    created: Option<bool>,
+    /// A refused or failed call changed nothing.
+    failed: bool,
+}
+
+/// Read the recorded diff off a tool-result row. `None` when the result
+/// carries no patch: the lines are then estimated from the call.
+fn recorded_diff(raw: &Object, failed: bool) -> Option<RecordedDiff> {
+    if failed {
+        return Some(RecordedDiff { added: 0, removed: 0, created: None, failed: true });
+    }
+    let tur = raw.get("toolUseResult").and_then(obj)?;
+    let Some(Value::Array(hunks)) = tur.get("structuredPatch") else { return None };
+    let (mut added, mut removed) = (0i64, 0i64);
+    for hunk in hunks.iter().filter_map(obj) {
+        let Some(Value::Array(lines)) = hunk.get("lines") else { continue };
+        for line in lines.iter().filter_map(|l| match l {
+            Value::String(s) => Some(s.as_str()),
+            _ => None,
+        }) {
+            if line.starts_with('+') {
+                added += 1;
+            } else if line.starts_with('-') {
+                removed += 1;
+            }
+        }
+    }
+    let created = match get_str(tur, "type") {
+        Some("create") => {
+            // A new file has no hunks: all of it is added.
+            added = get_str(tur, "content").map_or(added, line_count);
+            Some(true)
+        }
+        Some("update") => Some(false),
+        // An Edit changes a file that is there.
+        _ => Some(false),
+    };
+    Some(RecordedDiff { added, removed, created, failed: false })
+}
+
+/// A tool result's text: the string, or the text blocks of a list (#413).
+/// Agent, ToolSearch and MCP results arrive as lists — 16% of results —
+/// and were invisible to the byte count and the secret scan.
+fn tool_result_text(block: &Object) -> Option<String> {
+    match block.get("content") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Array(parts)) => {
+            let text: Vec<&str> = parts
+                .iter()
+                .filter_map(obj)
+                .filter(|p| get_str(p, "type") == Some("text"))
+                .filter_map(|p| get_str(p, "text"))
+                .collect();
+            (!text.is_empty()).then(|| text.join("\n"))
+        }
+        _ => None,
+    }
 }
 
 /// Shapes that mean a credential is in the text. Deliberately narrow:
 /// a false positive here sends someone hunting for a leak that is not
 /// there, which is worse than silence (#337).
+///
+/// A prefix alone is not a credential (#413): this file names every
+/// prefix it looks for, so reading it lit the lamp. A hit needs the
+/// token's body after the prefix — its alphabet, at its length.
 fn looks_like_secret(text: &str) -> bool {
-    text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----")
-        || text.contains("AKIA")
-        || text.contains("ghp_")
-        || text.contains("github_pat_")
-        || text.contains("xoxb-")
-        || text.contains("sk-ant-")
-        || text.contains("-----BEGIN OPENSSH")
+    let body = |prefix: &str, min: usize, ok: fn(char) -> bool| {
+        text.match_indices(prefix)
+            .any(|(i, _)| text[i + prefix.len()..].chars().take_while(|c| ok(*c)).count() >= min)
+    };
+    fn token(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+    }
+    (text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----"))
+        || body("AKIA", 16, |c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        || body("ghp_", 36, |c| c.is_ascii_alphanumeric())
+        || body("github_pat_", 22, token)
+        || body("xoxb-", 10, token)
+        || body("sk-ant-", 20, token)
+        // Atlassian API tokens (#413): one went by in a command unflagged.
+        || body("ATATT", 30, |c| token(c) || c == '=')
 }
 
 /// Outcomes attributable to one reasoning level (#337).
@@ -1520,6 +1785,10 @@ struct LiveAgg {
     /// Newest-first, capped — the walk sees the freshest calls first.
     files_now: Vec<String>,
     doing: Option<String>,
+    /// The reply whose calls say what the session is doing: its newest
+    /// tool-calling one (#413). The walk is newest-first, so the first
+    /// tool call met for the session sets it.
+    doing_reply: Option<String>,
     thinking_tokens: i64,
     last_op_ms: i64,
     /// Context at the newest usage-bearing message — first sighting
@@ -1555,7 +1824,14 @@ fn doing_rank(state: &str) -> u8 {
     }
 }
 
-fn claim_doing(l: &mut LiveAgg, state: &str) {
+/// Claim what a session is doing NOW (#413): only the calls of its newest
+/// tool-calling reply may claim, and the strongest of those wins. It used
+/// to keep the strongest claim of the whole range, so a session that ran
+/// `cargo test` twenty hours ago read "verifying" while it was reading.
+fn claim_doing(l: &mut LiveAgg, reply: Option<&str>, state: &str) {
+    if l.doing_reply.as_deref() != Some(reply.unwrap_or("")) {
+        return;
+    }
     if l.doing.as_deref().map(doing_rank).unwrap_or(0) < doing_rank(state) {
         l.doing = Some(state.to_string());
     }
@@ -1807,6 +2083,79 @@ fn score_output(text: &str, code: &mut CodeAgg, hour_key: &str) -> (i64, i64, i6
     )
 }
 
+/// Judge one shell call against what it printed (#412): which gates it
+/// passed, and what it shipped. A gate that ran and failed is not a gate
+/// passed, and a merge that was refused is not a merge.
+fn judge_shell(
+    code: &mut CodeAgg,
+    sid: &str,
+    when: chrono::DateTime<chrono::Utc>,
+    cmd: &str,
+    out: &str,
+) {
+    {
+        let events = code.gate_events.entry(sid.to_string()).or_default();
+        for label in command_labels(cmd) {
+            match label.as_str() {
+                "cargo test" if gate_passed(Gate::Test, Some(out)) => {
+                    events.push((when, GateEvent::Tested));
+                }
+                "cargo clippy" if gate_passed(Gate::Lint, Some(out)) => {
+                    events.push((when, GateEvent::Linted));
+                }
+                _ => {}
+            }
+        }
+        if cmd.contains("skill_audit") && gate_passed(Gate::Audit, Some(out)) {
+            events.push((when, GateEvent::Audited));
+        }
+    }
+    // What the output said about shipping — a PR number, a commit hash —
+    // for the live row (#381).
+    let detail_text = shipping_detail(out);
+    for (ship, num) in shipping(cmd) {
+        if !shipped(ship, out) {
+            continue;
+        }
+        let detail = |wanted_pr: bool| {
+            detail_text
+                .as_deref()
+                .filter(|d| d.starts_with('#') == wanted_pr)
+                .map(|d| format!(" {d}"))
+                .unwrap_or_default()
+        };
+        let text = match ship {
+            Ship::Commit => {
+                code.commits += 1;
+                format!("commit{}", detail(false))
+            }
+            Ship::Push => {
+                code.pushes += 1;
+                "pushed".to_string()
+            }
+            Ship::PrOpened => {
+                code.prs_opened += 1;
+                code.gate_events
+                    .entry(sid.to_string())
+                    .or_default()
+                    .push((when, GateEvent::OpenedPr));
+                format!("PR{} opened", detail(true))
+            }
+            Ship::PrMerged => {
+                code.prs_merged += 1;
+                format!("PR{} merged", num.as_deref().map(|n| format!(" {n}")).unwrap_or_default())
+            }
+        };
+        // Newest-first: the first shipping event met is the session's
+        // latest.
+        let l = code.live.entry(sid.to_string()).or_default();
+        if l.shipped.is_none() {
+            l.shipped = Some(text);
+            l.shipped_at = Some(when);
+        }
+    }
+}
+
 /// Hang one command's outcome on the branch and the agent that ran it
 /// (#350). Both are the point: a branch cannot be ranked without an
 /// outcome, and an agent compared on volume alone is not compared.
@@ -2022,6 +2371,14 @@ pub async fn stats_for_range_capped(
         msgs.retain(|m| m.emitted_at.unwrap_or(m.valid_from) > s);
     }
 
+    // Every working directory the range was written in, resolved to its
+    // repository and checkout once (#411).
+    let range_cwds: HashSet<String> = msgs
+        .iter()
+        .filter_map(|m| m.raw.as_ref().and_then(|r| get_str(r, "cwd")).map(str::to_string))
+        .collect();
+    let checkouts = crate::checkout::Checkouts::resolve(range_cwds.iter()).await;
+
     // Churn has two very different causes (operator insight, #337):
     // the agent rewriting its own work, or the design moving under it.
     // A rewrite that FOLLOWS a human turn is directed; one with nobody
@@ -2072,6 +2429,14 @@ pub async fn stats_for_range_capped(
     // Commit calls whose output is still to come — it carries the
     // shortstat (#381).
     let mut commit_calls: HashSet<String> = HashSet::new();
+    // tool_use_id → what the call changed, read off its result (#410).
+    let mut pending_diffs: HashMap<String, RecordedDiff> = HashMap::new();
+    // Calls that were refused and never ran (#412).
+    let mut denied_calls: HashSet<String> = HashSet::new();
+    // Shell calls met before their output: (session, when, command), to be
+    // judged once the output arrives (#412).
+    let mut pending_shell: HashMap<String, (String, chrono::DateTime<chrono::Utc>, String)> =
+        HashMap::new();
     // Replies already met (#409). A reply's usage rides every line Claude
     // Code writes for it, and a Gemini record is re-emitted, fuller each
     // time, as it streams. The walk is newest-first, so the first row met
@@ -2314,7 +2679,14 @@ pub async fn stats_for_range_capped(
         } else {
             when.format("%Y-%m-%dT%H").to_string()
         };
-        let repo_key = get_str(raw, "cwd").map(|c| c.rsplit('/').next().unwrap_or(c).to_string());
+        // The repository this row was written in, and the branch that
+        // checkout was on at the time — both read from git (#411). The
+        // last segment of `cwd` named a subdirectory as often as a
+        // repository, and `gitBranch` is the branch of the directory the
+        // session was LAUNCHED in, whatever checkout it worked in since.
+        let cwd = get_str(raw, "cwd");
+        let repo_key = cwd.and_then(|c| checkouts.of(c)).map(|c| c.repo.clone());
+        let branch_key = cwd.and_then(|c| checkouts.branch_at(c, when));
         // Being stopped or refused belongs to whatever the session was
         // running, not to the message that carries the flag — that one
         // names no model (#391). It is held for the next older reply
@@ -2342,11 +2714,11 @@ pub async fn stats_for_range_capped(
         }
         // Which repo the agent was standing in (#308, #325), and which
         // branch of it (#350).
-        if let Some(b) = get_str(raw, "gitBranch").filter(|b| !b.is_empty()) {
+        if let Some(b) = &branch_key {
             code.session_branches
                 .entry(superx_ops::record_uuid(&m.session))
                 .or_default()
-                .insert(b.to_string());
+                .insert(b.clone());
         }
         if let Some(rk) = &repo_key {
             code.intensity.entry(hour_key.clone()).or_default().repos.insert(rk.clone());
@@ -2355,11 +2727,9 @@ pub async fn stats_for_range_capped(
                 .or_default()
                 .insert(rk.clone());
         }
-        if let Some(c) = get_str(raw, "cwd") {
+        if let Some(c) = cwd {
             code.cwds.insert(c.to_string());
         }
-        let branch_key =
-            get_str(raw, "gitBranch").filter(|b| !b.is_empty()).map(str::to_string);
         // The (repo, branch) pair, present only when both are known —
         // a write with no branch belongs to no branch row rather than
         // to a guessed one.
@@ -2372,7 +2742,7 @@ pub async fn stats_for_range_capped(
             let l = code.live.entry(sid.clone()).or_default();
             if l.repo.is_none() {
                 l.repo = Some(rk.clone());
-                l.branch = get_str(raw, "gitBranch").filter(|b| !b.is_empty()).map(str::to_string);
+                l.branch = branch_key.clone();
             }
             // The span's repo was declared and never filled, so the
             // sortie log read a dash on every row (#367). Newest-first:
@@ -2412,8 +2782,8 @@ pub async fn stats_for_range_capped(
             if r.last_active.is_none_or(|prev| when > prev) {
                 r.last_active = Some(when);
             }
-            if let Some(b) = get_str(raw, "gitBranch").filter(|b| !b.is_empty()) {
-                r.branch.get_or_insert_with(|| b.to_string());
+            if let Some(b) = &branch_key {
+                r.branch.get_or_insert_with(|| b.clone());
             }
             // The branch dimension (#350). `repos` keeps the newest
             // branch as a LABEL; this keys on it, so two branches in
@@ -2432,14 +2802,15 @@ pub async fn stats_for_range_capped(
                 }
             }
         }
-        if let Some(cwd) = get_str(raw, "cwd") {
-            let project = cwd.rsplit('/').next().unwrap_or(cwd).to_string();
-            if let Some(branch) = get_str(raw, "gitBranch").filter(|b| !b.is_empty()) {
+        // Projects are repositories (#411): a directory outside any is
+        // not one, and a subdirectory is its repository.
+        if let Some(project) = &repo_key {
+            if let Some(branch) = &branch_key {
                 code.project_branch
                     .entry(project.clone())
-                    .or_insert_with(|| branch.to_string());
+                    .or_insert_with(|| branch.clone());
             }
-            *code.projects.entry(project).or_insert(0) += 1;
+            *code.projects.entry(project.clone()).or_insert(0) += 1;
         }
         // Compaction is dead time (#340): the agent stops, re-reads
         // its own history and resumes with less of it. The transcript
@@ -2538,6 +2909,11 @@ pub async fn stats_for_range_capped(
         // Claude-style blocks: raw.message.content[].
         if let Some(Value::Object(msg)) = raw.get("message") {
             if let Some(Value::Array(blocks)) = msg.get("content") {
+                let results_in_row = blocks
+                    .iter()
+                    .filter_map(obj)
+                    .filter(|b| get_str(b, "type") == Some("tool_result"))
+                    .count();
                 for b in blocks.iter() {
                     let Some(block) = obj(b) else { continue };
                     match get_str(block, "type") {
@@ -2551,6 +2927,9 @@ pub async fn stats_for_range_capped(
                                     .or_default();
                                 if l.last_tool.is_none() {
                                     l.last_tool = Some(name.clone());
+                                }
+                                if l.doing_reply.is_none() {
+                                    l.doing_reply = Some(reply.clone().unwrap_or_default());
                                 }
                             }
                             let entry = outcomes.entry(name.clone()).or_default();
@@ -2612,24 +2991,29 @@ pub async fn stats_for_range_capped(
                             // Now the tool is known: score its output
                             // if — and only if — it was a shell call.
                             let cmd_opt = block.get("input").and_then(obj).and_then(|i| get_str(i, "command"));
-                            // What the output said about shipping — a PR
-                            // number, a commit hash — for the live row (#381).
-                            let mut result_detail: Option<String> = None;
+                            // What the shell printed, kept for the gates and
+                            // the shipping events, which count only what the
+                            // output says happened (#412).
+                            let mut shell_text: Option<String> = None;
+                            // A refused call never ran: it wrote nothing,
+                            // shipped nothing and verified nothing (#412).
+                            let refused = get_str(block, "id").is_some_and(|id| denied_calls.contains(id));
                             if let Some(id) = get_str(block, "id") {
                                 match pending_output.remove(id) {
                                     Some(text) if SHELL_TOOLS.contains(&name.as_str()) => {
+                                        shell_text = Some(text.clone());
                                         let d = score_output(&text, &mut code, &hour_key);
                                         attribute_quality(
                                             &mut code, &branch_pair, &agent_name, &effort, &me_key,
                                             d,
                                         );
                                         if cmd_opt.is_some_and(commits) {
-                                            if let Some((ins, del)) = shortstat(&text) {
+                                            if let Some((ins, del)) = commit_shortstat(&text) {
                                                 code.committed_added += ins;
                                                 code.committed_removed += del;
+                                                code.commits_with_stat += 1;
                                             }
                                         }
-                                        result_detail = shipping_detail(&text);
                                     }
                                     // Output already seen but the tool
                                     // was not a shell: drop it.
@@ -2668,6 +3052,7 @@ pub async fn stats_for_range_capped(
                                                 code.live
                                                     .entry(superx_ops::record_uuid(&m.session))
                                                     .or_default(),
+                                                reply.as_deref(),
                                                 "verifying",
                                             );
                                         }
@@ -2689,6 +3074,25 @@ pub async fn stats_for_range_capped(
                             if matches!(name.as_str(), "Task" | "Skill" | "Agent") {
                                 code.subagent += 1;
                             }
+                            // A credential the agent RAN or WROTE left the
+                            // machine as surely as one it read (#413): one went
+                            // by in a shell command, and only tool output was
+                            // ever scanned.
+                            if let Some(input) = block.get("input").and_then(obj) {
+                                if ["command", "content", "new_string"]
+                                    .iter()
+                                    .any(|f| get_str(input, f).is_some_and(looks_like_secret))
+                                {
+                                    code.secret_hits += 1;
+                                    code.secret_paths.insert(match touched_path(input) {
+                                        Some(p) => p.to_string(),
+                                        None => format!(
+                                            "{name} input in {}",
+                                            repo_key.as_deref().or(cwd).unwrap_or("an unknown directory")
+                                        ),
+                                    });
+                                }
+                            }
                             if READ_TOOLS.contains(&name.as_str()) {
                                 code.reads += 1;
                             }
@@ -2706,7 +3110,7 @@ pub async fn stats_for_range_capped(
                                                 .live
                                                 .entry(superx_ops::record_uuid(&m.session))
                                                 .or_default();
-                                            claim_doing(l, "reading");
+                                            claim_doing(l, reply.as_deref(), "reading");
                                             if l.files_now.len() < LIVE_FILES
                                                 && !l.files_now.iter().any(|x| x == path)
                                             {
@@ -2716,10 +3120,7 @@ pub async fn stats_for_range_capped(
                                         if let Some(rk) = &repo_key {
                                             code.repos_exposed.insert(rk.clone());
                                         }
-                                        if get_str(raw, "cwd")
-                                            .is_some_and(|c| !path.starts_with(c))
-                                            && !agent_scratch(path)
-                                        {
+                                        if reads_outside(path, cwd, &checkouts) {
                                             code.outside_reads += 1;
                                         }
                                     }
@@ -2732,16 +3133,37 @@ pub async fn stats_for_range_capped(
                                     }
                                 }
                             }
-                            if WRITE_TOOLS.contains(&name.as_str()) {
-                                code.writes += 1;
-                            }
                             if let Some(Value::Object(input)) = block.get("input") {
-                                let n = block_lines(&name, input);
-                                let replaced = replaced_lines(&name, input);
+                                // What the call CHANGED (#410): the diff Claude
+                                // Code recorded on its result, when the result is
+                                // in the walk. An Edit's strings carry the unchanged
+                                // lines around the change — removed read 2.14x the
+                                // real figure — and a Write over a file carries all
+                                // of it. A refused or failed call changed nothing.
+                                let recorded =
+                                    get_str(block, "id").and_then(|id| pending_diffs.remove(id));
+                                let applied = recorded.as_ref().is_none_or(|d| !d.failed);
+                                // Only a change to the work counts as file work
+                                // (#412): a read is not a write, and the agent's
+                                // scratchpad is not the product.
+                                let work = WRITE_TOOLS.contains(&name.as_str())
+                                    && applied
+                                    && touched_path(input).is_some_and(|p| is_work_path(p, &checkouts));
+                                let (n, replaced) = match (&recorded, work) {
+                                    (_, false) => (0, 0),
+                                    (Some(d), true) => (d.added, d.removed),
+                                    (None, true) => (block_lines(&name, input), replaced_lines(&name, input)),
+                                };
                                 // A notebook cell replaced or deleted had a
                                 // prior text the call never carried — a write
                                 // of unknown replaced size (#346, #383).
-                                if name == "NotebookEdit" && get_str(input, "edit_mode") != Some("insert") {
+                                let notebook_rewrite = work
+                                    && name == "NotebookEdit"
+                                    && get_str(input, "edit_mode") != Some("insert");
+                                if work {
+                                    code.writes += 1;
+                                }
+                                if notebook_rewrite {
                                     code.replaced_unknown += 1;
                                     code.live
                                         .entry(superx_ops::record_uuid(&m.session))
@@ -2775,9 +3197,7 @@ pub async fn stats_for_range_capped(
                                 // (#388). A whole new file is not a rewrite —
                                 // counting it as one made a branch that only
                                 // created files read as 100% self-inflicted.
-                                let rewrote = replaced > 0
-                                    || (name == "NotebookEdit"
-                                        && get_str(input, "edit_mode") != Some("insert"));
+                                let rewrote = replaced > 0 || notebook_rewrite;
                                 if replaced > 0 {
                                     if steered {
                                         code.churn_directed += replaced;
@@ -2827,7 +3247,7 @@ pub async fn stats_for_range_capped(
                                             b.edits_self += 1;
                                         }
                                     }
-                                    if let Some(pth) = touched_path(input) {
+                                    if let Some(pth) = touched_path(input).filter(|_| work) {
                                         b.files.insert(pth.to_string());
                                         // Only a real write OWNS a path.
                                         // Unguarded, every Read mapped
@@ -2858,7 +3278,7 @@ pub async fn stats_for_range_capped(
                                             r.edits_self += 1;
                                         }
                                     }
-                                    if let Some(pth) = touched_path(input) {
+                                    if let Some(pth) = touched_path(input).filter(|_| work) {
                                         r.files.insert(pth.to_string());
                                     }
                                 }
@@ -2887,7 +3307,7 @@ pub async fn stats_for_range_capped(
                                             .or_default();
                                         cell.added += n;
                                         cell.removed += replaced;
-                                        if let Some(pth) = touched_path(input) {
+                                        if let Some(pth) = touched_path(input).filter(|_| work) {
                                             cell.files.insert(pth.to_string());
                                         }
                                     }
@@ -2897,9 +3317,14 @@ pub async fn stats_for_range_capped(
                                 // walk is newest-first, so the last
                                 // value written wins — and that is the
                                 // oldest event for the path (#340).
-                                if let Some(pth) = touched_path(input) {
-                                    let creates = name == "Write"
-                                        && get_str(input, "old_string").is_none();
+                                if let Some(pth) = touched_path(input).filter(|_| work) {
+                                    // Created, as the result says it was — every
+                                    // Write used to count as a new file, and one in
+                                    // four overwrote one that was there (#410).
+                                    let creates = recorded
+                                        .as_ref()
+                                        .and_then(|d| d.created)
+                                        .unwrap_or(name == "Write");
                                     code.path_origin.insert(pth.to_string(), creates);
                                     if let Some(rk) = &repo_key {
                                         code.path_repo.insert(pth.to_string(), rk.clone());
@@ -2910,7 +3335,7 @@ pub async fn stats_for_range_capped(
                                         .entry(superx_ops::record_uuid(&m.session))
                                         .or_default()
                                         .push((when, GateEvent::Wrote));
-                                    if let Some(pth) = touched_path(input) {
+                                    if let Some(pth) = touched_path(input).filter(|_| work) {
                                         note_bright_line(&mut code, pth);
                                     }
                                 }
@@ -2949,7 +3374,7 @@ pub async fn stats_for_range_capped(
                                     // Which files, and how often each —
                                     // a path written three times is
                                     // rework of rework (#350).
-                                    if let Some(pth) = touched_path(input) {
+                                    if let Some(pth) = touched_path(input).filter(|_| work) {
                                         *l.path_hits.entry(pth.to_string()).or_insert(0) += 1;
                                         if l.files_now.len() < LIVE_FILES
                                             && !l.files_now.iter().any(|f| f == pth)
@@ -2957,14 +3382,14 @@ pub async fn stats_for_range_capped(
                                             l.files_now.push(pth.to_string());
                                         }
                                     }
-                                    claim_doing(l, "writing");
+                                    claim_doing(l, reply.as_deref(), "writing");
                                 }
                                 if let Some(known) = &model_opt {
                                     let mm = code.models.entry(known.clone()).or_default();
                                     mm.lines_added += n;
                                     mm.lines_removed += replaced;
                                 }
-                                if let Some(path) = touched_path(input) {
+                                if let Some(path) = touched_path(input).filter(|_| work) {
                                     let seen = code.removed_text.entry(path.to_string()).or_default();
                                     // How long did this text live?
                                     // `removed_at` holds when a LATER
@@ -3041,9 +3466,7 @@ pub async fn stats_for_range_capped(
                                 code.lines_removed += replaced;
 
                                 // The file this call touched.
-                                if let Some(path) = touched_path(input)
-                                    .or_else(|| get_str(input, "path"))
-                                {
+                                if let Some(path) = touched_path(input).filter(|_| work) {
                                     // Which of your instructions was this
                                     // answering, and was it the only thing
                                     // being answered (#406)?
@@ -3074,8 +3497,9 @@ pub async fn stats_for_range_capped(
                                         *code.dirs.entry(dir).or_insert(0) += 1;
                                     }
                                 }
-                                // The shell command it ran.
-                                if let Some(cmd) = get_str(input, "command") {
+                                // The shell command it ran — unless it was
+                                // refused, in which case it ran nothing.
+                                if let Some(cmd) = get_str(input, "command").filter(|_| !refused) {
                                     if SHELL_TOOLS.contains(&name.as_str()) {
                                         // A call that only looks is the
                                         // agent reading (#367): the same
@@ -3083,7 +3507,12 @@ pub async fn stats_for_range_capped(
                                         // A write anywhere in the chain makes
                                         // the call a write — `cat a > b` copies;
                                         // only a chain that ONLY looks is reading.
-                                        if let Some(w) = shell_write(cmd, get_str(raw, "cwd")) {
+                                        // A write only to the agent's scratch is
+                                        // neither a write to the work nor a read
+                                        // of it (#412).
+                                        let shell = shell_write(cmd, cwd);
+                                        let wrote_any = shell.is_some();
+                                        if let Some(w) = shell.and_then(|w| w.into_work(&checkouts)) {
                                             // The agent WROTE through the shell
                                             // (#374): the same act as `Edit`, so
                                             // the same instruments move — the
@@ -3194,7 +3623,7 @@ pub async fn stats_for_range_capped(
                                                     l.edits_self += 1;
                                                 }
                                             }
-                                            claim_doing(l, "writing");
+                                            claim_doing(l, reply.as_deref(), "writing");
                                             for path in &w.paths {
                                                 *l.path_hits.entry(path.clone()).or_insert(0) += 1;
                                                 if l.files_now.len() < LIVE_FILES
@@ -3240,15 +3669,14 @@ pub async fn stats_for_range_capped(
                                                     code.repos.entry(rk.clone()).or_default().files.insert(path.clone());
                                                 }
                                             }
-                                                                                } else if shell_inspects(cmd) {
+                                        } else if !wrote_any && shell_inspects(cmd) {
                                             code.reads += 1;
-                                            let cwd = get_str(raw, "cwd");
                                             let paths = inspected_paths(cmd, cwd);
                                             let l = code
                                                 .live
                                                 .entry(superx_ops::record_uuid(&m.session))
                                                 .or_default();
-                                            claim_doing(l, "reading");
+                                            claim_doing(l, reply.as_deref(), "reading");
                                             for path in &paths {
                                                 if l.files_now.len() < LIVE_FILES
                                                     && !l.files_now.iter().any(|x| x == path)
@@ -3260,9 +3688,7 @@ pub async fn stats_for_range_capped(
                                                 if let Some(rk) = &repo_key {
                                                     code.repos_exposed.insert(rk.clone());
                                                 }
-                                                if cwd.is_some_and(|c| !path.starts_with(c))
-                                                    && !agent_scratch(&path)
-                                                {
+                                                if reads_outside(&path, cwd, &checkouts) {
                                                     code.outside_reads += 1;
                                                 }
                                                 code.files_read.insert(path);
@@ -3281,69 +3707,19 @@ pub async fn stats_for_range_capped(
                                     {
                                         code.branches_opened += 1;
                                     }
-                                    // What the gates saw, and when (#392).
-                                    // The question is an ORDER — did the
-                                    // checks run after the last change and
-                                    // before the pull request — so the
-                                    // events are collected here and judged
-                                    // once the walk has finished.
-                                    {
+                                    // What the gates saw, and what the call
+                                    // SHIPPED (#392, #381) — judged against what
+                                    // it printed, which is usually already in
+                                    // hand: the walk meets the output first. When
+                                    // it is not, the judgement waits for it.
+                                    if SHELL_TOOLS.contains(&name.as_str()) {
                                         let sid = superx_ops::record_uuid(&m.session);
-                                        let mut note = |e: GateEvent| {
-                                            code.gate_events.entry(sid.clone()).or_default().push((when, e));
-                                        };
-                                        for label in command_labels(cmd) {
-                                            match label.as_str() {
-                                                "cargo test" => note(GateEvent::Tested),
-                                                "cargo clippy" => note(GateEvent::Linted),
-                                                _ => {}
+                                        match (&shell_text, get_str(block, "id")) {
+                                            (Some(out), _) => judge_shell(&mut code, &sid, when, cmd, out),
+                                            (None, Some(id)) => {
+                                                pending_shell.insert(id.to_string(), (sid, when, cmd.to_string()));
                                             }
-                                        }
-                                        if cmd.contains("skill_audit") {
-                                            note(GateEvent::Audited);
-                                        }
-                                    }
-                                    // What the call SHIPPED (#381): the
-                                    // outcomes beside all this effort.
-                                    for (ship, num) in shipping(cmd) {
-                                        let detail = |wanted_pr: bool| {
-                                            result_detail
-                                                .as_deref()
-                                                .filter(|d| d.starts_with('#') == wanted_pr)
-                                                .map(|d| format!(" {d}"))
-                                                .unwrap_or_default()
-                                        };
-                                        let text = match ship {
-                                            Ship::Commit => {
-                                                code.commits += 1;
-                                                format!("commit{}", detail(false))
-                                            }
-                                            Ship::Push => {
-                                                code.pushes += 1;
-                                                "pushed".to_string()
-                                            }
-                                            Ship::PrOpened => {
-                                                code.prs_opened += 1;
-                                                code.gate_events
-                                                    .entry(superx_ops::record_uuid(&m.session))
-                                                    .or_default()
-                                                    .push((when, GateEvent::OpenedPr));
-                                                format!("PR{} opened", detail(true))
-                                            }
-                                            Ship::PrMerged => {
-                                                code.prs_merged += 1;
-                                                format!(
-                                                    "PR{} merged",
-                                                    num.as_deref().map(|n| format!(" {n}")).unwrap_or_default()
-                                                )
-                                            }
-                                        };
-                                        // Newest-first: the first shipping
-                                        // event met is the session's latest.
-                                        let l = code.live.entry(superx_ops::record_uuid(&m.session)).or_default();
-                                        if l.shipped.is_none() {
-                                            l.shipped = Some(text);
-                                            l.shipped_at = Some(when);
+                                            (None, None) => {}
                                         }
                                     }
                                     // Every stage of the chain counts —
@@ -3374,6 +3750,23 @@ pub async fn stats_for_range_capped(
                         Some("tool_result") => {
                             let Some(id) = get_str(block, "tool_use_id") else { continue };
                             let failed = matches!(block.get("is_error"), Some(Value::Bool(true)));
+                            // A refused call never ran (#412): Claude Code
+                            // stamps every refusal — the operator's, the
+                            // auto-mode classifier's, a permission rule's —
+                            // with `toolDenialKind` on the result line.
+                            let denied = get_str(raw, "toolDenialKind").is_some();
+                            if denied {
+                                denied_calls.insert(id.to_string());
+                            }
+                            // What the call changed, as Claude Code recorded
+                            // it (#410). `toolUseResult` describes the line's
+                            // result, so it is read only when the line holds
+                            // one.
+                            if results_in_row == 1 {
+                                if let Some(d) = recorded_diff(raw, failed || denied) {
+                                    pending_diffs.insert(id.to_string(), d);
+                                }
+                            }
                             // What the command PRINTED is where quality
                             // lives (#327) — but only a SHELL call's
                             // output is a report. The walk is
@@ -3381,7 +3774,8 @@ pub async fn stats_for_range_capped(
                             // this text is not known yet: stash it and
                             // score when the call resolves (review of
                             // #330).
-                            if let Some(text) = get_str(block, "content") {
+                            if let Some(text) = tool_result_text(block) {
+                                let text = text.as_str();
                                 // Everything a tool returns is carried
                                 // into the next prompt verbatim (#337).
                                 code.content_bytes += text.len() as i64;
@@ -3404,10 +3798,16 @@ pub async fn stats_for_range_capped(
                                 } else {
                                     pending_output.insert(id.to_string(), text.to_string());
                                 }
+                                if let Some((sid, at, cmd)) = pending_shell.remove(id) {
+                                    if !denied {
+                                        judge_shell(&mut code, &sid, at, &cmd, text);
+                                    }
+                                }
                                 if commit_calls.remove(id) {
-                                    if let Some((ins, del)) = shortstat(text) {
+                                    if let Some((ins, del)) = commit_shortstat(text) {
                                         code.committed_added += ins;
                                         code.committed_removed += del;
+                                        code.commits_with_stat += 1;
                                     }
                                 }
                             }
@@ -3663,7 +4063,9 @@ pub async fn stats_for_range_capped(
             turn_gaps.push((w[1] - w[0]).num_minutes().max(0));
         }
     }
-    let autonomy_p50_mins = median(&mut turn_gaps);
+    // -1 for NO data, so 0 can mean what it says (#413): a median under a
+    // minute used to render as "no session had two turns".
+    let autonomy_p50_mins = if turn_gaps.is_empty() { -1 } else { median(&mut turn_gaps) };
 
     // A file whose oldest event in the window was a full Write was
     // created here; anything else already existed.
@@ -3719,9 +4121,15 @@ pub async fn stats_for_range_capped(
         })
         .collect();
     compaction_sessions.sort_by_key(|c| std::cmp::Reverse(c.total_ms));
-    let compaction_total_ms: i64 = compaction_sessions.iter().map(|c| c.total_ms).sum();
-    let edit_to_verify_p50_secs = median(&mut verify_gaps);
-    let survival_p50_mins = median(&mut code.survivals);
+    // Unknown, not zero, when compactions happened and none was timed
+    // (#413): the timing is on system lines capture does not keep (#373).
+    let compaction_total_ms: Option<i64> = if compaction_sessions.is_empty() && code.compactions > 0 {
+        None
+    } else {
+        Some(compaction_sessions.iter().map(|c| c.total_ms).sum())
+    };
+    let edit_to_verify_p50_secs = if verify_gaps.is_empty() { -1 } else { median(&mut verify_gaps) };
+    let survival_p50_mins = if code.survivals.is_empty() { -1 } else { median(&mut code.survivals) };
 
     // Per-agent productivity, most productive first (#337).
     let mut agent_stats: Vec<_> = code
@@ -3739,7 +4147,7 @@ pub async fn stats_for_range_capped(
             reverts: a.reverts,
             repos: a.repos.len() as i64,
             repo_switches: a.repo_switches,
-            edit_to_verify_p50_secs: median(&mut a.verify_gaps),
+            edit_to_verify_p50_secs: if a.verify_gaps.is_empty() { -1 } else { median(&mut a.verify_gaps) },
             compactions: a.compactions,
             compaction_ms: a.compaction_ms,
             churn_directed: a.churn_directed,
@@ -3768,8 +4176,11 @@ pub async fn stats_for_range_capped(
     };
     // What the repositories say landed in this range (#386). The window
     // has no cutoff of its own: its range is the oldest message it holds.
-    let landed_since = if range == "window" {
-        msgs.last().map(|m| m.emitted_at.unwrap_or(m.valid_from))
+    // A capped range is a sample of its period: git is asked about the
+    // period the sample covers, not the whole range — at `all`, every
+    // repository's entire history against the newest 20,000 rows (#413).
+    let landed_since = if range == "window" || truncated {
+        code.instants.iter().min().copied()
     } else {
         since
     };
@@ -3825,6 +4236,8 @@ pub async fn stats_for_range_capped(
         messages_last_hour,
         tokens_last_hour,
         active_hours_24h,
+        active_hours: active_hours_list,
+        active_hours_range: code.active_hours.len() as i64,
         tests_run: code.tests,
         builds_run: code.builds,
         git_ops: code.git,
@@ -3834,6 +4247,7 @@ pub async fn stats_for_range_capped(
         prs_merged: code.prs_merged,
         committed_added: code.committed_added,
         committed_removed: code.committed_removed,
+        commits_with_stat: code.commits_with_stat,
         mcp_calls: code.mcp,
         web_calls: code.web,
         subagent_calls: code.subagent,
@@ -3937,9 +4351,10 @@ pub async fn stats_for_range_capped(
                 .repos
                 .iter()
                 .map(|(name, r)| RepoStat {
-                    survival_p50_mins: median(
-                        &mut code.repo_survivals.get(name).cloned().unwrap_or_default(),
-                    ),
+                    survival_p50_mins: match code.repo_survivals.get(name) {
+                        Some(v) if !v.is_empty() => median(&mut v.clone()),
+                        _ => -1,
+                    },
                     files_created: repo_created.get(name).copied().unwrap_or(0),
                     name: name.clone(),
                     branch: r.branch.clone(),
@@ -4252,8 +4667,10 @@ pub async fn stats_for_range_capped(
                     })
                 })
                 .collect();
+            // Every live session, not the busiest eight: the Waiting,
+            // Circling and Context lamps read this list, and a ninth live
+            // session lit none of them (#413). The panel shows the top rows.
             v.sort_by(|a, b| b.messages.cmp(&a.messages).then(a.identity.cmp(&b.identity)));
-            v.truncate(8);
             v
         },
         longest_quiet_mins: {

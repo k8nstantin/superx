@@ -443,6 +443,36 @@ pub async fn session_model_effort(
     Ok((pick(model), pick(effort)))
 }
 
+/// When a session last did anything, on the AGENT'S clock (#413): the
+/// newest captured row's own timestamp. The capture time said a session
+/// last worked at the moment a backfill read it — a Gemini chat from May
+/// read as active in August.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn session_last_emitted(
+    kernel: &Kernel,
+    session: RecordId,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let rows: Vec<Value> = kernel
+        .db()
+        .query(
+            "SELECT (emitted_at ?? valid_from) AS at, valid_from FROM message \
+             WHERE session = $sess ORDER BY valid_from DESC LIMIT 1",
+        )
+        .bind(("sess", session))
+        .await?
+        .take(0)?;
+    Ok(rows.first().and_then(|row| match row {
+        Value::Object(o) => match o.get("at") {
+            Some(Value::Datetime(d)) => Some(**d),
+            _ => None,
+        },
+        _ => None,
+    }))
+}
+
 pub async fn session_token_stats(
     kernel: &Kernel,
     session: RecordId,

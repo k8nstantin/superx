@@ -35,9 +35,6 @@ const COMMAND_WHITELIST: &[&str] = &["agents", "sessions", "actions", "read", "m
 /// SSE poller page size per tick.
 const SSE_BATCH: u32 = 200; // skill-allow: §9-const — poll page bound
 
-/// Charts aggregation source window.
-const CHART_EVENT_WINDOW: u32 = 2000; // skill-allow: §9-const — aggregation page bound
-
 #[derive(Clone)]
 struct AppState {
     kernel: Kernel,
@@ -107,8 +104,6 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/stats", get(api_stats))
         .route("/api/insights", get(api_insights))
         .route("/api/compare", get(api_compare))
-        .route("/api/actions", get(api_actions))
-        .route("/api/charts/summary", get(api_charts))
         .route("/api/events", get(api_events))
         .route("/api/command", post(api_command))
         .fallback(get(static_assets))
@@ -143,7 +138,12 @@ async fn sse_poller(
     tx: broadcast::Sender<String>,
     stop: superx_kernel::supervise::CancelToken,
 ) {
-    let mut after = chrono::Utc::now();
+    // One cursor per stream (#413). Both reads are capped at a batch, and
+    // a shared cursor advanced to the newer of the two ends skipped every
+    // row the other stream had not reached yet — in a burst, whole runs of
+    // the feed never arrived.
+    let mut after_events = chrono::Utc::now();
+    let mut after_messages = after_events;
     loop {
         let poll = superx_ops::live_poll_secs(&kernel).await;
         tokio::time::sleep(Duration::from_secs(poll)).await;
@@ -154,14 +154,15 @@ async fn sse_poller(
             return;
         }
         if tx.receiver_count() == 0 {
-            after = chrono::Utc::now(); // nobody watching — skip ahead
+            // Nobody watching — skip ahead.
+            after_events = chrono::Utc::now();
+            after_messages = after_events;
             continue;
         }
-        let mut high = after;
-        if let Ok(actions) = kernel.telemetry_since(after, SSE_BATCH).await {
+        if let Ok(actions) = kernel.telemetry_since(after_events, SSE_BATCH).await {
             for a in &actions {
-                if a.valid_from > high {
-                    high = a.valid_from;
+                if a.valid_from > after_events {
+                    after_events = a.valid_from;
                 }
                 let ev = crate::activity::action_event(a);
                 if let Ok(json) = serde_json::to_string(&ev) {
@@ -169,10 +170,10 @@ async fn sse_poller(
                 }
             }
         }
-        if let Ok(messages) = kernel.messages_since(after, SSE_BATCH).await {
+        if let Ok(messages) = kernel.messages_since(after_messages, SSE_BATCH).await {
             for m in &messages {
-                if m.valid_from > high {
-                    high = m.valid_from;
+                if m.valid_from > after_messages {
+                    after_messages = m.valid_from;
                 }
                 let ev = crate::activity::message_event(m);
                 if let Ok(json) = serde_json::to_string(&ev) {
@@ -180,7 +181,6 @@ async fn sse_poller(
                 }
             }
         }
-        after = high;
     }
 }
 
@@ -407,8 +407,7 @@ async fn api_sessions(
             + crate::activity::session_action_count(kernel, s.entity_id.clone(), scope)
                 .await
                 .unwrap_or(0);
-        let last_active = kernel
-            .session_last_activity(s.entity_id.clone())
+        let last_active = crate::activity::session_last_emitted(kernel, s.entity_id.clone())
             .await
             .ok()
             .flatten()
@@ -612,117 +611,6 @@ async fn api_activity(
         Ok(events) => Response::ok(events),
         Err(e) => Response::err(e.to_string()),
     }
-}
-
-#[derive(serde::Deserialize)]
-struct ActionsQuery {
-    limit: Option<u32>,
-}
-
-async fn api_actions(
-    State(state): State<AppState>,
-    Query(q): Query<ActionsQuery>,
-) -> Json<Vec<ActionView>> {
-    let kernel = &state.kernel;
-    let limit = q.limit.unwrap_or(50).min(SSE_BATCH); // skill-allow: §9-or — render page default, query-param overridable
-    let mut events = kernel.recent_telemetry(limit).await.unwrap_or_default();
-    events.reverse();
-    Json(
-        events
-            .iter()
-            .map(|e| ActionView {
-                event: e.lifecycle_event.clone(),
-                summary: superx_ops::render_event(e).trim_end().to_string(),
-                agent_id: e.agent.as_ref().map(superx_ops::record_uuid),
-                valid_from: e.valid_from.to_rfc3339(),
-            })
-            .collect(),
-    )
-}
-
-async fn api_charts(State(state): State<AppState>) -> Json<ChartsSummary> {
-    let kernel = &state.kernel;
-    let events = kernel
-        .recent_telemetry(CHART_EVENT_WINDOW)
-        .await
-        .unwrap_or_default();
-
-    // Events per minute (over the fetched window).
-    let mut per_minute: std::collections::BTreeMap<String, i64> = Default::default();
-    let mut per_agent_id: std::collections::BTreeMap<String, i64> = Default::default();
-    let mut boots = Vec::new();
-    for e in &events {
-        let minute = e.valid_from.format("%H:%M").to_string();
-        *per_minute.entry(minute).or_insert(0) += 1;
-        if let Some(agent) = &e.agent {
-            *per_agent_id.entry(superx_ops::record_uuid(agent)).or_insert(0) += 1;
-        }
-        if e.lifecycle_event == "boot_complete" {
-            if let superx_kernel::types::Value::Object(o) = &e.payload {
-                if let Some(superx_kernel::types::Value::Number(n)) = o.get("duration_ms") {
-                    boots.push(TimeCount {
-                        t: e.valid_from.format("%m-%d %H:%M").to_string(),
-                        value: n.to_int().unwrap_or(0),
-                    });
-                }
-            }
-        }
-    }
-    // Agent ids → names.
-    let mut per_agent = Vec::new();
-    if let Ok(agents) = kernel
-        .list_named_entities("node_agent", "attr_agent_descriptor")
-        .await
-    {
-        for a in &agents {
-            let uuid = superx_ops::record_uuid(&a.entity_id);
-            if let Some(count) = per_agent_id.get(&uuid) {
-                let name = match &a.payload {
-                    superx_kernel::types::Value::Object(o) => match o.get("name") {
-                        Some(superx_kernel::types::Value::String(s)) => s.clone(),
-                        _ => uuid.clone(),
-                    },
-                    _ => uuid.clone(),
-                };
-                per_agent.push(NameCount {
-                    name,
-                    value: *count,
-                });
-            }
-        }
-    }
-    // Message roles via a grouped query (kernel read handle).
-    let mut message_roles = Vec::new();
-    if let Ok(mut resp) = kernel
-        .db()
-        .query("SELECT role, count() AS c FROM message GROUP BY role")
-        .await
-    {
-        if let Ok(rows) = resp.take::<Vec<superx_kernel::types::Value>>(0) {
-            for row in rows {
-                if let superx_kernel::types::Value::Object(o) = row {
-                    let role = match o.get("role") {
-                        Some(superx_kernel::types::Value::String(s)) => s.clone(),
-                        _ => continue,
-                    };
-                    let c = match o.get("c") {
-                        Some(superx_kernel::types::Value::Number(n)) => n.to_int().unwrap_or(0),
-                        _ => 0,
-                    };
-                    message_roles.push(NameCount { name: role, value: c });
-                }
-            }
-        }
-    }
-    Json(ChartsSummary {
-        events_per_minute: per_minute
-            .into_iter()
-            .map(|(t, value)| TimeCount { t, value })
-            .collect(),
-        per_agent,
-        message_roles,
-        boot_durations: boots,
-    })
 }
 
 async fn api_events(
