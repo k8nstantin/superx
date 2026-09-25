@@ -3398,6 +3398,183 @@ async fn a_gate_run_into_a_file_is_read_by_the_exit_it_echoed() {
     assert_eq!(s.prs_ungated, 1, "the run that echoed TEST_EXIT=101");
 }
 
+/// A shell call is judged file by file (#415 review). One call that edits
+/// the repository through a variable and logs to the scratchpad is a
+/// write; one that writes a scratch note and edits a repository file lends
+/// the note's lines and its "created" to nothing. `perl -MList::Util` and
+/// `sed -fscript.sed` edit nothing; `find -exec sed -i` and `xargs perl
+/// -pi` edit files the line never names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_call_is_judged_file_by_file() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    repo.sub("src");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "files").await;
+    let shell = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let scratch = "/private/tmp/claude-1/scratchpad";
+    for (id, cmd) in [
+        // Writes: through a variable, logging to scratch…
+        ("w1", format!("python3 - <<'EOF'\np = 'src/stats.rs'\ns = open(p).read()\nopen(p, 'w').write(s)\nEOF\ncargo check > {scratch}/chk.log 2>&1")),
+        // …a scratch note beside an in-place edit…
+        ("w2", format!("cat > {scratch}/notes.md <<'EOF'\none\ntwo\nthree\nEOF\nsed -i 's/a/b/' src/lib.rs")),
+        // …and edits handed to another program.
+        ("w3", "find src -name '*.rs' -exec sed -i 's/a/b/' {} +".to_string()),
+        ("w4", "grep -rl foo src | xargs perl -pi -e 's/foo/bar/'".to_string()),
+        // Not writes.
+        ("n1", "perl -MList::Util=sum -e 'print sum(1, 2)'".to_string()),
+        ("n2", "perl -Ilib -e 'print 1'".to_string()),
+        ("n3", "sed -fscript.sed src/lib.rs".to_string()),
+        // Neither a read nor a write: it deletes what it finds.
+        ("n4", format!("find {scratch} -name '*.log' -delete")),
+    ] {
+        log_tool_message(&kernel, &session, &agent, shell(id, &cmd)).await;
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.writes_window, 4, "the variable write, the sed beside the note, find -exec and xargs");
+    assert_eq!(s.lines_added, 0, "the note's three lines went to the scratchpad");
+    assert_eq!((s.files_created, s.files_modified), (0, 1), "src/lib.rs was edited, not created");
+    assert_eq!(s.reads_window, 1, "sed -f reads with a script; the perl one-liners are neither");
+}
+
+/// Exposure is every stage that looked (#413): a credentials file read in
+/// a chain that also asked git something went to the vendor all the
+/// same, while a stage whose output went elsewhere showed the model
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exposure_is_every_stage_that_looked() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "exposed").await;
+    let shell = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    log_tool_message(&kernel, &session, &agent,
+        shell("a", "ls ~/.netrc && grep -i bitbucket -A2 ~/.netrc; git config --get credential.helper")).await;
+    log_tool_message(&kernel, &session, &agent, shell("b", "cat /etc/hosts > /dev/null && git status")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.exposure.outside_reads, 1, "~/.netrc, once for the call; not /etc/hosts, sent to /dev/null");
+    assert_eq!(s.exposure.files_read, 1, "{:?}", s.exposure);
+    assert_eq!(s.reads_window, 1, "the second call only looked; the first also asked git");
+}
+
+/// What shipped is what each stage printed (#415 review): a commit is not
+/// undone by the clean `git status` after it; a commit or push the call
+/// may never have reached counts only if its output shows it; a commit's
+/// lines are the stat under its own header; and a hook's bracketed line
+/// is no commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_shipped_is_what_each_stage_printed() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "ship").await;
+    let now = chrono::Utc::now();
+    let call = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": repo.cwd(), "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let result = |id: &str, failed: bool, body: &str| serde_json::json!({
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "is_error": failed, "content": body}]}});
+    let mut at = now - chrono::Duration::minutes(6);
+    for (id, cmd, failed, printed) in [
+        ("c1", "git commit -q -m one && git status", false,
+         "On branch main\nnothing to commit, working tree clean\n"),
+        ("c2", "git add gone.rs && git commit -q -m two", true,
+         "Exit code 128\nfatal: pathspec 'gone.rs' did not match any files"),
+        ("c3", "git commit --allow-empty -m three && git show --stat HEAD~1", false,
+         "[main 1a2b3c4d] three\ncommit 9f8e7d6c\nAuthor: t <t@t>\n\n    two\n\n a.rs | 3 +++\n 1 file changed, 3 insertions(+)\n"),
+        ("p1", "sleep 600 && git push -q", true, "Command timed out after 2m 0.0s"),
+        ("p2", "git push -q", false, ""),
+        ("c4", "git commit -m four", false,
+         "[WARNING] Unstaged files detected.\n[main 5e6f7a8b] four\n 2 files changed, 7 insertions(+), 1 deletion(-)\n"),
+    ] {
+        log_tool_message_at(&kernel, &session, &agent, call(id, cmd), at).await;
+        log_tool_message_at(&kernel, &session, &agent, result(id, failed, printed), at + chrono::Duration::seconds(5)).await;
+        at += chrono::Duration::minutes(1);
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.commits, 3, "one, three and four; not the commit a failed add never reached");
+    assert_eq!(s.pushes, 1, "the quiet push that returned; not the one that timed out");
+    assert_eq!(s.commits_with_stat, 1, "four's own stat; three is empty, and git show's stat is not its");
+    assert_eq!((s.committed_added, s.committed_removed), (7, 1));
+    assert_eq!(s.live.len(), 1);
+    assert_eq!(s.live[0].shipped.as_deref(), Some("commit 5e6f7a8b"), "the hook's [WARNING] line is no commit");
+}
+
+/// A gate's echoed exit code is its verdict (#415 review) — another
+/// command's `error:` line does not overturn `CLIPPY=0` — unless the gate
+/// was piped, when `$?` was the pipe's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_echoed_exit_is_the_verdict_unless_the_gate_was_piped() {
+    let kernel = fresh_kernel().await;
+    let repo = TestRepo::new("superx", "main");
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let now = chrono::Utc::now();
+    let at = |mins: i64| now - chrono::Duration::minutes(mins);
+    let write = |id: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Write",
+             "input": {"file_path": repo.file("a.rs"), "content": "fn a() {}"}}]}});
+    let shell = |id: &str, cmd: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let out = |id: &str, text: &str| serde_json::json!({"cwd": repo.cwd(),
+        "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}});
+    for (tag, test_cmd, test_out) in [
+        ("ok", "cargo test --workspace > /tmp/t.log 2>&1; echo TEST_EXIT=$?", "TEST_EXIT=0"),
+        ("piped", "cargo test --workspace 2>&1 | tail -3; echo TEST_EXIT=$?",
+         "test result: FAILED. 11 passed; 1 failed; 0 ignored\nTEST_EXIT=0"),
+    ] {
+        let session = kernel.create_entity("node_session").await.expect("session");
+        log_tool_message_at(&kernel, &session, &agent, write(&format!("{tag}0")), at(50)).await;
+        for (i, (cmd, printed)) in [
+            (test_cmd, test_out),
+            ("cargo clippy --workspace -- -D warnings > /tmp/c.log 2>&1; echo CLIPPY=$?; git push --dry-run",
+             "CLIPPY=0\nerror: failed to push some refs to 'origin'"),
+            ("python3 tools/skill_audit.py", "✅ SKILL AUDIT CLEAN"),
+            ("gh pr create --base main", "https://github.com/o/superx/pull/8"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("{tag}{}", i + 1);
+            let mins = 40 - i as i64;
+            log_tool_message_at(&kernel, &session, &agent, shell(&id, cmd), at(mins)).await;
+            log_tool_message_at(&kernel, &session, &agent, out(&id, printed),
+                at(mins) + chrono::Duration::seconds(5)).await;
+        }
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.prs_opened, 2);
+    assert_eq!(s.prs_gated, 1, "CLIPPY=0 stands; the unpiped TEST_EXIT=0 stands");
+    assert_eq!(s.prs_ungated, 1, "the piped run's TEST_EXIT=0 is tail's; its tests failed");
+}
+
+/// A refused test run verified nothing (#415 review): the session is not
+/// "verifying" because the operator stopped `cargo test` before it ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_test_run_verified_nothing() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "refused").await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx", "message": {"id": "r", "model": "claude-opus-5", "content": [
+            {"type": "tool_use", "id": "t", "name": "Bash", "input": {"command": "cargo test --workspace"}}]}})).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "toolDenialKind": "user-rejected",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "t", "is_error": true,
+            "content": "The user doesn't want to proceed with this tool use."}]}})).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.live.len(), 1);
+    assert_eq!(s.live[0].doing, "working", "a refused run is a call, not a verification");
+    assert_eq!(s.tests_run, 0);
+}
+
 /// What a live session is doing is what its NEWEST tool call is doing
 /// (#413) — not the strongest thing it did anywhere in the range.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

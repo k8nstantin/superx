@@ -301,25 +301,82 @@ fn stage_inspects(label: &str, stage: &str) -> bool {
     if !INSPECT_PROGRAMS.contains(&label) {
         return false;
     }
+    if label == "find" {
+        // `find -delete` and `find -exec sed -i …` change what they find.
+        if stage.split_whitespace().any(|w| w == "-delete") {
+            return false;
+        }
+        if let Some(inner) = handed_command(label, stage) {
+            return stage_label(&inner).is_some_and(|l| stage_inspects(&l, &inner));
+        }
+    }
     !edits_in_place(label, stage)
 }
 
 /// Does this stage edit a file where it lies (#412)? Only the programs
-/// that can: `sed -i` (any short-option group carrying `i`, since GNU
-/// sed reads whatever follows it as the backup suffix), `sed
-/// --in-place`, gawk's `-i inplace`, and `perl -i`. The test used to
-/// apply to every inspect program, so `grep -i` — case-insensitive —
-/// counted as an edit: 81 of 5,014 shell calls in 30 days.
+/// that can: `sed -i` (any group of switches carrying `i`, since GNU sed
+/// reads whatever follows it as the backup suffix), `sed --in-place`,
+/// gawk's `-i inplace`, and `perl -i`. The test used to apply to every
+/// inspect program, so `grep -i` — case-insensitive — counted as an
+/// edit: 81 of 5,014 shell calls in 30 days.
 fn edits_in_place(label: &str, stage: &str) -> bool {
     let words: Vec<&str> = stage.split_whitespace().skip(1).collect();
-    let short_i = |w: &&str| w.starts_with('-') && !w.starts_with("--") && w[1..].contains('i');
     match label {
-        "sed" => words.iter().any(|w| short_i(w) || w.starts_with("--in-place")),
+        "sed" => words.iter().any(|w| switches_carry_i(w, "efl") || w.starts_with("--in-place")),
         "awk" => words.windows(2).any(|p| p[0] == "-i" && p[1] == "inplace")
             || words.contains(&"--inplace"),
-        "perl" => words.iter().any(short_i),
+        "perl" => words.iter().any(|w| switches_carry_i(w, "MmIeExdDC")),
         _ => false,
     }
+}
+
+/// Does a group of single-letter switches — `-pi.bak`, `-ni`, `-Ei` —
+/// carry `i`? Reading stops at the first switch that takes the rest of
+/// the word as its value: `-MList::Util` loads a module, `-Ilib` adds a
+/// path and `-fscript.sed` names a script, and none of them edits in
+/// place (#415 review).
+fn switches_carry_i(word: &str, takes_value: &str) -> bool {
+    let Some(switches) = word.strip_prefix('-').filter(|s| !s.starts_with('-')) else {
+        return false;
+    };
+    for c in switches.chars() {
+        if c == 'i' {
+            return true;
+        }
+        if takes_value.contains(c) {
+            return false;
+        }
+    }
+    false
+}
+
+/// The command `find -exec` or `xargs` runs on the files it is handed:
+/// `find . -name '*.rs' -exec sed -i 's/a/b/' {} +` edits files no word
+/// of the line names (#415 review).
+fn handed_command(label: &str, stage: &str) -> Option<String> {
+    let words: Vec<&str> = stage.split_whitespace().collect();
+    let start = match label {
+        "find" => words.iter().position(|w| matches!(*w, "-exec" | "-execdir" | "-ok" | "-okdir"))? + 1,
+        "xargs" => {
+            let mut i = words.iter().position(|w| w.rsplit('/').next() == Some("xargs"))? + 1;
+            while let Some(w) = words.get(i) {
+                if !w.starts_with('-') {
+                    break;
+                }
+                // xargs's own switches, and the values of those that take one.
+                i += if matches!(*w, "-n" | "-I" | "-L" | "-P" | "-s" | "-d" | "-E" | "-a") { 2 } else { 1 };
+            }
+            i
+        }
+        _ => return None,
+    };
+    let inner: Vec<&str> = words
+        .get(start..)?
+        .iter()
+        .take_while(|w| !matches!(**w, ";" | "\\;" | "';'" | "+"))
+        .copied()
+        .collect();
+    (!inner.is_empty()).then(|| inner.join(" "))
 }
 
 /// A shell call that is all inspection, once the noise is set aside.
@@ -341,7 +398,7 @@ fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
     for (raw, here) in stages_in_place(cmd, cwd) {
         let stage = strip_redirections(&raw);
         let Some(label) = stage_label(&stage) else { continue };
-        if is_noise(&label) || !stage_inspects(&label, &stage) {
+        if is_noise(&label) || !stage_inspects(&label, &stage) || output_sent_elsewhere(&raw) {
             continue;
         }
         for w in operands(&raw, &label) {
@@ -366,6 +423,18 @@ fn inspected_paths(cmd: &str, cwd: Option<&str>) -> Vec<String> {
         }
     }
     out
+}
+
+/// Does this stage send its output somewhere other than the call's
+/// output? `cat a > b` put nothing of `a` in front of the model; `>&2`
+/// only moves it to stderr, which the call's output carries too.
+fn output_sent_elsewhere(stage: &str) -> bool {
+    shell_words(stage).iter().any(|(w, quoted)| {
+        !quoted
+            && (w.starts_with('>') || w.starts_with("1>") || w.starts_with("&>"))
+            && !w.starts_with(">&")
+            && !w.starts_with("1>&")
+    })
 }
 
 /// Characters a pattern, a glob or an unexpanded word carries and the
@@ -637,17 +706,28 @@ const WRITE_VERBS: [&str; 2] = ["git apply", "patch"];
 /// went straight into a file. Everything else a shell writes is of
 /// unknown size and is reported as none, not as zero by omission.
 struct ShellWrite {
-    paths: Vec<String>,
-    added: i64,
-    /// The call wrote a file end to end — a heredoc into it — rather
-    /// than editing it in place. The created/modified split reads this
-    /// the way it reads a whole-file `Write` (#388).
-    whole_file: bool,
-    /// Each file written whole, with the shape of the text written into
-    /// it — so the same content landing in two files is visible (#406).
-    shapes: Vec<(String, u64)>,
-    /// It wrote without naming a file: `git apply`, `patch`.
+    /// Each file it changed, with what it wrote there. One call often
+    /// writes the scratchpad and the repository at once, so what it wrote
+    /// is kept per file: setting the scratch file aside must not leave its
+    /// lines, its shape or its "created" on the repository's (#412).
+    files: Vec<Written>,
+    /// It changed something it did not name: `git apply`, `patch`, a
+    /// script writing through a variable, `find -exec sed -i`.
     pathless: bool,
+}
+
+/// One file a shell call wrote.
+struct Written {
+    path: String,
+    /// The lines written into it, when the text is on the line: a heredoc.
+    lines: Option<i64>,
+    /// The shape of that text, so the same content landing in two files
+    /// is visible (#406).
+    shape: Option<u64>,
+    /// Written end to end — `cat > f <<EOF` — rather than edited in place
+    /// or appended to. The created/modified split reads it the way it
+    /// reads a whole-file `Write` (#388).
+    whole: bool,
 }
 
 impl ShellWrite {
@@ -655,10 +735,42 @@ impl ShellWrite {
     /// left to count (#412). A heredoc into the scratchpad is neither a
     /// write to the work nor a read of it.
     fn into_work(mut self, checkouts: &crate::checkout::Checkouts) -> Option<Self> {
-        self.paths.retain(|p| is_work_path(p, checkouts));
-        self.shapes.retain(|(p, _)| is_work_path(p, checkouts));
-        (self.pathless || !self.paths.is_empty()).then_some(self)
+        self.files.retain(|f| is_work_path(&f.path, checkouts));
+        (self.pathless || !self.files.is_empty()).then_some(self)
     }
+
+    /// The lines it can be seen to have written.
+    fn added(&self) -> i64 {
+        self.files.iter().filter_map(|f| f.lines).sum()
+    }
+
+    /// Did it change something where it lay, rather than only write files
+    /// whole? That is one rewrite (#388).
+    fn rewrote(&self) -> bool {
+        self.pathless || self.files.iter().any(|f| !f.whole)
+    }
+}
+
+/// Note a file the call wrote, once: a file written whole anywhere in the
+/// call was created by it, and its heredocs' lines add up.
+fn note_written(files: &mut Vec<Written>, w: Written) {
+    match files.iter_mut().find(|f| f.path == w.path) {
+        Some(f) => {
+            f.whole |= w.whole;
+            if let Some(n) = w.lines {
+                f.lines = Some(f.lines.unwrap_or(0) + n);
+            }
+            if f.shape.is_none() {
+                f.shape = w.shape;
+            }
+        }
+        None => files.push(w),
+    }
+}
+
+/// A file the call changed and of which nothing more is known.
+fn touched(path: String) -> Written {
+    Written { path, lines: None, shape: None, whole: false }
 }
 
 /// The heredocs in a command: the line that opened each, with its body.
@@ -720,15 +832,17 @@ fn written_path(w: &str, cwd: Option<&str>) -> Option<String> {
     Some(normalize(&path))
 }
 
-/// The files a stage's `>` / `>>` / `&>` redirections write. `2>` is a
-/// log of the run, not work; `>&2` is plumbing.
-fn redirection_targets(stage: &str, cwd: Option<&str>) -> Vec<String> {
+/// The files a stage's `>` / `>>` / `&>` redirections write, and whether
+/// each only appends (`>>`). `2>` is a log of the run, not work; `>&2` is
+/// plumbing.
+fn redirection_targets(stage: &str, cwd: Option<&str>) -> Vec<(String, bool)> {
     let words: Vec<&str> = stage.split_whitespace().collect();
-    let mut out = Vec::new();
+    let mut out: Vec<(String, bool)> = Vec::new();
     let mut i = 0;
     while i < words.len() {
         let core = words[i].trim_start_matches(['1', '&']);
         if core.starts_with('>') {
+            let appends = core.starts_with(">>");
             let rest = core.trim_start_matches('>');
             let target = if rest.is_empty() {
                 i += 1;
@@ -739,8 +853,8 @@ fn redirection_targets(stage: &str, cwd: Option<&str>) -> Vec<String> {
                 Some(rest)
             };
             if let Some(p) = target.and_then(|t| written_path(t, cwd)) {
-                if !out.contains(&p) {
-                    out.push(p);
+                if !out.iter().any(|(q, _)| *q == p) {
+                    out.push((p, appends));
                 }
             }
         }
@@ -775,12 +889,6 @@ fn script_paths(body: &str, cwd: Option<&str>) -> Vec<String> {
     out
 }
 
-fn note_path(paths: &mut Vec<String>, p: String) {
-    if !paths.contains(&p) {
-        paths.push(p);
-    }
-}
-
 /// Did this shell call WRITE, and what? Under an operating mode that
 /// edits through `python3 - <<EOF`, `cat > file <<EOF` and `sed -i`,
 /// every edit of a working day was invisible: the session read `—`
@@ -790,11 +898,9 @@ fn note_path(paths: &mut Vec<String>, p: String) {
 /// openers. Lines are counted only where the text is on the line —
 /// a heredoc into a file — and are otherwise unknown.
 fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
-    let mut paths: Vec<String> = Vec::new();
-    let mut shapes: Vec<(String, u64)> = Vec::new();
-    let mut added = 0i64;
+    let mut files: Vec<Written> = Vec::new();
     let mut wrote = false;
-    let mut whole_file = false;
+    let mut pathless = false;
     // The heredoc bodies, in the order their stages open them.
     let mut docs = heredocs(cmd).into_iter().map(|(_, body)| body);
     for (stage, here) in stages_in_place(cmd, cwd) {
@@ -804,71 +910,86 @@ fn shell_write(cmd: &str, cwd: Option<&str>) -> Option<ShellWrite> {
         let Some(label) = stage_label(&stripped) else { continue };
         let targets = redirection_targets(&stage, at);
         if let Some(body) = &body {
-            // `cat > file <<EOF` and `tee file <<EOF`: the file IS the body.
-            let written: Vec<String> = match label.as_str() {
+            // `cat > file <<EOF` and `tee file <<EOF`: the file IS the body —
+            // all of it, unless the call only appends (`>>`, `tee -a`).
+            let written: Vec<(String, bool)> = match label.as_str() {
                 "cat" => targets.clone(),
-                "tee" => stripped.split_whitespace().skip(1).filter_map(|w| written_path(w, at)).collect(),
+                "tee" => {
+                    let appends = stripped.split_whitespace().any(|w| w == "-a" || w == "--append");
+                    stripped
+                        .split_whitespace()
+                        .skip(1)
+                        .filter_map(|w| written_path(w, at))
+                        .map(|p| (p, appends))
+                        .collect()
+                }
                 _ => Vec::new(),
             };
             if !written.is_empty() {
-                added += line_count(body.trim_end_matches('\n'));
                 wrote = true;
-                whole_file = true;
+                let lines = line_count(body.trim_end_matches('\n'));
                 // Each file keeps its OWN body's shape: one call writing
                 // four different files is not one text in four places.
-                let key = snippet_key(body);
-                for t in written {
-                    if let Some(k) = key {
-                        shapes.push((t.clone(), k));
-                    }
-                    note_path(&mut paths, t);
+                let shape = snippet_key(body);
+                for (path, appends) in written {
+                    note_written(&mut files, Written { path, lines: Some(lines), shape, whole: !appends });
                 }
             } else if STDIN_INTERPRETERS.contains(&label.as_str())
                 && stripped.split_whitespace().any(|w| w == "-")
                 && script_writes(body)
             {
                 wrote = true;
-                for p in script_paths(body, at) {
-                    note_path(&mut paths, p);
+                let named = script_paths(body, at);
+                // A script that writes through a variable names nothing,
+                // and is a write all the same (#415 review).
+                pathless |= named.is_empty();
+                for p in named {
+                    note_written(&mut files, touched(p));
                 }
             }
         }
         // Redirections, in-place editors, copying programs.
-        for t in targets {
+        for (t, _) in targets {
             wrote = true;
-            note_path(&mut paths, t);
+            note_written(&mut files, touched(t));
         }
         let words: Vec<&str> = stripped.split_whitespace().collect();
         if edits_in_place(&label, &stripped) {
             // `sed -i`, `awk -i inplace`, `perl -i`: the file is the last
             // path.
             wrote = true;
-            if let Some(p) = words.iter().rev().find_map(|w| written_path(w, at)) {
-                note_path(&mut paths, p);
+            match words.iter().rev().find_map(|w| written_path(w, at)) {
+                Some(p) => note_written(&mut files, touched(p)),
+                None => pathless = true,
             }
         } else if WRITE_PROGRAMS.contains(&label.as_str()) {
             wrote = true;
-            if matches!(label.as_str(), "cp" | "mv" | "install") {
+            let named: Vec<String> = if matches!(label.as_str(), "cp" | "mv" | "install") {
                 // The destination is the file changed.
-                if let Some(p) = words.iter().rev().find_map(|w| written_path(w, at)) {
-                    note_path(&mut paths, p);
-                }
+                words.iter().rev().find_map(|w| written_path(w, at)).into_iter().collect()
             } else {
-                for w in words.iter().skip(1) {
-                    if let Some(p) = written_path(w, at) {
-                        note_path(&mut paths, p);
-                    }
-                }
+                words.iter().skip(1).filter_map(|w| written_path(w, at)).collect()
+            };
+            pathless |= named.is_empty();
+            for p in named {
+                note_written(&mut files, touched(p));
             }
         } else if WRITE_VERBS.contains(&label.as_str()) {
             wrote = true;
+            pathless = true;
+        } else if let Some(inner) = handed_command(&label, &stripped) {
+            // `find -exec sed -i …`, `xargs perl -pi …`: it edits the files
+            // it is handed, which the line does not name.
+            if stage_label(&inner).is_some_and(|l| edits_in_place(&l, &inner) || WRITE_PROGRAMS.contains(&l.as_str())) {
+                wrote = true;
+                pathless = true;
+            }
         }
     }
-    // A write that names no file we can read — `git apply`, `patch` —
-    // is still a write; one that names only files outside the work is
-    // the caller's to drop (#412).
-    let pathless = paths.is_empty();
-    wrote.then_some(ShellWrite { paths, added, whole_file, shapes, pathless })
+    // A write that names no file we can read is still a write; one that
+    // names only files outside the work is the caller's to drop (#412).
+    pathless |= files.is_empty();
+    wrote.then_some(ShellWrite { files, pathless })
 }
 
 /// What a shell stage SHIPPED (#381): outcomes, where every other
@@ -956,21 +1077,16 @@ fn commit_shortstat(text: &str) -> Option<(i64, i64)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut found: Option<(i64, i64)> = None;
     for (i, line) in lines.iter().enumerate() {
-        let is_header = line.starts_with('[')
-            && line.find(']').is_some_and(|close| {
-                line[1..close]
-                    .split_whitespace()
-                    .last()
-                    .is_some_and(|h| h.len() >= 7 && h.chars().all(|c| c.is_ascii_hexdigit()))
-            });
-        if !is_header {
+        if commit_header(line).is_none() {
             continue;
         }
-        // The stat is the next line that reports one, before the next
-        // commit header.
+        // The stat is in the indented block git prints under the header —
+        // ` Author:`, ` 3 files changed, …`, ` create mode …`. An empty or
+        // merge commit prints none, and a `git show --stat` after it is
+        // not its stat (#415 review).
         if let Some((ins, del)) = lines[i + 1..]
             .iter()
-            .take_while(|l| !l.starts_with('['))
+            .take_while(|l| l.starts_with(' '))
             .find_map(|l| shortstat(l))
         {
             let acc = found.get_or_insert((0, 0));
@@ -984,25 +1100,59 @@ fn commit_shortstat(text: &str) -> Option<(i64, i64)> {
 /// Did this shipping event happen, as far as the call's output says
 /// (#412)? A refused call never gets here — it ran nothing. Failures are
 /// read from what git and gh print when they fail; a PR counts as opened
-/// only when gh printed the new PR's address.
-fn shipped(ship: Ship, text: &str) -> bool {
+/// only when gh printed the new PR's address. When the call itself
+/// `failed`, a stage of it did, and a quiet `git commit -q` or `git push
+/// -q` before or after that stage cannot be told apart: only what the
+/// output shows happened counts (#415 review).
+fn shipped(ship: Ship, text: &str, cmd: &str, failed: bool) -> bool {
     let has = |m: &str| text.contains(m);
     match ship {
         Ship::Commit => {
-            !(has("nothing to commit") || has("no changes added to commit") || has("nothing added to commit"))
+            if text.lines().any(|l| commit_header(l).is_some()) {
+                return true;
+            }
+            if failed {
+                return false;
+            }
+            // A refused commit says "nothing to commit" — and so does every
+            // `git status` of a clean tree. Only the ones beyond the
+            // statuses the call ran are the commit's own.
+            let refusals: usize = ["nothing to commit", "no changes added to commit", "nothing added to commit"]
+                .iter()
+                .map(|m| text.matches(m).count())
+                .sum();
+            refusals <= long_statuses(cmd)
         }
         Ship::Push => {
-            !(has("[rejected]") || has("[remote rejected]") || has("failed to push") || has("Everything up-to-date"))
+            let pushed = text.lines().any(|l| l.starts_with("To ")) && text.contains(" -> ");
+            let refused = has("[rejected]") || has("[remote rejected]") || has("failed to push") || has("Everything up-to-date");
+            !refused && (pushed || !failed)
         }
         Ship::PrOpened => text.contains("/pull/") && !(has("already exists") || has("create failed")),
         Ship::PrMerged => {
-            !(has("is not mergeable")
+            let merged = has("Merged pull request") || has("and merged pull request");
+            let refused = has("is not mergeable")
                 || has("GraphQL:")
                 || has("was already merged")
                 || has("could not merge")
-                || has("X Pull request"))
+                || has("X Pull request");
+            !refused && (merged || !failed)
         }
     }
+}
+
+/// How many `git status` runs in a command print the long form, which says
+/// "nothing to commit" of a clean tree.
+fn long_statuses(cmd: &str) -> usize {
+    labelled_stages(cmd)
+        .iter()
+        .filter(|(label, stage)| {
+            label == "git status"
+                && !stage.split_whitespace().any(|w| {
+                    w == "--short" || w.starts_with("--porcelain") || (w.starts_with('-') && !w.starts_with("--") && w.contains('s'))
+                })
+        })
+        .count()
 }
 
 /// The three gates a pull request is held to (#392).
@@ -1045,32 +1195,38 @@ fn echoed_exit(text: &str, names: &[&str]) -> Option<bool> {
 /// these gates are routinely piped through `tail` — so the tools' own
 /// verdicts are read: a failing tally or a compiler error fails, `test
 /// result: ok`, a clean `Finished` or `SKILL AUDIT CLEAN` passes, and an
-/// output that shows neither is not counted as a pass.
-fn gate_passed(gate: Gate, text: Option<&str>) -> bool {
+/// output that shows neither is not counted as a pass. An exit code the
+/// session echoed for the gate (`TEST_EXIT=0`) is the verdict itself —
+/// another command's `error:` line in the same call does not overturn it
+/// — unless the gate was `piped`, when `$?` was the pipe's last program's.
+fn gate_passed(gate: Gate, text: Option<&str>, piped: bool) -> bool {
     let Some(text) = text else { return false };
+    let echoed = |names: &[&str]| if piped { None } else { echoed_exit(text, names) };
     let errored = text.lines().any(|l| {
         let t = l.trim_start();
         t.starts_with("error[") || t.starts_with("error:")
     });
     match gate {
-        Gate::Test => {
-            // A run whose output was sent to a file says so by the exit
-            // code it echoed (`TEST_EXIT=0`), as these sessions do.
-            let echoed = echoed_exit(text, &["test"]);
-            !errored
-                && !text.contains("test result: FAILED")
-                && echoed != Some(false)
-                && (text.contains("test result: ok") || echoed == Some(true))
-        }
-        Gate::Lint => {
-            !errored && echoed_exit(text, &["clippy"]).unwrap_or_else(|| text.contains("Finished"))
-        }
-        Gate::Audit => {
-            !text.contains("SKILL AUDIT FAILED")
-                && (text.contains("SKILL AUDIT CLEAN")
-                    || echoed_exit(text, &["skill_audit", "audit"]) == Some(true))
-        }
+        Gate::Test => echoed(&["test"]).unwrap_or_else(|| {
+            !errored && !text.contains("test result: FAILED") && text.contains("test result: ok")
+        }),
+        Gate::Lint => echoed(&["clippy"]).unwrap_or_else(|| !errored && text.contains("Finished")),
+        Gate::Audit => echoed(&["skill_audit", "audit"])
+            .unwrap_or_else(|| !text.contains("SKILL AUDIT FAILED") && text.contains("SKILL AUDIT CLEAN")),
     }
+}
+
+/// Was a gate's stage piped into another program? `cargo test | tail -3;
+/// echo TEST_EXIT=$?` echoes tail's exit code, not the tests'.
+fn gate_piped(cmd: &str, gate: Gate) -> bool {
+    split_stages_piped(&strip_heredocs(cmd)).iter().any(|(stage, piped)| {
+        *piped
+            && match gate {
+                Gate::Test => stage_label(&strip_redirections(stage)).as_deref() == Some("cargo test"),
+                Gate::Lint => stage_label(&strip_redirections(stage)).as_deref() == Some("cargo clippy"),
+                Gate::Audit => stage.contains("skill_audit"),
+            }
+    })
 }
 
 /// What a shipping call's output said, for the live row: the PR number
@@ -1083,10 +1239,19 @@ fn shipping_detail(text: &str) -> Option<String> {
             return Some(format!("#{num}"));
         }
     }
-    let first = text.lines().find(|l| l.starts_with('['))?;
-    let close = first.find(']')?;
-    let hash = first[1..close].split_whitespace().last()?;
-    (hash.len() >= 7 && hash.chars().all(|c| c.is_ascii_hexdigit())).then(|| hash.to_string())
+    // The first line that IS a commit's header: a hook's `[WARNING] …`
+    // may come before it (#415 review).
+    text.lines().find_map(commit_header).map(str::to_string)
+}
+
+/// The short hash in the header git prints for a commit it made —
+/// `[main abc1234] subject`, `[main (root-commit) abc1234] subject` — when
+/// this line is one.
+fn commit_header(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let hash = rest[..close].split_whitespace().last()?;
+    (hash.len() >= 7 && hash.chars().all(|c| c.is_ascii_hexdigit())).then_some(hash)
 }
 
 /// The key a call repeats under: the whole line, noise stages dropped,
@@ -1132,6 +1297,12 @@ const REPEAT_KEY_CHARS: usize = 160; // skill-allow: §9-const — read-path bou
 /// splitting there produced a stage whose program was `1` — the
 /// most-repeated "command" on a live instance (issue #335).
 fn split_stages(cmd: &str) -> Vec<String> {
+    split_stages_piped(cmd).into_iter().map(|(stage, _)| stage).collect()
+}
+
+/// [`split_stages`], saying of each stage whether it fed a pipe — a lone
+/// `|`, not the `||` of a fallback.
+fn split_stages_piped(cmd: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let (mut single, mut double) = (false, false);
@@ -1146,15 +1317,22 @@ fn split_stages(cmd: &str) -> Vec<String> {
                 double = !double;
                 cur.push(c);
             }
-            '|' | ';' | '\n' | '\r' if !single && !double => out.push(std::mem::take(&mut cur)),
+            '|' if !single && !double && chars.peek() == Some(&'|') => {
+                // `a || b` keeps the two splits it always made.
+                chars.next();
+                out.push((std::mem::take(&mut cur), false));
+                out.push((String::new(), false));
+            }
+            '|' if !single && !double => out.push((std::mem::take(&mut cur), true)),
+            ';' | '\n' | '\r' if !single && !double => out.push((std::mem::take(&mut cur), false)),
             '&' if !single && !double && chars.peek() == Some(&'&') => {
                 chars.next();
-                out.push(std::mem::take(&mut cur));
+                out.push((std::mem::take(&mut cur), false));
             }
             _ => cur.push(c),
         }
     }
-    out.push(cur);
+    out.push((cur, false));
     out
 }
 
@@ -2373,21 +2551,23 @@ fn judge_shell(
     when: chrono::DateTime<chrono::Utc>,
     cmd: &str,
     out: &str,
+    failed: bool,
 ) {
     {
         let events = code.gate_events.entry(sid.to_string()).or_default();
+        let passed = |gate: Gate| gate_passed(gate, Some(out), gate_piped(cmd, gate));
         for label in command_labels(cmd) {
             match label.as_str() {
-                "cargo test" if gate_passed(Gate::Test, Some(out)) => {
+                "cargo test" if passed(Gate::Test) => {
                     events.push((when, GateEvent::Tested));
                 }
-                "cargo clippy" if gate_passed(Gate::Lint, Some(out)) => {
+                "cargo clippy" if passed(Gate::Lint) => {
                     events.push((when, GateEvent::Linted));
                 }
                 _ => {}
             }
         }
-        if cmd.contains("skill_audit") && gate_passed(Gate::Audit, Some(out)) {
+        if cmd.contains("skill_audit") && passed(Gate::Audit) {
             events.push((when, GateEvent::Audited));
         }
     }
@@ -2395,7 +2575,7 @@ fn judge_shell(
     // for the live row (#381).
     let detail_text = shipping_detail(out);
     for (ship, num) in shipping(cmd) {
-        if !shipped(ship, out) {
+        if !shipped(ship, out, cmd, failed) {
             continue;
         }
         let detail = |wanted_pr: bool| {
@@ -2701,8 +2881,9 @@ pub async fn stats_for_range_capped(
     let mut call_names: HashMap<String, CallCtx> = HashMap::new();
     // Results seen before their call (the walk is newest-first).
     let mut pending_results: HashMap<String, bool> = HashMap::new();
-    // Output text held until the call names the tool that produced it.
-    let mut pending_output: HashMap<String, String> = HashMap::new();
+    // Output text held until the call names the tool that produced it,
+    // and whether the call failed.
+    let mut pending_output: HashMap<String, (String, bool)> = HashMap::new();
     // Shell calls seen before their output — the reverse order, which
     // happens with interleaved sidechains. Without this the text is
     // stashed forever and silently dropped.
@@ -3276,14 +3457,14 @@ pub async fn stats_for_range_capped(
                             // What the shell printed, kept for the gates and
                             // the shipping events, which count only what the
                             // output says happened (#412).
-                            let mut shell_text: Option<String> = None;
+                            let mut shell_text: Option<(String, bool)> = None;
                             // A refused call never ran: it wrote nothing,
                             // shipped nothing and verified nothing (#412).
                             let refused = get_str(block, "id").is_some_and(|id| denied_calls.contains(id));
                             if let Some(id) = get_str(block, "id") {
                                 match pending_output.remove(id) {
-                                    Some(text) if SHELL_TOOLS.contains(&name.as_str()) => {
-                                        shell_text = Some(text.clone());
+                                    Some((text, failed)) if SHELL_TOOLS.contains(&name.as_str()) => {
+                                        shell_text = Some((text.clone(), failed));
                                         let d = score_output(&text, &mut code, &hour_key);
                                         attribute_quality(
                                             &mut code, &branch_pair, &agent_name, &effort, &me_key,
@@ -3313,8 +3494,9 @@ pub async fn stats_for_range_capped(
                             }
                             // A verification closes the edit→verify
                             // pair (#340): did the agent check its
-                            // work, and how long did it wait?
-                            if SHELL_TOOLS.contains(&name.as_str()) {
+                            // work, and how long did it wait? A refused
+                            // run checked nothing (#415 review).
+                            if SHELL_TOOLS.contains(&name.as_str()) && !refused {
                                 if let Some(Value::Object(input)) = block.get("input") {
                                     if let Some(cmd) = get_str(input, "command") {
                                         let verifies = command_labels(cmd).iter().any(|l| {
@@ -3794,6 +3976,7 @@ pub async fn stats_for_range_capped(
                                         // of it (#412).
                                         let shell = shell_write(cmd, cwd);
                                         let wrote_any = shell.is_some();
+                                        let looked_at = inspected_paths(cmd, cwd);
                                         if let Some(w) = shell.and_then(|w| w.into_work(&checkouts)) {
                                             // The agent WROTE through the shell
                                             // (#374): the same act as `Edit`, so
@@ -3803,7 +3986,7 @@ pub async fn stats_for_range_capped(
                                             // lines where the text is on the
                                             // line. Replaced lines are unknown
                                             // and stay unclaimed.
-                                            let n = w.added;
+                                            let n = w.added();
                                             code.writes += 1;
                                             code.replaced_unknown += 1;
                                             // One rewrite, and whether anyone
@@ -3811,7 +3994,7 @@ pub async fn stats_for_range_capped(
                                             // shell edit can still answer (#388).
                                             // A heredoc that writes a file end to
                                             // end creates it, as `Write` does.
-                                            let rewrote = !w.whole_file;
+                                            let rewrote = w.rewrote();
                                             if rewrote {
                                                 if steered {
                                                     code.edits_directed += 1;
@@ -3892,8 +4075,8 @@ pub async fn stats_for_range_capped(
                                             }
                                             code.verify_events.entry(sid.clone()).or_default().push((when, true));
                                             code.gate_events.entry(sid.clone()).or_default().push((when, GateEvent::Wrote));
-                                            for path in &w.paths {
-                                                note_bright_line(&mut code, path);
+                                            for f in &w.files {
+                                                note_bright_line(&mut code, &f.path);
                                             }
                                             let l = code.live.entry(sid.clone()).or_default();
                                             l.lines_added += n;
@@ -3906,7 +4089,7 @@ pub async fn stats_for_range_capped(
                                                 }
                                             }
                                             claim_doing(l, reply.as_deref(), "writing");
-                                            for path in &w.paths {
+                                            for path in w.files.iter().map(|f| &f.path) {
                                                 *l.path_hits.entry(path.clone()).or_insert(0) += 1;
                                                 if l.files_now.len() < LIVE_FILES
                                                     && !l.files_now.iter().any(|x| x == path)
@@ -3914,15 +4097,16 @@ pub async fn stats_for_range_capped(
                                                     l.files_now.push(path.clone());
                                                 }
                                             }
-                                            for path in &w.paths {
+                                            for f in &w.files {
+                                                let path = &f.path;
                                                 if let Some(dir) = dir_of(path) {
                                                     let win = human_turns
                                                         .get(&sid)
                                                         .map_or(0, |t| t.partition_point(|h| *h <= when));
                                                     code.focus.entry((sid.clone(), win)).or_default().insert(dir);
                                                 }
-                                                for (_, shape) in w.shapes.iter().filter(|(p, _)| p == path) {
-                                                    let seen = code.written_shapes.entry(*shape).or_default();
+                                                if let Some(shape) = f.shape {
+                                                    let seen = code.written_shapes.entry(shape).or_default();
                                                     if !seen.iter().any(|p| p == path) && seen.len() < DUP_PATHS {
                                                         seen.push(path.clone());
                                                     }
@@ -3933,7 +4117,7 @@ pub async fn stats_for_range_capped(
                                                 // modifies. Without this the
                                                 // created/modified split saw none
                                                 // of the day's shell edits (#388).
-                                                code.path_origin.insert(path.clone(), w.whole_file);
+                                                code.path_origin.insert(path.clone(), f.whole);
                                                 if let Some(rk) = &repo_key {
                                                     code.path_repo.insert(path.clone(), rk.clone());
                                                 }
@@ -3953,28 +4137,34 @@ pub async fn stats_for_range_capped(
                                             }
                                         } else if !wrote_any && shell_inspects(cmd) {
                                             code.reads += 1;
-                                            let paths = inspected_paths(cmd, cwd);
                                             let l = code
                                                 .live
                                                 .entry(superx_ops::record_uuid(&m.session))
                                                 .or_default();
                                             claim_doing(l, reply.as_deref(), "reading");
-                                            for path in &paths {
+                                            for path in &looked_at {
                                                 if l.files_now.len() < LIVE_FILES
                                                     && !l.files_now.iter().any(|x| x == path)
                                                 {
                                                     l.files_now.push(path.clone());
                                                 }
                                             }
-                                            for path in paths {
-                                                if let Some(rk) = &repo_key {
-                                                    code.repos_exposed.insert(rk.clone());
-                                                }
-                                                if reads_outside(&path, cwd, &checkouts) {
-                                                    code.outside_reads += 1;
-                                                }
-                                                code.files_read.insert(path);
+                                        }
+                                        // Exposure, whatever else the call did
+                                        // (#413): a stage that looked put what it
+                                        // read in front of the model. `ls ~/.netrc
+                                        // && grep … ~/.netrc; git config …` read a
+                                        // credentials file, and went uncounted
+                                        // because the call as a whole was not a
+                                        // read.
+                                        for path in looked_at {
+                                            if let Some(rk) = &repo_key {
+                                                code.repos_exposed.insert(rk.clone());
                                             }
+                                            if reads_outside(&path, cwd, &checkouts) {
+                                                code.outside_reads += 1;
+                                            }
+                                            code.files_read.insert(path);
                                         }
                                         if let Some(key) = repeat_key(cmd) {
                                             *code.command_lines.entry(key).or_insert(0) += 1;
@@ -3997,7 +4187,9 @@ pub async fn stats_for_range_capped(
                                     if SHELL_TOOLS.contains(&name.as_str()) {
                                         let sid = superx_ops::record_uuid(&m.session);
                                         match (&shell_text, get_str(block, "id")) {
-                                            (Some(out), _) => judge_shell(&mut code, &sid, when, cmd, out),
+                                            (Some((out, failed)), _) => {
+                                                judge_shell(&mut code, &sid, when, cmd, out, *failed)
+                                            }
                                             (None, Some(id)) => {
                                                 pending_shell.insert(id.to_string(), (sid, when, cmd.to_string()));
                                             }
@@ -4078,11 +4270,11 @@ pub async fn stats_for_range_capped(
                                     let d = score_output(text, &mut code, &hour_key);
                                     attribute_quality(&mut code, &branch_pair, &agent_name, &effort, &me_key, d);
                                 } else {
-                                    pending_output.insert(id.to_string(), text.to_string());
+                                    pending_output.insert(id.to_string(), (text.to_string(), failed));
                                 }
                                 if let Some((sid, at, cmd)) = pending_shell.remove(id) {
                                     if !denied {
-                                        judge_shell(&mut code, &sid, at, &cmd, text);
+                                        judge_shell(&mut code, &sid, at, &cmd, text, failed);
                                     }
                                 }
                                 if commit_calls.remove(id) {
