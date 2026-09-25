@@ -2941,8 +2941,9 @@ pub async fn stats_for_range_capped(
     let mut lines_written = 0i64;
     let mut per_session: HashMap<String, SessAgg> = HashMap::new();
     let mut outcomes: HashMap<String, Outcome> = HashMap::new();
-    // tool_use_id → the path it touched, and the ids whose output
-    // already looked like a credential before the call went by (#337).
+    // tool_use_id → where its output came from (the path it read, else the
+    // call), and the ids whose output already looked like a credential
+    // before the call went by (#337).
     let mut call_paths: HashMap<String, String> = HashMap::new();
     let mut secret_pending: HashSet<String> = HashSet::new();
     // tool_use_id → (tool name, model, repo). A `tool_result` message
@@ -3657,12 +3658,26 @@ pub async fn stats_for_range_capped(
                                             code.outside_reads += 1;
                                         }
                                     }
-                                    if let Some(id) = get_str(block, "id") {
-                                        if secret_pending.remove(id) {
-                                            code.secret_paths.insert(path.to_string());
-                                        } else {
-                                            call_paths.insert(id.to_string(), path.to_string());
-                                        }
+                                }
+                                // Where a credential in this call's output
+                                // came from: the file it read, else the call
+                                // itself — a shell's output named nothing, so
+                                // its hits went on the page without a place
+                                // (#415 review).
+                                if let Some(id) = get_str(block, "id") {
+                                    let place = touched_path(input).map_or_else(
+                                        || {
+                                            format!(
+                                                "{name} output in {}",
+                                                repo_key.as_deref().or(cwd).unwrap_or("an unknown directory")
+                                            )
+                                        },
+                                        str::to_string,
+                                    );
+                                    if secret_pending.remove(id) {
+                                        code.secret_paths.insert(place);
+                                    } else {
+                                        call_paths.insert(id.to_string(), place);
                                     }
                                 }
                             }

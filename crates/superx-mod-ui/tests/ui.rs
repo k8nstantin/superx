@@ -3811,11 +3811,20 @@ async fn a_secret_is_a_shape_and_commands_are_scanned() {
             {"type": "tool_use", "id": "c", "name": "Bash",
              "input": {"command": format!("curl -u me:{token} https://example.atlassian.net")}}]}})).await;
 
+    // A shell whose OUTPUT carries one names no file; the hit still has a
+    // place (#415 review).
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "cwd": "/w/superx", "message": {"content": [
+            {"type": "tool_use", "id": "o", "name": "Bash", "input": {"command": "env | grep TOKEN"}}]}})).await;
+    log_tool_message(&kernel, &session, &agent, serde_json::json!({
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "o", "content": format!("TOKEN={token}")}]}})).await;
+
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
-    assert_eq!(s.exposure.secret_hits, 2, "the command's token and the key block; not the source that names the markers");
-    assert_eq!(s.exposure.secret_paths.len(), 2, "{:?}", s.exposure.secret_paths);
+    assert_eq!(s.exposure.secret_hits, 3, "the command's token, the key block and the output's token; not the source that names the markers");
+    assert_eq!(s.exposure.secret_paths.len(), 3, "{:?}", s.exposure.secret_paths);
     assert!(s.exposure.secret_paths.iter().any(|p| p.starts_with("Bash input in")), "{:?}", s.exposure.secret_paths);
     assert!(s.exposure.secret_paths.iter().any(|p| p.ends_with("id_rsa")), "{:?}", s.exposure.secret_paths);
+    assert!(s.exposure.secret_paths.iter().any(|p| p == "Bash output in /w/superx"), "{:?}", s.exposure.secret_paths);
 }
 
 /// A private key is found however a tool shows it (#415 review): in a
