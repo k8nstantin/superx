@@ -106,4 +106,9 @@ abandoned_commits: bigint, abandoned_lines: bigint,
  * abandoned. The one number that says how much of the week the
  * repository never saw.
  */
-abandoned_pct: bigint, };
+abandoned_pct: bigint, 
+/**
+ * Lines on branches a checkout still has out (#414): not landed yet,
+ * and not abandoned either — kept out of `abandoned_lines`.
+ */
+in_flight_lines: bigint, };

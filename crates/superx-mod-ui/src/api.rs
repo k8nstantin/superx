@@ -1207,6 +1207,9 @@ pub struct Deviation {
     /// abandoned. The one number that says how much of the week the
     /// repository never saw.
     pub abandoned_pct: i64,
+    /// Lines on branches a checkout still has out (#414): not landed yet,
+    /// and not abandoned either — kept out of `abandoned_lines`.
+    pub in_flight_lines: i64,
 }
 
 /// One repository, one model (#406) — so a repo that went badly after a

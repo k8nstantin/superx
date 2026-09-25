@@ -231,6 +231,9 @@ pub struct RepoWork {
     /// file's work LANDED, by squash or by replay, though the commit
     /// itself never reached the main line.
     pub landed_via: HashMap<(String, String), String>,
+    /// Off-main commits on a branch some checkout still has out: work in
+    /// flight, not work abandoned (#414).
+    pub in_flight: HashSet<String>,
 }
 
 /// Commit logs the comparison reads: author time, author email, subject,
@@ -348,8 +351,18 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
     )
     .await
     .unwrap_or_default();
+    // Branches a checkout has out right now: what is on them and not on
+    // the main line is still being worked (#414).
+    let checked_out: HashSet<String> = git(dir, &["worktree", "list", "--porcelain"])
+        .await
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("branch "))
+        .map(|b| b.trim().to_string())
+        .collect();
     let mut seen: HashMap<String, usize> = HashMap::new();
     for tip in tips.lines().map(str::trim).filter(|t| !t.is_empty() && !t.ends_with("/HEAD")) {
+        let live_tip = checked_out.contains(tip);
         // Which of this branch's files reached the main line in exactly
         // the version the branch ends with: those landed (#414). A
         // squash commit writes precisely those versions; so does a
@@ -380,6 +393,9 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
             continue;
         };
         for c in parse_work_log(&log) {
+            if live_tip {
+                work.in_flight.insert(c.hash.clone());
+            }
             for (path, _, _) in &c.files {
                 if let Some(via) = landed_file.get(path) {
                     work.landed_via.insert((c.hash.clone(), path.clone()), via.clone());

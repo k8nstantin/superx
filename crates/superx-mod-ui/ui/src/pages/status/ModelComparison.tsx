@@ -840,6 +840,16 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
           judged here. Corrections and files returned to are in the grid beside what the work was
           worth; read them side by side rather than as a verdict.
         </Text>
+        {fams.some((r) => n(r.in_flight_lines) > 0) && (
+          <Text size="xs" c="dimmed" mt="xs">
+            In flight, and not counted as never landed:{' '}
+            {fams
+              .filter((r) => n(r.in_flight_lines) > 0)
+              .map((r) => `${r.model} ${fmtCompact(n(r.in_flight_lines))} lines`)
+              .join(' · ')}{' '}
+            on branches a checkout still has out.
+          </Text>
+        )}
         {unjudged.length > 0 && (
           <Text size="xs" c="yellow.5" mt="xs">
             Not judged:{' '}

@@ -198,8 +198,14 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
             if never > 0 {
                 if let Some(fam) = credit(&rc.claims, c.at) {
                     let e = dev.entry(fam.to_string()).or_default();
-                    e.abandoned_commits += 1;
-                    e.abandoned_lines += never;
+                    // Still checked out somewhere: in flight, not thrown
+                    // away (#414).
+                    if work.in_flight.contains(&c.hash) {
+                        e.in_flight_lines += never;
+                    } else {
+                        e.abandoned_commits += 1;
+                        e.abandoned_lines += never;
+                    }
                 }
             }
         }
@@ -390,6 +396,7 @@ fn deviation(model: String, a: &DevAcc, sp: &HashMap<&str, SpendAcc>) -> Deviati
         abandoned_commits: a.abandoned_commits,
         abandoned_lines: a.abandoned_lines,
         abandoned_pct: per(a.abandoned_lines, a.added + a.abandoned_lines),
+        in_flight_lines: a.in_flight_lines,
         model,
     }
 }
@@ -407,6 +414,7 @@ struct DevAcc {
     ages: Vec<i64>,
     abandoned_commits: i64,
     abandoned_lines: i64,
+    in_flight_lines: i64,
 }
 
 #[derive(Default, Clone)]

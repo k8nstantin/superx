@@ -3400,7 +3400,12 @@ async fn the_comparison_reads_git_as_the_work_moved() {
     // Fable's branch, two commits; its abandoned branch; a teammate's.
     repo.commit(wt, h(0.5), "t@t", "feat: a", &[("a.rs", &ten)]);
     repo.commit(wt, h(1.5), "t@t", "feat: more a", &[("a.rs", &fifteen)]);
+    // More on the same branch that the squash did not take — and the
+    // branch is still checked out, so that is work in flight.
+    repo.commit(wt, h(1.8), "t@t", "feat: d", &[("d.rs", "1\n2\n3\n4\n")]);
     repo.commit(wt2, h(1.0), "t@t", "feat: b", &[("b.rs", "1\n2\n3\n4\n5\n6\n7\n")]);
+    // feat/b's worktree is gone: the branch is abandoned, not in flight.
+    repo.git(&["worktree", "remove", "--force", wt2]);
     repo.commit(wt3, h(1.0), "mate@x", "feat: c", &[("c.rs", "1\n2\n3\n4\n5\n")]);
     // The squash, on main, as the merging account, while Opus works.
     repo.commit(main, h(3.5), "noreply@github.com", "feat: a (#1)", &[("a.rs", &fifteen)]);
@@ -3443,6 +3448,7 @@ async fn the_comparison_reads_git_as_the_work_moved() {
     assert_eq!(f.commits, 1);
     assert_eq!(f.abandoned_lines, 7, "fable's abandoned branch; not the teammate's");
     assert_eq!(f.abandoned_commits, 1);
+    assert_eq!(f.in_flight_lines, 4, "on a branch still checked out: not landed, not abandoned");
     assert!(row("opus").is_none_or(|o| o.added == 0), "merging it did not make it opus's");
     assert_eq!(c.unjudged.len(), 1, "{:?}", c.unjudged.iter().map(|u| &u.repo).collect::<Vec<_>>());
     assert_eq!(c.unjudged[0].repo, "lake");
