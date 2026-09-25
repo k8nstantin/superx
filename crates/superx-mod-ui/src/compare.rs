@@ -1,4 +1,4 @@
-//! Model comparison (#406): which model to reach for, and why.
+//! Model comparison (#406, #414): which model to reach for, and why.
 //!
 //! [`crate::thrown`] answers "what did the work cost to keep". This
 //! answers the operator's harder question: work is handed from one
@@ -9,12 +9,31 @@
 //!
 //! Everything here is read from git and from the same uncapped model
 //! runs [`crate::thrown`] builds. Nothing samples a message window.
+//!
+//! # How git is read (#414)
+//!
+//! - **One walk per repository.** A repository is its common git dir;
+//!   every worktree of it is the same repository. Walking each checkout
+//!   credited every commit once per checkout.
+//! - **Blame at the main line**, not the working tree: a checkout on
+//!   another branch read every commit it did not contain as dead.
+//! - **Landed is what reached the main line**: its commits, and the
+//!   commits of any branch whose final version of a file the main line
+//!   carries — a squash or a replay lands a branch's work without
+//!   landing its commits. Those are credited by when the BRANCH work was
+//!   done, not by when the squash was merged.
+//! - **Never landed** is the rest of the branch work — on real branches,
+//!   by the identity this machine commits as. `refs/stash`, and another
+//!   person's branches pulled in through `refs/remotes`, are not it.
+//! - **A repository whose main line took no commit while its branches
+//!   took many is not judged**: counting it called all of its work
+//!   "never landed".
 
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
-use crate::api::{Deviation, Handoff, ModelRun, RepoModel};
+use crate::api::{Deviation, Handoff, ModelRun, RepoModel, UnjudgedRepo};
 use crate::thrown::{credit, Claim};
 
 /// Commit subjects that mean the work is being done again. Read from
@@ -50,28 +69,27 @@ fn top_dir(path: &str) -> &str {
     path.split('/').next().unwrap_or(path)
 }
 
-/// Build the model timeline per repository, newest last.
-fn claims_by_repo(runs: &[ModelRun]) -> (HashMap<String, Vec<Claim>>, Option<DateTime<Utc>>) {
-    let mut claims: HashMap<String, Vec<Claim>> = HashMap::new();
-    let mut earliest: Option<DateTime<Utc>> = None;
-    for r in runs {
-        let (Ok(from), Ok(to)) = (
-            DateTime::parse_from_rfc3339(&r.first),
-            DateTime::parse_from_rfc3339(&r.last),
-        ) else {
-            continue;
-        };
-        let (from, to) = (from.with_timezone(&Utc), to.with_timezone(&Utc));
-        earliest = Some(earliest.map_or(from, |e: DateTime<Utc>| e.min(from)));
-        for cwd in &r.cwds {
-            claims.entry(cwd.clone()).or_default().push(Claim {
-                model: r.model.clone(),
-                from,
-                to,
-            });
-        }
+/// Split `total` over `weights` in proportion, in whole units, so the
+/// shares add up to `total` exactly — the remainder goes to the largest.
+fn split(total: i64, weights: &[i64]) -> Vec<i64> {
+    let sum: i64 = weights.iter().sum();
+    if sum <= 0 {
+        return vec![0; weights.len()];
     }
-    (claims, earliest)
+    let mut out: Vec<i64> = weights.iter().map(|w| total * w / sum).collect();
+    let rest = total - out.iter().sum::<i64>();
+    if let Some(i) = (0..weights.len()).max_by_key(|&i| weights[i]) {
+        out[i] += rest;
+    }
+    out
+}
+
+/// One repository the runs worked in, and every run's claim on it.
+struct RepoClaims {
+    name: String,
+    /// A checkout to read it from.
+    dir: String,
+    claims: Vec<Claim>,
 }
 
 /// Everything the comparison section draws.
@@ -79,123 +97,212 @@ fn claims_by_repo(runs: &[ModelRun]) -> (HashMap<String, Vec<Claim>>, Option<Dat
 /// Returned together because all of it comes from one walk of each
 /// repository: walking twice would double the cost of the most
 /// expensive read in the module.
-#[must_use]
-pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>, Vec<RepoModel>) {
-    let (by_cwd, earliest) = claims_by_repo(runs);
+pub struct Comparison {
+    pub handoffs: Vec<Handoff>,
+    pub deviations: Vec<Deviation>,
+    pub repos: Vec<RepoModel>,
+    pub unjudged: Vec<UnjudgedRepo>,
+}
 
-    // Fold the per-cwd claims onto repository roots.
-    let mut claims: HashMap<String, Vec<Claim>> = HashMap::new();
-    for (cwd, list) in &by_cwd {
-        let Some(top) = crate::landed::toplevel(std::path::Path::new(cwd)).await else {
-            continue;
-        };
-        claims.entry(top).or_default().extend(list.iter().cloned());
+/// The comparison over every run. `mainlines` is the operator's
+/// `attr_ui_mainline_refs`: repository name → the ref its work lands on.
+#[must_use]
+pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> Comparison {
+    let cwds: HashSet<String> = runs.iter().flat_map(|r| r.work.iter().map(|w| w.cwd.clone())).collect();
+    let checkouts = crate::checkout::Checkouts::resolve(cwds.iter()).await;
+    let parse = |s: &str| DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc));
+
+    // Claims per repository — by its common git dir, so a worktree is its
+    // repository (#414).
+    let mut repos: HashMap<String, RepoClaims> = HashMap::new();
+    let mut earliest: Option<DateTime<Utc>> = None;
+    for r in runs {
+        let (Some(from), Some(to)) = (parse(&r.first), parse(&r.last)) else { continue };
+        earliest = Some(earliest.map_or(from, |e| e.min(from)));
+        let mut seen: HashSet<&str> = HashSet::new();
+        for w in &r.work {
+            let Some(co) = checkouts.of(&w.cwd) else { continue };
+            if !seen.insert(co.common.as_str()) {
+                continue;
+            }
+            let rc = repos.entry(co.common.clone()).or_insert_with(|| RepoClaims {
+                name: co.repo.clone(),
+                dir: co.toplevel.clone(),
+                claims: Vec::new(),
+            });
+            rc.claims.push(Claim { model: r.model.clone(), from, to });
+        }
     }
 
-    // Per model: the deviation counters.
     let mut dev: HashMap<String, DevAcc> = HashMap::new();
-    // Per (from, to): what the incoming model did in its first hours.
     let mut hand: HashMap<(String, String), HandAcc> = HashMap::new();
-    // Per repository and model, so one checkout that went badly after a
-    // switch is visible instead of averaged into every other.
     let mut per_repo: HashMap<(String, String), DevAcc> = HashMap::new();
+    let mut unjudged: Vec<UnjudgedRepo> = Vec::new();
+    let mut judged: HashSet<String> = HashSet::new();
 
-    let mut roots: Vec<&String> = claims.keys().collect();
-    roots.sort();
-    for top in roots {
-        let list = &claims[top];
+    let mut keys: Vec<&String> = repos.keys().collect();
+    keys.sort_by_key(|k| &repos[*k].name);
+    for key in keys {
+        let rc = &repos[key];
+        let dir = std::path::Path::new(&rc.dir);
+        let mainline = crate::landed::mainline_of(dir, &rc.name, mainlines).await;
+        let Some(work) = crate::landed::repo_work(dir, &mainline, earliest).await else { continue };
+        let ours = |author: &str| work.identity.as_deref() == Some(author);
+
+        // A main line that took nothing while this machine's branches took
+        // plenty is not where the work lands: say so, judge nothing.
+        let off_ours = work.off_mainline.iter().filter(|c| ours(&c.author)).count() as i64;
+        if work.landed.is_empty() && off_ours > 0 {
+            unjudged.push(UnjudgedRepo {
+                repo: rc.name.clone(),
+                mainline,
+                off_mainline_commits: off_ours,
+            });
+            continue;
+        }
+        judged.insert(key.clone());
+
         // Switch moments on this repository, in order.
-        let mut spans: Vec<&Claim> = list.iter().collect();
+        let mut spans: Vec<&Claim> = rc.claims.iter().collect();
         spans.sort_by_key(|c| c.from);
-        let mut switches: Vec<(DateTime<Utc>, String, String)> = Vec::new();
-        for w in spans.windows(2) {
-            if w[0].model != w[1].model {
-                switches.push((w[1].from, w[0].model.clone(), w[1].model.clone()));
-            }
-        }
-
-        let commits = crate::landed::survival(std::path::Path::new(top), earliest).await;
-        // The complement: everything committed on a branch that never
-        // reached the main line. Credited to whoever was working when it
-        // was written, exactly as landed work is.
-        for c in crate::landed::abandoned(std::path::Path::new(top), earliest).await {
-            if c.added + c.removed > BULK_COMMIT {
-                continue;
-            }
-            let Some(model) = credit(list, c.at) else { continue };
-            let e = dev.entry(model.to_string()).or_default();
-            e.abandoned_commits += 1;
-            e.abandoned_lines += c.added;
-        }
-        // Files a model has already touched here, for thrash.
-        let mut touched: HashMap<(String, String), i64> = HashMap::new();
-        for c in &commits {
-            let Some(model) = credit(list, c.at) else { continue };
-            // A vendor drop is not authored work.
-            if c.added + c.removed > BULK_COMMIT {
-                continue;
-            }
-            let e = dev.entry(model.to_string()).or_default();
-            e.commits += 1;
-            e.added += c.added;
-            e.removed += c.removed;
-            e.alive += c.alive;
-            if is_rework(&c.subject) {
-                e.rework_commits += 1;
-            }
-            let short = std::path::Path::new(top)
-                .file_name()
-                .map_or_else(|| top.clone(), |n| n.to_string_lossy().into_owned());
-            let rk = per_repo
-                .entry((short, model.to_string()))
-                .or_default();
-            rk.commits += 1;
-            rk.added += c.added;
-            rk.removed += c.removed;
-            rk.alive += c.alive;
-            if is_rework(&c.subject) {
-                rk.rework_commits += 1;
-            }
-
-            let dirs: HashSet<&str> = c.files.iter().map(|f| top_dir(f)).collect();
-            if dirs.len() > 1 {
-                e.multi_dir_commits += 1;
-            }
-            e.dir_spread += dirs.len() as i64;
-            e.ages.push((Utc::now() - c.at).num_days().max(0));
-            for f in &c.files {
-                let k = (model.to_string(), f.clone());
-                let n = touched.entry(k).or_insert(0);
-                *n += 1;
-                if *n == THRASH_TOUCHES {
-                    e.thrash_files += 1;
-                }
-            }
-
-            // Did this land in the first hours after a switch?
-            if let Some((at, from, to)) = switches
-                .iter()
-                .rev()
-                .find(|(at, _, to)| *at <= c.at && to == model)
-            {
-                if (c.at - *at).num_seconds() <= TAKEOVER_SECS {
-                    let h = hand
-                        .entry((from.clone(), to.clone()))
-                        .or_insert_with(|| HandAcc {
-                            switches: 0,
-                            ..HandAcc::default()
-                        });
-                    h.added += c.added;
-                    h.removed += c.removed;
-                    h.alive += c.alive;
-                    h.commits += 1;
-                }
-            }
-        }
-        for (at, from, to) in &switches {
-            let _ = at;
+        let switches: Vec<(DateTime<Utc>, String, String)> = spans
+            .windows(2)
+            .filter(|w| w[0].model != w[1].model)
+            .map(|w| (w[1].from, w[0].model.clone(), w[1].model.clone()))
+            .collect();
+        for (_, from, to) in &switches {
             hand.entry((from.clone(), to.clone())).or_default().switches += 1;
         }
+        let takeover = |fam: &str, at: DateTime<Utc>| {
+            switches
+                .iter()
+                .rev()
+                .find(|(t, _, to)| *t <= at && to == fam)
+                .filter(|(t, _, _)| (at - *t).num_seconds() <= TAKEOVER_SECS)
+                .map(|(_, from, to)| (from.clone(), to.clone()))
+        };
+
+        // Branch work: per file, landed by a main-line commit or not.
+        let mut shares: HashMap<&str, Vec<(DateTime<Utc>, i64)>> = HashMap::new();
+        for c in work.off_mainline.iter().filter(|c| ours(&c.author)) {
+            if c.added() + c.removed() > BULK_COMMIT {
+                continue;
+            }
+            let mut never = 0i64;
+            for (path, added, removed) in &c.files {
+                match work.landed_via.get(&(c.hash.clone(), path.clone())) {
+                    Some(via) => shares.entry(via.as_str()).or_default().push((c.at, (added + removed).max(1))),
+                    None => never += added,
+                }
+            }
+            if never > 0 {
+                if let Some(fam) = credit(&rc.claims, c.at) {
+                    let e = dev.entry(fam.to_string()).or_default();
+                    e.abandoned_commits += 1;
+                    e.abandoned_lines += never;
+                }
+            }
+        }
+        // The identities a squash of this machine's branches was made as —
+        // the account that clicked merge — are this machine's too.
+        let aliases: HashSet<&str> = work
+            .landed
+            .iter()
+            .filter(|c| shares.contains_key(c.hash.as_str()))
+            .map(|c| c.author.as_str())
+            .collect();
+
+        // Files a model has already touched here, for thrash.
+        let mut touched: HashMap<(String, String), i64> = HashMap::new();
+        for c in &work.landed {
+            let (added, removed) = (c.added(), c.removed());
+            // A vendor drop is not authored work.
+            if added + removed > BULK_COMMIT {
+                continue;
+            }
+            // When the work was done: the branch commits' times for a
+            // squash of this machine's branches, else the commit's own —
+            // and only for commits this machine made.
+            let pieces: Vec<(DateTime<Utc>, i64)> = match shares.get(c.hash.as_str()) {
+                Some(v) => v.clone(),
+                None if ours(&c.author) || aliases.contains(c.author.as_str()) => vec![(c.at, 1)],
+                None => continue,
+            };
+            let alive = work.alive.get(&c.hash).copied().unwrap_or(0);
+            let weights: Vec<i64> = pieces.iter().map(|p| p.1).collect();
+            let (sa, sr, sl) = (split(added, &weights), split(removed, &weights), split(alive, &weights));
+            let mut dominant: Option<(i64, String)> = None;
+            for (k, (at, w)) in pieces.iter().enumerate() {
+                let Some(fam) = credit(&rc.claims, *at) else { continue };
+                for acc in [dev.entry(fam.to_string()).or_default(),
+                            per_repo.entry((rc.name.clone(), fam.to_string())).or_default()] {
+                    acc.added += sa[k];
+                    acc.removed += sr[k];
+                    acc.alive += sl[k];
+                }
+                if let Some(pair) = takeover(fam, *at) {
+                    let h = hand.entry(pair).or_default();
+                    h.added += sa[k];
+                    h.removed += sr[k];
+                    h.alive += sl[k];
+                    h.commits += 1;
+                }
+                if dominant.as_ref().is_none_or(|(dw, _)| w > dw) {
+                    dominant = Some((*w, fam.to_string()));
+                }
+            }
+            // A commit is one event: it counts once, for the model that
+            // did most of it.
+            let Some((_, fam)) = dominant else { continue };
+            let rework = is_rework(&c.subject);
+            {
+                let e = dev.entry(fam.clone()).or_default();
+                e.commits += 1;
+                if rework {
+                    e.rework_commits += 1;
+                }
+                let dirs: HashSet<&str> = c.files.iter().map(|f| top_dir(&f.0)).collect();
+                if dirs.len() > 1 {
+                    e.multi_dir_commits += 1;
+                }
+                e.dir_spread += dirs.len() as i64;
+                e.ages.push((Utc::now() - c.at).num_days().max(0));
+                for (path, _, _) in &c.files {
+                    let n = touched.entry((fam.clone(), path.clone())).or_insert(0);
+                    *n += 1;
+                    if *n == THRASH_TOUCHES {
+                        e.thrash_files += 1;
+                    }
+                }
+            }
+            let rk = per_repo.entry((rc.name.clone(), fam)).or_default();
+            rk.commits += 1;
+            if rework {
+                rk.rework_commits += 1;
+            }
+        }
+    }
+
+    // Tokens, time and turns per model, over the work done in the
+    // repositories judged here (#414) — the same work the lines above
+    // come from. Spend outside any repository, or in one left unjudged,
+    // bought nothing this section can see.
+    let mut sp: HashMap<&str, SpendAcc> = HashMap::new();
+    for r in runs {
+        let e = sp.entry(r.model.as_str()).or_default();
+        for w in &r.work {
+            if checkouts.of(&w.cwd).is_some_and(|co| judged.contains(&co.common)) {
+                e.out_tokens += w.out_tokens;
+                e.messages += w.replies;
+                e.minutes += w.minutes;
+            }
+        }
+        e.runs += 1;
+        e.operator_turns += r.operator_turns;
+        e.corrections += r.redo_asks;
+        e.context_weighted += r.context_avg.saturating_mul(r.messages);
+        e.context_msgs += if r.context_avg > 0 { r.messages } else { 0 };
+        e.context_peak = e.context_peak.max(r.context_peak);
     }
 
     let mut handoffs: Vec<Handoff> = hand
@@ -208,132 +315,18 @@ pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>, Vec<Re
             added: a.added,
             removed: a.removed,
             alive: a.alive,
-            survived_pct: if a.added > 0 {
-                (100 * a.alive) / a.added
-            } else {
-                0
-            },
+            survived_pct: if a.added > 0 { (100 * a.alive) / a.added } else { 0 },
         })
         .collect();
     handoffs.sort_by_key(|h| std::cmp::Reverse(h.switches));
 
-    // Tokens, turns and context per model — the same rollup the pricing
-    // view used, folded in here so there is ONE number per quantity.
-    // Two walks computing "survived %" separately is how two sections
-    // came to disagree with each other on screen.
-    let mut sp: HashMap<&str, SpendAcc> = HashMap::new();
-    for r in runs {
-        let e = sp.entry(r.model.as_str()).or_default();
-        e.out_tokens += r.out_tokens;
-        e.messages += r.messages;
-        e.runs += 1;
-        e.operator_turns += r.operator_turns;
-        e.corrections += r.redo_asks;
-        e.context_weighted += r.context_avg.saturating_mul(r.messages);
-        e.context_msgs += if r.context_avg > 0 { r.messages } else { 0 };
-        e.context_peak = e.context_peak.max(r.context_peak);
-        e.minutes += r.minutes;
-    }
-
     let mut deviations: Vec<Deviation> = dev
         .into_iter()
-        .map(|(model, a)| {
-            let s = sp.get(model.as_str()).cloned().unwrap_or_default();
-            let (op, redo) = (s.operator_turns, s.corrections);
-            let thrown = (a.added - a.alive).max(0);
-            let mut ages = a.ages.clone();
-            ages.sort_unstable();
-            Deviation {
-                model,
-                commits: a.commits,
-                added: a.added,
-                removed: a.removed,
-                alive: a.alive,
-                survived_pct: if a.added > 0 {
-                    (100 * a.alive) / a.added
-                } else {
-                    0
-                },
-                removed_per_100_added: if a.added > 0 {
-                    (100 * a.removed) / a.added
-                } else {
-                    0
-                },
-                rework_commits: a.rework_commits,
-                rework_pct: if a.commits > 0 {
-                    (100 * a.rework_commits) / a.commits
-                } else {
-                    0
-                },
-                thrash_files: a.thrash_files,
-                thrash_per_100_commits: if a.commits > 0 {
-                    (100 * a.thrash_files) / a.commits
-                } else {
-                    0
-                },
-                multi_dir_commits: a.multi_dir_commits,
-                multi_dir_pct: if a.commits > 0 {
-                    (100 * a.multi_dir_commits) / a.commits
-                } else {
-                    0
-                },
-                dirs_per_commit_x10: if a.commits > 0 {
-                    (10 * a.dir_spread) / a.commits
-                } else {
-                    0
-                },
-                operator_turns: op,
-                corrections: redo,
-                corrections_per_100: if op > 0 { (100 * redo) / op } else { 0 },
-                out_tokens: s.out_tokens,
-                messages: s.messages,
-                runs: s.runs,
-                thrown,
-                tokens_thrown: if a.added > 0 {
-                    s.out_tokens.saturating_mul(thrown) / a.added
-                } else {
-                    0
-                },
-                tokens_per_line_landed: if a.added > 0 { s.out_tokens / a.added } else { 0 },
-                tokens_per_line_kept: if a.alive > 0 { s.out_tokens / a.alive } else { 0 },
-                median_age_days: ages.get(ages.len() / 2).copied().unwrap_or(0),
-                context_avg: if s.context_msgs > 0 {
-                    s.context_weighted / s.context_msgs
-                } else {
-                    0
-                },
-                context_peak: s.context_peak,
-                minutes: s.minutes,
-                // Time is charged the way tokens are: the model's own
-                // rate, applied to the work that did not last.
-                minutes_thrown: if a.added > 0 {
-                    s.minutes.saturating_mul(thrown) / a.added
-                } else {
-                    0
-                },
-                alive_per_mtok: if s.out_tokens > 0 {
-                    (a.alive.saturating_mul(1_000_000)) / s.out_tokens
-                } else {
-                    0
-                },
-                alive_per_hour: if s.minutes > 0 {
-                    (a.alive * 60) / s.minutes
-                } else {
-                    0
-                },
-                abandoned_commits: a.abandoned_commits,
-                abandoned_lines: a.abandoned_lines,
-                abandoned_pct: if a.added + a.abandoned_lines > 0 {
-                    (100 * a.abandoned_lines) / (a.added + a.abandoned_lines)
-                } else {
-                    0
-                },
-            }
-        })
+        .map(|(model, a)| deviation(model, &a, &sp))
         .collect();
     deviations.sort_by_key(|d| std::cmp::Reverse(d.added));
 
-    let mut repos: Vec<RepoModel> = per_repo
+    let mut repo_rows: Vec<RepoModel> = per_repo
         .into_iter()
         .map(|((repo, model), a)| RepoModel {
             repo,
@@ -342,17 +335,63 @@ pub async fn compare(runs: &[ModelRun]) -> (Vec<Handoff>, Vec<Deviation>, Vec<Re
             added: a.added,
             alive: a.alive,
             removed: a.removed,
-            survived_pct: if a.added > 0 {
-                (100 * a.alive) / a.added
-            } else {
-                0
-            },
+            survived_pct: if a.added > 0 { (100 * a.alive) / a.added } else { 0 },
             rework_commits: a.rework_commits,
         })
         .collect();
-    repos.sort_by_key(|r| std::cmp::Reverse(r.added));
+    repo_rows.sort_by_key(|r| std::cmp::Reverse(r.added));
+    unjudged.sort_by(|a, b| a.repo.cmp(&b.repo));
 
-    (handoffs, deviations, repos)
+    Comparison { handoffs, deviations, repos: repo_rows, unjudged }
+}
+
+/// One model's row, every rate computed from its own summed numerator
+/// and denominator.
+fn deviation(model: String, a: &DevAcc, sp: &HashMap<&str, SpendAcc>) -> Deviation {
+    let s = sp.get(model.as_str()).cloned().unwrap_or_default();
+    let (op, redo) = (s.operator_turns, s.corrections);
+    let thrown = (a.added - a.alive).max(0);
+    let mut ages = a.ages.clone();
+    ages.sort_unstable();
+    let per = |num: i64, den: i64| if den > 0 { (100 * num) / den } else { 0 };
+    Deviation {
+        commits: a.commits,
+        added: a.added,
+        removed: a.removed,
+        alive: a.alive,
+        survived_pct: per(a.alive, a.added),
+        removed_per_100_added: per(a.removed, a.added),
+        rework_commits: a.rework_commits,
+        rework_pct: per(a.rework_commits, a.commits),
+        thrash_files: a.thrash_files,
+        thrash_per_100_commits: per(a.thrash_files, a.commits),
+        multi_dir_commits: a.multi_dir_commits,
+        multi_dir_pct: per(a.multi_dir_commits, a.commits),
+        dirs_per_commit_x10: if a.commits > 0 { (10 * a.dir_spread) / a.commits } else { 0 },
+        operator_turns: op,
+        corrections: redo,
+        corrections_per_100: per(redo, op),
+        out_tokens: s.out_tokens,
+        messages: s.messages,
+        runs: s.runs,
+        thrown,
+        tokens_thrown: if a.added > 0 { s.out_tokens.saturating_mul(thrown) / a.added } else { 0 },
+        tokens_per_line_landed: if a.added > 0 { s.out_tokens / a.added } else { 0 },
+        tokens_per_line_kept: if a.alive > 0 { s.out_tokens / a.alive } else { 0 },
+        median_age_days: ages.get(ages.len() / 2).copied().unwrap_or(0),
+        context_avg: if s.context_msgs > 0 { s.context_weighted / s.context_msgs } else { 0 },
+        context_peak: s.context_peak,
+        minutes: s.minutes,
+        // Time is charged the way tokens are: the model's own rate,
+        // applied to the work that did not last.
+        minutes_thrown: if a.added > 0 { s.minutes.saturating_mul(thrown) / a.added } else { 0 },
+        alive_per_mtok: if s.out_tokens > 0 { a.alive.saturating_mul(1_000_000) / s.out_tokens } else { 0 },
+        alive_per_hour: if s.minutes > 0 { (a.alive * 60) / s.minutes } else { 0 },
+        abandoned_commits: a.abandoned_commits,
+        abandoned_lines: a.abandoned_lines,
+        abandoned_pct: per(a.abandoned_lines, a.added + a.abandoned_lines),
+        model,
+    }
 }
 
 #[derive(Default)]
@@ -411,6 +450,15 @@ mod tests {
     fn rework_does_not_match_inside_a_word() {
         assert!(!is_rework("add a prefix to the key"));
         assert!(!is_rework("affix the label"));
+    }
+
+    #[test]
+    fn a_split_adds_up_and_the_largest_takes_the_remainder() {
+        // Ties go to the last of the largest, which takes the remainder.
+        assert_eq!(split(10, &[1, 1, 1]), vec![3, 3, 4]);
+        assert_eq!(split(100, &[3, 1]), vec![75, 25]);
+        assert_eq!(split(7, &[0, 0]), vec![0, 0]);
+        assert_eq!(split(5, &[2]).iter().sum::<i64>(), 5);
     }
 
     #[test]

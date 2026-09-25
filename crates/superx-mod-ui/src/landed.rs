@@ -21,14 +21,10 @@ use crate::api::{ChurnPoint, Landed, LandedRepo};
 
 /// Repositories read per request, at most.
 const LANDED_REPOS: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
-/// Files blamed per repository when measuring survival (#405). Blame
-/// is the only way to ask "is this line still here", and it costs one
-/// pass per file.
-/// Paths kept per commit. Enough to read scope and thrash; a vendor
-/// drop must not make one commit weigh as much as the rest.
-const FILES_PER_COMMIT: usize = 64; // skill-allow: §9-const — read-path bound, not a policy tunable
-
-const SURVIVAL_FILES: usize = 600; // skill-allow: §9-const — read-path bound, not a policy tunable
+/// Files blamed per repository when measuring survival (#405): only the
+/// files the period's landed commits touched, so the bound is on the
+/// work, not on the alphabet (#414).
+const SURVIVAL_FILES: usize = 4_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
 /// A git call slower than this is abandoned and counted unreadable.
 const GIT_TIMEOUT_MS: u64 = 4_000; // skill-allow: §9-const — read-path bound, not a policy tunable
@@ -48,7 +44,7 @@ pub(crate) async fn git(dir: &Path, args: &[&str]) -> Option<String> {
 
 /// The main line's ref: what `origin/HEAD` points at, else a local
 /// `main` or `master`, else `HEAD`.
-async fn main_ref(dir: &Path) -> String {
+pub(crate) async fn main_ref(dir: &Path) -> String {
     if let Some(s) = git(dir, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]).await {
         if let Some(short) = s.trim().strip_prefix("refs/remotes/") {
             return short.to_string();
@@ -185,198 +181,229 @@ pub async fn landed(cwds: &HashSet<String>, since: Option<DateTime<Utc>>) -> Lan
 }
 
 
-/// One commit on a main line: when it landed, how many lines it added,
-/// and how many of those are still in the working tree today (#405).
-///
-/// This is the only rework measure with no blind spot. The transcript
-/// cannot see what a shell edit replaced (#383), and lines written are
-/// undercounted because of it — but git knows exactly what landed and
-/// blame knows exactly what is left. Both sides come from the
-/// repository, so the ratio is honest whatever tools the agent used.
-pub struct CommitSurvival {
+/// One commit, as the model comparison reads it (#414): when its work
+/// was done — the AUTHOR time, which a rebase keeps and a squash's branch
+/// commits still carry — who wrote it, what it said, and what it changed,
+/// file by file.
+#[derive(Debug, Clone)]
+pub struct WorkCommit {
     pub hash: String,
-    /// When it landed, RFC3339, so it can be matched to whoever was
-    /// working then.
     pub at: DateTime<Utc>,
-    pub added: i64,
-    /// Lines this commit REMOVED. They belonged to whoever wrote them
-    /// earlier, so this is the other half of the story: a model that
-    /// takes over and deletes its predecessor's work shows up here and
-    /// nowhere else.
-    pub removed: i64,
-    /// Of those added lines, how many blame still attributes here.
-    pub alive: i64,
-    /// The paths this commit touched, so scope and thrash can be read
-    /// without a second walk. Bounded per commit: a vendor drop must
-    /// not make one commit weigh as much as the rest of the history.
-    pub files: Vec<String>,
-    /// The commit subject, lower-cased. A model that keeps landing
-    /// "fix", "revert" and "undo" is redoing its own work.
+    /// The author's email: the identity a commit was made as.
+    pub author: String,
+    /// The subject, lower-cased. A model that keeps landing "fix",
+    /// "revert" and "undo" is redoing its own work.
     pub subject: String,
+    /// `(path, added, removed)` per file. A binary reads `0, 0`.
+    pub files: Vec<(String, i64, i64)>,
 }
 
-/// Work that was committed and never reached the main line (#406).
-///
-/// [`survival`] only sees commits that landed, so it measures what was
-/// kept against what was later replaced. It cannot see the other and
-/// larger category: a branch written, committed to many times, and then
-/// abandoned or deleted. In one repository here that was 198 commits
-/// and 220,449 lines — none of which appears in any landed figure,
-/// because none of it ever landed.
-///
-/// This walks every ref EXCEPT the main line. A commit reachable from
-/// the main line is landed work and belongs to [`survival`]; everything
-/// else was written and thrown away before it counted.
-///
-/// Read-only. Commits with no timestamp, and merge commits, are skipped.
-pub async fn abandoned(dir: &Path, since: Option<DateTime<Utc>>) -> Vec<CommitSurvival> {
-    let branch = main_ref(dir).await;
-    // `--not <main>` is what makes this the complement of `survival`.
-    let mut args = vec![
-        "log",
-        "--all",
-        "--no-merges",
-        "--numstat",
-        "--format=%x01%H %ct %s",
-        "--not",
-    ];
-    args.push(&branch);
-    let since_s = since.map(|s| s.to_rfc3339());
-    if let Some(s) = &since_s {
-        args.push("--since");
-        args.push(s);
+impl WorkCommit {
+    #[must_use]
+    pub fn added(&self) -> i64 {
+        self.files.iter().map(|f| f.1).sum()
     }
-    let Some(out) = git(dir, &args).await else {
-        return Vec::new();
-    };
-    parse_numstat_log(&out)
+
+    #[must_use]
+    pub fn removed(&self) -> i64 {
+        self.files.iter().map(|f| f.2).sum()
+    }
 }
 
-/// The shared parser for a `--numstat --format=%x01%H %ct %s` log.
-fn parse_numstat_log(out: &str) -> Vec<CommitSurvival> {
-    let mut commits: Vec<CommitSurvival> = Vec::new();
+/// Everything the comparison needs from one repository (#414), read once
+/// per repository — not once per checkout of it.
+#[derive(Debug, Default)]
+pub struct RepoWork {
+    /// The identity this machine commits as here (`user.email`).
+    pub identity: Option<String>,
+    /// Non-merge commits the main line contains in the period: direct
+    /// commits, squash commits, and the commits a merge brought in.
+    pub landed: Vec<WorkCommit>,
+    /// Lines blame still attributes to each landed commit — AT THE MAIN
+    /// LINE, whatever branch any checkout has out. Blaming the working
+    /// tree read every commit a checkout's branch did not contain as
+    /// dead.
+    pub alive: HashMap<String, i64>,
+    /// Non-merge commits on branches the main line does not contain.
+    pub off_mainline: Vec<WorkCommit>,
+    /// `(off-main commit, path)` → the main-line commit that carries the
+    /// final version of that file from a branch holding the commit: that
+    /// file's work LANDED, by squash or by replay, though the commit
+    /// itself never reached the main line.
+    pub landed_via: HashMap<(String, String), String>,
+}
+
+/// Commit logs the comparison reads: author time, author email, subject,
+/// per-file line counts. Renames are read as a delete and an add, so
+/// every path is one that exists in some tree and can be blamed.
+const WORK_FORMAT: &str = "--format=%x01%H %at %ae %s";
+
+fn parse_work_log(out: &str) -> Vec<WorkCommit> {
+    let mut commits: Vec<WorkCommit> = Vec::new();
     for line in out.lines() {
         if let Some(rest) = line.strip_prefix('\u{1}') {
-            let mut parts = rest.splitn(3, ' ');
-            let (Some(hash), Some(ts)) = (parts.next(), parts.next()) else {
+            let mut parts = rest.splitn(4, ' ');
+            let (Some(hash), Some(ts), Some(author)) = (parts.next(), parts.next(), parts.next()) else {
                 continue;
             };
-            let subject = parts.next().unwrap_or("").to_ascii_lowercase();
-            let Some(at) = ts
-                .parse::<i64>()
-                .ok()
-                .and_then(|t| Utc.timestamp_opt(t, 0).single())
-            else {
+            let Some(at) = ts.parse::<i64>().ok().and_then(|t| Utc.timestamp_opt(t, 0).single()) else {
                 continue;
             };
-            commits.push(CommitSurvival {
+            commits.push(WorkCommit {
                 hash: hash.to_string(),
                 at,
-                added: 0,
-                removed: 0,
-                alive: 0,
+                author: author.to_string(),
+                subject: parts.next().unwrap_or("").to_ascii_lowercase(),
                 files: Vec::new(),
-                subject,
             });
             continue;
         }
-        if let Some(c) = commits.last_mut() {
-            let mut p = line.split('\t');
-            if let (Some(a), Some(d)) = (p.next(), p.next()) {
-                if let Ok(a) = a.trim().parse::<i64>() {
-                    c.added += a;
-                }
-                if let Ok(d) = d.trim().parse::<i64>() {
-                    c.removed += d;
-                }
-                if let Some(path) = p.next() {
-                    if c.files.len() < FILES_PER_COMMIT && !path.is_empty() {
-                        c.files.push(path.to_string());
-                    }
-                }
-            }
+        let Some(c) = commits.last_mut() else { continue };
+        let mut p = line.split('\t');
+        let (Some(a), Some(d), Some(path)) = (p.next(), p.next(), p.next()) else { continue };
+        if path.is_empty() {
+            continue;
         }
+        // A binary file prints `-` for both.
+        c.files.push((
+            path.to_string(),
+            a.trim().parse::<i64>().unwrap_or(0),
+            d.trim().parse::<i64>().unwrap_or(0),
+        ));
     }
     commits
 }
 
-/// What survived, per commit, on one repository's main line.
-///
-/// Read-only, and bounded: at most [`SURVIVAL_FILES`] tracked files,
-/// binaries and built bundles skipped. An unreadable repository yields
-/// nothing rather than a guess.
-pub async fn survival(dir: &Path, since: Option<DateTime<Utc>>) -> Vec<CommitSurvival> {
-    let branch = main_ref(dir).await;
-    let mut args = vec![
-        "log",
-        "--first-parent",
-        "-m",
-        "--numstat",
-        "--format=%x01%H %ct %s",
-    ];
-    let since_s = since.map(|s| s.to_rfc3339());
-    if let Some(s) = &since_s {
+/// `(path, blob)` → the main-line commit that wrote that version of the
+/// file, oldest writer kept. A `--raw` log names every file's new blob.
+fn parse_versions(out: &str) -> HashMap<(String, String), String> {
+    let mut versions: HashMap<(String, String), String> = HashMap::new();
+    let mut commit = String::new();
+    for line in out.lines() {
+        if let Some(hash) = line.strip_prefix('\u{1}') {
+            commit = hash.trim().to_string();
+            continue;
+        }
+        let Some(meta) = line.strip_prefix(':') else { continue };
+        let Some((head, path)) = meta.split_once('\t') else { continue };
+        let Some(blob) = head.split_whitespace().nth(3) else { continue };
+        // Newest first, so a later insert is an older writer.
+        versions.insert((path.to_string(), blob.to_string()), commit.clone());
+    }
+    versions
+}
+
+/// The main line a repository's work lands on: the operator's
+/// `attr_ui_mainline_refs` entry for it when there is one (#414), else
+/// what `origin/HEAD` points at, else a local `main` or `master`.
+pub(crate) async fn mainline_of(dir: &Path, repo: &str, overrides: &HashMap<String, String>) -> String {
+    match overrides.get(repo) {
+        Some(r) => r.clone(),
+        None => main_ref(dir).await,
+    }
+}
+
+/// `args`, bounded to commits since `since` when there is one.
+fn bounded<'a>(mut args: Vec<&'a str>, since: Option<&'a str>) -> Vec<&'a str> {
+    if let Some(s) = since {
         args.push("--since");
         args.push(s);
     }
-    args.push(&branch);
-    let Some(out) = git(dir, &args).await else {
-        return Vec::new();
+    args
+}
+
+/// Read one repository for the comparison (#414). `None` when git cannot
+/// answer at all.
+pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>) -> Option<RepoWork> {
+    let since_s = since.map(|s| s.to_rfc3339());
+    let landed_log = git(
+        dir,
+        &bounded(vec!["log", mainline, "--no-merges", "--no-renames", "--numstat", WORK_FORMAT], since_s.as_deref()),
+    )
+    .await?;
+    let mut work = RepoWork {
+        identity: git(dir, &["config", "user.email"])
+            .await
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        landed: parse_work_log(&landed_log),
+        ..RepoWork::default()
     };
-    let mut commits: Vec<CommitSurvival> = Vec::new();
-    for line in out.lines() {
-        if let Some(rest) = line.strip_prefix('\u{1}') {
-            let mut parts = rest.splitn(3, ' ');
-            let (Some(hash), Some(ts)) = (parts.next(), parts.next()) else { continue };
-            let subject = parts.next().unwrap_or("").to_ascii_lowercase();
-            let Some(at) = ts.parse::<i64>().ok().and_then(|t| Utc.timestamp_opt(t, 0).single()) else {
-                continue;
-            };
-            commits.push(CommitSurvival {
-                hash: hash.to_string(),
-                at,
-                added: 0,
-                removed: 0,
-                alive: 0,
-                files: Vec::new(),
-                subject,
-            });
-            continue;
-        }
-        if let Some(c) = commits.last_mut() {
-            let mut p = line.split('\t');
-            if let (Some(a), Some(d)) = (p.next(), p.next()) {
-                if let Ok(a) = a.trim().parse::<i64>() {
-                    c.added += a;
-                }
-                // A binary file reports `-` in both columns.
-                if let Ok(d) = d.trim().parse::<i64>() {
-                    c.removed += d;
-                }
-                if let Some(path) = p.next() {
-                    if c.files.len() < FILES_PER_COMMIT && !path.is_empty() {
-                        c.files.push(path.to_string());
+    let versions = git(
+        dir,
+        &bounded(
+            vec!["log", mainline, "--no-merges", "--no-renames", "--raw", "--no-abbrev", "--format=%x01%H"],
+            since_s.as_deref(),
+        ),
+    )
+    .await
+    .map(|o| parse_versions(&o))
+    .unwrap_or_default();
+
+    // Every branch the main line does not contain. `refs/stash` and the
+    // other odd refs `--all` swept in are not branches (#414).
+    let tips = git(
+        dir,
+        &["for-each-ref", &format!("--no-merged={mainline}"), "--format=%(refname)", "refs/heads", "refs/remotes"],
+    )
+    .await
+    .unwrap_or_default();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for tip in tips.lines().map(str::trim).filter(|t| !t.is_empty() && !t.ends_with("/HEAD")) {
+        // Which of this branch's files reached the main line in exactly
+        // the version the branch ends with: those landed (#414). A
+        // squash commit writes precisely those versions; so does a
+        // replay onto a later main.
+        let mut landed_file: HashMap<String, String> = HashMap::new();
+        if let Some(base) = git(dir, &["merge-base", mainline, tip]).await {
+            let base = base.trim().to_string();
+            if let Some(diff) = git(dir, &["diff", "--raw", "--no-abbrev", "--no-renames", &base, tip]).await {
+                for line in diff.lines() {
+                    let Some(meta) = line.strip_prefix(':') else { continue };
+                    let Some((head, path)) = meta.split_once('\t') else { continue };
+                    let Some(blob) = head.split_whitespace().nth(3) else { continue };
+                    if let Some(via) = versions.get(&(path.to_string(), blob.to_string())) {
+                        landed_file.insert(path.to_string(), via.clone());
                     }
                 }
             }
         }
-    }
-    if commits.is_empty() {
-        return commits;
+        let Some(log) = git(
+            dir,
+            &bounded(
+                vec!["log", tip, "--not", mainline, "--no-merges", "--no-renames", "--numstat", WORK_FORMAT],
+                since_s.as_deref(),
+            ),
+        )
+        .await
+        else {
+            continue;
+        };
+        for c in parse_work_log(&log) {
+            for (path, _, _) in &c.files {
+                if let Some(via) = landed_file.get(path) {
+                    work.landed_via.insert((c.hash.clone(), path.clone()), via.clone());
+                }
+            }
+            if !seen.contains_key(&c.hash) {
+                seen.insert(c.hash.clone(), work.off_mainline.len());
+                work.off_mainline.push(c);
+            }
+        }
     }
 
-    // Which commit does each surviving line still belong to?
-    let Some(listing) = git(dir, &["ls-files"]).await else {
-        return commits;
-    };
-    let mut alive: HashMap<String, i64> = HashMap::new();
-    for file in listing
-        .lines()
-        .filter(|f| !f.is_empty() && !skip_for_survival(f))
-        .take(SURVIVAL_FILES)
-    {
-        let Some(blame) = git(dir, &["blame", "--line-porcelain", "--", file]).await else {
-            continue;
+    // What is still there, per landed commit, blamed at the main line.
+    let mut files: Vec<&str> = work
+        .landed
+        .iter()
+        .flat_map(|c| c.files.iter().map(|f| f.0.as_str()))
+        .filter(|f| !skip_for_survival(f))
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    for file in files.into_iter().take(SURVIVAL_FILES) {
+        let Some(blame) = git(dir, &["blame", "--line-porcelain", mainline, "--", file]).await else {
+            continue; // not in the main line's tree any more: nothing left
         };
         for line in blame.lines() {
             // A porcelain header opens with the commit and three
@@ -386,14 +413,11 @@ pub async fn survival(dir: &Path, since: Option<DateTime<Utc>>) -> Vec<CommitSur
                 && hash.bytes().all(|b| b.is_ascii_hexdigit())
                 && rest.starts_with(|c: char| c.is_ascii_digit())
             {
-                *alive.entry(hash.to_string()).or_insert(0) += 1;
+                *work.alive.entry(hash.to_string()).or_insert(0) += 1;
             }
         }
     }
-    for c in &mut commits {
-        c.alive = alive.get(&c.hash).copied().unwrap_or(0);
-    }
-    commits
+    Some(work)
 }
 
 /// Files whose lines say nothing about whether work survived: built

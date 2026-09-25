@@ -1036,36 +1036,60 @@ pub struct SseEvent {
     pub valid_from: String,
 }
 
-/// One model's stint inside one session (#406), aggregated inside the
-/// engine. No message payload crosses the wire: every field is a sum,
-/// an indexed edge lookup or a grouped count, so the walk is uncapped
-/// without being expensive.
+/// One model's stint inside one session (#406, #414): a run of
+/// consecutive replies by one model FAMILY, on the agent's clock.
 ///
 /// A session is not one model — the operator switches mid-session —
-/// so the run, not the session, is the unit that owns a span.
+/// so the run, not the session, is the unit that owns a span. And a
+/// run is contiguous: a session that went fable → opus → fable is three
+/// runs, where one span per model overlapped the other and left every
+/// commit in between ambiguous.
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct ModelRun {
     pub session: String,
+    /// The model family (`fable`, `opus`): point releases of one model
+    /// are the same choice from the operator's side (#408, #414).
     pub model: String,
-    /// The checkouts this session worked in, heaviest first.
+    /// The exact version most of the run's replies named.
+    pub version: String,
+    /// The checkouts this run worked in, heaviest first.
     pub cwds: Vec<String>,
-    /// RFC3339 bounds of the stint, so a commit can be bracketed.
+    /// RFC3339 bounds of the run on the agent's clock, so a commit can
+    /// be bracketed. Capture time put every run backfilled on first
+    /// contact inside the minutes of the backfill (#414).
     pub first: String,
     pub last: String,
-    /// Wall-clock minutes the stint spanned.
+    /// Minutes the run was WORKING: the gaps between its replies, each
+    /// capped at the live-session threshold (#414). Wall-clock first to
+    /// last counted the idle days in between.
     pub minutes: i64,
+    /// Replies, once each (#409).
     pub messages: i64,
     pub out_tokens: i64,
-    /// The operator's own turns inside the span (`role = 'user'`), and
-    /// the two kinds worth counting separately.
+    /// The operator's own turns while this run was the one answering
+    /// (`role = 'user'`), and the two kinds worth counting separately —
+    /// matched as words, so "against" is not "again" (#414).
     pub operator_turns: i64,
     pub redo_asks: i64,
     pub escalations: i64,
-    /// Tokens carried in the prompt per turn: fresh input plus
+    /// Tokens carried in the prompt per reply: fresh input plus
     /// everything read back from cache.
     pub context_avg: i64,
     pub context_peak: i64,
+    /// What the run spent in each directory, so a comparison over
+    /// repositories leaves out what was spent outside them (#414).
+    pub work: Vec<RunWork>,
+}
+
+/// A run's spend in one working directory (#414).
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct RunWork {
+    pub cwd: String,
+    pub replies: i64,
+    pub out_tokens: i64,
+    pub minutes: i64,
 }
 
 /// One direction of model switch (#406), and what the incoming model
@@ -1208,5 +1232,22 @@ pub struct CompareSummary {
     pub deviations: Vec<Deviation>,
     /// Per repository and model, biggest first.
     pub repos: Vec<RepoModel>,
+    /// Repositories the comparison could not judge, and why (#414).
+    pub unjudged: Vec<UnjudgedRepo>,
     pub computed_at: String,
+}
+
+/// A repository left out of the comparison (#414). Its main line took no
+/// commit in the period while its other branches took many, so nothing
+/// can be said about what landed there: counting it would call all of
+/// its work "never landed". `attr_ui_mainline_refs` names the branch the
+/// work actually lands on.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct UnjudgedRepo {
+    pub repo: String,
+    /// The ref read as its main line.
+    pub mainline: String,
+    /// Commits made off the main line in the period, by this machine.
+    pub off_mainline_commits: i64,
 }

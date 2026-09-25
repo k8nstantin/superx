@@ -146,24 +146,28 @@ pub(crate) const OUT_TOKENS_SQL: &str =
 /// reports its `thoughts` beside `output`, so the two are added to read
 /// the same way. Gemini's `input` includes what it served from cache,
 /// so fresh input is the difference.
-#[derive(Clone, Copy, Default)]
-struct ReplyUsage {
-    out: i64,
-    thinking: i64,
-    input: i64,
-    cache_write: i64,
-    cache_read: i64,
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct ReplyUsage {
+    pub(crate) out: i64,
+    pub(crate) thinking: i64,
+    pub(crate) input: i64,
+    pub(crate) cache_write: i64,
+    pub(crate) cache_read: i64,
     /// The whole prompt this reply was answering.
-    context: i64,
+    pub(crate) context: i64,
 }
 
 fn reply_usage(raw: &Object) -> Option<ReplyUsage> {
-    if let Some(u) = raw
-        .get("message")
-        .and_then(obj)
-        .and_then(|m| m.get("usage"))
-        .and_then(obj)
-    {
+    usage_of(
+        raw.get("message").and_then(obj).and_then(|m| m.get("usage")).and_then(obj),
+        raw.get("tokens").and_then(obj),
+    )
+}
+
+/// [`ReplyUsage`] from Claude's `message.usage` or Gemini's `tokens`,
+/// whichever the row carries.
+pub(crate) fn usage_of(claude: Option<&Object>, gemini: Option<&Object>) -> Option<ReplyUsage> {
+    if let Some(u) = claude {
         let input = get_int(u, "input_tokens");
         let cache_write = get_int(u, "cache_creation_input_tokens");
         let cache_read = get_int(u, "cache_read_input_tokens");
@@ -179,7 +183,7 @@ fn reply_usage(raw: &Object) -> Option<ReplyUsage> {
             context: input + cache_write + cache_read,
         });
     }
-    let t = raw.get("tokens").and_then(obj)?;
+    let t = gemini?;
     let cached = get_int(t, "cached");
     let prompt = get_int(t, "input");
     Some(ReplyUsage {
@@ -4696,7 +4700,7 @@ pub async fn stats_for_range_capped(
 
 /// Resolve the active-session threshold from the ui module's
 /// parameter, else the default.
-async fn resolved_active_secs(kernel: &Kernel) -> i64 {
+pub(crate) async fn resolved_active_secs(kernel: &Kernel) -> i64 {
     let Ok(Some(entity)) = kernel
         .find_module_by_name(NodeKind::KernelModule, crate::MODULE_NAME)
         .await

@@ -2248,6 +2248,11 @@ struct TestRepo {
 impl TestRepo {
     /// A repository called `name`, on `branch`, with one commit.
     fn new(name: &str, branch: &str) -> Self {
+        Self::new_dated(name, branch, chrono::Utc::now())
+    }
+
+    /// The same, with the first commit made at `when`.
+    fn new_dated(name: &str, branch: &str, when: chrono::DateTime<chrono::Utc>) -> Self {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
         let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir");
@@ -2261,10 +2266,43 @@ impl TestRepo {
         std::fs::create_dir_all(&root).expect("repo dir");
         let repo = Self { base, root };
         repo.git(&["init", "-q", "-b", branch]);
-        std::fs::write(repo.root.join("README"), "x\n").expect("write");
-        repo.git(&["add", "README"]);
-        repo.git(&["commit", "-q", "-m", "init"]);
+        // The identity this machine's agents commit as, in the repo's own
+        // config — which is where the comparison reads it (#414).
+        repo.git(&["config", "user.email", "t@t"]);
+        repo.git(&["config", "user.name", "t"]);
+        // Worktrees live inside the checkout, and are ignored there — as
+        // a real repository's `.claude/worktrees/` is.
+        std::fs::write(repo.root.join(".git/info/exclude"), ".claude/worktrees/\n").expect("exclude");
+        let root = repo.cwd();
+        repo.commit(root, when, "t@t", "init", &[("README", "x\n")]);
         repo
+    }
+
+    /// Write `files` into the checkout at `dir` and commit them at `when`
+    /// as `email` — author and committer time both, as a real commit has.
+    fn commit(&self, dir: &str, when: chrono::DateTime<chrono::Utc>, email: &str, msg: &str,
+              files: &[(&str, &str)]) {
+        for (rel, body) in files {
+            let path = std::path::Path::new(dir).join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("dir");
+            }
+            std::fs::write(&path, body).expect("write");
+        }
+        let stamp = format!("@{} +0000", when.timestamp());
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C").arg(dir)
+                .args(["-c", &format!("user.email={email}"), "-c", "user.name=a", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .env("GIT_AUTHOR_DATE", &stamp)
+                .env("GIT_COMMITTER_DATE", &stamp)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", msg]);
     }
 
     fn git(&self, args: &[&str]) {
@@ -3333,4 +3371,80 @@ async fn a_secret_is_a_shape_and_commands_are_scanned() {
     assert_eq!(s.exposure.secret_hits, 1, "the command's token; not the source that names prefixes");
     assert_eq!(s.exposure.secret_paths.len(), 1);
     assert!(s.exposure.secret_paths[0].starts_with("Bash input in"), "{:?}", s.exposure.secret_paths);
+}
+
+/// The model comparison reads git as the work actually moved (#414).
+///
+/// One repository, two checkouts. Fable writes a branch in a worktree;
+/// Opus, in the main checkout, squash-merges it as the account that
+/// clicks merge. The squash is Fable's work — credited by when the
+/// branch was written, not by when it merged — and it is counted once,
+/// not once per checkout, and blamed at the main line though the main
+/// checkout has another branch out. Fable's abandoned branch is never
+/// landed; a teammate's branch is not this machine's work at all. And a
+/// second repository whose main line took nothing is not judged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_comparison_reads_git_as_the_work_moved() {
+    let kernel = fresh_kernel().await;
+    let now = chrono::Utc::now();
+    let t0 = now - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let repo = TestRepo::new_dated("superx", "main", t0 - chrono::Duration::hours(1));
+    let wt = repo.worktree("wt", "feat/a");
+    let wt2 = repo.worktree("wt2", "feat/b");
+    let wt3 = repo.worktree("wt3", "feat/c");
+    let main = repo.cwd();
+    let ten: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    let fifteen: String = (1..=15).map(|i| format!("line {i}\n")).collect();
+
+    // Fable's branch, two commits; its abandoned branch; a teammate's.
+    repo.commit(wt, h(0.5), "t@t", "feat: a", &[("a.rs", &ten)]);
+    repo.commit(wt, h(1.5), "t@t", "feat: more a", &[("a.rs", &fifteen)]);
+    repo.commit(wt2, h(1.0), "t@t", "feat: b", &[("b.rs", "1\n2\n3\n4\n5\n6\n7\n")]);
+    repo.commit(wt3, h(1.0), "mate@x", "feat: c", &[("c.rs", "1\n2\n3\n4\n5\n")]);
+    // The squash, on main, as the merging account, while Opus works.
+    repo.commit(main, h(3.5), "noreply@github.com", "feat: a (#1)", &[("a.rs", &fifteen)]);
+    // The main checkout moves to a branch where a.rs is gone.
+    repo.git(&["checkout", "-q", "-b", "feat/other"]);
+    repo.git(&["rm", "-q", "a.rs"]);
+    repo.commit(main, h(4.5), "t@t", "chore: drop a", &[]);
+
+    // A second repository: its main line has only its first commit, from
+    // long before; the work goes to another branch.
+    let lake = TestRepo::new_dated("lake", "main", now - chrono::Duration::days(200));
+    lake.git(&["checkout", "-q", "-b", "sandbox"]);
+    lake.commit(lake.cwd(), h(5.5), "t@t", "feat: lake", &[("l.py", "x = 1\n")]);
+
+    let reply = |id: &str, model: &str, cwd: &str| serde_json::json!({
+        "cwd": cwd, "effort": "max",
+        "message": {"id": id, "model": model, "usage": {"output_tokens": 100},
+            "content": [{"type": "text", "text": "working"}]}});
+    let (agent, fable) = seed_agent_and_session(&kernel, "claude_code", "fable").await;
+    let (_, opus) = seed_agent_and_session(&kernel, "claude_code", "opus").await;
+    let (_, laker) = seed_agent_and_session(&kernel, "claude_code", "lake").await;
+    log_tool_message_at(&kernel, &fable, &agent, reply("f1", "claude-fable-5", wt), h(0.0)).await;
+    log_tool_message_at(&kernel, &fable, &agent, reply("f2", "claude-fable-5-1", wt), h(2.0)).await;
+    log_tool_message_at(&kernel, &opus, &agent, reply("o1", "claude-opus-5", main), h(3.0)).await;
+    log_tool_message_at(&kernel, &opus, &agent, reply("o2", "claude-opus-5", main), h(4.9)).await;
+    log_tool_message_at(&kernel, &laker, &agent, reply("l1", "claude-fable-5", lake.cwd()), h(5.0)).await;
+    log_tool_message_at(&kernel, &laker, &agent, reply("l2", "claude-fable-5", lake.cwd()), h(6.0)).await;
+
+    let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
+    let fable_run = runs.iter().find(|r| r.session.ends_with("/fable")).expect("fable run");
+    assert_eq!(fable_run.model, "fable", "two point releases, one family, one run");
+    assert_eq!(fable_run.messages, 2);
+    assert_eq!(fable_run.minutes, 5, "two hours apart is one gap, capped at the live threshold");
+
+    let c = superx_mod_ui::compare::compare(&runs, &std::collections::HashMap::new()).await;
+    let row = |m: &str| c.deviations.iter().find(|d| d.model == m);
+    let f = row("fable").expect("fable row");
+    assert_eq!(f.added, 15, "the squash, once — not once per checkout");
+    assert_eq!(f.alive, 15, "blamed at main, not at the branch the checkout has out");
+    assert_eq!(f.commits, 1);
+    assert_eq!(f.abandoned_lines, 7, "fable's abandoned branch; not the teammate's");
+    assert_eq!(f.abandoned_commits, 1);
+    assert!(row("opus").is_none_or(|o| o.added == 0), "merging it did not make it opus's");
+    assert_eq!(c.unjudged.len(), 1, "{:?}", c.unjudged.iter().map(|u| &u.repo).collect::<Vec<_>>());
+    assert_eq!(c.unjudged[0].repo, "lake");
+    assert!(c.repos.iter().all(|r| r.repo == "superx"), "one repository row, not one per checkout");
 }

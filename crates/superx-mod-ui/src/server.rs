@@ -571,11 +571,13 @@ async fn api_compare(State(state): State<AppState>) -> axum::response::Response 
         Ok(r) => r,
         Err(e) => return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
     };
-    let (handoffs, deviations, repos) = crate::compare::compare(&runs).await;
+    let mainlines = crate::resolved_mainline_refs(&state.kernel).await;
+    let c = crate::compare::compare(&runs, &mainlines).await;
     let summary = crate::api::CompareSummary {
-        handoffs,
-        deviations,
-        repos,
+        handoffs: c.handoffs,
+        deviations: c.deviations,
+        repos: c.repos,
+        unjudged: c.unjudged,
         computed_at: chrono::Utc::now().to_rfc3339(),
     };
     match serde_json::to_string(&summary) {

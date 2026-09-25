@@ -1,4 +1,4 @@
-//! The uncapped per-model reading layer (#406).
+//! The uncapped per-model reading layer (#406, #414).
 //!
 //! The question this answers is not "did the calls succeed" — tool
 //! failure and test pass rates put the models within noise of each
@@ -15,247 +15,261 @@
 //! handed one model's surviving lines to another, and argued the
 //! reverse of the truth.
 //!
-//! So nothing here reads a message payload. Every per-session fact is
-//! aggregated inside the engine and comes back as one row — a sum, a
-//! min/max, a grouped count. The session list itself is uncapped, and
-//! there are tens of sessions rather than tens of thousands of rows.
-//! Cost scales with sessions, and the attribution covers all of them.
+//! So nothing here reads a message payload beyond the handful of fields
+//! a run needs — when, which model, which reply, where, and what it
+//! spent — and the session list itself is uncapped.
+//!
+//! # A run (#414)
+//!
+//! A session is split into RUNS: consecutive replies by one model
+//! family, on the agent's clock. The earlier version gave each model one
+//! span per session — first reply to last, by capture time — so a
+//! session that went fable → opus → fable had two overlapping spans and
+//! every commit between them was ambiguous, and a session captured by
+//! the first backfill had every span squeezed into the minutes the
+//! backfill took. A run's time is its WORKING time: the gaps between its
+//! replies, each capped at the live-session threshold.
+
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use superx_kernel::types::{RecordId, Value};
+use superx_kernel::types::{Object, RecordId, Value};
 use superx_kernel::{Kernel, Result};
 
-use crate::api::ModelRun;
+use crate::api::{ModelRun, RunWork};
 
-/// Working directories kept per session. A session is normally one
-/// checkout; the cap catches the occasional wanderer without letting
-/// one session claim every repository on the machine.
-const CWDS_PER_SESSION: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
+/// Working directories kept per run. A run is normally one checkout;
+/// the cap catches the occasional wanderer without letting one run claim
+/// every repository on the machine.
+const CWDS_PER_RUN: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
 
-fn str_of(row: &Value, key: &str) -> Option<String> {
-    match row {
-        Value::Object(o) => match o.get(key) {
-            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-            _ => None,
-        },
+/// The model family: `claude-opus-5-5` is `opus`, `claude-fable-5-1` is
+/// `fable`, `gemini-3.1-pro` is `gemini` (#408, #414). Point releases of
+/// one model are one choice from the operator's side, and splitting them
+/// lets a thin recent release distort a rate. The family is the first
+/// word of the name that is not the vendor's and not a version number.
+#[must_use]
+pub fn family(model: &str) -> String {
+    let rest = model.strip_prefix("claude-").unwrap_or(model);
+    rest.split('-')
+        .find(|seg| seg.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
+        .unwrap_or(rest)
+        .to_string()
+}
+
+fn obj(v: &Value) -> Option<&Object> {
+    match v {
+        Value::Object(o) => Some(o),
         _ => None,
     }
 }
 
-fn int_of(row: &Value, key: &str) -> i64 {
-    match row {
-        Value::Object(o) => match o.get(key) {
-            Some(Value::Number(n)) => n.to_int().unwrap_or(0),
-            _ => 0,
-        },
-        _ => 0,
-    }
-}
-
-fn time_of(row: &Value, key: &str) -> Option<DateTime<Utc>> {
-    match row {
-        Value::Object(o) => match o.get(key) {
-            Some(Value::Datetime(d)) => Some(**d),
-            _ => None,
-        },
+fn str_of<'a>(o: &'a Object, key: &str) -> Option<&'a str> {
+    match o.get(key) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
         _ => None,
     }
 }
 
-
-/// A SurrealQL disjunction matching any marker against `content`,
-/// lower-cased on both sides. Markers are literals from
-/// [`crate::stats`]; they are interpolated rather than bound because a
-/// bind cannot stand where a list of alternatives goes. They contain
-/// only letters, spaces and punctuation the parser treats as text —
-/// asserted here so a future marker cannot smuggle syntax in.
-fn any_marker(markers: &[&str]) -> String {
-    let parts: Vec<String> = markers
-        .iter()
-        .filter(|m| !m.contains('\'') && !m.contains('\\'))
-        .map(|m| format!("string::lowercase(content) CONTAINS '{}'", m.to_lowercase()))
-        .collect();
-    if parts.is_empty() {
-        // Nothing safe to match: a predicate that is always false, so
-        // the caller reads zero rather than every row.
-        return "false".to_string();
+fn time_of(o: &Object, key: &str) -> Option<DateTime<Utc>> {
+    match o.get(key) {
+        Some(Value::Datetime(d)) => Some(**d),
+        _ => None,
     }
-    format!("({})", parts.join(" OR "))
 }
 
-/// Count the operator's own turns in a span, optionally only those
-/// carrying one of `markers`. `role = 'user'` is the operator: tool
-/// results ride `role = 'tool'`, so they are not counted as a person
-/// speaking.
-async fn operator_turns(
-    kernel: &Kernel,
-    session: &RecordId,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-    markers: Option<&[&str]>,
-) -> i64 {
-    let extra = markers.map_or_else(String::new, |m| format!(" AND {}", any_marker(m)));
-    let q = format!(
-        "SELECT count() AS n FROM message \
-         WHERE session = $sess AND role = 'user' \
-             AND valid_from >= $from AND valid_from <= $to{extra} \
-         GROUP ALL"
-    );
-    let rows: std::result::Result<Vec<Value>, _> = async {
-        kernel
-            .db()
-            .query(q)
-            .bind(("sess", session.clone()))
-            .bind(("from", from))
-            .bind(("to", to))
-            .await?
-            .take(0)
+/// The reply a row belongs to: Claude's `message.id` or Gemini's record
+/// `id` (strings), or the row's own id when it carries neither.
+fn key_of(o: &Object) -> Option<String> {
+    match o.get("k") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::RecordId(r)) => Some(superx_ops::record_uuid(r)),
+        _ => None,
     }
-    .await;
-    rows.ok()
-        .and_then(|r| r.first().map(|v| int_of(v, "n")))
-        .unwrap_or(0)
 }
 
-/// Every distinct model a session used, with the span it was in
-/// charge and what it spent.
-///
-/// A session is NOT one model. The operator switches mid-session and
-/// that is normal, so asking a session for "its" model returns only
-/// the newest one and quietly credits the whole span to it. That is
-/// the mistake this replaces: it folded every earlier model into
-/// whichever one happened to finish the session.
+/// One reply of a session, folded from its rows.
+struct Reply {
+    at: DateTime<Utc>,
+    model: String,
+    cwd: Option<String>,
+    usage: Option<crate::stats::ReplyUsage>,
+}
+
+/// Every run of one session (#414). Replies are counted once (#409), a
+/// run is contiguous, and its time is the gaps between its replies, each
+/// capped at `idle_secs`.
 ///
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
-pub async fn session_runs(kernel: &Kernel, session: RecordId, name: &str) -> Result<Vec<ModelRun>> {
-    // Which checkouts this session worked in, by weight of activity.
+pub async fn session_runs(
+    kernel: &Kernel,
+    session: RecordId,
+    name: &str,
+    idle_secs: i64,
+) -> Result<Vec<ModelRun>> {
     let rows: Vec<Value> = kernel
         .db()
         .query(
-            "SELECT raw.cwd AS cwd, count() AS n FROM message \
-             WHERE session = $sess AND raw.cwd != NONE \
-             GROUP BY cwd ORDER BY n DESC LIMIT $cap",
-        )
-        .bind(("sess", session.clone()))
-        .bind(("cap", CWDS_PER_SESSION as i64))
-        .await?
-        .take(0)?;
-    let cwds: Vec<String> = rows.iter().filter_map(|r| str_of(r, "cwd")).collect();
-    if cwds.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Every model that appears in the session, grouped by the engine.
-    let rows: Vec<Value> = kernel
-        .db()
-        .query(
-            "SELECT raw.message.model ?? raw.model AS model, count() AS n, \
-                 math::sum(raw.message.usage.output_tokens ?? raw.tokens.output ?? 0) AS out \
+            "SELECT (emitted_at ?? valid_from) AS at, (raw.message.model ?? raw.model) AS model, \
+                 (raw.message.id ?? raw.id ?? id) AS k, raw.cwd AS cwd, \
+                 raw.message.usage AS cu, raw.tokens AS gu, valid_from \
              FROM message WHERE session = $sess \
                  AND (raw.message.model != NONE OR raw.model != NONE) \
-             GROUP BY model",
+             ORDER BY valid_from ASC",
         )
         .bind(("sess", session.clone()))
         .await?
         .take(0)?;
-
-    let mut out = Vec::new();
-    for row in &rows {
+    // Fold a reply's rows: they share a key, and the last of them is the
+    // fullest (a Gemini record re-emitted as it streamed).
+    let mut replies: Vec<Reply> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for o in rows.iter().filter_map(obj) {
         // `<synthetic>` and friends are the runtime's own markers, not
         // models (#367/#388).
-        let Some(model) = str_of(row, "model").filter(|m| !m.starts_with('<')) else {
-            continue;
-        };
-        let messages = int_of(row, "n");
-        let out_tokens = int_of(row, "out");
-        if messages == 0 {
-            continue;
-        }
-        // The span this model held, as two indexed lookups.
-        // `math::min`/`math::max` aggregate numbers, not datetimes —
-        // asking them for a timestamp returns nothing, which silently
-        // emptied this whole table once.
-        let edge = |dir: &str| {
-            format!(
-                "SELECT valid_from FROM message WHERE session = $sess \
-                 AND (raw.message.model ?? raw.model) = $model \
-                 ORDER BY valid_from {dir} LIMIT 1"
-            )
-        };
-        let a: Vec<Value> = kernel
-            .db()
-            .query(edge("ASC"))
-            .bind(("sess", session.clone()))
-            .bind(("model", model.clone()))
-            .await?
-            .take(0)?;
-        let b: Vec<Value> = kernel
-            .db()
-            .query(edge("DESC"))
-            .bind(("sess", session.clone()))
-            .bind(("model", model.clone()))
-            .await?
-            .take(0)?;
-        let (Some(first), Some(last)) = (
-            a.first().and_then(|r| time_of(r, "valid_from")),
-            b.first().and_then(|r| time_of(r, "valid_from")),
+        let (Some(model), Some(at), Some(key)) = (
+            str_of(o, "model").filter(|m| !m.starts_with('<')),
+            time_of(o, "at"),
+            key_of(o),
         ) else {
             continue;
         };
-        // The operator's half of the record, over this model's span.
-        // One person writes every one of these turns, so their style is
-        // a constant and a difference between models is the models.
-        let asks = operator_turns(kernel, &session, first, last, None).await;
-        let redo =
-            operator_turns(kernel, &session, first, last, Some(&crate::stats::CORRECTIONS)).await;
-        let cross =
-            operator_turns(kernel, &session, first, last, Some(&crate::stats::ESCALATIONS)).await;
+        let usage = crate::stats::usage_of(o.get("cu").and_then(obj), o.get("gu").and_then(obj));
+        let reply = Reply {
+            at,
+            model: model.to_string(),
+            cwd: str_of(o, "cwd").map(str::to_string),
+            usage,
+        };
+        match index.get(&key) {
+            Some(&i) => {
+                let prev = &mut replies[i];
+                prev.at = prev.at.max(reply.at);
+                prev.usage = reply.usage.or(prev.usage);
+                prev.cwd = reply.cwd.or(prev.cwd.take());
+            }
+            None => {
+                index.insert(key, replies.len());
+                replies.push(reply);
+            }
+        }
+    }
+    replies.sort_by_key(|r| r.at);
 
-        // What it carried to do the work. Context is the whole prompt:
-        // fresh input plus everything read back from cache.
-        let rows: Vec<Value> = kernel
-            .db()
-            .query(
-                // Every term is parenthesised: `??` binds tighter than
-                // `+`, so the unbracketed sum parses as a chain of
-                // coalesces and returns single digits for a prompt of
-                // half a million tokens. It did exactly that once.
-                "SELECT math::mean((raw.message.usage.input_tokens ?? 0) \
-                     + (raw.message.usage.cache_read_input_tokens ?? 0) \
-                     + (raw.message.usage.cache_creation_input_tokens ?? 0)) AS avg, \
-                   math::max((raw.message.usage.input_tokens ?? 0) \
-                     + (raw.message.usage.cache_read_input_tokens ?? 0) \
-                     + (raw.message.usage.cache_creation_input_tokens ?? 0)) AS peak \
-                 FROM message WHERE session = $sess \
-                     AND (raw.message.model ?? raw.model) = $model \
-                     AND raw.message.usage != NONE GROUP ALL",
-            )
-            .bind(("sess", session.clone()))
-            .bind(("model", model.clone()))
-            .await?
-            .take(0)?;
-        let context_avg = rows.first().map_or(0, |r| int_of(r, "avg"));
-        let context_peak = rows.first().map_or(0, |r| int_of(r, "peak"));
+    // The operator's turns, each answered by the run that was going when
+    // it was written (#414): the one that started last before it.
+    let turns: Vec<(DateTime<Utc>, String)> = kernel
+        .db()
+        .query(
+            "SELECT (emitted_at ?? valid_from) AS at, content, valid_from FROM message \
+             WHERE session = $sess AND role = 'user' ORDER BY valid_from ASC",
+        )
+        .bind(("sess", session))
+        .await?
+        .take::<Vec<Value>>(0)?
+        .iter()
+        .filter_map(obj)
+        .filter_map(|o| Some((time_of(o, "at")?, str_of(o, "content").unwrap_or("").to_string())))
+        .collect();
 
-        out.push(ModelRun {
-            session: name.to_string(),
-            model,
-            cwds: cwds.clone(),
-            first: first.to_rfc3339(),
-            last: last.to_rfc3339(),
-            minutes: (last - first).num_minutes().max(0),
-            messages,
-            out_tokens,
-            operator_turns: asks,
-            redo_asks: redo,
-            escalations: cross,
-            context_avg,
-            context_peak,
-        });
+    let mut out: Vec<ModelRun> = Vec::new();
+    let mut starts: Vec<DateTime<Utc>> = Vec::new();
+    let mut start = 0;
+    while start < replies.len() {
+        let fam = family(&replies[start].model);
+        let mut end = start + 1;
+        while end < replies.len() && family(&replies[end].model) == fam {
+            end += 1;
+        }
+        starts.push(replies[start].at);
+        out.push(build_run(name, &fam, &replies[start..end], idle_secs));
+        start = end;
+    }
+    for (at, content) in &turns {
+        // A turn before the first reply opened the session: the first run
+        // answered it.
+        let Some(i) = starts.iter().rposition(|s| s <= at).or((!out.is_empty()).then_some(0)) else {
+            continue;
+        };
+        let run = &mut out[i];
+        run.operator_turns += 1;
+        if crate::stats::says_word(content, &crate::stats::CORRECTIONS, false) {
+            run.redo_asks += 1;
+        }
+        if crate::stats::says_word(content, &crate::stats::ESCALATIONS, true) {
+            run.escalations += 1;
+        }
     }
     Ok(out)
+}
+
+/// One run from its replies, oldest first.
+fn build_run(session: &str, fam: &str, replies: &[Reply], idle_secs: i64) -> ModelRun {
+    let mut versions: HashMap<&str, i64> = HashMap::new();
+    let mut work: HashMap<String, RunWork> = HashMap::new();
+    let (mut out_tokens, mut ctx_sum, mut ctx_n, mut ctx_peak, mut secs) = (0i64, 0i64, 0i64, 0i64, 0i64);
+    for (i, r) in replies.iter().enumerate() {
+        *versions.entry(r.model.as_str()).or_insert(0) += 1;
+        // The gap before a reply was spent on it — up to the threshold.
+        let gap = if i == 0 {
+            0
+        } else {
+            (r.at - replies[i - 1].at).num_seconds().clamp(0, idle_secs)
+        };
+        secs += gap;
+        let out = r.usage.map_or(0, |u| u.out);
+        out_tokens += out;
+        if let Some(u) = r.usage.filter(|u| u.context > 0) {
+            ctx_sum += u.context;
+            ctx_n += 1;
+            ctx_peak = ctx_peak.max(u.context);
+        }
+        if let Some(cwd) = &r.cwd {
+            let w = work.entry(cwd.clone()).or_insert_with(|| RunWork {
+                cwd: cwd.clone(),
+                replies: 0,
+                out_tokens: 0,
+                minutes: 0,
+            });
+            w.replies += 1;
+            w.out_tokens += out;
+            // Minutes are whole at the end; seconds carry until then.
+            w.minutes += gap;
+        }
+    }
+    let mut work: Vec<RunWork> = work
+        .into_values()
+        .map(|mut w| {
+            w.minutes /= 60;
+            w
+        })
+        .collect();
+    work.sort_by(|a, b| b.replies.cmp(&a.replies).then(a.cwd.cmp(&b.cwd)));
+    let mut cwds: Vec<String> = work.iter().map(|w| w.cwd.clone()).collect();
+    cwds.truncate(CWDS_PER_RUN);
+    let version = versions
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        .map_or_else(|| fam.to_string(), |(v, _)| (*v).to_string());
+    ModelRun {
+        session: session.to_string(),
+        model: fam.to_string(),
+        version,
+        cwds,
+        first: replies.first().map(|r| r.at.to_rfc3339()).unwrap_or_default(),
+        last: replies.last().map(|r| r.at.to_rfc3339()).unwrap_or_default(),
+        minutes: secs / 60,
+        messages: replies.len() as i64,
+        out_tokens,
+        operator_turns: 0,
+        redo_asks: 0,
+        escalations: 0,
+        context_avg: if ctx_n > 0 { ctx_sum / ctx_n } else { 0 },
+        context_peak: ctx_peak,
+        work,
+    }
 }
 
 /// Every model run across every session. Uncapped by design — see the
@@ -268,6 +282,7 @@ pub async fn model_runs(kernel: &Kernel) -> Result<Vec<ModelRun>> {
     let sessions = kernel
         .list_named_entities("node_session", "attr_session_descriptor")
         .await?;
+    let idle = crate::stats::resolved_active_secs(kernel).await;
     let mut out = Vec::new();
     for s in sessions {
         let name = match &s.payload {
@@ -277,7 +292,7 @@ pub async fn model_runs(kernel: &Kernel) -> Result<Vec<ModelRun>> {
             },
             _ => continue,
         };
-        if let Ok(runs) = session_runs(kernel, s.entity_id.clone(), &name).await {
+        if let Ok(runs) = session_runs(kernel, s.entity_id.clone(), &name, idle).await {
             out.extend(runs);
         }
     }
@@ -376,6 +391,16 @@ mod tests {
             claim("fable", "2026-06-02T00:00:00Z", "2026-06-04T00:00:00Z"),
         ];
         assert_eq!(credit(&claims, t("2026-06-02T12:00:00Z")), Some("fable"));
+    }
+
+    #[test]
+    fn a_family_is_the_model_without_its_vendor_or_version() {
+        assert_eq!(family("claude-opus-5-5"), "opus");
+        assert_eq!(family("claude-fable-5-1"), "fable");
+        assert_eq!(family("claude-fable-5"), "fable");
+        assert_eq!(family("claude-3-5-sonnet-20241022"), "sonnet");
+        assert_eq!(family("claude-haiku-4-5-20251001"), "haiku");
+        assert_eq!(family("gemini-3.1-pro-preview"), "gemini");
     }
 
     #[test]
