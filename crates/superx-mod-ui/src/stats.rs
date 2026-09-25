@@ -2089,21 +2089,68 @@ fn looks_like_secret(text: &str) -> bool {
         || body("ATATT", 30, |c| token(c) || c == '=')
 }
 
-/// A private key is a PEM block: a line that ends `PRIVATE KEY-----`
-/// after a `-----BEGIN `, then a line of base64 (#413). Naming the two
-/// markers anywhere in a text — as the scanner's own source does — is
-/// not one. A `Read` result carries a line number and a tab before each
-/// line, so the body is read after the last tab.
+/// A private key is a PEM block: `-----BEGIN … PRIVATE KEY-----`, then
+/// its base64 body (#413). Naming the two markers anywhere in a text — as
+/// the scanner's own source does — is not one. The block arrives wrapped
+/// every way a tool shows it (#415 review): as lines, each maybe behind a
+/// `Read` result's line number and tab or `grep -n`'s `12:`; as one line
+/// with `\n` escapes, the way a service-account JSON file or an `.env`
+/// value holds it; and, encrypted, behind its `Proc-Type:` and
+/// `DEK-Info:` headers.
 fn pem_private_key(text: &str) -> bool {
-    let lines: Vec<&str> = text.lines().collect();
-    lines.windows(2).any(|w| {
-        let head = w[0].trim_end();
-        let body = w[1].rsplit('\t').next().unwrap_or("").trim();
-        head.contains("-----BEGIN ")
-            && head.ends_with("PRIVATE KEY-----")
-            && body.len() >= 40
-            && body.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    const MARKER: &str = "PRIVATE KEY-----";
+    text.match_indices(MARKER).any(|(at, _)| {
+        let line_start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+        if !text[line_start..at].contains("-----BEGIN ") {
+            return false;
+        }
+        let after = &text[at + MARKER.len()..];
+        let end = after
+            .char_indices()
+            .nth(PEM_LOOKAHEAD)
+            .map_or(after.len(), |(i, _)| i);
+        let after = after[..end].replace("\\r\\n", "\n").replace("\\n", "\n");
+        // The rest of the marker's own line, then the headers and the blank
+        // line an encrypted key carries, then the body's first line.
+        after
+            .lines()
+            .skip(1)
+            .filter(|l| {
+                !numbered(l).1.trim().is_empty() && !l.contains("Proc-Type:") && !l.contains("DEK-Info:")
+            })
+            .take(1)
+            .any(pem_body_line)
     })
+}
+
+/// A line split into the number a tool put in front of it and the rest.
+/// A PEM body holds no tab, colon or dash, so the number ends at the last
+/// of them: `  12\t`, `12:`, `12-`, `path:12:`.
+fn numbered(line: &str) -> (&str, &str) {
+    match line.rfind(['\t', ':', '-']) {
+        Some(i) => (&line[..=i], &line[i + 1..]),
+        None => ("", line),
+    }
+}
+
+/// Characters of a PEM block read past its marker, at most: its headers
+/// and the first line of its body.
+const PEM_LOOKAHEAD: usize = 400; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// A line of a PEM body: 40 or more characters of base64, indented or
+/// behind nothing but the line number a tool put in front of it.
+fn pem_body_line(line: &str) -> bool {
+    let (prefix, body) = numbered(line);
+    let body = body.trim();
+    let prefix: Vec<char> = prefix.trim_end_matches(' ').chars().collect();
+    let behind_a_number = match prefix.as_slice() {
+        [] => true,
+        [.., digit, '\t' | ':' | '-'] => digit.is_ascii_digit(),
+        p => p.iter().all(|c| c.is_whitespace()),
+    };
+    behind_a_number
+        && body.len() >= 40
+        && body.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
 }
 
 /// Outcomes attributable to one reasoning level (#337).

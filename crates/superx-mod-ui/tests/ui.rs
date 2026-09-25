@@ -1461,8 +1461,10 @@ async fn productivity_and_exposure_are_measured_per_agent() {
         "cwd": superx.cwd(),
         "message": {"model": "claude-fable-5", "content": [
             {"type": "tool_result", "tool_use_id": "r1", "content": "fn main() {}"},
+            // Assembled at run time: this file, read, holds no key block.
             {"type": "tool_result", "tool_use_id": "r2",
-                "content": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n"}]}})).await;
+                "content": format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n",
+                    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW")}]}})).await;
 
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
 
@@ -3695,6 +3697,45 @@ async fn a_secret_is_a_shape_and_commands_are_scanned() {
     assert_eq!(s.exposure.secret_paths.len(), 2, "{:?}", s.exposure.secret_paths);
     assert!(s.exposure.secret_paths.iter().any(|p| p.starts_with("Bash input in")), "{:?}", s.exposure.secret_paths);
     assert!(s.exposure.secret_paths.iter().any(|p| p.ends_with("id_rsa")), "{:?}", s.exposure.secret_paths);
+}
+
+/// A private key is found however a tool shows it (#415 review): in a
+/// service-account JSON file and an `.env` value, one line with `\n`
+/// escapes; in `grep -n -A2` output; encrypted, behind its headers, in a
+/// `Read` result. Prose naming the markers, and a marker over a short
+/// line, are not keys. The fixtures are assembled at run time, so reading
+/// this file is not a leak.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_key_is_found_however_a_tool_shows_it() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "keys").await;
+    let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC".repeat(2);
+    let begin = |kind: &str| format!("-----BEGIN {kind}PRIVATE KEY-----");
+    let end = format!("-----END {}PRIVATE KEY-----", "");
+    let shown = [
+        format!("{{\"type\": \"service_account\", \"private_key\": \"{}\\n{body}\\n{end}\\n\"}}", begin("")),
+        format!("PRIVATE_KEY=\"{}\\n{body}\\n{end}\"", begin("RSA ")),
+        format!("1:{}\n2-{body}\n3-{body}", begin("OPENSSH ")),
+        format!("     1\t{}\n     2\tProc-Type: 4,ENCRYPTED\n     3\tDEK-Info: AES-128-CBC,{}\n     4\t\n     5\t{body}",
+            begin("RSA "), "0123456789ABCDEF".repeat(2)),
+        // Not keys.
+        format!("/// A block opens {} and the body follows\n/// on the next line, as base64.", begin("")),
+        format!("{}\nMIIEvQIBADAN\n{end}", begin("")),
+    ];
+    for (i, text) in shown.iter().enumerate() {
+        let id = format!("k{i}");
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "cwd": "/w/superx", "message": {"content": [
+                {"type": "tool_use", "id": id, "name": "Read", "input": {"file_path": format!("/w/superx/key{i}")}}]}})).await;
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}})).await;
+    }
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.exposure.secret_hits, 4, "{:?}", s.exposure.secret_paths);
+    let mut paths = s.exposure.secret_paths.clone();
+    paths.sort();
+    assert_eq!(paths, vec!["/w/superx/key0", "/w/superx/key1", "/w/superx/key2", "/w/superx/key3"]);
 }
 
 /// The model comparison reads git as the work actually moved (#414).
