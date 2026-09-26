@@ -248,15 +248,6 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
                 }
             }
         }
-        // The identities a squash of this machine's branches was made as —
-        // the account that clicked merge — are this machine's too.
-        let aliases: HashSet<&str> = work
-            .landed
-            .iter()
-            .filter(|c| shares.contains_key(c.hash.as_str()))
-            .map(|c| c.author.as_str())
-            .collect();
-
         // Files a model has already touched here, for thrash.
         let mut touched: HashMap<(String, String), i64> = HashMap::new();
         for c in &work.landed {
@@ -266,11 +257,14 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
                 continue;
             }
             // When the work was done: the branch commits' times for a
-            // squash of this machine's branches, else the commit's own —
-            // and only for commits this machine made.
+            // squash of this machine's branch work, else the commit's own —
+            // and only for commits this machine made. The merging account's
+            // commit that matches no branch work is no one's here: crediting
+            // it to whatever model ran when it merged was a guess (#415
+            // review).
             let pieces: Vec<(DateTime<Utc>, i64)> = match shares.get(c.hash.as_str()) {
                 Some(v) => v.clone(),
-                None if ours(&c.author) || aliases.contains(c.author.as_str()) => vec![(c.at, 1)],
+                None if ours(&c.author) => vec![(c.at, 1)],
                 None => continue,
             };
             let alive = work.alive.get(&c.hash).copied().unwrap_or(0);

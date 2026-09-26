@@ -3970,7 +3970,10 @@ async fn the_comparison_reads_git_as_the_work_moved() {
 /// in the reflog of the checkout that made them, so its squash is credited
 /// by when the branch was written, not by when it merged: the model that
 /// wrote it, not the one running when it landed. The amend's leftover, in
-/// that reflog too, is nobody's abandoned work.
+/// that reflog too, is nobody's abandoned work. A branch whose worktree was
+/// removed as well has no reflog left; its commits are read back from the
+/// object store. And a commit the merging account made that matches no
+/// branch work is credited to no one — not to whoever ran when it merged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_squash_whose_branch_is_gone_is_credited_to_who_wrote_it() {
     let kernel = fresh_kernel().await;
@@ -3992,6 +3995,15 @@ async fn a_squash_whose_branch_is_gone_is_credited_to_who_wrote_it() {
     // The checkout moves on and the branch is deleted, as merged branches are.
     repo.git(&["-C", wt, "checkout", "-q", "--detach"]);
     repo.git(&["branch", "-q", "-D", "feat/a"]);
+    // A second branch, written in a worktree that is then removed with it.
+    let wt2 = repo.worktree("wt2", "feat/b");
+    let seven: String = (1..=7).map(|i| format!("b {i}\n")).collect();
+    repo.commit(wt2, h(1.2), "t@t", "feat: b", &[("b.rs", &seven)]);
+    repo.commit(main, h(3.6), "noreply@github.com", "feat: b (#2)", &[("b.rs", &seven)]);
+    repo.git(&["worktree", "remove", "--force", wt2]);
+    repo.git(&["branch", "-q", "-D", "feat/b"]);
+    // The merging account's own commit, matching no branch work.
+    repo.commit(main, h(3.8), "noreply@github.com", "docs: edited on the web", &[("c.md", "1\n2\n3\n4\n5\n")]);
 
     let reply = |id: &str, model: &str, cwd: &str| serde_json::json!({
         "cwd": cwd, "message": {"id": id, "model": model, "usage": {"output_tokens": 100},
@@ -4006,10 +4018,11 @@ async fn a_squash_whose_branch_is_gone_is_credited_to_who_wrote_it() {
     let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
     let c = superx_mod_ui::compare::compare(&runs, &std::collections::HashMap::new()).await;
     let row = |m: &str| c.deviations.iter().find(|d| d.model == m);
-    let f = row("fable").expect("fable wrote the branch");
-    assert_eq!((f.added, f.commits), (15, 1), "the squash, by when the branch was written");
+    let f = row("fable").expect("fable wrote the branches");
+    assert_eq!((f.added, f.commits), (22, 2), "both squashes, by when their branches were written");
     assert_eq!(f.abandoned_lines, 0, "the amend's leftover is no abandoned work");
-    assert!(row("opus").is_none_or(|o| o.added == 0), "merging it did not make it opus's");
+    assert!(row("opus").is_none_or(|o| o.added == 0 && o.commits == 0),
+        "merging them did not make them opus's, nor the web edit made as the merging account");
 }
 
 /// A repository is judged where its work lands (#415 review). Its host's
