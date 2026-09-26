@@ -135,10 +135,14 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/activity", get(api_activity))
         .route("/api/stats", get(api_stats))
         .route("/api/insights", get(api_insights))
-        .route("/api/compare", get(api_compare))
         .route("/api/events", get(api_events))
         .route("/api/command", post(api_command))
         .route_layer(axum::middleware::from_fn_with_state(budget, bounded))
+        // The model comparison takes its time (operator, #415 QA): it walks
+        // every repository's git, nothing else on the page waits for it,
+        // and a slow walk cut off would never finish to be cached. A route
+        // added after `route_layer` is outside it.
+        .route("/api/compare", get(api_compare))
         .fallback(get(static_assets))
         .with_state(state);
     let addr = format!("127.0.0.1:{port}");
@@ -802,25 +806,26 @@ mod tests {
 
     /// An answer that never comes is a failure within the budget (#415
     /// QA); one inside it passes untouched, and no budget holds nothing.
+    /// A route added after the layer, as the model comparison is, takes
+    /// its time.
     #[tokio::test]
     async fn a_request_that_never_answers_fails_within_the_budget() {
         use tower::ServiceExt as _;
         // `get` in this module fetches a static asset; routes need axum's.
         use axum::routing::get as route_get;
-        // A budget far shorter than any real one; the slow handler takes
+        // A budget far shorter than any real one; the slow handlers take
         // twice as long, and the generous budget a hundred times.
         const BUDGET: Duration = Duration::from_millis(20); // skill-allow: §9-duration — test fixture, not a policy
+        let slow = || async {
+            tokio::time::sleep(BUDGET * 2).await;
+            "late"
+        };
         let app = |budget: Option<Duration>| {
             Router::new()
                 .route("/never", route_get(std::future::pending::<&'static str>))
-                .route(
-                    "/slow",
-                    route_get(|| async {
-                        tokio::time::sleep(BUDGET * 2).await;
-                        "late"
-                    }),
-                )
+                .route("/slow", route_get(slow))
                 .route_layer(axum::middleware::from_fn_with_state(budget, bounded))
+                .route("/compare", route_get(slow))
         };
         let call = |app: Router, path: &'static str| {
             app.oneshot(axum::http::Request::get(path).body(axum::body::Body::empty()).expect("request"))
@@ -841,6 +846,11 @@ mod tests {
         assert_eq!(within.status(), StatusCode::OK, "an answer inside the budget passes");
         let unbounded = call(app(None), "/slow").await.expect("response");
         assert_eq!(unbounded.status(), StatusCode::OK, "no budget, no bound");
+
+        let cut = call(app(Some(BUDGET)), "/slow").await.expect("response");
+        assert_eq!(cut.status(), StatusCode::GATEWAY_TIMEOUT, "slower than the budget, inside the layer");
+        let compare = call(app(Some(BUDGET)), "/compare").await.expect("response");
+        assert_eq!(compare.status(), StatusCode::OK, "the same wait, outside the layer, finishes");
     }
 
     async fn get(path: &str) -> axum::response::Response {
