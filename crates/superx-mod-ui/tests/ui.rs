@@ -3661,19 +3661,70 @@ async fn an_echoed_exit_is_the_verdict_unless_the_gate_was_piped() {
 async fn a_word_first_summary_is_no_test_tally() {
     let kernel = fresh_kernel().await;
     let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "tally").await;
-    for (id, printed) in [
-        ("a", "passed 266 failed 0"),
-        ("b", "===== 2 failed, 5 passed in 1.23s ====="),
-        ("c", "Tests:       1 failed, 3 passed, 4 total"),
+    for (id, cmd, printed) in [
+        ("a", "./ci/test.sh", "passed 266 failed 0"),
+        ("b", "pytest -q", "===== 2 failed, 5 passed in 1.23s ====="),
+        ("c", "npm test", "Tests:       1 failed, 3 passed, 4 total"),
     ] {
         log_tool_message(&kernel, &session, &agent, serde_json::json!({
             "cwd": "/w/superx", "message": {"content": [
-                {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": "run the suite"}}]}})).await;
+                {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}})).await;
         log_tool_message(&kernel, &session, &agent, serde_json::json!({
             "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": printed}]}})).await;
     }
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
     assert_eq!((s.tests_passed, s.tests_failed), (8, 3), "pytest's and jest's tallies; not the script's summary");
+}
+
+/// Only a run that tests or builds reports a tally or a diagnostic (#415
+/// QA). A file printed through the shell, a script's own report and a log
+/// read back after its run are reading, as a `Read` is: a comment quoting
+/// "266 failed", printed by `sed`, lit the lamp with 532 failures in a
+/// morning, and a gate's log grepped after the gate counted its failure
+/// twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_run_that_tests_or_builds_reports() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "reports").await;
+    let call = |id: &str, cmd: &str| serde_json::json!({
+        "cwd": "/w/superx", "message": {"content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": cmd}}]}});
+    let out = |id: &str, printed: &str| serde_json::json!({
+        "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": printed}]}});
+    let gate_tally = "test result: FAILED. 62 passed; 1 failed; 0 ignored";
+    for (id, cmd, printed) in [
+        // Reading, whatever it prints.
+        ("r1", "sed -n 2550,2560p src/stats.rs".to_string(),
+            "// number with the next word: it read as 266 failed, and six such\nerror[E0382]: in a fixture".to_string()),
+        ("r2", "grep -n \"test result\" tests/ui.rs".to_string(),
+            "1242:    let red_test = \"test result: FAILED. 11 passed; 1 failed\";".to_string()),
+        ("r3", "python3 report.py".to_string(), gate_tally.to_string()),
+        // The gate prints its own tally once...
+        ("g1", "cargo test -p superx-mod-ui > $G/ui3.log 2>&1; echo \"UI_TEST_EXIT=$?\"; grep -E \"^test result\" $G/ui3.log".to_string(),
+            format!("UI_TEST_EXIT=101\n{gate_tally}")),
+        // ...and its log read back is not a second run.
+        ("g2", "grep -E \"FAILED|panicked\" -A 6 $G/ui3.log".to_string(), gate_tally.to_string()),
+        // An edit chained into a test run is the test run.
+        ("t1", "python3 - <<'EOF'\np = 'src/a.rs'\nEOF\ncargo test -p superx-mod-ui 2>&1 | tail -3".to_string(),
+            "test result: ok. 5 passed; 0 failed; 0 ignored".to_string()),
+        ("b1", "cargo build --release".to_string(), "error[E0425]: cannot find value `x` in this scope".to_string()),
+    ] {
+        log_tool_message(&kernel, &session, &agent, call(id, &cmd)).await;
+        log_tool_message(&kernel, &session, &agent, out(id, &printed)).await;
+    }
+    // The reverse order — output before its call — is judged the same.
+    log_tool_message(&kernel, &session, &agent, out("r4", "test result: ok. 9 passed; 0 failed")).await;
+    log_tool_message(&kernel, &session, &agent, call("r4", "cat /tmp/tasks/b1.output")).await;
+    log_tool_message(&kernel, &session, &agent, out("t2", "test result: ok. 4 passed; 0 failed")).await;
+    log_tool_message(&kernel, &session, &agent, call("t2", "cargo test --workspace")).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(
+        (s.tests_passed, s.tests_failed),
+        (62 + 5 + 4, 1),
+        "the gate once, the chained run, the late output; no file, script or log read back"
+    );
+    assert_eq!(s.compile_errors, 1, "the build's error, not the fixture `sed` printed");
 }
 
 /// A refused test run verified nothing (#415 review): the session is not
