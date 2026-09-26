@@ -22,4 +22,10 @@ failures_recent: bigint, failures_total: bigint,
 /**
  * The error text carried by the newest failure, when it had one.
  */
-last_error: string | null, };
+last_error: string | null, 
+/**
+ * When that failure happened, RFC3339: an error from weeks ago is
+ * shown as old, not beside "0 recent" as if it were failing now (#415
+ * QA).
+ */
+last_error_at: string | null, };

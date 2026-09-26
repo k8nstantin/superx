@@ -2114,10 +2114,16 @@ async fn module_health_reads_failures_and_last_event() {
     assert_eq!(runner.failures_recent, 1, "the three-day-old one is not recent");
     assert_eq!(runner.failures_total, 2);
     assert_eq!(runner.last_error.as_deref(), Some("boom"));
+    // …and when it happened, so an old error is shown as old (#415 QA).
+    let at = chrono::DateTime::parse_from_rfc3339(runner.last_error_at.as_deref().expect("dated"))
+        .expect("rfc3339")
+        .with_timezone(&chrono::Utc);
+    assert!((3000..4000).contains(&(chrono::Utc::now() - at).num_seconds()), "the newest failure's moment");
     let ui = i.module_health.iter().find(|h| h.name == "ui").expect("ui");
     assert_eq!(ui.last_event, "module_active");
     assert_eq!(ui.failures_total, 0);
     assert_eq!(ui.last_error, None);
+    assert_eq!(ui.last_error_at, None);
     assert_eq!(i.module_health[0].name, "runner", "the module with the most to fix sorts first");
 }
 
@@ -3647,6 +3653,29 @@ async fn an_echoed_exit_is_the_verdict_unless_the_gate_was_piped() {
     assert_eq!(s.prs_ungated, 1, "the piped run's TEST_EXIT=0 is tail's; its tests failed");
 }
 
+/// Test tallies are read where the number comes first (#415 QA): pytest's
+/// "2 failed, 5 passed", jest's "Tests: 1 failed, 3 passed". A script's own
+/// summary that puts the word first — `passed 266 failed 0` — is no tally:
+/// it was read as 266 failures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_word_first_summary_is_no_test_tally() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "tally").await;
+    for (id, printed) in [
+        ("a", "passed 266 failed 0"),
+        ("b", "===== 2 failed, 5 passed in 1.23s ====="),
+        ("c", "Tests:       1 failed, 3 passed, 4 total"),
+    ] {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "cwd": "/w/superx", "message": {"content": [
+                {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": "run the suite"}}]}})).await;
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({
+            "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": printed}]}})).await;
+    }
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!((s.tests_passed, s.tests_failed), (8, 3), "pytest's and jest's tallies; not the script's summary");
+}
+
 /// A refused test run verified nothing (#415 review): the session is not
 /// "verifying" because the operator stopped `cargo test` before it ran.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3744,6 +3773,9 @@ async fn coverage_counts_the_hours_the_strip_draws() {
     }
     let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
     assert_eq!(s.active_hours_24h, 1, "{:?}", s.active_hours);
+    // The range's own count agrees: the older message is inside the last
+    // 24 hours, but in an hour that began before the range did (#415 QA).
+    assert_eq!(s.active_hours_range, 1);
 }
 
 /// The page's hours and days are the viewer's (#415 review): at UTC−4 a

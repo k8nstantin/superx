@@ -356,6 +356,7 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
                     failures_recent: 0,
                     failures_total: 0,
                     last_error: None,
+                    last_error_at: None,
                 });
                 health.len() - 1
             }
@@ -365,7 +366,10 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
                 health[idx].failures_recent += 1;
             }
             if health[idx].last_error.is_none() {
-                health[idx].last_error = get_str(row, "error").map(str::to_string);
+                if let Some(error) = get_str(row, "error") {
+                    health[idx].last_error = Some(error.to_string());
+                    health[idx].last_error_at = Some(at.to_rfc3339());
+                }
             }
         }
     }
@@ -383,6 +387,7 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
                 failures_recent: 0,
                 failures_total: total,
                 last_error: None,
+                last_error_at: None,
             }),
         }
     }

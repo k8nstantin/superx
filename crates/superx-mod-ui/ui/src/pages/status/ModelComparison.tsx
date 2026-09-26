@@ -52,6 +52,14 @@ const per = (a: number, b: number, mult = 1) => (b > 0 ? Math.round((a * mult) /
 /// The twenty measures, in reading order: what you GET, what you SPEND
 /// per unit, what was WASTED, how the work WENT, and the totals that
 /// put the rates in context.
+/// Working hours from minutes, to one decimal under ten (#415 QA): rounded
+/// to whole hours, eight minutes read "0" beside the 1,027 lines an hour
+/// computed from them.
+const hours = (minutes: number) => {
+  const h = minutes / 60
+  return h < 10 ? h.toFixed(1) : String(Math.round(h))
+}
+
 function metrics(): Metric[] {
   // Only measures whose job is a plain RANKING stay as bars. Anything
   // that is a proportion, a pair of values, or two measures against
@@ -492,8 +500,9 @@ function heroes(rows: Row[]): { k: string; v: string; sub: string; good: boolean
   const v = verdict(rows)
   if (!v) return []
   const ratio = (a: number, b: number) => (b > 0 ? `${(a / b).toFixed(1)}×` : '—')
-  const hrsPer1k = (d: Row) =>
-    n(d.alive) > 0 ? Math.round(n(d.minutes) / 60 / (n(d.alive) / 1000)) : 0
+  // Unrounded: the ratio is taken on these, and rounding first made it
+  // 3.5× where lines-per-hour — its reciprocal — read 2.8× (#415 QA).
+  const hrsPer1k = (d: Row) => (n(d.alive) > 0 ? n(d.minutes) / 60 / (n(d.alive) / 1000) : 0)
   return [
     {
       k: 'Lasting lines per 1M tokens',
@@ -516,7 +525,7 @@ function heroes(rows: Row[]): { k: string; v: string; sub: string; good: boolean
     {
       k: 'Hours per 1,000 surviving lines',
       v: ratio(hrsPer1k(v.worst), hrsPer1k(v.best)),
-      sub: `${hrsPer1k(v.worst)}h from ${v.worst.model} · ${hrsPer1k(v.best)}h from ${v.best.model}`,
+      sub: `${hours(hrsPer1k(v.worst) * 60)}h from ${v.worst.model} · ${hours(hrsPer1k(v.best) * 60)}h from ${v.best.model}`,
       good: false,
     },
   ]
@@ -668,10 +677,10 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
                 <Table.Tr>
                   <Table.Td>Spent, to leave that behind</Table.Td>
                   <Table.Td ta="right">
-                    {fmtCompact(n(v.best.out_tokens))} · {Math.round(n(v.best.minutes) / 60)}h
+                    {fmtCompact(n(v.best.out_tokens))} · {hours(n(v.best.minutes))}h
                   </Table.Td>
                   <Table.Td ta="right">
-                    {fmtCompact(n(v.worst.out_tokens))} · {Math.round(n(v.worst.minutes) / 60)}h
+                    {fmtCompact(n(v.worst.out_tokens))} · {hours(n(v.worst.minutes))}h
                   </Table.Td>
                   <Table.Td ta="right">—</Table.Td>
                 </Table.Tr>
@@ -828,7 +837,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
                 <Table.Tr key={r.model} opacity={thin ? 0.55 : 1}>
                   <Table.Td>{r.model}</Table.Td>
                   <Table.Td ta="right">{fmtCompact(n(r.out_tokens))}</Table.Td>
-                  <Table.Td ta="right">{Math.round(n(r.minutes) / 60)}</Table.Td>
+                  <Table.Td ta="right">{hours(n(r.minutes))}</Table.Td>
                   <Table.Td ta="right">{fmtCompact(n(r.added))}</Table.Td>
                   <Table.Td ta="right">{fmtCompact(n(r.alive))}</Table.Td>
                   <Table.Td ta="right" c={n(r.survived_pct) >= 50 ? KEPT : THROWN}>{n(r.survived_pct)}%</Table.Td>

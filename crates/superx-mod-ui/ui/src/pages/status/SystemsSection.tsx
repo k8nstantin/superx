@@ -130,8 +130,10 @@ export function SystemsSection({
                     </Table.Td>
                     <Table.Td>
                       {h?.last_error ? (
+                        // An old error reads as old: dimmed, and aged (#415 QA).
                         <Tooltip label={h.last_error} withArrow multiline w={420}>
-                          <Text size="xs" c="orange.4" lineClamp={1} style={{ maxWidth: 260 }}>
+                          <Text size="xs" c={recent > 0 ? 'orange.4' : 'dimmed'} lineClamp={1} style={{ maxWidth: 260 }}>
+                            {ageOf(h.last_error_at, now) != null ? `${fmtAge(ageOf(h.last_error_at, now) ?? 0)} ago · ` : ''}
                             {h.last_error}
                           </Text>
                         </Tooltip>
