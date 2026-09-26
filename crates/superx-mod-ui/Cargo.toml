@@ -26,3 +26,5 @@ chrono.workspace = true
 [dev-dependencies]
 surrealdb.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `ServiceExt::oneshot` drives the router in tests, as axum documents.
+tower = { version = "0.5", features = ["util"] }

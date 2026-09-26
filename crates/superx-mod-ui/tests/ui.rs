@@ -3,9 +3,10 @@
 
 use superx_kernel::{Kernel, KernelModule, SCHEMA_DDL};
 use superx_mod_ui::{
-    resolved_context_window, resolved_default_range, resolved_port, resolved_url, UiModule,
-    CONTEXT_WINDOW_PARAM, DEFAULT_CONTEXT_WINDOW, DEFAULT_PORT, DEFAULT_RANGE,
-    DEFAULT_RANGE_PARAM, MODULE_NAME, PORT_PARAM,
+    resolved_context_window, resolved_default_range, resolved_port, resolved_read_timeout_secs,
+    resolved_url, UiModule, CONTEXT_WINDOW_PARAM, DEFAULT_CONTEXT_WINDOW, DEFAULT_PORT,
+    DEFAULT_RANGE, DEFAULT_RANGE_PARAM, DEFAULT_READ_TIMEOUT_SECS, MODULE_NAME, PORT_PARAM,
+    READ_TIMEOUT_SECS_PARAM,
 };
 
 const TEST_PASSWORD: &str = "test-kernel-password-for-mem-engine";
@@ -1889,6 +1890,33 @@ async fn default_range_defaults_then_follows_the_parameter() {
         DEFAULT_RANGE,
         "a range the API does not know falls back rather than 400ing every load"
     );
+}
+
+/// How long one request may take is a substrate decision too (#415 QA,
+/// §9): unset, the fallback; a whole number of seconds, that; `0`, no
+/// bound; anything else, the fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_read_budget_defaults_then_follows_the_parameter() {
+    use superx_kernel::types::Value;
+    let kernel = fresh_kernel().await;
+    assert_eq!(resolved_read_timeout_secs(&kernel).await, DEFAULT_READ_TIMEOUT_SECS, "unregistered → default");
+    let entity = kernel
+        .register_module(&UiModule.descriptor())
+        .await
+        .expect("register");
+    assert_eq!(resolved_read_timeout_secs(&kernel).await, DEFAULT_READ_TIMEOUT_SECS, "no param → default");
+    for (value, expected, why) in [
+        (Value::Number(30.into()), 30, "the parameter wins"),
+        (Value::Number(0.into()), 0, "0 lifts the bound"),
+        (Value::Number((-5).into()), DEFAULT_READ_TIMEOUT_SECS, "a negative budget falls back"),
+        (Value::String("soon".into()), DEFAULT_READ_TIMEOUT_SECS, "not a number falls back"),
+    ] {
+        kernel
+            .set_parameter(entity.clone(), READ_TIMEOUT_SECS_PARAM, value)
+            .await
+            .expect("param");
+        assert_eq!(resolved_read_timeout_secs(&kernel).await, expected, "{why}");
+    }
 }
 
 /// One `LIMIT 20000` reset the connection on `30d` and `all`. The

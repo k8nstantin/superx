@@ -115,6 +115,18 @@ pub const CACHE_SECS_PARAM: &str = "attr_ui_cache_secs";
 /// Fallback when the parameter is unset.
 pub const DEFAULT_CACHE_SECS: u64 = 20; // skill-allow: §9-const — bootstrap fallback, param-overridable
 
+/// How long one API request may take before it is answered as a failure
+/// (#415 QA). Every read awaits the substrate without a bound: a reply
+/// that never came held the 24h range at "reading…" for minutes, the
+/// panels still showing the last range's figures and nothing saying so.
+/// The slowest honest read is the model comparison's walk of git, about
+/// 45 s uncached. Seconds, read when the server starts; `0` lifts the
+/// bound.
+pub const READ_TIMEOUT_SECS_PARAM: &str = "attr_ui_read_timeout_secs";
+
+/// Fallback when the parameter is unset.
+pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 120; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
 /// Fallback when the parameter is unset or names no known range.
 pub const DEFAULT_RANGE: &str = "24h";
 
@@ -139,18 +151,29 @@ pub async fn resolved_default_range(kernel: &Kernel) -> String {
 
 /// Resolve how long an answer may be reused, in seconds.
 pub async fn resolved_cache_secs(kernel: &Kernel) -> u64 {
+    resolved_secs(kernel, CACHE_SECS_PARAM, DEFAULT_CACHE_SECS).await
+}
+
+/// Resolve how long one request may take, in seconds; `0` is no bound.
+pub async fn resolved_read_timeout_secs(kernel: &Kernel) -> u64 {
+    resolved_secs(kernel, READ_TIMEOUT_SECS_PARAM, DEFAULT_READ_TIMEOUT_SECS).await
+}
+
+/// A count of seconds on the module entity: the parameter when it is a
+/// whole number of zero or more, else the fallback.
+async fn resolved_secs(kernel: &Kernel, param: &str, fallback: u64) -> u64 {
     let Ok(Some(entity)) = kernel
         .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
         .await
     else {
-        return DEFAULT_CACHE_SECS;
+        return fallback;
     };
-    match kernel.get_parameter(entity, CACHE_SECS_PARAM).await {
+    match kernel.get_parameter(entity, param).await {
         Ok(Some(Value::Number(n))) => n
             .to_int()
             .filter(|&v| v >= 0)
-            .map_or(DEFAULT_CACHE_SECS, |v| v as u64),
-        _ => DEFAULT_CACHE_SECS,
+            .map_or(fallback, |v| v as u64),
+        _ => fallback,
     }
 }
 
