@@ -87,6 +87,34 @@ fn json_body(body: String) -> axum::response::Response {
         .into_response()
 }
 
+/// Every request answers within the read budget (#415 QA). The reads
+/// await the substrate without a bound, and a reply that never came left
+/// the page on the last range's figures with nothing saying so: an answer
+/// that does not come in time is a failure the page shows, in the
+/// `{ is_error, output }` shape of every other. `None` is no bound. The
+/// event stream's handler answers at once, so its stream is never cut.
+async fn bounded(
+    State(budget): State<Option<Duration>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let Some(budget) = budget else {
+        return next.run(request).await;
+    };
+    match tokio::time::timeout(budget, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "output": format!("no answer within {budget:?} ({})", crate::READ_TIMEOUT_SECS_PARAM),
+                "is_error": true,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Bind and spawn the server + the single SSE poller task.
 pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
     let (events, _) = broadcast::channel(1024);
@@ -95,6 +123,10 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         events: events.clone(),
         cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
+    // Read once, here: resolving it per request would itself await the
+    // substrate that might not answer.
+    let secs = crate::resolved_read_timeout_secs(&kernel).await;
+    let budget = (secs > 0).then(|| Duration::from_secs(secs));
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/agents", get(api_agents))
@@ -106,6 +138,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/compare", get(api_compare))
         .route("/api/events", get(api_events))
         .route("/api/command", post(api_command))
+        .route_layer(axum::middleware::from_fn_with_state(budget, bounded))
         .fallback(get(static_assets))
         .with_state(state);
     let addr = format!("127.0.0.1:{port}");
@@ -765,6 +798,49 @@ mod tests {
         assert_eq!(viewer_clock(None), utc);
         assert_eq!(viewer_clock(Some(100_000)), utc, "past a day is no offset");
         assert_eq!(viewer_clock(Some(i32::MAX)), utc, "and never overflows");
+    }
+
+    /// An answer that never comes is a failure within the budget (#415
+    /// QA); one inside it passes untouched, and no budget holds nothing.
+    #[tokio::test]
+    async fn a_request_that_never_answers_fails_within_the_budget() {
+        use tower::ServiceExt as _;
+        // `get` in this module fetches a static asset; routes need axum's.
+        use axum::routing::get as route_get;
+        // A budget far shorter than any real one; the slow handler takes
+        // twice as long, and the generous budget a hundred times.
+        const BUDGET: Duration = Duration::from_millis(20); // skill-allow: §9-duration — test fixture, not a policy
+        let app = |budget: Option<Duration>| {
+            Router::new()
+                .route("/never", route_get(std::future::pending::<&'static str>))
+                .route(
+                    "/slow",
+                    route_get(|| async {
+                        tokio::time::sleep(BUDGET * 2).await;
+                        "late"
+                    }),
+                )
+                .route_layer(axum::middleware::from_fn_with_state(budget, bounded))
+        };
+        let call = |app: Router, path: &'static str| {
+            app.oneshot(axum::http::Request::get(path).body(axum::body::Body::empty()).expect("request"))
+        };
+
+        let never = call(app(Some(BUDGET)), "/never").await.expect("response");
+        assert_eq!(never.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(never.into_body(), usize::MAX).await.expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["is_error"], true);
+        let output = body["output"].as_str().unwrap_or_default();
+        assert!(
+            output.contains(&format!("{BUDGET:?}")) && output.contains(crate::READ_TIMEOUT_SECS_PARAM),
+            "{output}"
+        );
+
+        let within = call(app(Some(BUDGET * 100)), "/slow").await.expect("response");
+        assert_eq!(within.status(), StatusCode::OK, "an answer inside the budget passes");
+        let unbounded = call(app(None), "/slow").await.expect("response");
+        assert_eq!(unbounded.status(), StatusCode::OK, "no budget, no bound");
     }
 
     async fn get(path: &str) -> axum::response::Response {

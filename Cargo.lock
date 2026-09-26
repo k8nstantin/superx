@@ -3822,6 +3822,7 @@ dependencies = [
  "superx-ops",
  "surrealdb",
  "tokio",
+ "tower",
  "tracing",
  "ts-rs",
 ]
