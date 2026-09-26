@@ -49,6 +49,13 @@ export const TOOLTIP = {
   textStyle: { color: INK, fontSize: 12 },
 }
 
+/// A label inside a bar shows only where it fits (#415 QA): centred on a
+/// segment narrower than itself, it ran over the row's name and into its
+/// neighbours' labels. The figure is still in the tooltip. ECharts' layout
+/// callback has no way to hide a label; a zero font size draws none.
+export const insideFits = (p: { rect: { width: number }; labelRect: { width: number } }) =>
+  p.labelRect.width > p.rect.width - 4 ? { fontSize: 0 } : {}
+
 export function EChart({ option, height }: { option: Record<string, unknown>; height: number }) {
   const merged = {
     color: [...CHART_COLORS],

@@ -541,7 +541,10 @@ export function Gauge({
                 fontWeight: 700,
                 fontFamily: MONO,
                 color: value == null ? INK_MUTED : INK,
-                offsetCenter: [0, '30%'],
+                // Below the needle's reach: at either end of the arc it dips
+                // 29% of the radius under the pivot, and it crossed the
+                // figure at 30% (#415 QA).
+                offsetCenter: [0, '50%'],
                 formatter: () => (value == null ? '—' : `${Math.round(value)}${unit}`),
               },
               data: [{ value: value ?? 0 }],
