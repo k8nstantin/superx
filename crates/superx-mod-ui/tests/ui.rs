@@ -4049,7 +4049,7 @@ async fn the_comparison_reads_git_as_the_work_moved() {
     let (_, opus) = seed_agent_and_session(&kernel, "claude_code", "opus").await;
     let (_, laker) = seed_agent_and_session(&kernel, "claude_code", "lake").await;
     log_tool_message_at(&kernel, &fable, &agent, reply("f1", "claude-fable-5", wt), h(0.0)).await;
-    log_tool_message_at(&kernel, &fable, &agent, reply("f2", "claude-fable-5-1", wt), h(2.0)).await;
+    log_tool_message_at(&kernel, &fable, &agent, reply("f2", "claude-fable-5-20260101", wt), h(2.0)).await;
     log_tool_message_at(&kernel, &opus, &agent, reply("o1", "claude-opus-5", main), h(3.0)).await;
     log_tool_message_at(&kernel, &opus, &agent, reply("o2", "claude-opus-5", main), h(4.9)).await;
     log_tool_message_at(&kernel, &laker, &agent, reply("l1", "claude-fable-5", lake.cwd()), h(5.0)).await;
@@ -4057,20 +4057,20 @@ async fn the_comparison_reads_git_as_the_work_moved() {
 
     let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
     let fable_run = runs.iter().find(|r| r.session.ends_with("/fable")).expect("fable run");
-    assert_eq!(fable_run.model, "fable", "two point releases, one family, one run");
+    assert_eq!(fable_run.model, "fable 5", "a dated snapshot of the same version: one model, one run");
     assert_eq!(fable_run.messages, 2);
     assert_eq!(fable_run.minutes, 5, "two hours apart is one gap, capped at the live threshold");
 
     let c = superx_mod_ui::compare::compare(&runs, &std::collections::HashMap::new()).await;
     let row = |m: &str| c.deviations.iter().find(|d| d.model == m);
-    let f = row("fable").expect("fable row");
+    let f = row("fable 5").expect("fable row");
     assert_eq!(f.added, 15, "the squash, once — not once per checkout");
     assert_eq!(f.alive, 15, "blamed at main, not at the branch the checkout has out");
     assert_eq!(f.commits, 1);
     assert_eq!(f.abandoned_lines, 7, "fable's abandoned branch; not the teammate's");
     assert_eq!(f.abandoned_commits, 1);
     assert_eq!(f.in_flight_lines, 4, "on a branch still checked out: not landed, not abandoned");
-    assert!(row("opus").is_none_or(|o| o.added == 0), "merging it did not make it opus's");
+    assert!(row("opus 5").is_none_or(|o| o.added == 0), "merging it did not make it opus's");
     assert_eq!(c.unjudged.len(), 1, "{:?}", c.unjudged.iter().map(|u| &u.repo).collect::<Vec<_>>());
     assert_eq!(c.unjudged[0].repo, "lake");
     assert!(c.repos.iter().all(|r| r.repo == "superx"), "one repository row, not one per checkout");
@@ -4129,10 +4129,10 @@ async fn a_squash_whose_branch_is_gone_is_credited_to_who_wrote_it() {
     let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
     let c = superx_mod_ui::compare::compare(&runs, &std::collections::HashMap::new()).await;
     let row = |m: &str| c.deviations.iter().find(|d| d.model == m);
-    let f = row("fable").expect("fable wrote the branches");
+    let f = row("fable 5").expect("fable wrote the branches");
     assert_eq!((f.added, f.commits), (22, 2), "both squashes, by when their branches were written");
     assert_eq!(f.abandoned_lines, 0, "the amend's leftover is no abandoned work");
-    assert!(row("opus").is_none_or(|o| o.added == 0 && o.commits == 0),
+    assert!(row("opus 5").is_none_or(|o| o.added == 0 && o.commits == 0),
         "merging them did not make them opus's, nor the web edit made as the merging account");
 }
 
@@ -4168,10 +4168,53 @@ async fn a_repository_is_judged_where_its_work_lands() {
 
     let c = superx_mod_ui::compare::compare(&runs, &refs(&[("lake", "sandbox")])).await;
     assert!(c.unjudged.is_empty(), "{:?}", c.unjudged.iter().map(|u| &u.repo).collect::<Vec<_>>());
-    let fable = c.deviations.iter().find(|d| d.model == "fable").expect("judged on sandbox");
+    let fable = c.deviations.iter().find(|d| d.model == "fable 5").expect("judged on sandbox");
     assert_eq!((fable.added, fable.commits), (2, 1));
 
     let c = superx_mod_ui::compare::compare(&runs, &refs(&[("lake", "origin/nope")])).await;
     assert_eq!(c.unjudged.len(), 1);
     assert!(c.unjudged[0].unresolved, "a ref that does not resolve is said");
+}
+
+/// A new version is a new model (operator, #415 QA): folded into one
+/// `opus`, Opus 5 was credited with the work of Opus 5.5. One session
+/// runs Opus 5, then Opus 5.5, each landing a commit while it works: each
+/// is credited with its own, and the switch is a handover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_version_is_credited_as_itself() {
+    let kernel = fresh_kernel().await;
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let repo = TestRepo::new_dated("superx", "main", t0 - chrono::Duration::hours(1));
+    let main = repo.cwd();
+    let ten: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    let fifteen: String = (1..=15).map(|i| format!("line {i}\n")).collect();
+    repo.commit(main, h(0.5), "t@t", "feat: old", &[("old.rs", &ten)]);
+    repo.commit(main, h(2.5), "t@t", "feat: new", &[("new.rs", &fifteen)]);
+
+    let reply = |id: &str, model: &str| serde_json::json!({
+        "cwd": main, "message": {"id": id, "model": model, "usage": {"output_tokens": 100},
+            "content": [{"type": "text", "text": "working"}]}});
+    let (agent, pilot) = seed_agent_and_session(&kernel, "claude_code", "pilot").await;
+    log_tool_message_at(&kernel, &pilot, &agent, reply("a1", "claude-opus-5"), h(0.0)).await;
+    log_tool_message_at(&kernel, &pilot, &agent, reply("a2", "claude-opus-5"), h(1.0)).await;
+    log_tool_message_at(&kernel, &pilot, &agent, reply("b1", "claude-opus-5-5"), h(2.0)).await;
+    log_tool_message_at(&kernel, &pilot, &agent, reply("b2", "claude-opus-5-5"), h(3.0)).await;
+
+    let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
+    let models: Vec<&str> = runs.iter().map(|r| r.model.as_str()).collect();
+    assert_eq!(models.len(), 2, "{models:?}");
+    assert!(models.contains(&"opus 5") && models.contains(&"opus 5.5"), "{models:?}");
+
+    let c = superx_mod_ui::compare::compare(&runs, &std::collections::HashMap::new()).await;
+    let row = |m: &str| c.deviations.iter().find(|d| d.model == m);
+    let old = row("opus 5").expect("opus 5 row");
+    let new = row("opus 5.5").expect("opus 5.5 row");
+    assert_eq!((old.added, old.commits), (10, 1), "opus 5 is credited with its own commit only");
+    assert_eq!((new.added, new.commits), (15, 1), "opus 5.5 is credited with its own");
+    assert!(
+        c.handoffs.iter().any(|h| h.from == "opus 5" && h.to == "opus 5.5" && h.switches == 1),
+        "the switch between them is a handover: {:?}",
+        c.handoffs.iter().map(|h| (&h.from, &h.to, h.switches)).collect::<Vec<_>>()
+    );
 }

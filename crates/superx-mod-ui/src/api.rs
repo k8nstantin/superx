@@ -1034,7 +1034,7 @@ pub struct SseEvent {
 }
 
 /// One model's stint inside one session (#406, #414): a run of
-/// consecutive replies by one model FAMILY, on the agent's clock.
+/// consecutive replies by one model at one version, on the agent's clock.
 ///
 /// A session is not one model — the operator switches mid-session —
 /// so the run, not the session, is the unit that owns a span. And a
@@ -1045,8 +1045,9 @@ pub struct SseEvent {
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct ModelRun {
     pub session: String,
-    /// The model family (`fable`, `opus`): point releases of one model
-    /// are the same choice from the operator's side (#408, #414).
+    /// The model at its version (`opus 5.5`, `fable 5.1`): Opus 5 and Opus
+    /// 5.5 are different models, and folding them credited one with the
+    /// other's work (operator, #415 QA). A dated snapshot is its version.
     pub model: String,
     /// RFC3339 bounds of the run on the agent's clock, so a commit can
     /// be bracketed. Capture time put every run backfilled on first

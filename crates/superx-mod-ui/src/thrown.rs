@@ -38,29 +38,50 @@ use superx_kernel::{Kernel, Result};
 
 use crate::api::{ModelRun, RunWork};
 
-/// The model family: `claude-opus-5-5` is `opus`, `claude-fable-5-1` is
-/// `fable` (#408, #414). Point releases of one model are one choice from
-/// the operator's side, and splitting them lets a thin recent release
-/// distort a rate. The family is the first word of the name that is not
-/// the vendor's and not a version number — and for Gemini, whose names
-/// put the tier after the version, the tier: `gemini-3.1-pro` is
-/// `gemini-pro`, `gemini-2.5-flash-lite` is `gemini-flash`. Folding every
-/// tier into `gemini` hid the fallback from Pro to Flash that a spent quota
-/// forces, which is the handover this comparison is here to test (#415
-/// review).
+/// The model a run is credited to: the model at its version —
+/// `claude-opus-5-5` is `opus 5.5`, `claude-opus-5` is `opus 5`,
+/// `claude-3-5-sonnet-20241022` is `sonnet 3.5`. Folding versions into one
+/// family (#408, #414) credited Opus 5 with the work of Opus 5.5, a
+/// different and far better model (operator, #415 QA). A dated snapshot is
+/// its version (`claude-haiku-4-5-20251001` is `haiku 4.5`): the version is
+/// the first run of version-shaped words, and a date is not one. Gemini's
+/// names put the tier after the version, and the tier stays: the fallback
+/// from Pro to Flash a spent quota forces is a handover this comparison is
+/// here to test (#415 review) — `gemini-3.1-pro-preview` is
+/// `gemini 3.1 pro`, `gemini-2.5-flash-lite` is `gemini 2.5 flash`.
 #[must_use]
 pub fn family(model: &str) -> String {
-    if let Some(rest) = model.strip_prefix("gemini-") {
-        let tier = rest
-            .split('-')
-            .find(|seg| seg.chars().next().is_some_and(|c| c.is_ascii_alphabetic()));
-        return tier.map_or_else(|| "gemini".to_string(), |t| format!("gemini-{t}"));
-    }
-    let rest = model.strip_prefix("claude-").unwrap_or(model);
-    rest.split('-')
-        .find(|seg| seg.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
-        .unwrap_or(rest)
-        .to_string()
+    let (gemini, rest) = match model.strip_prefix("gemini-") {
+        Some(rest) => (true, rest),
+        None => (false, model.strip_prefix("claude-").unwrap_or(model)),
+    };
+    let words: Vec<&str> = rest.split('-').collect();
+    let name = words
+        .iter()
+        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
+        .copied();
+    let version = words
+        .iter()
+        .skip_while(|w| !version_word(w))
+        .take_while(|w| version_word(w))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(".");
+    let parts: Vec<&str> = if gemini {
+        ["gemini", version.as_str(), name.unwrap_or_default()].into()
+    } else {
+        [name.unwrap_or(rest), version.as_str()].into()
+    };
+    parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+/// A word of a version — `5`, `3.1` — and not a date (`20251001`), a
+/// build (`001`) or a preview's day (`0827`): digits and dots, no run of
+/// more than two digits.
+fn version_word(w: &str) -> bool {
+    w.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && w.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && w.split('.').all(|d| !d.is_empty() && d.len() <= 2)
 }
 
 fn obj(v: &Value) -> Option<&Object> {
@@ -391,16 +412,24 @@ mod tests {
     }
 
     #[test]
-    fn a_family_is_the_model_without_its_vendor_or_version() {
-        assert_eq!(family("claude-opus-5-5"), "opus");
-        assert_eq!(family("claude-fable-5-1"), "fable");
-        assert_eq!(family("claude-fable-5"), "fable");
-        assert_eq!(family("claude-3-5-sonnet-20241022"), "sonnet");
-        assert_eq!(family("claude-haiku-4-5-20251001"), "haiku");
-        assert_eq!(family("gemini-3.1-pro-preview"), "gemini-pro");
-        assert_eq!(family("gemini-2.5-flash"), "gemini-flash");
-        assert_eq!(family("gemini-2.5-flash-lite"), "gemini-flash", "a lighter flash is still the flash tier");
-        assert_eq!(family("gemini-3"), "gemini");
+    fn a_model_is_its_name_at_its_version() {
+        assert_eq!(family("claude-opus-5-5"), "opus 5.5");
+        assert_eq!(family("claude-opus-5"), "opus 5", "not the same model as 5.5");
+        assert_eq!(family("claude-fable-5-1"), "fable 5.1");
+        assert_eq!(family("claude-fable-5"), "fable 5");
+        assert_eq!(family("claude-sonnet-5"), "sonnet 5");
+        assert_eq!(family("claude-3-5-sonnet-20241022"), "sonnet 3.5", "the old names put the version first");
+        assert_eq!(family("claude-haiku-4-5-20251001"), "haiku 4.5", "a dated snapshot is its version");
+        assert_eq!(family("claude-haiku-4-5"), "haiku 4.5");
+        assert_eq!(family("claude-opus"), "opus");
+        assert_eq!(family("gemini-3.1-pro-preview"), "gemini 3.1 pro");
+        assert_eq!(family("gemini-3.1-pro-preview-customtools"), "gemini 3.1 pro");
+        assert_eq!(family("gemini-2.5-pro"), "gemini 2.5 pro", "not the same model as 3.1");
+        assert_eq!(family("gemini-2.5-flash"), "gemini 2.5 flash");
+        assert_eq!(family("gemini-2.5-flash-lite"), "gemini 2.5 flash", "a lighter flash is still that flash");
+        assert_eq!(family("gemini-2.5-flash-preview-05-20"), "gemini 2.5 flash", "a preview's date is no version");
+        assert_eq!(family("gemini-1.5-pro-001"), "gemini 1.5 pro", "nor is a build");
+        assert_eq!(family("gemini-3"), "gemini 3");
     }
 
     #[test]
