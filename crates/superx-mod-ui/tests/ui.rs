@@ -4218,3 +4218,53 @@ async fn a_new_version_is_credited_as_itself() {
         c.handoffs.iter().map(|h| (&h.from, &h.to, h.switches)).collect::<Vec<_>>()
     );
 }
+
+/// A branch that lives on lands every squash (#415 QA). The main line is
+/// merged back into it after each squash: reading the tip against the merge
+/// base saw only the newest stretch, so every earlier squash matched no
+/// branch work and went to no one. And a squash of a day's authored work is
+/// as big as the day — over the vendor-drop bound it was dropped too, where
+/// a squash a vendor drop rode in on still is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_branch_that_lives_on_lands_every_squash() {
+    let kernel = fresh_kernel().await;
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let repo = TestRepo::new_dated("superx", "main", t0 - chrono::Duration::hours(1));
+    let main = repo.cwd();
+    let wt = repo.worktree("wt", "fix/long");
+    let lines = |n: usize, tag: &str| -> String { (1..=n).map(|i| format!("{tag} {i}\n")).collect() };
+    let (a10, a12, b15) = (lines(10, "a"), lines(12, "a"), lines(15, "b"));
+    let (c3k, d3k, v6k, g5) = (lines(3_000, "c"), lines(3_000, "d"), lines(6_000, "v"), lines(5, "g"));
+
+    // #1: a.rs, squashed by the merging account; main merged back in.
+    repo.commit(wt, h(0.5), "t@t", "fix: a", &[("a.rs", &a10)]);
+    repo.commit(main, h(1.0), "noreply@github.com", "fix: a (#1)", &[("a.rs", &a10)]);
+    repo.git(&["-C", wt, "merge", "--no-edit", "-q", "main"]);
+    // #2: a.rs again, and b.rs.
+    repo.commit(wt, h(2.0), "t@t", "fix: b", &[("a.rs", &a12), ("b.rs", &b15)]);
+    repo.commit(main, h(2.5), "noreply@github.com", "fix: b (#2)", &[("a.rs", &a12), ("b.rs", &b15)]);
+    repo.git(&["-C", wt, "merge", "--no-edit", "-q", "main"]);
+    // #3: a day's work over the vendor-drop bound, in commits under it.
+    repo.commit(wt, h(3.0), "t@t", "fix: c", &[("c.rs", &c3k)]);
+    repo.commit(wt, h(3.2), "t@t", "fix: d", &[("d.rs", &d3k)]);
+    repo.commit(main, h(3.5), "noreply@github.com", "fix: cd (#3)", &[("c.rs", &c3k), ("d.rs", &d3k)]);
+    repo.git(&["-C", wt, "merge", "--no-edit", "-q", "main"]);
+    // #4: a vendor drop, riding in with a small commit.
+    repo.commit(wt, h(4.0), "t@t", "chore: vendor", &[("vendor.js", &v6k)]);
+    repo.commit(wt, h(4.2), "t@t", "fix: glue", &[("glue.rs", &g5)]);
+    repo.commit(main, h(4.5), "noreply@github.com", "chore: vendor (#4)", &[("vendor.js", &v6k), ("glue.rs", &g5)]);
+
+    let reply = |id: &str| serde_json::json!({
+        "cwd": wt, "message": {"id": id, "model": "claude-opus-5-5", "usage": {"output_tokens": 100},
+            "content": [{"type": "text", "text": "working"}]}});
+    let (agent, pilot) = seed_agent_and_session(&kernel, "claude_code", "pilot").await;
+    log_tool_message_at(&kernel, &pilot, &agent, reply("r1"), h(0.0)).await;
+    log_tool_message_at(&kernel, &pilot, &agent, reply("r2"), h(5.0)).await;
+
+    let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
+    let c = superx_mod_ui::compare::compare(&runs, &std::collections::HashMap::new()).await;
+    let row = c.deviations.iter().find(|d| d.model == "opus 5.5").expect("opus 5.5 row");
+    assert_eq!(row.commits, 3, "#1, #2 and #3 — not #4, which a vendor drop rode in on");
+    assert_eq!(row.added, 10 + (2 + 15) + 6_000, "each squash its own lines");
+}
