@@ -1494,6 +1494,20 @@ fn classify_command(label: &str) -> (bool, bool, bool) {
     (test, build, git)
 }
 
+/// Does this shell call test or build — is it the session verifying
+/// (#340)? Only such a call's output is a runner's report. A file printed
+/// through the shell (`sed -n`, `cat`, `grep`) is READING, exactly as a
+/// `Read` is, and so is a script's own report and a log read back after
+/// its run: a comment in `stats.rs` quoting "266 failed", printed by
+/// `sed`, lit the lamp with 532 failures in a morning, and a gate's log
+/// grepped after the gate counted its one failure twice (#415 QA).
+fn verifies(cmd: &str) -> bool {
+    command_labels(cmd).iter().any(|l| {
+        let (test, build, _) = classify_command(l);
+        test || build
+    })
+}
+
 /// The extension of a path, lowercased — the language proxy.
 fn extension_of(path: &str) -> Option<String> {
     let file = path.rsplit('/').next()?;
@@ -2969,8 +2983,9 @@ pub async fn stats_for_range_capped(
     let mut pending_output: HashMap<String, (String, bool)> = HashMap::new();
     // Shell calls seen before their output — the reverse order, which
     // happens with interleaved sidechains. Without this the text is
-    // stashed forever and silently dropped.
-    let mut shell_calls: HashSet<String> = HashSet::new();
+    // stashed forever and silently dropped. The flag: did the call test
+    // or build, which is all that makes its output a report.
+    let mut shell_calls: HashMap<String, bool> = HashMap::new();
     // tool_use_id → what the call changed, read off its result (#410).
     let mut pending_diffs: HashMap<String, RecordedDiff> = HashMap::new();
     // Calls that were refused and never ran (#412).
@@ -3557,23 +3572,32 @@ pub async fn stats_for_range_capped(
                             // A refused call never ran: it wrote nothing,
                             // shipped nothing and verified nothing (#412).
                             let refused = get_str(block, "id").is_some_and(|id| denied_calls.contains(id));
+                            // A test or build run's output is a report;
+                            // any other shell output is reading (#415 QA).
+                            let verifying = block
+                                .get("input")
+                                .and_then(obj)
+                                .and_then(|input| get_str(input, "command"))
+                                .is_some_and(verifies);
                             if let Some(id) = get_str(block, "id") {
                                 match pending_output.remove(id) {
                                     Some((text, failed)) if SHELL_TOOLS.contains(&name.as_str()) => {
-                                        shell_text = Some((text.clone(), failed));
-                                        let d = score_output(&text, &mut code, &hour_key);
-                                        attribute_quality(
-                                            &mut code, &branch_pair, &agent_name, &effort, &me_key,
-                                            d,
-                                        );
+                                        if verifying {
+                                            let d = score_output(&text, &mut code, &hour_key);
+                                            attribute_quality(
+                                                &mut code, &branch_pair, &agent_name, &effort, &me_key,
+                                                d,
+                                            );
+                                        }
+                                        shell_text = Some((text, failed));
                                     }
                                     // Output already seen but the tool
                                     // was not a shell: drop it.
                                     Some(_) => {}
                                     // Output not seen yet — remember
-                                    // that this id is worth scoring.
+                                    // that this id is a shell's.
                                     None if SHELL_TOOLS.contains(&name.as_str()) => {
-                                        shell_calls.insert(id.to_string());
+                                        shell_calls.insert(id.to_string(), verifying);
                                     }
                                     None => {}
                                 }
@@ -3582,32 +3606,19 @@ pub async fn stats_for_range_capped(
                             // pair (#340): did the agent check its
                             // work, and how long did it wait? A refused
                             // run checked nothing (#415 review).
-                            if SHELL_TOOLS.contains(&name.as_str()) && !refused {
-                                if let Some(Value::Object(input)) = block.get("input") {
-                                    if let Some(cmd) = get_str(input, "command") {
-                                        let verifies = command_labels(cmd).iter().any(|l| {
-                                            let (test, build, _) = classify_command(l);
-                                            test || build
-                                        });
-                                        if verifies {
-                                            code.verify_events
-                                                .entry(superx_ops::record_uuid(&m.session))
-                                                .or_default()
-                                                .push((when, false));
-                                            // A test or build run is
-                                            // the session VERIFYING,
-                                            // which `Bash` alone cannot
-                                            // say (#350).
-                                            claim_doing(
-                                                code.live
-                                                    .entry(superx_ops::record_uuid(&m.session))
-                                                    .or_default(),
-                                                reply.as_deref(),
-                                                "verifying",
-                                            );
-                                        }
-                                    }
-                                }
+                            if SHELL_TOOLS.contains(&name.as_str()) && !refused && verifying {
+                                code.verify_events
+                                    .entry(superx_ops::record_uuid(&m.session))
+                                    .or_default()
+                                    .push((when, false));
+                                // A test or build run is the session
+                                // VERIFYING, which `Bash` alone cannot
+                                // say (#350).
+                                claim_doing(
+                                    code.live.entry(superx_ops::record_uuid(&m.session)).or_default(),
+                                    reply.as_deref(),
+                                    "verifying",
+                                );
                             }
                             // When does work go wrong (#337)?
                             code.by_hour.entry(hour_of_day).or_insert((0, 0)).0 += 1;
@@ -4368,11 +4379,14 @@ pub async fn stats_for_range_capped(
                                         }
                                     }
                                 }
-                                if shell_calls.remove(id) {
+                                if let Some(verifying) = shell_calls.remove(id) {
                                     // The call already went by and it
-                                    // was a shell: score immediately.
-                                    let d = score_output(text, &mut code, &hour_key);
-                                    attribute_quality(&mut code, &branch_pair, &agent_name, &effort, &me_key, d);
+                                    // was a shell: score immediately,
+                                    // if it tested or built.
+                                    if verifying {
+                                        let d = score_output(text, &mut code, &hour_key);
+                                        attribute_quality(&mut code, &branch_pair, &agent_name, &effort, &me_key, d);
+                                    }
                                 } else {
                                     pending_output.insert(id.to_string(), (text.to_string(), failed));
                                 }
