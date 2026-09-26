@@ -167,12 +167,20 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
         };
         let ours = |author: &str| work.identity.as_deref() == Some(author);
 
-        // Branch work, per file: which main-line commit landed it (#414).
+        // Branch work, per file: which main-line commit landed it (#414). A
+        // vendor drop's branch commit shares in nothing, and marks what it
+        // landed through as no one's authored work, however that is split.
         let mut shares: HashMap<&str, Vec<(DateTime<Utc>, i64)>> = HashMap::new();
-        for c in work.off_mainline.iter().filter(|c| ours(&c.author) && c.added() + c.removed() <= BULK_COMMIT) {
+        let mut bulk_via: HashSet<&str> = HashSet::new();
+        for c in work.off_mainline.iter().filter(|c| ours(&c.author)) {
+            let bulk = c.added() + c.removed() > BULK_COMMIT;
             for (path, added, removed) in &c.files {
                 if let Some(via) = work.landed_via.get(&(c.hash.clone(), path.clone())) {
-                    shares.entry(via.as_str()).or_default().push((c.at, (added + removed).max(1)));
+                    if bulk {
+                        bulk_via.insert(via.as_str());
+                    } else {
+                        shares.entry(via.as_str()).or_default().push((c.at, (added + removed).max(1)));
+                    }
                 }
             }
         }
@@ -252,8 +260,12 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
         let mut touched: HashMap<(String, String), i64> = HashMap::new();
         for c in &work.landed {
             let (added, removed) = (c.added(), c.removed());
-            // A vendor drop is not authored work.
-            if added + removed > BULK_COMMIT {
+            // A vendor drop is not authored work: a commit that size, unless
+            // it squashes branch work no vendor drop rode in on — the squash of
+            // a day's branch is as big as the day, and #415's, at 7.5k lines of
+            // code and tests, went to no one (#415 QA).
+            let authored_squash = shares.contains_key(c.hash.as_str()) && !bulk_via.contains(c.hash.as_str());
+            if added + removed > BULK_COMMIT && !authored_squash {
                 continue;
             }
             // When the work was done: the branch commits' times for a

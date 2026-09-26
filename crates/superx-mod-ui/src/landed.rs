@@ -330,9 +330,15 @@ fn bounded<'a>(mut args: Vec<&'a str>, since: Option<&'a str>) -> Vec<&'a str> {
 }
 
 /// One branch tip's work off the main line, noting in `work` which of its
-/// files reached the main line in exactly the version the branch ends with:
-/// those landed (#414). A squash commit writes precisely those versions; so
-/// does a replay onto a later main.
+/// files reached the main line, and through which main-line commit (#414).
+/// A version of a file the main line carries landed with the main-line
+/// commit that wrote it — a squash writes precisely the versions its branch
+/// ends with — and so did every commit of the branch that led to that
+/// version since the file's last version that landed. A branch lives on
+/// past its first squash when the main line is merged back into it:
+/// reading only its tip against the merge base saw nothing but the newest
+/// stretch, every earlier squash matched no branch work and went to no one,
+/// and the newest took the older commits' files (#415 QA).
 async fn read_tip(
     dir: &Path,
     mainline: &str,
@@ -341,31 +347,57 @@ async fn read_tip(
     versions: &HashMap<(String, String), String>,
     work: &mut RepoWork,
 ) -> Option<Vec<WorkCommit>> {
-    let mut landed_file: HashMap<String, String> = HashMap::new();
-    if let Some(base) = git(dir, &["merge-base", mainline, tip]).await {
-        let base = base.trim().to_string();
-        if let Some(diff) = git(dir, &["diff", "--raw", "--no-abbrev", "--no-renames", &base, tip]).await {
-            for (path, blob) in diff.lines().filter_map(raw_entry) {
-                if let Some(via) = versions.get(&(path.to_string(), blob.to_string())) {
-                    landed_file.insert(path.to_string(), via.clone());
+    let log = git(
+        dir,
+        &bounded(
+            vec![
+                "log", tip, "--not", mainline, "--no-merges", "--no-renames", "--raw", "--no-abbrev", "--numstat",
+                WORK_FORMAT,
+            ],
+            since,
+        ),
+    )
+    .await?;
+    // (commit, path, version) as the branch wrote them, newest first.
+    let mut wrote: Vec<(&str, &str, &str)> = Vec::new();
+    let mut commit: Option<&str> = None;
+    for line in log.lines() {
+        if let Some(rest) = line.strip_prefix('\u{1}') {
+            commit = rest.split(' ').next();
+            continue;
+        }
+        if let (Some(hash), Some((path, blob))) = (commit, raw_entry(line)) {
+            wrote.push((hash, path, blob));
+        }
+    }
+    // Oldest first: a file's commits wait until a version they led to lands.
+    let mut pending: HashMap<&str, Vec<&str>> = HashMap::new();
+    for &(hash, path, blob) in wrote.iter().rev() {
+        pending.entry(path).or_default().push(hash);
+        if let Some(via) = versions.get(&(path.to_string(), blob.to_string())) {
+            for h in pending.remove(path).unwrap_or_default() {
+                work.landed_via.insert((h.to_string(), path.to_string()), via.clone());
+            }
+        }
+    }
+    // The last stretch may have landed in a version none of its own commits
+    // wrote — a merge's resolution — so the tip's version decides it.
+    if !pending.is_empty() {
+        if let Some(base) = git(dir, &["merge-base", mainline, tip]).await {
+            if let Some(diff) = git(dir, &["diff", "--raw", "--no-abbrev", "--no-renames", base.trim(), tip]).await {
+                for (path, blob) in diff.lines().filter_map(raw_entry) {
+                    let (Some(hashes), Some(via)) = (pending.get(path), versions.get(&(path.to_string(), blob.to_string())))
+                    else {
+                        continue;
+                    };
+                    for h in hashes {
+                        work.landed_via.insert(((*h).to_string(), path.to_string()), via.clone());
+                    }
                 }
             }
         }
     }
-    let log = git(
-        dir,
-        &bounded(vec!["log", tip, "--not", mainline, "--no-merges", "--no-renames", "--numstat", WORK_FORMAT], since),
-    )
-    .await?;
-    let commits = parse_work_log(&log);
-    for c in &commits {
-        for (path, _, _) in &c.files {
-            if let Some(via) = landed_file.get(path) {
-                work.landed_via.insert((c.hash.clone(), path.clone()), via.clone());
-            }
-        }
-    }
-    Some(commits)
+    Some(parse_work_log(&log))
 }
 
 /// Unreachable commits read per repository, at most.
