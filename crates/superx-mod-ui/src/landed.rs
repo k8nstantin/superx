@@ -368,6 +368,33 @@ async fn read_tip(
     Some(commits)
 }
 
+/// Unreachable commits read per repository, at most.
+const UNREACHABLE_COMMITS: usize = 5_000; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// Take commits no branch holds — from a reflog, or from the object store —
+/// out of a `--raw --numstat` log: a version of a file the main line carries
+/// landed with the commit that wrote it. Kept only for what landed (#415
+/// review): these sources also hold every amended and rebased-away commit.
+fn recover(log: &str, versions: &HashMap<(String, String), String>, seen: &mut HashSet<String>, work: &mut RepoWork) {
+    let mut commit: Option<&str> = None;
+    for line in log.lines() {
+        if let Some(rest) = line.strip_prefix('\u{1}') {
+            commit = rest.split(' ').next();
+            continue;
+        }
+        let (Some(hash), Some((path, blob))) = (commit, raw_entry(line)) else { continue };
+        if let Some(via) = versions.get(&(path.to_string(), blob.to_string())) {
+            work.landed_via.insert((hash.to_string(), path.to_string()), via.clone());
+        }
+    }
+    for c in parse_work_log(log) {
+        if seen.insert(c.hash.clone()) {
+            work.recovered.insert(c.hash.clone());
+            work.off_mainline.push(c);
+        }
+    }
+}
+
 /// Read one repository for the comparison (#414). `None` when git cannot
 /// answer at all.
 pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>) -> Option<RepoWork> {
@@ -468,21 +495,33 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
     )
     .await
     .unwrap_or_default();
-    let mut commit: Option<&str> = None;
-    for line in lost.lines() {
-        if let Some(rest) = line.strip_prefix('\u{1}') {
-            commit = rest.split(' ').next();
-            continue;
-        }
-        let (Some(hash), Some((path, blob))) = (commit, raw_entry(line)) else { continue };
-        if let Some(via) = versions.get(&(path.to_string(), blob.to_string())) {
-            work.landed_via.insert((hash.to_string(), path.to_string()), via.clone());
-        }
-    }
-    for c in parse_work_log(&lost) {
-        if seen.insert(c.hash.clone()) {
-            work.recovered.insert(c.hash.clone());
-            work.off_mainline.push(c);
+    recover(&lost, &versions, &mut seen, &mut work);
+
+    // A worktree removed takes its HEAD reflog with it, and a deleted
+    // branch its own, so a squash of that work matched nothing above. Its
+    // commits stay in the object store, reachable from nothing, until git
+    // prunes them (#415 review). `fsck` walks every object, so they are read
+    // only while a main-line commit with lines is still unmatched and not
+    // this machine's own.
+    let matched: HashSet<&str> = work.landed_via.values().map(String::as_str).collect();
+    let unmatched = work.landed.iter().any(|c| {
+        c.added() > 0 && !matched.contains(c.hash.as_str()) && work.identity.as_deref() != Some(c.author.as_str())
+    });
+    if unmatched {
+        let unreachable: Vec<String> = git(dir, &["fsck", "--unreachable", "--no-reflogs", "--no-progress"])
+            .await
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.strip_prefix("unreachable commit "))
+            .map(|h| h.trim().to_string())
+            .take(UNREACHABLE_COMMITS)
+            .collect();
+        if !unreachable.is_empty() {
+            let mut args = vec!["log", "--no-walk=unsorted", "--no-merges", "--no-renames", "--raw", "--no-abbrev", "--numstat", WORK_FORMAT];
+            args.extend(unreachable.iter().map(String::as_str));
+            if let Some(out) = git(dir, &bounded(args, since_s.as_deref())).await {
+                recover(&out, &versions, &mut seen, &mut work);
+            }
         }
     }
 
@@ -491,24 +530,15 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
     // holds nothing, and a file no creditable commit touched credits no one:
     // blaming every file any main-line commit touched cost 2,204 blames, 30
     // seconds, on one repository, 1,397 of them for files long gone. The
-    // commits that can be credited are this machine's, the squashes of its
-    // branches, and the rest made as the account that clicked merge.
+    // commits that can be credited are this machine's and the squashes of
+    // its branch work.
     let present: HashSet<String> = git(dir, &["ls-tree", "-r", "--name-only", mainline])
         .await
         .map(|o| o.lines().map(str::to_string).collect())
         .unwrap_or_default();
     let via: HashSet<&str> = work.landed_via.values().map(String::as_str).collect();
-    let mergers: HashSet<&str> = work
-        .landed
-        .iter()
-        .filter(|c| via.contains(c.hash.as_str()))
-        .map(|c| c.author.as_str())
-        .collect();
-    let creditable = |c: &&WorkCommit| {
-        work.identity.as_deref() == Some(c.author.as_str())
-            || via.contains(c.hash.as_str())
-            || mergers.contains(c.author.as_str())
-    };
+    let creditable =
+        |c: &&WorkCommit| work.identity.as_deref() == Some(c.author.as_str()) || via.contains(c.hash.as_str());
     let mut files: Vec<String> = work
         .landed
         .iter()
