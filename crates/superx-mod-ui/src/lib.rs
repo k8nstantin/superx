@@ -119,9 +119,9 @@ pub const DEFAULT_CACHE_SECS: u64 = 20; // skill-allow: §9-const — bootstrap 
 /// (#415 QA). Every read awaits the substrate without a bound: a reply
 /// that never came held the 24h range at "reading…" for minutes, the
 /// panels still showing the last range's figures and nothing saying so.
-/// The slowest honest read is the model comparison's walk of git, about
-/// 45 s uncached. Seconds, read when the server starts; `0` lifts the
-/// bound.
+/// The slowest bounded read, `all`, takes about 15 s uncached. The model
+/// comparison is not bounded: it takes as long as its git walk needs.
+/// Seconds, read when the server starts; `0` lifts the bound.
 pub const READ_TIMEOUT_SECS_PARAM: &str = "attr_ui_read_timeout_secs";
 
 /// Fallback when the parameter is unset.
