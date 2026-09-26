@@ -154,6 +154,46 @@ pub async fn resolved_cache_secs(kernel: &Kernel) -> u64 {
     resolved_secs(kernel, CACHE_SECS_PARAM, DEFAULT_CACHE_SECS).await
 }
 
+/// How long one substrate query may go unanswered before it is asked once
+/// more, in milliseconds; `0` is no bound. The server sets it at start to a
+/// quarter of the read budget, so a lost reply and its retry still answer
+/// inside the budget. A reply that never came held a range at "reading…"
+/// for minutes (#415 QA): the kernel's client waits forever, and the
+/// kernel is not this module's to change.
+static QUERY_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn set_query_timeout(budget: Option<std::time::Duration>) {
+    let ms = budget.map_or(0, |b| u64::try_from((b / 4).as_millis()).unwrap_or(u64::MAX));
+    QUERY_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One substrate read, asked once more if no answer comes in time; a miss
+/// is logged, so a hang leaves a trace. `ask` builds the query afresh each
+/// time. Reads only: a write asked twice could land twice.
+pub(crate) async fn answered<T, F, Fut>(what: &str, ask: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let ms = QUERY_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    answered_within((ms > 0).then(|| std::time::Duration::from_millis(ms)), what, ask).await
+}
+
+async fn answered_within<T, F, Fut>(limit: Option<std::time::Duration>, what: &str, ask: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let Some(limit) = limit else { return ask().await };
+    for attempt in 1..=2u8 {
+        if let Ok(answer) = tokio::time::timeout(limit, ask()).await {
+            return answer;
+        }
+        tracing::warn!(target: "ui", query = what, attempt, limit = ?limit, "substrate query got no answer");
+    }
+    Err(KernelError::Module(format!("{what}: the substrate did not answer within {limit:?}, twice")))
+}
+
 /// Resolve how long one request may take, in seconds; `0` is no bound.
 pub async fn resolved_read_timeout_secs(kernel: &Kernel) -> u64 {
     resolved_secs(kernel, READ_TIMEOUT_SECS_PARAM, DEFAULT_READ_TIMEOUT_SECS).await

@@ -2467,14 +2467,17 @@ pub async fn walk_messages(
             (Some(_), None) => WALK_NEXT,
             (Some(_), Some(_)) => WALK_NEXT_SINCE,
         };
-        let mut q = kernel.db().query(query).bind(("limit", want));
-        if let Some(b) = before {
-            q = q.bind(("before", b));
-        }
-        if let Some(s) = since {
-            q = q.bind(("since", s));
-        }
-        let rows: Vec<MessageRecord> = q.await?.take(0)?;
+        let rows: Vec<MessageRecord> = crate::answered("stats walk page", || async move {
+            let mut q = kernel.db().query(query).bind(("limit", want));
+            if let Some(b) = before {
+                q = q.bind(("before", b));
+            }
+            if let Some(s) = since {
+                q = q.bind(("since", s));
+            }
+            Ok(q.await?.take(0)?)
+        })
+        .await?;
         let fetched = rows.len() as u32;
         let mut added = 0u32;
         for row in rows {
@@ -2749,7 +2752,8 @@ fn note_bright_line(code: &mut CodeAgg, path: &str) {
 
 /// One in-engine `count() GROUP ALL` over a table.
 async fn count_rows(kernel: &Kernel, query: &'static str) -> Result<i64> {
-    let rows: Vec<Value> = kernel.db().query(query).await?.take(0)?;
+    let rows: Vec<Value> =
+        crate::answered("row count", || async move { Ok(kernel.db().query(query).await?.take(0)?) }).await?;
     Ok(rows.first().and_then(|r| obj(r).map(|o| get_int(o, "c"))).unwrap_or(0))
 }
 
@@ -2777,11 +2781,14 @@ async fn reply_output_tokens(
              GROUP BY k\
          ) GROUP ALL"
     );
-    let mut q = kernel.db().query(query);
-    if let Some(cut) = since {
-        q = q.bind(("cut", cut));
-    }
-    let rows: Vec<Value> = q.await?.take(0)?;
+    let rows: Vec<Value> = crate::answered("reply output tokens", || async {
+        let mut q = kernel.db().query(query.as_str());
+        if let Some(cut) = since {
+            q = q.bind(("cut", cut));
+        }
+        Ok(q.await?.take(0)?)
+    })
+    .await?;
     Ok(rows.first().and_then(|r| obj(r).map(|o| get_int(o, "c"))).unwrap_or(0))
 }
 
@@ -2853,16 +2860,19 @@ pub async fn stats_for_range_capped(
     // is never captured before it was written (#413).
     let active_secs = resolved_active_secs(kernel).await;
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(active_secs);
-    let rows: Vec<Value> = kernel
-        .db()
-        .query(
-            "SELECT session FROM message \
-             WHERE valid_from > $cutoff AND (emitted_at ?? valid_from) > $cutoff \
-             GROUP BY session",
-        )
-        .bind(("cutoff", cutoff))
-        .await?
-        .take(0)?;
+    let rows: Vec<Value> = crate::answered("active sessions", || async move {
+        Ok(kernel
+            .db()
+            .query(
+                "SELECT session FROM message \
+                 WHERE valid_from > $cutoff AND (emitted_at ?? valid_from) > $cutoff \
+                 GROUP BY session",
+            )
+            .bind(("cutoff", cutoff))
+            .await?
+            .take(0)?)
+    })
+    .await?;
     let sessions_active = rows.len() as i64;
 
     let agents = kernel
@@ -4548,11 +4558,10 @@ pub async fn stats_for_range_capped(
     }
     boots.reverse(); // recent_telemetry is newest-first; charts read left→right
     let mut message_roles = Vec::new();
-    let rows: Vec<Value> = kernel
-        .db()
-        .query("SELECT role, count() AS c FROM message GROUP BY role")
-        .await?
-        .take(0)?;
+    let rows: Vec<Value> = crate::answered("message roles", || async move {
+        Ok(kernel.db().query("SELECT role, count() AS c FROM message GROUP BY role").await?.take(0)?)
+    })
+    .await?;
     for row in rows {
         if let Some(o) = obj(&row) {
             if let Some(role) = get_str(o, "role") {
@@ -4572,17 +4581,20 @@ pub async fn stats_for_range_capped(
     let messages_last_hour = {
         // Replies, once each, as every other "messages" on the page (#415
         // review).
-        let rows: Vec<Value> = kernel
-            .db()
-            .query(format!(
-                "SELECT count() AS c FROM (\
-                     SELECT {REPLY_KEY_SQL} AS k FROM message \
-                     WHERE valid_from > $cut AND (emitted_at ?? valid_from) > $cut GROUP BY k\
-                 ) GROUP ALL"
-            ))
-            .bind(("cut", hour_ago))
-            .await?
-            .take(0)?;
+        let rows: Vec<Value> = crate::answered("messages last hour", || async move {
+            Ok(kernel
+                .db()
+                .query(format!(
+                    "SELECT count() AS c FROM (\
+                         SELECT {REPLY_KEY_SQL} AS k FROM message \
+                         WHERE valid_from > $cut AND (emitted_at ?? valid_from) > $cut GROUP BY k\
+                     ) GROUP ALL"
+                ))
+                .bind(("cut", hour_ago))
+                .await?
+                .take(0)?)
+        })
+        .await?;
         rows.first().and_then(|r| obj(r).map(|o| get_int(o, "c"))).unwrap_or(0)
     };
     let tokens_last_hour = reply_output_tokens(kernel, Some(hour_ago)).await?;
@@ -4596,19 +4608,22 @@ pub async fn stats_for_range_capped(
         - chrono::Duration::nanoseconds(i64::from(now.timestamp_subsec_nanos()));
     let day_ago = this_hour - chrono::Duration::hours(23);
     let active_hours_list: Vec<String> = {
-        let rows: Vec<Value> = kernel
-            .db()
-            .query(
-                // (day, hour), not hour alone: in a rolling 24-hour
-                // window the same clock hour occurs twice, and
-                // collapsing them caps a round-the-clock operator
-                // below 24 (review of #311).
-                "SELECT time::format(emitted_at ?? valid_from, '%Y-%m-%dT%H') AS h FROM message \
-                 WHERE valid_from > $cut AND (emitted_at ?? valid_from) > $cut GROUP BY h",
-            )
-            .bind(("cut", day_ago))
-            .await?
-            .take(0)?;
+        let rows: Vec<Value> = crate::answered("active hours", || async move {
+            Ok(kernel
+                .db()
+                .query(
+                    // (day, hour), not hour alone: in a rolling 24-hour
+                    // window the same clock hour occurs twice, and
+                    // collapsing them caps a round-the-clock operator
+                    // below 24 (review of #311).
+                    "SELECT time::format(emitted_at ?? valid_from, '%Y-%m-%dT%H') AS h FROM message \
+                     WHERE valid_from > $cut AND (emitted_at ?? valid_from) > $cut GROUP BY h",
+                )
+                .bind(("cut", day_ago))
+                .await?
+                .take(0)?)
+        })
+        .await?;
         let mut hours: Vec<String> = rows
             .iter()
             .filter_map(|r| obj(r).and_then(|o| get_str(o, "h")).map(str::to_string))
