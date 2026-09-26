@@ -807,13 +807,16 @@ mod tests {
         use tower::ServiceExt as _;
         // `get` in this module fetches a static asset; routes need axum's.
         use axum::routing::get as route_get;
+        // A budget far shorter than any real one; the slow handler takes
+        // twice as long, and the generous budget a hundred times.
+        const BUDGET: Duration = Duration::from_millis(20); // skill-allow: §9-duration — test fixture, not a policy
         let app = |budget: Option<Duration>| {
             Router::new()
                 .route("/never", route_get(std::future::pending::<&'static str>))
                 .route(
                     "/slow",
                     route_get(|| async {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        tokio::time::sleep(BUDGET * 2).await;
                         "late"
                     }),
                 )
@@ -823,15 +826,18 @@ mod tests {
             app.oneshot(axum::http::Request::get(path).body(axum::body::Body::empty()).expect("request"))
         };
 
-        let never = call(app(Some(Duration::from_millis(20))), "/never").await.expect("response");
+        let never = call(app(Some(BUDGET)), "/never").await.expect("response");
         assert_eq!(never.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = axum::body::to_bytes(never.into_body(), usize::MAX).await.expect("body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(body["is_error"], true);
         let output = body["output"].as_str().unwrap_or_default();
-        assert!(output.contains("20ms") && output.contains(crate::READ_TIMEOUT_SECS_PARAM), "{output}");
+        assert!(
+            output.contains(&format!("{BUDGET:?}")) && output.contains(crate::READ_TIMEOUT_SECS_PARAM),
+            "{output}"
+        );
 
-        let within = call(app(Some(Duration::from_secs(5))), "/slow").await.expect("response");
+        let within = call(app(Some(BUDGET * 100)), "/slow").await.expect("response");
         assert_eq!(within.status(), StatusCode::OK, "an answer inside the budget passes");
         let unbounded = call(app(None), "/slow").await.expect("response");
         assert_eq!(unbounded.status(), StatusCode::OK, "no budget, no bound");
