@@ -966,6 +966,10 @@ pub struct ModuleHealth {
     pub failures_total: i64,
     /// The error text carried by the newest failure, when it had one.
     pub last_error: Option<String>,
+    /// When that failure happened, RFC3339: an error from weeks ago is
+    /// shown as old, not beside "0 recent" as if it were failing now (#415
+    /// QA).
+    pub last_error_at: Option<String>,
 }
 
 /// One cell of the hour × weekday grid. `weekday` is SurrealDB's

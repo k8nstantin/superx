@@ -2551,22 +2551,28 @@ fn score_output(text: &str, code: &mut CodeAgg, hour_key: &str) -> (i64, i64, i6
             }
             continue;
         }
-        // pytest / jest / vitest: "5 passed, 2 failed".
+        // pytest / jest / vitest: "5 passed, 2 failed" — every count word
+        // right after its number. A line that puts the word first, as a
+        // script's own summary does (`passed 266 failed 0`), paired each
+        // number with the next word: it read as 266 failed, and six such
+        // lines lit the lamp with 1.6k failures in a day (#415 QA).
         if l.contains("passed") || l.contains("failed") {
-            let mut prev: Option<i64> = None;
-            for w in l.split_whitespace() {
-                match count_word(w) {
-                    "passed" => {
-                        if let Some(v) = prev.take() {
-                            code.tests_passed += v;
-                        }
+            let words: Vec<&str> = l.split_whitespace().collect();
+            let counts: Vec<(usize, &str)> = words
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| matches!(count_word(w), "passed" | "failed"))
+                .map(|(i, w)| (i, count_word(w)))
+                .collect();
+            let number_before = |i: usize| i.checked_sub(1).and_then(|j| words[j].parse::<i64>().ok());
+            if counts.iter().all(|(i, _)| number_before(*i).is_some()) {
+                for (i, word) in counts {
+                    let v = number_before(i).unwrap_or(0);
+                    if word == "passed" {
+                        code.tests_passed += v;
+                    } else {
+                        code.tests_failed += v;
                     }
-                    "failed" => {
-                        if let Some(v) = prev.take() {
-                            code.tests_failed += v;
-                        }
-                    }
-                    other => prev = other.parse::<i64>().ok(),
                 }
             }
         }
@@ -3015,7 +3021,17 @@ pub async fn stats_for_range_capped(
             .entry(bucket5)
             .or_default()
             .insert(superx_ops::record_uuid(&m.session));
-        code.active_hours.insert(local.format("%Y-%m-%dT%H").to_string());
+        // An hour counts only if it began inside the range. The range's
+        // first clock hour began before it did, and counting that sliver
+        // made a 1h range read "2 active hours" and the 24h range one more
+        // than the coverage strip, which counts whole clock hours (#415 QA).
+        let into_hour = i64::from(chrono::Timelike::minute(&local)) * 60 + i64::from(chrono::Timelike::second(&local));
+        let hour_began = when
+            - chrono::Duration::seconds(into_hour)
+            - chrono::Duration::nanoseconds(i64::from(when.timestamp_subsec_nanos()));
+        if since.is_none_or(|s| hour_began >= s) {
+            code.active_hours.insert(local.format("%Y-%m-%dT%H").to_string());
+        }
 
         let Some(raw) = &m.raw else { continue };
 

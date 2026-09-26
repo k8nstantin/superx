@@ -137,6 +137,23 @@ function identityOf(
 // in the engine, over the captured text; a row arriving over SSE is
 // already rendered, so it is matched against what the reader sees.
 // Same intent, the only check available at that point.
+/// The stamp a row leads with, on the viewer's clock (#415 QA). The line
+/// comes from the renderer the CLI shares — UTC, `[hh:mm:ss]` for an event
+/// and `[yyyy-mm-dd hh:mm:ss]` for a message — while every other time on
+/// the page is the viewer's. The same instant, local, in one shape; the
+/// date only when it is not today.
+export function localStamp(e: SseEvent, now: Date = new Date()): string {
+  const m = e.rendered.match(/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|\d{2}:\d{2}:\d{2})\]/)
+  if (!m) return e.rendered
+  // A message's stamp is its whole UTC moment; an event's carries only
+  // the time, and its moment is the row's own `valid_from`.
+  const at = m[1].length > 8 ? new Date(`${m[1].replace(' ', 'T')}Z`) : new Date(e.valid_from)
+  if (Number.isNaN(at.getTime())) return e.rendered
+  const time = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+  const day = at.toDateString() === now.toDateString() ? '' : `${at.toLocaleDateString([], { month: 'short', day: 'numeric' })} `
+  return `[${day}${time}]${e.rendered.slice(m[0].length)}`
+}
+
 export function matchesSearch(e: SseEvent, q: string): boolean {
   if (!q) return true
   return e.rendered.toLowerCase().includes(q.toLowerCase())
@@ -316,8 +333,11 @@ export function Feed({
         {visible.map((r) => {
           const identity = identityOf(r, directory)
           return (
+            // A div, not the default <p>: a row holds badges, which are
+            // divs, and a div inside a <p> is invalid HTML (#415 QA).
             <Text
               key={r.id}
+              component="div"
               size="sm"
               ff="monospace"
               mb={2}
@@ -343,7 +363,7 @@ export function Feed({
                   {identity?.label ?? 'system'}
                 </Badge>
               </Tooltip>
-              {r.rendered}
+              {localStamp(r)}
             </Text>
           )
         })}
