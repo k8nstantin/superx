@@ -1,5 +1,5 @@
 import { Box, SimpleGrid, Table, Text, Title } from '@mantine/core'
-import { AXIS, EChart, GRID_LINE, INK, INK_MUTED, TOOLTIP } from '../../EChart'
+import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK, INK_MUTED, TOOLTIP, insideFits } from '../../EChart'
 import { Panel, fmtCompact, n } from './parts'
 import type { CompareSummary } from '../../generated/CompareSummary'
 import type { Deviation } from '../../generated/Deviation'
@@ -31,13 +31,24 @@ function toRow(d: Deviation): Row {
 
 const KEPT = '#199e70'
 const THROWN = '#e66767'
-const IDENT = ['#B833E8', '#c98500', '#3987e5']
+// A model's colour: the validated ramp (EChart.tsx) less the red and the
+// greens that mean thrown away and kept on this very page. Three colours
+// for six versions painted Opus 5 and Opus 5.5 alike (#415 QA).
+const IDENT = [CHART_COLORS[0], CHART_COLORS[5], CHART_COLORS[2], CHART_COLORS[3], CHART_COLORS[6]]
 const MIN_ADDED = 5000
 
-// Families are folded on the server (#414): every row is one family, and
-// every rate and median in it was computed from that family's own totals.
-// Re-folding here dropped the never-landed figures of every family with
-// more than one version.
+/// Each row's colour. The models with work enough to place take the
+/// identity colours in order; one under MIN_ADDED lines is drawn muted,
+/// as its row in the table is faded.
+function colours(rows: Row[]): string[] {
+  let k = 0
+  return rows.map((r) => (n(r.added) < MIN_ADDED ? INK_MUTED : IDENT[k++ % IDENT.length]))
+}
+
+// Models are folded on the server (#414), and each version is its own
+// model (#421): every row is one model at its version, and every rate and
+// median in it was computed from its own totals. Re-folding here dropped
+// the never-landed figures.
 
 type Metric = {
   title: string
@@ -76,18 +87,39 @@ function metrics(): Metric[] {
   ]
 }
 
-/// One small multiple: a bar per model, sorted so the best is on top
-/// once ECharts flips the category axis, and tinted by whether being
-/// high here is good or bad.
+/// One small multiple: a lollipop per model, the best on top once ECharts
+/// flips the category axis. A rate is only as good as the work behind it
+/// (operator, #415 QA): one file can score what two hundred cannot, and
+/// Sonnet 5 ranked second on 190 lines. So every figure carries the lines
+/// it rests on, and a model under MIN_ADDED lines is drawn faded under the
+/// ranked ones — shown, never ranked, never marked best.
 function mini(all: Row[], m: Metric) {
   // A negative value is the payload's "no data" (-1), never a reading: no
   // metric here can go below zero. It is left out, not drawn left of zero.
   const rows = all.filter((r) => m.pick(r) >= 0)
-  const sorted = [...rows].sort((a, b) => (m.good === 'high' ? m.pick(a) - m.pick(b) : m.pick(b) - m.pick(a)))
-  const best = m.good === 'high' ? Math.max(...rows.map(m.pick)) : Math.min(...rows.map(m.pick))
+  const worstFirst = (a: Row, b: Row) => (m.good === 'high' ? m.pick(a) - m.pick(b) : m.pick(b) - m.pick(a))
+  const ranked = rows.filter((r) => n(r.added) >= MIN_ADDED).sort(worstFirst)
+  const thin = rows.filter((r) => n(r.added) < MIN_ADDED).sort((a, b) => n(a.added) - n(b.added))
+  // The category axis runs bottom-up: the thin rows first, under the ranked.
+  const sorted = [...thin, ...ranked]
+  const isThin = (i: number) => i < thin.length
+  const picks = ranked.map(m.pick)
+  const best = picks.length === 0 ? null : m.good === 'high' ? Math.max(...picks) : Math.min(...picks)
+  const fmt = (v: number) => (m.fmt ? m.fmt(v) : `${v}`)
   return {
-    tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    grid: { left: 108, right: 62, top: 6, bottom: 6, containLabel: false },
+    tooltip: {
+      ...TOOLTIP,
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      formatter: (ps: { dataIndex: number }[]) => {
+        const i = ps[0]?.dataIndex ?? 0
+        const r = sorted[i]
+        if (!r) return ''
+        const work = `${fmtCompact(n(r.added))} lines landed · ${n(r.commits)} commits`
+        return `${r.model}<br/>${fmt(m.pick(r))}<br/>${work}${isThin(i) ? '<br/>too little work to rank' : ''}`
+      },
+    },
+    grid: { left: 108, right: 116, top: 6, bottom: 6, containLabel: false },
     xAxis: { ...AXIS, type: 'value', axisLabel: { show: false }, splitLine: { show: false }, axisLine: { show: false } },
     yAxis: {
       type: 'category',
@@ -98,7 +130,7 @@ function mini(all: Row[], m: Metric) {
     },
     series: [
       {
-        // A lollipop, not a bar. One value per family needs a stem and a
+        // A lollipop, not a bar. One value per model needs a stem and a
         // dot: the bar's area encodes nothing here, and the ink it costs
         // is ink not spent on the number itself.
         type: 'bar',
@@ -111,18 +143,26 @@ function mini(all: Row[], m: Metric) {
         type: 'scatter',
         symbolSize: 11,
         itemStyle: {
-          color: (p: { value: number }) => (p.value === best ? KEPT : THROWN),
+          color: (p: { value: number; dataIndex: number }) =>
+            isThin(p.dataIndex) ? INK_MUTED : p.value === best ? KEPT : THROWN,
           borderColor: '#150420',
           borderWidth: 2,
         },
         label: {
           show: true,
           position: 'right',
-          color: INK,
-          fontSize: 11,
-          formatter: (p: { value: number }) => (m.fmt ? m.fmt(p.value) : `${p.value}`),
+          formatter: (p: { value: number; dataIndex: number }) => {
+            const lines = `${fmtCompact(n(sorted[p.dataIndex]?.added))} lines`
+            return isThin(p.dataIndex) ? `{tv|${fmt(p.value)}}  {tn|${lines}}` : `{v|${fmt(p.value)}}  {n|${lines}}`
+          },
+          rich: {
+            v: { color: INK, fontSize: 11 },
+            n: { color: INK_MUTED, fontSize: 10 },
+            tv: { color: INK_MUTED, fontSize: 11 },
+            tn: { color: INK_MUTED, fontSize: 10 },
+          },
         },
-        data: sorted.map(m.pick),
+        data: sorted.map((r, i) => (isThin(i) ? { value: m.pick(r), itemStyle: { opacity: 0.55 } } : m.pick(r))),
         z: 2,
       },
     ],
@@ -130,7 +170,7 @@ function mini(all: Row[], m: Metric) {
 }
 
 
-/// A dumbbell: two values of the SAME unit per family, joined by the
+/// A dumbbell: two values of the SAME unit per model, joined by the
 /// line whose length is the gap. The right form when the story is the
 /// DISTANCE between two numbers — typical against peak, the price
 /// before rework against the price after — where two separate bars
@@ -145,10 +185,17 @@ function dumbbell(
   fmt: (v: number) => string,
 ) {
   const names = rows.map((r) => r.model)
+  // A rate is only as good as the work behind it (#415 QA): each name
+  // carries its lines, and a model under MIN_ADDED is drawn faded.
+  const thin = (r: Row) => n(r.added) < MIN_ADDED
+  const faded = (r: Row, value: number, label?: object) =>
+    thin(r) ? { value, itemStyle: { opacity: 0.45 }, ...(label ? { label } : {}) } : value
   return {
     tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
     legend: { data: [aName, bName], textStyle: { color: INK_MUTED }, top: 0, right: 0 },
-    grid: { left: 96, right: 88, top: 30, bottom: 40 },
+    // The names stand off the plot far enough for a value at the axis to
+    // sit between them: it ran into its model's name (#415 QA).
+    grid: { left: 8, right: 88, top: 30, bottom: 40, containLabel: true },
     xAxis: {
       ...AXIS,
       type: 'value',
@@ -162,7 +209,16 @@ function dumbbell(
     yAxis: {
       type: 'category',
       data: names,
-      axisLabel: { color: INK, fontSize: 11 },
+      axisLabel: {
+        margin: 44,
+        formatter: (v: string, i: number) =>
+          `{${thin(rows[i]) ? 't' : 'm'}|${v}}\n{n|${fmtCompact(n(rows[i]?.added))} lines}`,
+        rich: {
+          m: { color: INK, fontSize: 11 },
+          t: { color: INK_MUTED, fontSize: 11 },
+          n: { color: INK_MUTED, fontSize: 9 },
+        },
+      },
       axisLine: { lineStyle: { color: GRID_LINE } },
     },
     series: [
@@ -197,7 +253,7 @@ function dumbbell(
           fontSize: 10,
           formatter: (p: { value: number }) => fmt(p.value),
         },
-        data: rows.map(a),
+        data: rows.map((r) => faded(r, a(r))),
       },
       {
         // The gap is the whole reason this form was chosen, so it is
@@ -218,7 +274,7 @@ function dumbbell(
             return lo > 0 ? `${(hi / lo).toFixed(1)}×` : ''
           },
         },
-        data: rows.map((r) => (a(r) + b(r)) / 2),
+        data: rows.map((r) => faded(r, (a(r) + b(r)) / 2, { color: INK_MUTED })),
       },
       {
         name: bName,
@@ -232,7 +288,7 @@ function dumbbell(
           fontSize: 10,
           formatter: (p: { value: number }) => fmt(p.value),
         },
-        data: rows.map(b),
+        data: rows.map((r) => faded(r, b(r), { color: INK_MUTED })),
       },
     ],
   }
@@ -256,6 +312,7 @@ function fate(rows: Row[]) {
     stack: 'fate',
     barWidth: 18,
     itemStyle: { color: colour, borderColor: 'transparent', borderWidth: 1 },
+    ...(labelRight ? {} : { labelLayout: insideFits }),
     label: {
       show: true,
       position: labelRight ? 'right' : 'inside',
@@ -311,8 +368,38 @@ function fate(rows: Row[]) {
 /// shows decay in a way two bars never do. Both ends carry their value,
 /// so the chart is read without touching the axis, and the steeper line
 /// is the model losing more of what it wrote.
+/// The slope chart's height, which its label spread is computed for.
+const SLOPE_HEIGHT = 230
+
 function slope(rows: Row[]) {
   const landed = (d: Row) => per(n(d.added), n(d.out_tokens), 1_000_000)
+  const kept = (d: Row) => n(d.alive_per_mtok)
+  const colour = colours(rows)
+  // Each end's labels are spread so no two overlap (#415 QA): four sat on
+  // top of each other. ECharts' own shift treats every label on a chart
+  // as one column, and this chart has two, so the spread is done here —
+  // the axis max is fixed, which makes each value's height known.
+  const [height, top, bottom, line] = [SLOPE_HEIGHT, 34, 34, 14]
+  const max = Math.max(1, ...rows.flatMap((r) => [landed(r), kept(r)])) * 1.08
+  const spread = (vals: number[]): number[] => {
+    const at = vals.map((v) => top + (height - top - bottom) * (1 - v / max))
+    const order = at.map((y, i) => [y, i]).sort((a, b) => a[0] - b[0])
+    const pos: number[] = []
+    let last = -Infinity
+    for (const [y, i] of order) {
+      pos[i] = Math.max(y, last + line)
+      last = pos[i]
+    }
+    // Pushed past the floor: walk back up. The floor is the plot's, so no
+    // label reaches the axis names under it.
+    let floor = height - bottom - line / 2
+    for (const [, i] of [...order].reverse()) {
+      pos[i] = Math.min(pos[i], floor)
+      floor = pos[i] - line
+    }
+    return pos.map((p, i) => p - at[i])
+  }
+  const [dyLanded, dyKept] = [spread(rows.map(landed)), spread(rows.map(kept))]
   return {
     tooltip: {
       ...TOOLTIP,
@@ -336,6 +423,7 @@ function slope(rows: Row[]) {
       type: 'value',
       name: 'per 1M output tokens',
       nameTextStyle: { color: INK_MUTED },
+      max,
       axisLabel: { show: false },
       splitLine: { show: false },
     },
@@ -344,21 +432,22 @@ function slope(rows: Row[]) {
       type: 'line',
       symbol: 'circle',
       symbolSize: 11,
-      lineStyle: { width: 2, color: IDENT[i % IDENT.length] },
-      itemStyle: { color: IDENT[i % IDENT.length], borderColor: '#150420', borderWidth: 2 },
+      lineStyle: { width: 2, color: colour[i] },
+      itemStyle: { color: colour[i], borderColor: '#150420', borderWidth: 2 },
+      // In its line's colour, so a label moved off its dot still says whose.
       label: {
         show: true,
-        color: INK,
+        color: colour[i],
         fontSize: 11,
         formatter: (p: { dataIndex: number; value: number[] }) =>
           p.dataIndex === 0
             ? `${r.model}  ${p.value[1]}`
-            : `${p.value[1]}  (${landed(r) > 0 ? Math.round((100 * n(r.alive_per_mtok)) / landed(r)) : 0}% kept)`,
-        position: (p: { dataIndex: number }) => (p.dataIndex === 0 ? 'left' : 'right'),
+            : `${p.value[1]}  (${landed(r) > 0 ? Math.round((100 * kept(r)) / landed(r)) : 0}% kept)`,
       },
+      // A position per point: the series-wide `position` takes no function.
       data: [
-        [0, landed(r)],
-        [1, n(r.alive_per_mtok)],
+        { value: [0, landed(r)], label: { position: 'left', offset: [0, dyLanded[i]] } },
+        { value: [1, kept(r)], label: { position: 'right', offset: [0, dyKept[i]] } },
       ],
     })),
   }
@@ -368,13 +457,19 @@ function slope(rows: Row[]) {
 /// units belong on two axes of ONE plot, never on two y-scales of one
 /// bar chart.
 function quadrant(rows: Row[]) {
+  const colour = colours(rows)
+  const xmax = Math.max(1, ...rows.map((r) => n(r.tokens_per_line_kept)))
   return {
     tooltip: {
       ...TOOLTIP,
       formatter: (p: { data: [number, number, string, number] }) =>
         `${p.data[2]}<br/>${fmtCompact(p.data[0])} tokens per surviving line<br/>${p.data[1]}% survived · ${fmtCompact(p.data[3])} lines landed`,
     },
-    grid: { left: 58, right: 40, top: 26, bottom: 46 },
+    // The legend says whose bubble is whose; a label names it where it
+    // fits and gives way where it would land on another (#415 QA — six
+    // two-line labels sat on each other and on the axis name).
+    legend: { data: rows.map((r) => r.model), textStyle: { color: INK_MUTED }, top: 0, right: 0 },
+    grid: { left: 58, right: 40, top: 40, bottom: 46 },
     xAxis: {
       ...AXIS,
       type: 'value',
@@ -389,36 +484,28 @@ function quadrant(rows: Row[]) {
       ...AXIS,
       type: 'value',
       name: 'survived %',
+      nameLocation: 'middle',
+      nameGap: 36,
+      nameTextStyle: { color: INK_MUTED },
       max: 100,
       splitLine: { lineStyle: { color: GRID_LINE } },
     },
-    series: [
-      {
-        type: 'scatter',
-        symbolSize: (d: number[]) => Math.max(14, Math.min(54, Math.sqrt(d[3]) / 3)),
-        itemStyle: {
-          color: (p: { dataIndex: number }) => IDENT[p.dataIndex % IDENT.length],
-          opacity: 0.85,
-          borderColor: '#150420',
-          borderWidth: 2,
-        },
-        label: {
-          show: true,
-          position: 'top',
-          color: INK,
-          fontSize: 10,
-          lineHeight: 13,
-          formatter: (p: { data: [number, number, string, number] }) =>
-            `${p.data[2]}\n${fmtCompact(p.data[0])} tok/line · ${p.data[1]}% kept`,
-        },
-        data: rows.map((r) => [
-          n(r.tokens_per_line_kept),
-          n(r.survived_pct),
-          r.model,
-          n(r.added),
-        ]),
+    series: rows.map((r, i) => ({
+      name: r.model,
+      type: 'scatter',
+      symbolSize: (d: number[]) => Math.max(14, Math.min(54, Math.sqrt(d[3]) / 3)),
+      itemStyle: { color: colour[i], opacity: 0.85, borderColor: '#150420', borderWidth: 2 },
+      labelLayout: { hideOverlap: true },
+      label: {
+        show: true,
+        // Near the right edge a label on the right would be cut off.
+        position: n(r.tokens_per_line_kept) > 0.6 * xmax ? 'left' : 'right',
+        color: INK,
+        fontSize: 10,
+        formatter: () => r.model,
       },
-    ],
+      data: [[n(r.tokens_per_line_kept), n(r.survived_pct), r.model, n(r.added)]],
+    })),
   }
 }
 
@@ -450,6 +537,7 @@ function stacked(rows: Row[], kept: (d: Row) => number, gone: (d: Row) => number
         stack: 's',
         barWidth: 16,
         itemStyle: { color: KEPT, borderColor: 'transparent', borderWidth: 1 },
+        labelLayout: insideFits,
         label: {
           show: true,
           color: '#fff',
@@ -491,7 +579,7 @@ function stacked(rows: Row[], kept: (d: Row) => number, gone: (d: Row) => number
 
 /// The four headline comparisons, as figures rather than charts.
 ///
-/// A single number per family, compared once, is read faster as a
+/// A single number per model, compared once, is read faster as a
 /// number than as a picture of a number — so these are not charts, and
 /// the guidance is explicit that sometimes the right form is no chart
 /// at all. Each carries the ratio, which is the part that actually
@@ -570,12 +658,12 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
     .filter((r) => r.added >= 1000)
     .slice(0, 12)
   // Only switches that produced commits can say anything about what the
-  // incoming family then did.
+  // incoming model then did.
   const hand = (c.handoffs ?? [])
     .map((h) => ({ from: h.from, to: h.to, switches: n(h.switches), commits: n(h.commits), added: n(h.added), alive: n(h.alive), survived_pct: n(h.survived_pct) }))
     .filter((h) => h.commits > 0)
   // Does work written just after a takeover survive better or worse than
-  // the incoming family's own average? Read from the rows, not asserted —
+  // the incoming model's own average? Read from the rows, not asserted —
   // and a tie is a tie: near 100% survival it is the common case, and
   // counting it as "below" announced a loss that was not there (#415
   // review).
@@ -592,7 +680,8 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
 
   const switchChart = {
     tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    grid: { left: 190, right: 90, top: 10, bottom: 42 },
+    // Room for a full bar's end label: "100% · 248 lines" was cut off (#415 QA).
+    grid: { left: 190, right: 130, top: 10, bottom: 42 },
     xAxis: {
       ...AXIS, type: 'value', max: 100,
       name: 'of what it wrote just after taking over, % still there',
@@ -618,7 +707,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
 
   const repoChart = {
     tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    grid: { left: 210, right: 80, top: 10, bottom: 42 },
+    grid: { left: 210, right: 130, top: 10, bottom: 42 },
     xAxis: {
       ...AXIS, type: 'value', max: 100,
       name: '% of what it landed there that is still in the tree',
@@ -751,7 +840,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
 
       <SimpleGrid cols={{ base: 1, lg: 2 }} mb="md">
         <Panel title="What a million tokens buys" scope="all" range={null} note="and how much of it is still there">
-          <EChart option={slope(fams)} height={230} />
+          <EChart option={slope(fams)} height={SLOPE_HEIGHT} />
         </Panel>
         <Panel title="Cheap against good" scope="all" range={null} note="bubble is lines landed · bottom right is the worst place to be">
           <EChart option={quadrant(fams)} height={230} />
@@ -785,8 +874,10 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
           ))}
         </SimpleGrid>
         <Text size="xs" c="dimmed" mt="sm">
-          Green is the better family. Point releases are folded together — you reach for Fable or you
-          reach for Opus — and every rate is recomputed from the summed totals rather than averaged.
+          Green is the best of the models with work enough to rank — {MIN_ADDED.toLocaleString()} landed
+          lines or more. A faded row did less: one file can score what two hundred cannot, so its figure is
+          shown beside the lines behind it, not ranked. Each version is its own model — Opus 5.5 is not
+          Opus 5 — and every rate is recomputed from its own summed totals rather than averaged.
         </Text>
       </Panel>
 
@@ -802,7 +893,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
           <Text size="xs" c="dimmed" mt={4}>
             The account being tested is that a budget runs out, another model takes over, and what it
             does then gets thrown away. Of {hand.length} switch direction{hand.length === 1 ? '' : 's'}, what the
-            incoming family wrote in its first three hours survives above its own average in {aboveOwn}, level
+            incoming model wrote in its first three hours survives above its own average in {aboveOwn}, level
             with it in {levelOwn} and below it in {belowOwn}
             {belowOwn === 0
               ? ' — the handover is not where the work is lost.'
@@ -813,7 +904,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
         </Panel>
       )}
 
-      <Panel title="The comparison, in full" scope="all" range={null} note="point releases folded — reaching for Fable or Opus is the choice actually made">
+      <Panel title="The comparison, in full" scope="all" range={null} note="each version its own model · a dated snapshot counts as its version">
         <Table striped withTableBorder fz="xs" horizontalSpacing="xs">
           <Table.Thead>
             <Table.Tr>

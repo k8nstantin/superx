@@ -210,7 +210,8 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
           <EChart
             height={220}
             option={{
-              grid: { left: 58, right: 48, top: 18, bottom: 26 },
+              // The legend sits above the plot, not on its top line (#415 QA).
+              grid: { left: 58, right: 48, top: 30, bottom: 26 },
               tooltip: { ...TOOLTIP, trigger: 'axis' },
               legend: { data: ['lines written', 'sessions', 'repos'], textStyle: { color: INK_MUTED }, right: 0, top: -2 },
               xAxis: {
@@ -227,12 +228,21 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                 },
                 // Fronts open is a small count beside line volume, so it
                 // gets its own axis or it would sit flat on the floor.
-                { type: 'value', minInterval: 1, axisLabel: { color: AXIS.axisLabel.color }, splitLine: { show: false } },
+                // One step of headroom: at its peak the count ran along the
+                // plot's top edge (#415 QA).
+                {
+                  type: 'value',
+                  minInterval: 1,
+                  max: (v: { max: number }) => v.max + 1,
+                  axisLabel: { color: AXIS.axisLabel.color },
+                  splitLine: { show: false },
+                },
               ],
               series: [
                 { name: 'lines written', type: 'bar', itemStyle: { color: CHART_COLORS[0] }, data: (s?.intensity ?? []).map((p) => n(p.lines_added)) },
                 { name: 'sessions', type: 'line', yAxisIndex: 1, smooth: true, symbol: 'circle', symbolSize: 5, itemStyle: { color: OK }, data: (s?.intensity ?? []).map((p) => n(p.sessions)) },
-                { name: 'repos', type: 'line', yAxisIndex: 1, smooth: true, symbol: 'circle', symbolSize: 5, itemStyle: { color: CANCEL }, data: (s?.intensity ?? []).map((p) => n(p.repos)) },
+                // Dashed, so the sessions line shows through where the two are equal.
+                { name: 'repos', type: 'line', yAxisIndex: 1, smooth: true, symbol: 'circle', symbolSize: 5, itemStyle: { color: CANCEL }, lineStyle: { type: 'dashed' }, data: (s?.intensity ?? []).map((p) => n(p.repos)) },
               ],
             }}
           />
