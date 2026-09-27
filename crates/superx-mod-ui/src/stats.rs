@@ -1876,11 +1876,12 @@ struct AgentAgg {
 /// the blend is -1, which the UI renders as a dash.
 const DURABLE_MINS: i64 = 120; // skill-allow: §9-const — analysis scale, render-layer
 
+/// Rounded to the nearest, as the page rounds (#426).
 fn pct(part: i64, whole: i64) -> i64 {
     if whole <= 0 {
         return 0;
     }
-    (part * 100 / whole).clamp(0, 100)
+    ((200 * part + whole) / (2 * whole)).clamp(0, 100)
 }
 
 /// Every derived figure a branch row carries. Computed together
@@ -2180,6 +2181,46 @@ struct EffortAgg {
     reverts: i64,
     tests_passed: i64,
     tests_failed: i64,
+}
+
+/// A long range's hourly series, folded into its days (#426). The page
+/// labels a long range by day, and an hourly series under day labels read
+/// `09-14` four times on one axis. A day's fronts are the union of its
+/// hours', not their sum — one session across three hours is one — and
+/// the peaks, read from the folded series, stay the peaks of what is drawn.
+fn fold_into_days(
+    burn: &mut BTreeMap<String, (i64, i64, i64, i64)>,
+    intensity: &mut BTreeMap<String, IntensityAgg>,
+    quality: &mut HashMap<String, (i64, i64, i64)>,
+) {
+    let day = |t: &str| t.chars().take(10).collect::<String>();
+    let mut days: BTreeMap<String, (i64, i64, i64, i64)> = BTreeMap::new();
+    for (t, (out, thinking, input, cache_read)) in std::mem::take(burn) {
+        let d = days.entry(day(&t)).or_default();
+        d.0 += out;
+        d.1 += thinking;
+        d.2 += input;
+        d.3 += cache_read;
+    }
+    *burn = days;
+    let mut days: BTreeMap<String, IntensityAgg> = BTreeMap::new();
+    for (t, hour) in std::mem::take(intensity) {
+        let d = days.entry(day(&t)).or_default();
+        d.sessions.extend(hour.sessions);
+        d.repos.extend(hour.repos);
+        d.added += hour.added;
+        d.removed += hour.removed;
+        d.out_tokens += hour.out_tokens;
+    }
+    *intensity = days;
+    let mut days: HashMap<String, (i64, i64, i64)> = HashMap::new();
+    for (t, (passed, failed, tool_failures)) in std::mem::take(quality) {
+        let d = days.entry(day(&t)).or_default();
+        d.0 += passed;
+        d.1 += failed;
+        d.2 += tool_failures;
+    }
+    *quality = days;
 }
 
 /// How hard the machine was working in one bucket (#395). Burn says
@@ -2883,8 +2924,6 @@ pub async fn stats_for_range_capped(
         .list_named_entities("node_session", "attr_session_descriptor")
         .await?;
     let sessions_total = sessions.len() as i64;
-    // uuid → "agent/uuid8" display identity.
-    let mut identity: HashMap<String, String> = HashMap::new();
     // uuid → the agent that owns the session (#337).
     let mut agent_of: HashMap<String, String> = HashMap::new();
     for s in &sessions {
@@ -2893,10 +2932,18 @@ pub async fn stats_for_range_capped(
             _ => "?".to_string(),
         };
         let agent = name.split('/').next().unwrap_or("?").to_string();
-        let uuid = superx_ops::record_uuid(&s.entity_id);
-        identity.insert(uuid.clone(), format!("{agent}/{}", &uuid[..uuid.len().min(8)]));
-        agent_of.insert(uuid, agent);
+        agent_of.insert(superx_ops::record_uuid(&s.entity_id), agent);
     }
+    // uuid → the fewest characters that tell it from every other session
+    // (#426), and "agent/short", the display identity.
+    let short = crate::short_ids(agent_of.keys().map(String::as_str));
+    let identity: HashMap<String, String> = agent_of
+        .iter()
+        .map(|(uuid, agent)| {
+            let s = short.get(uuid).map_or(uuid.as_str(), String::as_str);
+            (uuid.clone(), format!("{agent}/{s}"))
+        })
+        .collect();
 
     let mut modules_total = 0i64;
     let mut modules_active = 0i64;
@@ -4524,10 +4571,7 @@ pub async fn stats_for_range_capped(
         .into_iter()
         .take(6)
         .map(|(sid, a)| SessionStat {
-            identity: identity
-                .get(&sid)
-                .cloned()
-                .unwrap_or_else(|| sid.chars().take(8).collect()),
+            identity: identity.get(&sid).cloned().unwrap_or_else(|| sid.clone()),
             session_id: sid,
             messages: a.messages,
             lines_written: a.lines,
@@ -4798,6 +4842,11 @@ pub async fn stats_for_range_capped(
     };
     let mainlines = crate::resolved_mainline_refs(kernel).await;
     let landed = crate::landed::landed(&code.cwds, &checkouts, landed_since, clock, &mainlines).await;
+    // A long range reads by day, so its hourly series are folded into
+    // days here, as the work cube already is (#426).
+    if fold_days {
+        fold_into_days(&mut code.burn, &mut code.intensity, &mut code.quality);
+    }
 
     Ok(StatsSummary {
         landed,
@@ -5183,6 +5232,7 @@ pub async fn stats_for_range_capped(
                 .iter()
                 .map(|(sid, (start, end, agent, repo, msgs))| SessionSpan {
                     identity: sid.clone(),
+                    short_id: short.get(sid).cloned().unwrap_or_else(|| sid.clone()),
                     agent: agent.clone(),
                     repo: repo.clone(),
                     lines_added: session_work.get(sid).map_or(0, |w| w.0),
@@ -5215,6 +5265,7 @@ pub async fn stats_for_range_capped(
                     }
                     Some(LiveSession {
                         identity: sid.clone(),
+                        short_id: short.get(sid).cloned().unwrap_or_else(|| sid.clone()),
                         agent: l.agent.clone(),
                         repo: l.repo.clone(),
                         branch: l.branch.clone(),

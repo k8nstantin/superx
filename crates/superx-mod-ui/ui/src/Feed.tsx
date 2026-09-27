@@ -114,7 +114,7 @@ function identityOf(
       // rides along the same way when the agent reports it — the same
       // work at a different effort is different work.
       label:
-        `${match.agent}/${match.session_id.slice(0, 8)}` +
+        `${match.agent}/${match.short_id}` +
         (match.model ? ` · ${match.model}` : '') +
         (match.effort ? ` · ${match.effort}` : ''),
       key: match.session_id,
@@ -122,7 +122,9 @@ function identityOf(
       effort: match.effort ?? undefined,
     }
   if (e.kind === 'message' && e.session_id)
-    return { label: e.session_id.slice(0, 8), key: e.session_id }
+    // Not in the directory yet: the server's floor for a short id
+    // (SHORT_ID_MIN), the whole millisecond of the UUIDv7 (#426).
+    return { label: e.session_id.slice(0, 13), key: e.session_id }
   if (e.session_src)
     return {
       // Legacy pre-#204 rows carry the literal fallback key; label

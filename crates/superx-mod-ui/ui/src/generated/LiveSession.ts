@@ -5,7 +5,12 @@
  * just that it exists (issue #325). The panel a 24×7 operator reads
  * first: which agent, which repo, which model, how hard it is going.
  */
-export type LiveSession = { identity: string, agent: string, repo: string | null, branch: string | null, model: string | null, 
+export type LiveSession = { identity: string, 
+/**
+ * The fewest characters of the session id that tell it from every
+ * other session, at least `SHORT_ID_MIN` (#426) — what the page shows.
+ */
+short_id: string, agent: string, repo: string | null, branch: string | null, model: string | null, 
 /**
  * The reasoning effort it is running at. The model alone does not
  * say what a session costs — the same model at low and at max

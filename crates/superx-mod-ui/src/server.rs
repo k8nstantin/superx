@@ -476,6 +476,10 @@ async fn api_sessions(
     };
     // The context bar's denominator — resolved once per request.
     let window = crate::resolved_context_window(kernel).await;
+    // Each label is told apart from EVERY session, whatever the filter, so
+    // it reads as it does on the Status page (#426).
+    let uuids: Vec<String> = sessions.iter().map(|s| superx_ops::record_uuid(&s.entity_id)).collect();
+    let short = crate::short_ids(uuids.iter().map(String::as_str));
     // Resolve every agent ONCE — the per-session action count takes a
     // pre-resolved scope instead of re-reading descriptors and
     // re-resolving agents per row (review finding, issue #187).
@@ -540,6 +544,7 @@ async fn api_sessions(
         let uuid = superx_ops::record_uuid(&s.entity_id);
         out.push(SessionView {
             identity: format!("{agent}/{uuid}"),
+            short_id: short.get(&uuid).cloned().unwrap_or_else(|| uuid.clone()),
             session_id: uuid,
             agent,
             src,

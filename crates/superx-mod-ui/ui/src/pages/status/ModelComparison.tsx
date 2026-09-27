@@ -509,9 +509,17 @@ function quadrant(rows: Row[]) {
   }
 }
 
-function stacked(rows: Row[], kept: (d: Row) => number, gone: (d: Row) => number, unit: string, keptName: string, goneName: string) {
+function stacked(
+  rows: Row[],
+  kept: (d: Row) => number,
+  gone: (d: Row) => number,
+  unit: string,
+  keptName: string,
+  goneName: string,
+  fmt: (v: number) => string = fmtCompact,
+) {
   return {
-    tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' } },
+    tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: (v: number) => fmt(v) },
     legend: { data: [keptName, goneName], textStyle: { color: INK_MUTED }, top: 0, right: 0 },
     grid: { left: 150, right: 84, top: 32, bottom: 42 },
     xAxis: {
@@ -546,7 +554,7 @@ function stacked(rows: Row[], kept: (d: Row) => number, gone: (d: Row) => number
             const r = rows[p.dataIndex]
             const tot = kept(r) + gone(r)
             return p.value > 0 && tot > 0
-              ? `${fmtCompact(p.value)}  ${Math.round((100 * p.value) / tot)}%`
+              ? `${fmt(p.value)}  ${Math.round((100 * p.value) / tot)}%`
               : ''
           },
         },
@@ -567,7 +575,7 @@ function stacked(rows: Row[], kept: (d: Row) => number, gone: (d: Row) => number
             const r = rows[p.dataIndex]
             const tot = kept(r) + gone(r)
             return p.value > 0 && tot > 0
-              ? `${fmtCompact(p.value)}  ${Math.round((100 * p.value) / tot)}%`
+              ? `${fmt(p.value)}  ${Math.round((100 * p.value) / tot)}%`
               : ''
           },
         },
@@ -832,7 +840,17 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
         </Panel>
         <Panel title="Of your time" scope="all" range={null} note="the cost you cannot get back">
           <EChart
-            option={stacked(fams, (d) => Math.max(0, Math.round((n(d.minutes) - n(d.minutes_thrown)) / 60)), (d) => Math.round(n(d.minutes_thrown) / 60), 'hours', 'hours that lasted', 'hours thrown away')}
+            // Hours as they are, not rounded before the split: rounded first,
+            // 20 of 22 read 91% beside the 92% its lines kept (#426).
+            option={stacked(
+              fams,
+              (d) => Math.max(0, n(d.minutes) - n(d.minutes_thrown)) / 60,
+              (d) => n(d.minutes_thrown) / 60,
+              'hours',
+              'hours that lasted',
+              'hours thrown away',
+              (h) => hours(h * 60),
+            )}
             height={60 + fams.length * 40}
           />
         </Panel>

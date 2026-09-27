@@ -366,7 +366,7 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
             added: a.added,
             removed: a.removed,
             alive: a.alive,
-            survived_pct: if a.added > 0 { (100 * a.alive) / a.added } else { 0 },
+            survived_pct: pct(a.alive, a.added),
         })
         .collect();
     handoffs.sort_by_key(|h| std::cmp::Reverse(h.switches));
@@ -386,7 +386,7 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
             added: a.added,
             alive: a.alive,
             removed: a.removed,
-            survived_pct: if a.added > 0 { (100 * a.alive) / a.added } else { 0 },
+            survived_pct: pct(a.alive, a.added),
             rework_commits: a.rework_commits,
         })
         .collect();
@@ -394,6 +394,13 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
     unjudged.sort_by(|a, b| a.repo.cmp(&b.repo));
 
     Comparison { handoffs, deviations, repos: repo_rows, unjudged }
+}
+
+/// `num` as a whole percentage of `den`, rounded to the nearest — the
+/// page's own rule. Floored here and rounded there, one share read 10% in
+/// the table and 11% on the bar beside it (#426).
+fn pct(num: i64, den: i64) -> i64 {
+    if den > 0 { (200 * num + den) / (2 * den) } else { 0 }
 }
 
 /// One model's row, every rate computed from its own summed numerator
@@ -404,24 +411,23 @@ fn deviation(model: String, a: &DevAcc, sp: &HashMap<&str, SpendAcc>) -> Deviati
     let thrown = (a.added - a.alive).max(0);
     let mut ages = a.ages.clone();
     ages.sort_unstable();
-    let per = |num: i64, den: i64| if den > 0 { (100 * num) / den } else { 0 };
     Deviation {
         commits: a.commits,
         added: a.added,
         removed: a.removed,
         alive: a.alive,
-        survived_pct: per(a.alive, a.added),
-        removed_per_100_added: per(a.removed, a.added),
+        survived_pct: pct(a.alive, a.added),
+        removed_per_100_added: pct(a.removed, a.added),
         rework_commits: a.rework_commits,
-        rework_pct: per(a.rework_commits, a.commits),
+        rework_pct: pct(a.rework_commits, a.commits),
         thrash_files: a.thrash_files,
-        thrash_per_100_commits: per(a.thrash_files, a.commits),
+        thrash_per_100_commits: pct(a.thrash_files, a.commits),
         multi_dir_commits: a.multi_dir_commits,
-        multi_dir_pct: per(a.multi_dir_commits, a.commits),
+        multi_dir_pct: pct(a.multi_dir_commits, a.commits),
         dirs_per_commit_x10: if a.commits > 0 { (10 * a.dir_spread) / a.commits } else { 0 },
         operator_turns: op,
         corrections: redo,
-        corrections_per_100: per(redo, op),
+        corrections_per_100: pct(redo, op),
         out_tokens: s.out_tokens,
         messages: s.messages,
         runs: s.runs,
@@ -442,7 +448,7 @@ fn deviation(model: String, a: &DevAcc, sp: &HashMap<&str, SpendAcc>) -> Deviati
         alive_per_hour: if s.minutes > 0 { (a.alive * 60) / s.minutes } else { 0 },
         abandoned_commits: a.abandoned_commits,
         abandoned_lines: a.abandoned_lines,
-        abandoned_pct: per(a.abandoned_lines, a.added + a.abandoned_lines),
+        abandoned_pct: pct(a.abandoned_lines, a.added + a.abandoned_lines),
         in_flight_lines: a.in_flight_lines,
         model,
     }
@@ -489,6 +495,17 @@ struct HandAcc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page rounds, so the comparison rounds (#426): floored, one share
+    /// read 10% in the table and 11% on the bar beside it.
+    #[test]
+    fn a_share_is_rounded_as_the_page_rounds() {
+        assert_eq!(pct(811, 7411), 11, "10.9% is 11%");
+        assert_eq!(pct(2, 3), 67);
+        assert_eq!(pct(1, 3), 33);
+        assert_eq!(pct(1, 200), 1, "a half rounds up, as Math.round does");
+        assert_eq!(pct(5, 0), 0, "nothing to divide by");
+    }
 
     #[test]
     fn a_fix_commit_is_rework_and_a_feature_is_not() {

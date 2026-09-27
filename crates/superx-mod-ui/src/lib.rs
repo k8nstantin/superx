@@ -217,6 +217,33 @@ async fn resolved_secs(kernel: &Kernel, param: &str, fallback: u64) -> u64 {
     }
 }
 
+/// The fewest characters a session's label shows (#426). A session id is
+/// a UUIDv7, which opens with its millisecond clock: the first eight
+/// characters move only every 65 seconds, so sessions registered together
+/// shared them, and four rows of one table read `claude_code/01a08a9c`.
+/// Thirteen carry the whole millisecond.
+pub const SHORT_ID_MIN: usize = 13; // skill-allow: §9-const — render-layer label width
+
+/// Each id's shortest prefix that no other id in `ids` shares, and never
+/// shorter than [`SHORT_ID_MIN`] — git's rule for a commit — so a session
+/// reads the same on every panel and no two sessions read alike.
+pub fn short_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> std::collections::HashMap<String, String> {
+    let mut ids: Vec<&str> = ids.into_iter().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    // Sorted, an id shares its longest prefix with a neighbour.
+    let shared = |a: &str, b: &str| a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    ids.iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let before = i.checked_sub(1).map_or(0, |j| shared(ids[j], id));
+            let after = ids.get(i + 1).map_or(0, |next| shared(id, next));
+            let len = SHORT_ID_MIN.max(before.max(after) + 1);
+            (id.to_string(), id.chars().take(len).collect())
+        })
+        .collect()
+}
+
 /// The ref each repository's work actually lands on, where it is not what
 /// `origin/HEAD` says (#414): an object `{repository name: ref}` on the ui
 /// module's registry entity — `{"gryphon-data-lake": "origin/sandbox"}`

@@ -2,7 +2,7 @@ import { Badge, Grid, Group, Progress, Table, Text, Tooltip } from '@mantine/cor
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
 import { sessionColor } from '../../Feed'
-import { BANDS, Churn, FAIL, OK, Panel, fmtAge, fmtCompact, fmtMs, fmtSecs, n, pct, steering } from './parts'
+import { BANDS, Churn, FAIL, OK, Panel, fmtAge, fmtCompact, fmtMs, fmtSecs, n, pct, steering, timeline } from './parts'
 import { openSession } from '../../route'
 
 // Who flew what (#367): agents, reasoning levels, models, branches and
@@ -29,7 +29,8 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
       totals.set(k, (totals.get(k) ?? 0) + n(c.added))
     }
     const top = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 7).map(([k]) => k)
-    const buckets = [...new Set(cells.map((c) => c.t))].sort()
+    // Every day or hour of the span, the quiet ones drawn empty (#426).
+    const buckets = timeline(cells.map((c) => c.t))
     const keyOf = (c: (typeof cells)[number]) => {
       const k = `${c.agent} · ${c.repo}`
       return top.includes(k) ? k : 'other'
@@ -394,7 +395,7 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                         <Table.Td>
                           <Group gap={6} wrap="nowrap">
                             <span style={{ width: 8, height: 8, borderRadius: 2, background: sessionColor(sp.identity), flexShrink: 0 }} />
-                            <Text size="xs" ff={MONO}>{sp.identity.slice(0, 13)}</Text>
+                            <Text size="xs" ff={MONO}>{sp.short_id}</Text>
                           </Group>
                         </Table.Td>
                         <Table.Td><Text size="xs" c="dimmed">{sp.repo ?? '—'}</Text></Table.Td>

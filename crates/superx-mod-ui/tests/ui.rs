@@ -1839,7 +1839,7 @@ async fn command_outcomes_reach_branch_agent_and_effort() {
     let b = s.branches.iter().find(|b| b.branch == "feat/x").expect("branch row");
     assert_eq!(b.tests_passed, 7, "the tally reached the branch");
     assert_eq!(b.tests_failed, 2);
-    assert_eq!(b.test_pass_pct, 77, "7 of 9");
+    assert_eq!(b.test_pass_pct, 78, "7 of 9, rounded as the page rounds (#426)");
     assert_eq!(b.tests_run, 1, "one test invocation, so -1 could not mean 'never ran'");
     // The point of the fix: the failure that resolved through the OTHER
     // arm is on the branch, not silently dropped.
@@ -2727,7 +2727,7 @@ async fn steering_reads_in_edits_when_replaced_lines_are_unknown() {
     // So do the branch and agent rows.
     let b = s.branches.iter().find(|b| b.branch == "feat/x").expect("branch row");
     assert_eq!((b.edits_directed, b.edits_self), (1, 2));
-    assert_eq!(b.self_churn_pct, 66, "two of three rewrites unasked");
+    assert_eq!(b.self_churn_pct, 67, "two of three rewrites unasked, rounded (#426)");
     assert_eq!(
         (
             s.agent_stats.iter().map(|a| a.edits_directed).sum::<i64>(),
@@ -4267,4 +4267,97 @@ async fn a_branch_that_lives_on_lands_every_squash() {
     let row = c.deviations.iter().find(|d| d.model == "opus 5.5").expect("opus 5.5 row");
     assert_eq!(row.commits, 3, "#1, #2 and #3 — not #4, which a vendor drop rode in on");
     assert_eq!(row.added, 10 + (2 + 15) + 6_000, "each squash its own lines");
+}
+
+/// A session reads by the fewest characters that tell it from every other
+/// (#426). Its id is a UUIDv7, whose first eight characters move every 65
+/// seconds: sessions made together shared them, and one table drew four
+/// rows as `claude_code/01a08a9c`.
+#[test]
+fn a_session_reads_by_the_fewest_characters_that_tell_it_apart() {
+    let ids = [
+        "01a08a9c-cdc5-7e23-b639-9f091e53bd75",
+        "01a08a9c-cb5a-7ff0-9873-7af08a195877",
+        // Two made in the same millisecond part further in.
+        "01a0d85b-e600-7990-9473-1503920c8a7b",
+        "01a0d85b-e600-7a01-8e1f-0c3b7d51aa20",
+    ];
+    let short = superx_mod_ui::short_ids(ids);
+    assert_eq!(short[ids[0]], "01a08a9c-cdc5", "the whole millisecond, and no more");
+    assert_eq!(short[ids[1]], "01a08a9c-cb5a");
+    assert_eq!(short[ids[2]], "01a0d85b-e600-79");
+    assert_eq!(short[ids[3]], "01a0d85b-e600-7a");
+    assert_eq!(superx_mod_ui::short_ids(["abc"])["abc"], "abc", "an id shorter than the floor is itself");
+}
+
+/// Every panel names a session the same way (#426): Busiest sessions,
+/// the live panel and the Sortie log all show the head of the id the
+/// Sessions page prints in full, and two sessions made together differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_made_together_are_told_apart_on_every_panel() {
+    let kernel = fresh_kernel().await;
+    let (agent, one) = seed_agent_and_session(&kernel, "claude_code", "together-a").await;
+    let (_, two) = seed_agent_and_session(&kernel, "claude_code", "together-b").await;
+    let msg = serde_json::json!({"cwd": "/w/superx", "message": {"model": "claude-opus-5",
+        "usage": {"output_tokens": 10}, "content": [{"type": "text", "text": "."}]}});
+    log_tool_message(&kernel, &one, &agent, msg.clone()).await;
+    log_tool_message(&kernel, &two, &agent, msg).await;
+
+    let s = superx_mod_ui::stats::stats_for_range(&kernel, 500, "24h").await.expect("stats");
+    assert_eq!(s.top_sessions.len(), 2);
+    assert_ne!(s.top_sessions[0].identity, s.top_sessions[1].identity);
+    for sid in [superx_ops::record_uuid(&one), superx_ops::record_uuid(&two)] {
+        let top = s.top_sessions.iter().find(|t| t.session_id == sid).expect("busiest row");
+        let short = top.identity.strip_prefix("claude_code/").expect("the agent, then the id");
+        assert!(short.len() >= superx_mod_ui::SHORT_ID_MIN && sid.starts_with(short), "{short} of {sid}");
+        let live = s.live.iter().find(|l| l.identity == sid).expect("live row");
+        let span = s.timeline.iter().find(|t| t.identity == sid).expect("sortie");
+        assert_eq!((live.short_id.as_str(), span.short_id.as_str()), (short, short), "one name on every panel");
+    }
+}
+
+/// A long range reads by the day (#426): an hourly series under day labels
+/// read `09-14` four times on one axis. Folded, a day's fronts are the
+/// sessions of any of its hours, so one session across two hours is one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_range_reads_its_series_by_the_day() {
+    let kernel = fresh_kernel().await;
+    let (agent, one) = seed_agent_and_session(&kernel, "claude_code", "day-a").await;
+    let (_, two) = seed_agent_and_session(&kernel, "claude_code", "day-b").await;
+    // Two hours of yesterday, on the viewer's clock.
+    let clock = chrono::FixedOffset::west_opt(4 * 3600).expect("UTC-4");
+    let day = (chrono::Utc::now().with_timezone(&clock) - chrono::Duration::days(1)).date_naive();
+    let at = |h: u32| {
+        day.and_hms_opt(h, 0, 0)
+            .expect("hour")
+            .and_local_timezone(clock)
+            .single()
+            .expect("a fixed offset has one reading")
+            .with_timezone(&chrono::Utc)
+    };
+    let spend = |out: i64| serde_json::json!({"cwd": "/w/superx", "message": {"model": "claude-opus-5",
+        "usage": {"output_tokens": out}, "content": [{"type": "text", "text": "."}]}});
+    let call = |id: &str| serde_json::json!({"cwd": "/w/superx", "message": {"content": [
+        {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": "cargo test"}}]}});
+    let out = |id: &str, n: i64| serde_json::json!({"message": {"content": [
+        {"type": "tool_result", "tool_use_id": id, "content": format!("test result: ok. {n} passed; 0 failed")}]}});
+    log_tool_message_at(&kernel, &one, &agent, spend(10), at(10)).await;
+    log_tool_message_at(&kernel, &one, &agent, call("q1"), at(10)).await;
+    log_tool_message_at(&kernel, &one, &agent, out("q1", 3), at(10)).await;
+    log_tool_message_at(&kernel, &two, &agent, spend(20), at(15)).await;
+    log_tool_message_at(&kernel, &one, &agent, spend(30), at(15)).await;
+    log_tool_message_at(&kernel, &two, &agent, call("q2"), at(15)).await;
+    log_tool_message_at(&kernel, &two, &agent, out("q2", 4), at(15)).await;
+
+    let s = superx_mod_ui::stats::stats_for_range_on(&kernel, 500, "7d", clock).await.expect("stats");
+    let key = day.format("%Y-%m-%d").to_string();
+    assert_eq!(s.burn.iter().map(|b| (b.t.clone(), b.out)).collect::<Vec<_>>(), vec![(key.clone(), 60)]);
+    assert_eq!(
+        s.quality_series.iter().map(|q| (q.t.clone(), q.tests_passed)).collect::<Vec<_>>(),
+        vec![(key.clone(), 7)]
+    );
+    assert_eq!(s.intensity.len(), 1, "{:?}", s.intensity.iter().map(|i| &i.t).collect::<Vec<_>>());
+    let d = &s.intensity[0];
+    assert_eq!((d.t.as_str(), d.sessions, d.out_tokens), (key.as_str(), 2, 60), "two sessions that day, not three session-hours");
+    assert_eq!(s.peak_sessions, 2, "the peak of the series drawn");
 }

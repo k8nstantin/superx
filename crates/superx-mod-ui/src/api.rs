@@ -50,6 +50,9 @@ pub struct AgentView {
 pub struct SessionView {
     pub identity: String,
     pub session_id: String,
+    /// The fewest characters of the session id that tell it from every
+    /// other session, at least `SHORT_ID_MIN` (#426) — what the page shows.
+    pub short_id: String,
     pub agent: String,
     pub src: String,
     /// TOTAL activity for the session — messages + action events
@@ -409,6 +412,9 @@ pub struct RepoStat {
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct LiveSession {
     pub identity: String,
+    /// The fewest characters of the session id that tell it from every
+    /// other session, at least `SHORT_ID_MIN` (#426) — what the page shows.
+    pub short_id: String,
     pub agent: String,
     pub repo: Option<String>,
     pub branch: Option<String>,
@@ -711,6 +717,9 @@ pub struct HourRate {
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct SessionSpan {
     pub identity: String,
+    /// The fewest characters of the session id that tell it from every
+    /// other session, at least `SHORT_ID_MIN` (#426) — what the page shows.
+    pub short_id: String,
     pub agent: String,
     pub repo: Option<String>,
     /// What the sortie was LIKE, not just how long it lasted (#395):
