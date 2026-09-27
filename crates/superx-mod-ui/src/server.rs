@@ -253,12 +253,11 @@ async fn sse_poller(
     tx: broadcast::Sender<String>,
     stop: superx_kernel::supervise::CancelToken,
 ) {
-    // One cursor per stream (#413). Both reads are capped at a batch, and
-    // a shared cursor advanced to the newer of the two ends skipped every
-    // row the other stream had not reached yet — in a burst, whole runs of
-    // the feed never arrived.
-    let mut after_events = chrono::Utc::now();
-    let mut after_messages = after_events;
+    // One cursor per stream (#413), each a (time, id) position with a
+    // look back for rows that commit late (#183).
+    let now = chrono::Utc::now();
+    let mut actions = crate::activity::LiveCursor::new("telemetry_stream", now);
+    let mut messages = crate::activity::LiveCursor::new("message", now);
     loop {
         let poll = superx_ops::live_poll_secs(&kernel).await;
         tokio::time::sleep(Duration::from_secs(poll)).await;
@@ -270,31 +269,27 @@ async fn sse_poller(
         }
         if tx.receiver_count() == 0 {
             // Nobody watching — skip ahead.
-            after_events = chrono::Utc::now();
-            after_messages = after_events;
+            let now = chrono::Utc::now();
+            actions.skip_to(now);
+            messages.skip_to(now);
             continue;
         }
-        if let Ok(actions) = kernel.telemetry_since(after_events, SSE_BATCH).await {
-            for a in &actions {
-                if a.valid_from > after_events {
-                    after_events = a.valid_from;
-                }
-                let ev = crate::activity::action_event(a);
-                if let Ok(json) = serde_json::to_string(&ev) {
-                    let _receivers = tx.send(json);
-                }
-            }
+        match actions.read::<superx_kernel::TelemetryRecord>(&kernel, SSE_BATCH).await {
+            Ok(events) => broadcast_events(&tx, &events),
+            Err(e) => tracing::warn!(target: "ui", error = %e, "live actions read failed"),
         }
-        if let Ok(messages) = kernel.messages_since(after_messages, SSE_BATCH).await {
-            for m in &messages {
-                if m.valid_from > after_messages {
-                    after_messages = m.valid_from;
-                }
-                let ev = crate::activity::message_event(m);
-                if let Ok(json) = serde_json::to_string(&ev) {
-                    let _receivers = tx.send(json);
-                }
-            }
+        match messages.read::<superx_kernel::MessageRecord>(&kernel, SSE_BATCH).await {
+            Ok(events) => broadcast_events(&tx, &events),
+            Err(e) => tracing::warn!(target: "ui", error = %e, "live messages read failed"),
+        }
+    }
+}
+
+/// Send each event to every SSE client, as its JSON.
+fn broadcast_events(tx: &broadcast::Sender<String>, events: &[SseEvent]) {
+    for ev in events {
+        if let Ok(json) = serde_json::to_string(ev) {
+            let _receivers = tx.send(json);
         }
     }
 }
@@ -572,6 +567,9 @@ struct ActivityQuery {
     /// Walk BACKWARDS from here (RFC3339): the newest page strictly
     /// older than this instant. Absent = the present (issue #241).
     before: Option<String>,
+    /// The id of the row at `before`, which breaks a tie between rows
+    /// captured in the same instant (#273).
+    before_id: Option<String>,
     /// Keyword filter, matched in the engine against captured message
     /// text and action payloads — so it searches ALL history, not just
     /// the page the client happens to hold (issue #241).
@@ -591,14 +589,22 @@ const ACTIVITY_BACKLOG_MAX: u32 = 2000; // skill-allow: §9-const — render pag
 /// Parse the backwards cursor. A malformed one is an error, never a
 /// silent fall back to the present — that would serve the newest page
 /// again and the feed would loop forever instead of paging back.
-fn parse_before(raw: Option<&String>) -> std::result::Result<crate::activity::Before, String> {
-    match raw {
-        None => Ok(None),
-        Some(s) => match chrono::DateTime::parse_from_rfc3339(s) {
-            Ok(t) => Ok(Some(t.with_timezone(&chrono::Utc))),
-            Err(e) => Err(format!("before must be an RFC3339 timestamp: {e}")),
-        },
-    }
+fn parse_before(
+    raw: Option<&String>,
+    raw_id: Option<&String>,
+) -> std::result::Result<crate::activity::Before, String> {
+    let Some(s) = raw else { return Ok(None) };
+    let at = chrono::DateTime::parse_from_rfc3339(s)
+        .map_err(|e| format!("before must be an RFC3339 timestamp: {e}"))?
+        .with_timezone(&chrono::Utc);
+    let id = match raw_id {
+        None => None,
+        Some(i) => Some(
+            i.parse::<superx_kernel::types::Uuid>()
+                .map_err(|e| format!("before_id must be a row's uuid: {e}"))?,
+        ),
+    };
+    Ok(Some((at, id)))
 }
 
 /// Everything the OS captured for one session — messages + actions,
@@ -618,7 +624,7 @@ async fn api_session_activity(
         .limit
         .unwrap_or(ACTIVITY_BACKLOG_DEFAULT)
         .min(ACTIVITY_BACKLOG_MAX);
-    let before = match parse_before(q.before.as_ref()) {
+    let before = match parse_before(q.before.as_ref(), q.before_id.as_ref()) {
         Ok(b) => b,
         Err(e) => return Response::err(e),
     };
@@ -762,7 +768,7 @@ async fn api_activity(
         .limit
         .unwrap_or(ACTIVITY_BACKLOG_DEFAULT)
         .min(ACTIVITY_BACKLOG_MAX);
-    let before = match parse_before(q.before.as_ref()) {
+    let before = match parse_before(q.before.as_ref(), q.before_id.as_ref()) {
         Ok(b) => b,
         Err(e) => return Response::err(e),
     };
@@ -780,7 +786,12 @@ async fn api_events(
         loop {
             match rx.recv().await {
                 Ok(json) => yield Ok(Event::default().data(json)),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // Too slow for the stream, this client missed frames. It is
+                // told, so it reads the backlog again rather than silently
+                // holding a gap (#183).
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    yield Ok(Event::default().event("resync").data(missed.to_string()))
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }

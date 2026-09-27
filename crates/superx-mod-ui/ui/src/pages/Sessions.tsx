@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useDebouncedValue } from '@mantine/hooks'
 import { Alert, Badge, Button, Card, Group, Progress, ScrollArea, Table, Text, Title, Tooltip } from '@mantine/core'
-import { fetchAgents, fetchSessionActivity, fetchSessions } from '../api'
+import { fetchAgents, fetchSessionActivity, fetchSessions, type FeedCursor } from '../api'
 import { useSse } from '../useSse'
 import { Feed, MAX_FEED_ROWS, matchesSearch, mergeFeed } from '../Feed'
 import { useFeedHistory } from '../useFeedHistory'
@@ -214,10 +214,10 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
     )
     const keep = mine.filter((e) => matchesSearch(e, q))
     if (keep.length) setLiveRows((prev) => [...prev, ...keep].slice(-MAX_FEED_ROWS))
-  }, paused)
+  }, paused, () => void backlog.refetch())
 
   const page = useCallback(
-    (before: string, limit: number) => fetchSessionActivity(session.session_id, limit, before, q),
+    (before: FeedCursor, limit: number) => fetchSessionActivity(session.session_id, limit, before, q),
     [session.session_id, q],
   )
   const { older, loadOlder, loadingOlder, exhausted } = useFeedHistory(

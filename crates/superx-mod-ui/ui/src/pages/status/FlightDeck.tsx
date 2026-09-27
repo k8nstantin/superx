@@ -192,7 +192,7 @@ export function FlightDeck({
                           {/* Stated, not re-derived: the server already cut
                               this panel to the activity window (#344). */}
                           <LivenessDot state="active" size={8} />
-                          <Text size="xs" ff={MONO}>
+                          <Text size="xs" ff={MONO} style={{ whiteSpace: 'nowrap' }}>
                             {l.short_id}
                           </Text>
                         </Group>
@@ -216,7 +216,9 @@ export function FlightDeck({
                             </Text>
                             {l.effort && (
                               <Tooltip label="reasoning effort this session is running at" withArrow>
-                                <Badge variant="outline" color="gray" size="xs">
+                                {/* Never narrower than its word: a squeezed column
+                                    shrank it to a dot (operator QA). */}
+                                <Badge variant="outline" color="gray" size="xs" style={{ flexShrink: 0, minWidth: 'max-content' }}>
                                   {l.effort}
                                 </Badge>
                               </Tooltip>
@@ -230,7 +232,7 @@ export function FlightDeck({
                       </Table.Td>
                       <Table.Td>
                         <Tooltip label={l.last_tool ?? 'no tool call in this range'} withArrow>
-                          <Badge size="sm" variant="light" color={DOING_COLOR[l.doing] ?? 'gray'}>
+                          <Badge size="sm" variant="light" color={DOING_COLOR[l.doing] ?? 'gray'} style={{ minWidth: 'max-content' }}>
                             {l.doing}
                             {n(l.last_op_secs) > 0 ? ` · ${fmtAge(l.last_op_secs)}` : ''}
                           </Badge>

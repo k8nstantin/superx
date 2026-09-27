@@ -10,6 +10,7 @@ import {
   TextInput,
   Tooltip,
 } from '@mantine/core'
+import type { FeedCursor } from './api'
 import type { SseEvent } from './generated/SseEvent'
 import type { SessionView } from './generated/SessionView'
 import type { AgentView } from './generated/AgentView'
@@ -34,8 +35,10 @@ export function mergeFeed(backlog: SseEvent[], live: SseEvent[], cap = MAX_FEED_
   const seen = new Map<string, SseEvent>()
   // Backlog LAST: on a duplicate id the backlog copy wins.
   for (const r of [...live, ...backlog]) seen.set(r.id, r)
+  // Rows of one instant order by id, as the server pages them (#273).
+  const order = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
   return [...seen.values()]
-    .sort((a, b) => (a.valid_from < b.valid_from ? -1 : a.valid_from > b.valid_from ? 1 : 0))
+    .sort((a, b) => order(a.valid_from, b.valid_from) || order(a.id, b.id))
     .slice(-cap)
 }
 
@@ -205,7 +208,7 @@ export function Feed({
   loading?: boolean
   error?: string | null
   /// Fetch the page before the oldest row on screen (issue #241).
-  onLoadOlder?: (before: string | undefined) => void
+  onLoadOlder?: (before: FeedCursor | undefined) => void
   loadingOlder?: boolean
   exhausted?: boolean
   /// Keyword search — matched in the engine across ALL captured
@@ -249,7 +252,7 @@ export function Feed({
     if (!v || !onLoadOlder || loadingOlder || exhausted) return
     if (v.scrollHeight <= v.clientHeight + 40) return // nothing to scroll yet
     anchor.current = { height: v.scrollHeight, top: v.scrollTop }
-    onLoadOlder(visible[0]?.valid_from)
+    onLoadOlder(visible[0] ? { at: visible[0].valid_from, id: visible[0].id } : undefined)
   }
   useLayoutEffect(() => {
     const v = viewport.current

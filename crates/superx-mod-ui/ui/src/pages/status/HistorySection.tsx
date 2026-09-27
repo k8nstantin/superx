@@ -82,12 +82,21 @@ export function HistorySection({ s, i, range }: { s: StatsSummary | undefined; i
               height={240}
               option={{
                 tooltip: { ...TOOLTIP, trigger: 'item' },
-                legend: { orient: 'vertical', right: 0, top: 'middle', textStyle: { color: INK_MUTED, fontSize: 11 } },
+                // The legend holds the right half and the ring the left, so a
+                // long model name never runs under the ring (operator QA).
+                // A long name ends in an ellipsis inside the card, whole on hover.
+                legend: {
+                  orient: 'vertical',
+                  left: '50%',
+                  top: 'middle',
+                  textStyle: { color: INK_MUTED, fontSize: 11, width: 160, overflow: 'truncate' },
+                  tooltip: { show: true },
+                },
                 series: [
                   {
                     type: 'pie',
-                    radius: ['52%', '78%'],
-                    center: ['32%', '50%'],
+                    radius: ['36%', '56%'],
+                    center: ['25%', '50%'],
                     itemStyle: { borderColor: TRACK, borderWidth: 2 },
                     label: { show: false },
                     data: (i?.models ?? [])

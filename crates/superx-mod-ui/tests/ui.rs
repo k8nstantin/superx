@@ -706,7 +706,8 @@ async fn search_reaches_all_history_across_messages_and_actions() {
         .expect("scoped");
     assert_eq!(scoped.len(), 2, "both haystacks, no needle: {scoped:#?}");
     let cut: chrono::DateTime<chrono::Utc> = scoped[1].valid_from.parse().expect("rfc3339");
-    let older = session_activity(&kernel, session.clone(), 100, Some(cut), Some("haystack"))
+    let cut_id = scoped[1].id.parse().ok();
+    let older = session_activity(&kernel, session.clone(), 100, Some((cut, cut_id)), Some("haystack"))
         .await
         .expect("older page of matches");
     assert_eq!(older.len(), 1, "paging a search walks only its matches");
@@ -853,10 +854,11 @@ async fn feeds_page_backwards_through_the_whole_history() {
     }
 
     // Walk the session feed backwards a page at a time, exactly as the
-    // dashboard does: cursor = the oldest row currently held.
+    // dashboard does: cursor = the oldest row currently held, its time
+    // and its id (#273).
     let page = 10;
     let mut seen: Vec<String> = Vec::new();
-    let mut cursor: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut cursor: superx_mod_ui::activity::Before = None;
     for _ in 0..12 {
         let rows = session_activity(&kernel, session.clone(), page, cursor, None)
             .await
@@ -867,7 +869,7 @@ async fn feeds_page_backwards_through_the_whole_history() {
         assert!(rows.len() <= page as usize, "a page never exceeds its limit");
         // Oldest-first within the page, and every page older than the last.
         let oldest = &rows[0];
-        cursor = Some(oldest.valid_from.parse().expect("rfc3339"));
+        cursor = Some((oldest.valid_from.parse().expect("rfc3339"), oldest.id.parse().ok()));
         for r in &rows {
             seen.push(r.id.clone());
         }
@@ -879,7 +881,7 @@ async fn feeds_page_backwards_through_the_whole_history() {
     // A cursor older than everything ends the walk rather than looping.
     let ancient: chrono::DateTime<chrono::Utc> = "2000-01-01T00:00:00Z".parse().expect("ts");
     assert!(
-        session_activity(&kernel, session.clone(), page, Some(ancient), None)
+        session_activity(&kernel, session.clone(), page, Some((ancient, None)), None)
             .await
             .expect("empty")
             .is_empty(),
@@ -891,7 +893,7 @@ async fn feeds_page_backwards_through_the_whole_history() {
     let first = global_activity(&kernel, 10, None, None).await.expect("global");
     assert_eq!(first.len(), 10);
     let cut: chrono::DateTime<chrono::Utc> = first[0].valid_from.parse().expect("rfc3339");
-    let older = global_activity(&kernel, 10, Some(cut), None).await.expect("older");
+    let older = global_activity(&kernel, 10, Some((cut, first[0].id.parse().ok())), None).await.expect("older");
     assert!(!older.is_empty(), "there IS more history behind the first page");
     assert!(
         older.iter().all(|o| o.valid_from < first[0].valid_from),
@@ -4360,4 +4362,111 @@ async fn a_long_range_reads_its_series_by_the_day() {
     let d = &s.intensity[0];
     assert_eq!((d.t.as_str(), d.sessions, d.out_tokens), (key.as_str(), 2, 60), "two sessions that day, not three session-hours");
     assert_eq!(s.peak_sessions, 2, "the peak of the series drawn");
+}
+
+/// A telemetry row written straight into the table at `at`, the way the
+/// kernel writes it but at a chosen instant, so a test can put rows in
+/// one instant on purpose.
+async fn telemetry_at(
+    kernel: &Kernel,
+    agent: &superx_kernel::types::RecordId,
+    at: chrono::DateTime<chrono::Utc>,
+    src: &str,
+    tool: &str,
+) -> String {
+    let id = superx_kernel::types::RecordId::new("telemetry_stream", superx_kernel::types::Uuid::new_v7());
+    kernel
+        .db()
+        .query("CREATE $id CONTENT { lifecycle_event: 'tool_call', payload: { session: $src, tool: $tool }, agent: $agent, valid_from: $at }")
+        .bind(("id", id.clone()))
+        .bind(("src", src.to_string()))
+        .bind(("tool", tool.to_string()))
+        .bind(("agent", agent.clone()))
+        .bind(("at", at))
+        .await
+        .expect("create telemetry")
+        .check()
+        .expect("telemetry row");
+    superx_ops::record_uuid(&id)
+}
+
+/// A page edge between rows of one instant skips none of them (#273).
+/// The cursor was the time alone, compared with `<`: rows sharing the
+/// oldest instant of a page, cut by its limit, were never returned. With
+/// the id as the tie break every row is reached exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_edge_between_rows_of_one_instant_skips_none() {
+    use superx_mod_ui::activity::session_activity;
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-tie").await;
+    let at = chrono::Utc::now();
+    let mut written = std::collections::HashSet::new();
+    for n in 0..12 {
+        let mid = superx_kernel::types::RecordId::new("message", superx_kernel::types::Uuid::new_v7());
+        kernel
+            .db()
+            .query("CREATE $id CONTENT { session: $s, agent: $a, role: 'user', content: $c, valid_from: $at }")
+            .bind(("id", mid.clone()))
+            .bind(("s", session.clone()))
+            .bind(("a", agent.clone()))
+            .bind(("c", format!("m{n}")))
+            .bind(("at", at))
+            .await
+            .expect("create message")
+            .check()
+            .expect("message row");
+        written.insert(superx_ops::record_uuid(&mid));
+        written.insert(telemetry_at(&kernel, &agent, at, "src-tie", &format!("t{n}")).await);
+    }
+    assert_eq!(written.len(), 24, "24 rows, every one in the same instant");
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: superx_mod_ui::activity::Before = None;
+    for _ in 0..20 {
+        let rows = session_activity(&kernel, session.clone(), 5, cursor, None).await.expect("page");
+        if rows.is_empty() {
+            break;
+        }
+        let oldest = &rows[0];
+        cursor = Some((oldest.valid_from.parse().expect("rfc3339"), oldest.id.parse().ok()));
+        seen.extend(rows.iter().map(|r| r.id.clone()));
+    }
+    let unique: std::collections::HashSet<String> = seen.iter().cloned().collect();
+    assert_eq!(unique, written, "every row of the instant reached");
+    assert_eq!(seen.len(), 24, "and none served twice");
+}
+
+/// The live stream resumes inside an instant and catches a late row
+/// (#183). Its read is capped per poll, and a cap that ended inside a run
+/// of rows written in one instant resumed past the rest of the run. A row
+/// stamped before a poll and committed after it lands behind the cursor,
+/// where a read of newer rows never looked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_stream_resumes_inside_an_instant_and_catches_a_late_row() {
+    use superx_mod_ui::activity::LiveCursor;
+    let kernel = fresh_kernel().await;
+    let (agent, _session) = seed_agent_and_session(&kernel, "claude_code", "src-live").await;
+    let start = chrono::Utc::now();
+    let before_start = telemetry_at(&kernel, &agent, start - chrono::Duration::seconds(1), "src-live", "old").await;
+    let at = start + chrono::Duration::milliseconds(5);
+    let mut run = std::collections::HashSet::new();
+    for n in 0..20 {
+        run.insert(telemetry_at(&kernel, &agent, at, "src-live", &format!("r{n}")).await);
+    }
+
+    // A batch of 3 and five batches a poll: 15 rows, then the other 5.
+    let mut live = LiveCursor::new("telemetry_stream", start);
+    let first = live.read::<superx_kernel::TelemetryRecord>(&kernel, 3).await.expect("first poll");
+    let second = live.read::<superx_kernel::TelemetryRecord>(&kernel, 3).await.expect("second poll");
+    assert_eq!((first.len(), second.len()), (15, 5), "the second poll resumed inside the instant");
+    let got: std::collections::HashSet<String> = first.iter().chain(&second).map(|e| e.id.clone()).collect();
+    assert_eq!(got, run, "every row of the run, once");
+    assert!(!got.contains(&before_start), "nothing from before the stream started");
+
+    // Committed now, stamped just behind the cursor.
+    let late = telemetry_at(&kernel, &agent, at - chrono::Duration::milliseconds(2), "src-live", "late").await;
+    let third = live.read::<superx_kernel::TelemetryRecord>(&kernel, 3).await.expect("third poll");
+    assert_eq!(third.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), vec![late], "the late row, and only it");
+    let fourth = live.read::<superx_kernel::TelemetryRecord>(&kernel, 3).await.expect("fourth poll");
+    assert!(fourth.is_empty(), "sent once: {fourth:?}");
 }

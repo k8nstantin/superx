@@ -474,7 +474,9 @@ export function FleetSection({ s, range }: { s: StatsSummary | undefined; range:
                     return t ? `${t.identity}<br/>${t.messages} messages · ${fmtCompact(t.lines_written)} lines · ${fmtCompact(t.output_tokens)} out tokens` : ''
                   },
                 },
-                xAxis: { type: 'value', ...AXIS },
+                // Short ticks, and few: "1,000" beside "2,000" ran together in a
+                // narrow card (operator QA).
+                xAxis: { type: 'value', ...AXIS, splitNumber: 3, axisLabel: { ...AXIS.axisLabel, formatter: (v: number) => fmtCompact(v) } },
                 yAxis: {
                   type: 'category',
                   data: (s?.top_sessions ?? []).map((t) => t.identity).reverse(),

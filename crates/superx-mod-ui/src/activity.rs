@@ -75,6 +75,166 @@ pub fn action_event(a: &TelemetryRecord) -> SseEvent {
     }
 }
 
+/// How far back each live poll looks again (#183). A row is stamped with
+/// its time before it is written, so one stamped before a poll and
+/// committed after it lands behind the cursor, where a read of newer rows
+/// never looks. Rows already sent are skipped by id.
+const LATE_COMMIT_SECS: i64 = 10; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// Batches one live poll reads, at most; the rest follow on the next.
+const LIVE_PAGES: usize = 5; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// A row the live stream carries.
+pub trait LiveRow: superx_kernel::types::SurrealValue + Send {
+    /// Its id and capture time: the stream's order.
+    fn key(&self) -> (&RecordId, chrono::DateTime<chrono::Utc>);
+    /// The feed event it renders as.
+    fn event(&self) -> SseEvent;
+}
+
+impl LiveRow for TelemetryRecord {
+    fn key(&self) -> (&RecordId, chrono::DateTime<chrono::Utc>) {
+        (&self.id, self.valid_from)
+    }
+    fn event(&self) -> SseEvent {
+        action_event(self)
+    }
+}
+
+impl LiveRow for MessageRecord {
+    fn key(&self) -> (&RecordId, chrono::DateTime<chrono::Utc>) {
+        (&self.id, self.valid_from)
+    }
+    fn event(&self) -> SseEvent {
+        message_event(self)
+    }
+}
+
+/// One live stream's read position (#183). The newest row sent is held as
+/// (capture time, id), a total order: a batch cut inside a run of rows
+/// written in one instant resumes inside that run, where a time alone
+/// resumed past it. The ids sent in the last `LATE_COMMIT_SECS` are held
+/// too, so each poll looks back over that window for a row that committed
+/// late, and sends nothing twice.
+pub struct LiveCursor {
+    table: &'static str,
+    at: chrono::DateTime<chrono::Utc>,
+    id: Option<RecordId>,
+    /// Where the stream started: nothing before it is sent, late or not.
+    floor: chrono::DateTime<chrono::Utc>,
+    sent: std::collections::HashMap<RecordId, chrono::DateTime<chrono::Utc>>,
+}
+
+impl LiveCursor {
+    /// A stream over `table` from `at` onwards.
+    #[must_use]
+    pub fn new(table: &'static str, at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self { table, at, id: None, floor: at, sent: std::collections::HashMap::new() }
+    }
+
+    /// Start again from `at`, forgetting what was sent: nobody watched.
+    pub fn skip_to(&mut self, at: chrono::DateTime<chrono::Utc>) {
+        *self = Self::new(self.table, at);
+    }
+
+    /// The rows written since the last read, as feed events: the new rows
+    /// oldest first, then any that committed late behind the cursor. The
+    /// feed orders by capture time, so a late row lands where it belongs.
+    ///
+    /// # Errors
+    ///
+    /// [`superx_kernel::KernelError`] for engine errors or a read that got
+    /// no answer, twice.
+    pub async fn read<T: LiveRow>(&mut self, kernel: &Kernel, batch: u32) -> Result<Vec<SseEvent>> {
+        let mut out = Vec::new();
+        for _ in 0..LIVE_PAGES {
+            // Forward from the newest row sent, in (time, id) order. `>=`
+            // first, so the time index is walked and the tie is a filter.
+            let forward = match self.id {
+                Some(_) => format!(
+                    "SELECT * FROM {} WHERE valid_from >= $at AND (valid_from > $at OR id > $id) \
+                     ORDER BY valid_from ASC, id ASC LIMIT $batch",
+                    self.table
+                ),
+                None => format!(
+                    "SELECT * FROM {} WHERE valid_from > $at ORDER BY valid_from ASC, id ASC LIMIT $batch",
+                    self.table
+                ),
+            };
+            let (at, id) = (self.at, self.id.clone());
+            let rows: Vec<T> = crate::answered("live stream", || {
+                let (sql, id) = (forward.clone(), id.clone());
+                async move {
+                    let mut q = kernel.db().query(sql).bind(("at", at)).bind(("batch", batch));
+                    if let Some(id) = id {
+                        q = q.bind(("id", id));
+                    }
+                    Ok(q.await?.take(0)?)
+                }
+            })
+            .await?;
+            for r in &rows {
+                let (id, t) = r.key();
+                self.at = t;
+                self.id = Some(id.clone());
+                if self.sent.insert(id.clone(), t).is_none() {
+                    out.push(r.event());
+                }
+            }
+            if rows.len() < batch as usize {
+                break;
+            }
+        }
+        // Behind the cursor in (time, id) order, for a row that committed
+        // after the cursor passed it; what is ahead of the cursor is the
+        // next poll's forward read. The rows already sent are excluded in
+        // the engine: counted against the limit, the ones nearest the
+        // cursor crowded out a late row further back.
+        let lo = (self.at - chrono::Duration::seconds(LATE_COMMIT_SECS)).max(self.floor);
+        let (at, id) = (self.at, self.id.clone());
+        let sent: Vec<RecordId> = self.sent.keys().cloned().collect();
+        let behind = match self.id {
+            Some(_) => format!(
+                "SELECT * FROM {} WHERE valid_from > $lo AND valid_from <= $at \
+                 AND (valid_from < $at OR id <= $id) AND id NOTINSIDE $sent \
+                 ORDER BY valid_from DESC LIMIT $batch",
+                self.table
+            ),
+            None => format!(
+                "SELECT * FROM {} WHERE valid_from > $lo AND valid_from <= $at \
+                 AND id NOTINSIDE $sent ORDER BY valid_from DESC LIMIT $batch",
+                self.table
+            ),
+        };
+        let rows: Vec<T> = crate::answered("live stream, late rows", || {
+            let (sql, id, sent) = (behind.clone(), id.clone(), sent.clone());
+            async move {
+                let mut q = kernel
+                    .db()
+                    .query(sql)
+                    .bind(("lo", lo))
+                    .bind(("at", at))
+                    .bind(("sent", sent))
+                    .bind(("batch", batch));
+                if let Some(id) = id {
+                    q = q.bind(("id", id));
+                }
+                Ok(q.await?.take(0)?)
+            }
+        })
+        .await?;
+        for r in &rows {
+            let (id, t) = r.key();
+            if self.sent.insert(id.clone(), t).is_none() {
+                out.push(r.event());
+            }
+        }
+        // Older than the window, a row is never read again: forget it.
+        self.sent.retain(|_, t| *t > lo);
+        Ok(out)
+    }
+}
+
 /// The session's source key and agent name from its current
 /// `attr_session_descriptor` payload (`{name, session, locator}` —
 /// written by the capture engine's `ensure_session`; `name` is
@@ -132,37 +292,42 @@ enum Raw<'a> {
 /// Merge message + action rows by capture time and keep the NEWEST
 /// `limit`, rendered oldest-first — per-stream limits alone would
 /// return 2×limit. This function is the SOLE ordering authority: the
-/// input slices may arrive in any order.
+/// input slices may arrive in any order. Rows of one instant order by
+/// id, the order the page cursor walks (#273).
 fn merge_newest(
     messages: &[MessageRecord],
     actions: &[TelemetryRecord],
     limit: u32,
 ) -> Vec<SseEvent> {
-    let mut rows: Vec<(chrono::DateTime<chrono::Utc>, Raw)> =
+    let mut rows: Vec<(chrono::DateTime<chrono::Utc>, String, Raw)> =
         Vec::with_capacity(messages.len() + actions.len());
     for m in messages {
-        rows.push((m.valid_from, Raw::Msg(m)));
+        rows.push((m.valid_from, superx_ops::record_uuid(&m.id), Raw::Msg(m)));
     }
     for a in actions {
-        rows.push((a.valid_from, Raw::Act(a)));
+        rows.push((a.valid_from, superx_ops::record_uuid(&a.id), Raw::Act(a)));
     }
-    rows.sort_by_key(|&(t, _)| t);
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let excess = rows.len().saturating_sub(limit as usize);
     rows.split_off(excess)
         .into_iter()
-        .map(|(_, r)| match r {
+        .map(|(_, _, r)| match r {
             Raw::Msg(m) => message_event(m),
             Raw::Act(a) => action_event(a),
         })
         .collect()
 }
 
-/// Where a backwards page starts: the newest rows STRICTLY older than
-/// this instant. `None` means the present — the first page.
+/// Where a backwards page starts: the rows before this one — the oldest
+/// row the client holds — in (capture time, id) order. `None` means the
+/// present, the first page.
 ///
-/// Strict `<` cannot skip a row: the cursor is the oldest row the
-/// client already holds, so its exact instant is already on screen.
-pub type Before = Option<chrono::DateTime<chrono::Utc>>;
+/// The time alone is not a total order: two rows can share an instant,
+/// and a page edge between them skipped the other one for good, because
+/// strict `<` never returned it (#273). The UUIDv7 id breaks the tie, as
+/// the entities chains already do. Without an id (an older client) the
+/// cursor is the time alone.
+pub type Before = Option<(chrono::DateTime<chrono::Utc>, Option<superx_kernel::types::Uuid>)>;
 
 /// A keyword the feed is filtered to, lowercased. `None` = no filter.
 pub type Query<'a> = Option<&'a str>;
@@ -204,8 +369,15 @@ fn page_query(table: &str, scope: Option<&str>, before: Before, q: Query, keywor
     if let Some(s) = scope {
         wheres.push(s);
     }
-    if before.is_some() {
-        wheres.push("valid_from < $before");
+    // `<=` first, so the engine walks the time index backwards and the
+    // tie is only a filter on it; an `OR` of two ranges instead planned
+    // as a union and a sort (EXPLAIN, #273).
+    match before {
+        Some((_, Some(_))) => {
+            wheres.push("valid_from <= $before AND (valid_from < $before OR id < $before_id)")
+        }
+        Some((_, None)) => wheres.push("valid_from < $before"),
+        None => {}
     }
     if q.is_some() {
         wheres.push(keyword);
@@ -215,17 +387,22 @@ fn page_query(table: &str, scope: Option<&str>, before: Before, q: Query, keywor
     } else {
         format!("WHERE {} ", wheres.join(" AND "))
     };
-    format!("SELECT * FROM {table} {clause}ORDER BY valid_from DESC LIMIT $limit")
+    format!("SELECT * FROM {table} {clause}ORDER BY valid_from DESC, id DESC LIMIT $limit")
 }
 
 /// Run a page query with only the bindings its clauses actually use.
+/// The cursor's id is bound as a record of `$table`, so the engine
+/// compares it with each row's id as the record it is (§14).
 macro_rules! page {
-    ($kernel:expr, $sql:expr, $limit:expr, $before:expr, $q:expr $(, $extra:expr)*) => {{
+    ($kernel:expr, $table:expr, $sql:expr, $limit:expr, $before:expr, $q:expr $(, $extra:expr)*) => {{
         crate::answered("activity page", || async {
             let mut stmt = $kernel.db().query(&$sql).bind(("limit", $limit));
             $( stmt = stmt.bind($extra); )*
-            if let Some(cut) = $before {
+            if let Some((cut, id)) = $before {
                 stmt = stmt.bind(("before", cut));
+                if let Some(id) = id {
+                    stmt = stmt.bind(("before_id", superx_kernel::types::RecordId::new($table, id)));
+                }
             }
             if let Some(k) = $q {
                 stmt = stmt.bind(("q", k.to_lowercase()));
@@ -258,7 +435,7 @@ async fn recent_messages(
         return Ok(rows);
     }
     let sql = page_query("message", None, before, q, MSG_MATCH);
-    let rows: Vec<MessageRecord> = page!(kernel, sql, limit, before, q);
+    let rows: Vec<MessageRecord> = page!(kernel, "message", sql, limit, before, q);
     Ok(rows)
 }
 
@@ -277,7 +454,7 @@ async fn recent_actions(
         return kernel.recent_telemetry(limit).await;
     }
     let sql = page_query("telemetry_stream", None, before, q, &act_match());
-    let rows: Vec<TelemetryRecord> = page!(kernel, sql, limit, before, q);
+    let rows: Vec<TelemetryRecord> = page!(kernel, "telemetry_stream", sql, limit, before, q);
     Ok(rows)
 }
 
@@ -319,7 +496,7 @@ pub async fn session_activity(
 
     let msg_sql = page_query("message", Some("session = $sess"), before, q, MSG_MATCH);
     let messages: Vec<MessageRecord> =
-        page!(kernel, msg_sql, limit, before, q, ("sess", session.clone()));
+        page!(kernel, "message", msg_sql, limit, before, q, ("sess", session.clone()));
 
     // Two ways an action belongs to a session (see the module doc);
     // without a resolved scope only the subject arm can match — it must
@@ -337,6 +514,7 @@ pub async fn session_activity(
     let actions: Vec<TelemetryRecord> = match scope {
         Some((agent, src_key)) => page!(
             kernel,
+            "telemetry_stream",
             act_sql,
             limit,
             before,
@@ -345,7 +523,7 @@ pub async fn session_activity(
             ("agent", agent.clone()),
             ("src", src_key.clone())
         ),
-        None => page!(kernel, act_sql, limit, before, q, ("sess", session.clone())),
+        None => page!(kernel, "telemetry_stream", act_sql, limit, before, q, ("sess", session.clone())),
     };
     Ok(merge_newest(&messages, &actions, limit))
 }

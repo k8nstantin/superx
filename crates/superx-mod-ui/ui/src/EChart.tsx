@@ -1,3 +1,4 @@
+import { useRef } from 'react'
 import ReactECharts from 'echarts-for-react'
 
 // Apache ECharts is the SuperX charting standard (issue #228, operator
@@ -56,7 +57,35 @@ export const TOOLTIP = {
 export const insideFits = (p: { rect: { width: number }; labelRect: { width: number } }) =>
   p.labelRect.width > p.rect.width - 4 ? { fontSize: 0 } : {}
 
+/// What a chart draws, as text: functions drop out of JSON, so a formatter
+/// rebuilt on a re-render is not a change. `null` when it cannot be
+/// written out, which counts as a change.
+function drawn(option: unknown): string | null {
+  try {
+    return JSON.stringify(option)
+  } catch {
+    return null
+  }
+}
+
 export function EChart({ option, height }: { option: Record<string, unknown>; height: number }) {
+  const chart = useRef<ReactECharts>(null)
+  // A tooltip open over a chart whose option is replaced re-shows itself
+  // against the data it was opened on, which the refetch has just thrown
+  // away: `getRawIndex` of undefined (#376). echarts-for-react asks this
+  // just before it sets the new option, so the tooltip closes first — but
+  // only when what is drawn changed. The formatters are rebuilt on every
+  // render, and closing on those made the tooltip vanish under the pointer
+  // each second on a panel with a clock.
+  const shouldSetOption = (prev: { option: unknown }, next: { option: unknown }) => {
+    if (prev.option !== next.option) {
+      const before = drawn(prev.option)
+      if (before === null || before !== drawn(next.option)) {
+        chart.current?.getEchartsInstance()?.dispatchAction({ type: 'hideTip' })
+      }
+    }
+    return true
+  }
   const merged = {
     color: [...CHART_COLORS],
     backgroundColor: 'transparent',
@@ -66,5 +95,5 @@ export function EChart({ option, height }: { option: Record<string, unknown>; he
     },
     ...option,
   }
-  return <ReactECharts option={merged} style={{ height }} notMerge lazyUpdate />
+  return <ReactECharts ref={chart} option={merged} style={{ height }} notMerge lazyUpdate shouldSetOption={shouldSetOption} />
 }
