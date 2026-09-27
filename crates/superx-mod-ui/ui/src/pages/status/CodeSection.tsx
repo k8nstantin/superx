@@ -16,6 +16,7 @@ import {
   n,
   pct,
   rangeLabel,
+  timeline,
 } from './parts'
 
 // What got built (#367): the code the range produced, what it was made
@@ -77,7 +78,8 @@ export function CodeSection({ s, range }: { s: StatsSummary | undefined; range: 
   // What landed on main in the same buckets (#386), so the two read on
   // one axis: the transcript's edits beside the repository's commits.
   const landedSeries = fold(s?.landed?.series ?? [])
-  const buckets = [...new Set([...churnSeries, ...landedSeries].map((p) => p.t))].sort()
+  // Every day or hour of the span, the quiet ones drawn empty (#426).
+  const buckets = timeline([...churnSeries, ...landedSeries].map((p) => p.t))
   const at = (series: Pt[], key: 'added' | 'removed') => {
     const m = new Map(series.map((p) => [p.t, p[key]]))
     return buckets.map((b) => m.get(b) ?? 0)

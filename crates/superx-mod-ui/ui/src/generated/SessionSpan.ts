@@ -3,7 +3,12 @@
 /**
  * One session's span across the range — the 24×7 picture (#337).
  */
-export type SessionSpan = { identity: string, agent: string, repo: string | null, 
+export type SessionSpan = { identity: string, 
+/**
+ * The fewest characters of the session id that tell it from every
+ * other session, at least `SHORT_ID_MIN` (#426) — what the page shows.
+ */
+short_id: string, agent: string, repo: string | null, 
 /**
  * What the sortie was LIKE, not just how long it lasted (#395):
  * the lines and tokens behind those messages, and how many

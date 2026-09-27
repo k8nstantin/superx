@@ -1,7 +1,7 @@
 import { Grid, Group, SimpleGrid, Table, Text } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
-import { BANDS, CANCEL, Counter, FAIL, Meter, OK, Panel, Stat, UNKNOWN, fmtAge, fmtCompact, fmtMins, fmtMs, fmtSecs, n, pct, rangeLabel, steering } from './parts'
+import { BANDS, CANCEL, Counter, FAIL, Meter, OK, Panel, Stat, UNKNOWN, fmtAge, fmtCompact, fmtMins, fmtMs, fmtSecs, n, pct, rangeLabel, steering, timeline } from './parts'
 import { openSession } from '../../route'
 
 // Did it hold (#367): what the commands reported, when it went wrong,
@@ -9,6 +9,11 @@ import { openSession } from '../../route'
 
 export function QualitySection({ s, range }: { s: StatsSummary | undefined; range: string | null }) {
   const note = rangeLabel(range, s?.window_messages)
+  // A long range's series come folded into days (#426); every bucket of
+  // the span is drawn, the quiet ones empty.
+  const long = range === '7d' || range === '30d' || range === 'all'
+  const quality = new Map((s?.quality_series ?? []).map((p) => [p.t, p]))
+  const qualityBuckets = timeline([...quality.keys()])
   const passed = n(s?.tests_passed)
   const failed = n(s?.tests_failed)
   const passPct = pct(passed, passed + failed)
@@ -82,7 +87,7 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
 
       <Grid mb="md" gap="md">
         <Grid.Col span={{ base: 12, lg: 8 }}>
-          <Panel title="Quality over time" scope="range" range={range} note={`tests and tool failures per hour · your time · ${note}`} h="100%">
+          <Panel title="Quality over time" scope="range" range={range} note={`tests and tool failures per ${long ? 'day' : 'hour'} · your time · ${note}`} h="100%">
             <EChart
               height={200}
               option={{
@@ -91,15 +96,15 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
                 legend: { data: ['passed', 'failed', 'tool failures'], textStyle: { color: INK_MUTED }, right: 0, top: -2 },
                 xAxis: {
                   type: 'category',
-                  data: (s?.quality_series ?? []).map((p) => (range === '7d' || range === '30d' || range === 'all' ? p.t.slice(5) : p.t.slice(11) + ':00')),
+                  data: qualityBuckets.map((t) => (long ? t.slice(5) : t.slice(11) + ':00')),
                   axisLabel: { color: AXIS.axisLabel.color, fontSize: 10 },
                   axisLine: { lineStyle: { color: GRID_LINE } },
                 },
                 yAxis: { type: 'value', axisLabel: { color: AXIS.axisLabel.color }, splitLine: { lineStyle: { color: GRID_LINE } } },
                 series: [
-                  { name: 'passed', type: 'bar', stack: 'q', itemStyle: { color: OK }, data: (s?.quality_series ?? []).map((p) => n(p.tests_passed)) },
-                  { name: 'failed', type: 'bar', stack: 'q', itemStyle: { color: FAIL }, data: (s?.quality_series ?? []).map((p) => n(p.tests_failed)) },
-                  { name: 'tool failures', type: 'line', smooth: true, itemStyle: { color: CANCEL }, data: (s?.quality_series ?? []).map((p) => n(p.tool_failures)) },
+                  { name: 'passed', type: 'bar', stack: 'q', itemStyle: { color: OK }, data: qualityBuckets.map((t) => n(quality.get(t)?.tests_passed)) },
+                  { name: 'failed', type: 'bar', stack: 'q', itemStyle: { color: FAIL }, data: qualityBuckets.map((t) => n(quality.get(t)?.tests_failed)) },
+                  { name: 'tool failures', type: 'line', smooth: true, itemStyle: { color: CANCEL }, data: qualityBuckets.map((t) => n(quality.get(t)?.tool_failures)) },
                 ],
               }}
             />
@@ -250,7 +255,7 @@ export function QualitySection({ s, range }: { s: StatsSummary | undefined; rang
                 <Table.Tr key={c.session_id} onClick={() => openSession(c.session_id)} style={{ cursor: 'pointer' }} title="open this session's feed">
                   <Table.Td>
                     <Text size="xs" ff={MONO}>
-                      {c.identity.slice(0, 20)}
+                      {c.identity}
                     </Text>
                   </Table.Td>
                   <Table.Td>

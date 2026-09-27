@@ -193,7 +193,7 @@ export function FlightDeck({
                               this panel to the activity window (#344). */}
                           <LivenessDot state="active" size={8} />
                           <Text size="xs" ff={MONO}>
-                            {l.identity.slice(0, 13)}
+                            {l.short_id}
                           </Text>
                         </Group>
                       </Table.Td>

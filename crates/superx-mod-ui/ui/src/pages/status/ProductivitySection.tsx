@@ -1,7 +1,7 @@
 import { Grid, Group, SimpleGrid, Table, Text, Tooltip } from '@mantine/core'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import { AXIS, CHART_COLORS, EChart, GRID_LINE, INK_MUTED, MONO, TOOLTIP } from '../../EChart'
-import { CANCEL, Counter, FAIL, OK, Panel, Stat, fmtCompact, fmtMins, n, pct, steering } from './parts'
+import { CANCEL, Counter, FAIL, OK, Panel, Stat, fmtCompact, fmtMins, n, pct, steering, timeline } from './parts'
 
 // Productivity (#391). Every other band counts effort — lines, tokens,
 // calls, tests. This one divides effort by outcome, and measures the
@@ -39,7 +39,11 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
   // tokens per agent × repo × bucket since #340 and nothing ever drew
   // them — no backend work was needed for this chart.
   const cells = s?.work_cells ?? []
-  const buckets = [...new Set(cells.map((c) => c.t))].sort()
+  // The token mix beside it claims the same hours, so both charts walk one
+  // timeline: every day or hour of the span, the quiet ones drawn empty
+  // rather than dropped (#426).
+  const burn = s?.burn ?? []
+  const buckets = timeline([...cells.map((c) => c.t), ...burn.map((p) => p.t)])
   const repos = [...new Set(cells.map((c) => c.repo))]
     .map((r) => ({ repo: r, total: cells.filter((c) => c.repo === r).reduce((a, c) => a + n(c.out_tokens), 0) }))
     .sort((a, b) => b.total - a.total)
@@ -59,8 +63,10 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
   // The token mix, in the same buckets: what was sent, what came back
   // out of the vendor's cache, what the models produced, and how much
   // of that production was reasoning.
-  const burn = s?.burn ?? []
-  const mixBuckets = burn.map((p) => p.t)
+  const burnAt = new Map(burn.map((p) => [p.t, p]))
+  // Fronts open, on a timeline of their own, quiet buckets drawn empty.
+  const intensityAt = new Map((s?.intensity ?? []).map((p) => [p.t, p]))
+  const intensityBuckets = timeline([...intensityAt.keys()])
 
   const pairs = s?.model_effort ?? []
   const biggest = pairs.reduce((a, p) => Math.max(a, n(p.messages)), 0)
@@ -128,7 +134,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
             note={long ? 'per day · your time' : 'per hour · your time'}
             h="100%"
           >
-            {buckets.length === 0 ? (
+            {cells.length === 0 ? (
               <Text size="xs" c="dimmed">
                 nothing spent in this range
               </Text>
@@ -158,7 +164,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
         </Grid.Col>
         <Grid.Col span={{ base: 12, lg: 4 }}>
           <Panel title="The token mix, over the same hours" scope="range" range={range} h="100%">
-            {mixBuckets.length === 0 ? (
+            {burn.length === 0 ? (
               <Text size="xs" c="dimmed">
                 nothing spent in this range
               </Text>
@@ -171,7 +177,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                   legend: { data: ['sent', 'from cache', 'produced', 'reasoning'], textStyle: { color: INK_MUTED }, right: 0, top: -2 },
                   xAxis: {
                     type: 'category',
-                    data: mixBuckets.map(label),
+                    data: buckets.map(label),
                     axisLabel: { color: AXIS.axisLabel.color },
                     axisLine: { lineStyle: { color: GRID_LINE } },
                   },
@@ -181,12 +187,12 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                     splitLine: { lineStyle: { color: GRID_LINE } },
                   },
                   series: [
-                    { name: 'sent', type: 'bar', stack: 'mix', itemStyle: { color: CANCEL }, data: burn.map((p) => n(p.input)) },
-                    { name: 'from cache', type: 'bar', stack: 'mix', itemStyle: { color: CHART_COLORS[3] }, data: burn.map((p) => n(p.cache_read)) },
-                    { name: 'produced', type: 'bar', stack: 'mix', itemStyle: { color: OK }, data: burn.map((p) => n(p.out)) },
+                    { name: 'sent', type: 'bar', stack: 'mix', itemStyle: { color: CANCEL }, data: buckets.map((t) => n(burnAt.get(t)?.input)) },
+                    { name: 'from cache', type: 'bar', stack: 'mix', itemStyle: { color: CHART_COLORS[3] }, data: buckets.map((t) => n(burnAt.get(t)?.cache_read)) },
+                    { name: 'produced', type: 'bar', stack: 'mix', itemStyle: { color: OK }, data: buckets.map((t) => n(burnAt.get(t)?.out)) },
                     // Reasoning is part of what was produced, so it is a
                     // line over the stack rather than another slice of it.
-                    { name: 'reasoning', type: 'line', smooth: true, symbol: 'none', itemStyle: { color: FAIL }, data: burn.map((p) => n(p.thinking)) },
+                    { name: 'reasoning', type: 'line', smooth: true, symbol: 'none', itemStyle: { color: FAIL }, data: buckets.map((t) => n(burnAt.get(t)?.thinking)) },
                   ],
                 }}
               />
@@ -199,7 +205,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
         title="How hard it was working — fronts open, and what moved"
         scope="range"
         range={range}
-        note={`${long ? 'per day' : 'per hour'} · your time · peak ${n(s?.peak_sessions)} session${n(s?.peak_sessions) === 1 ? '' : 's'} and ${n(s?.peak_repos)} repositor${n(s?.peak_repos) === 1 ? 'y' : 'ies'} at once`}
+        note={`${long ? 'per day' : 'per hour'} · your time · peak ${n(s?.peak_sessions)} session${n(s?.peak_sessions) === 1 ? '' : 's'} and ${n(s?.peak_repos)} repositor${n(s?.peak_repos) === 1 ? 'y' : 'ies'} in one ${long ? 'day' : 'hour'}`}
         mb="md"
       >
         {(s?.intensity?.length ?? 0) === 0 ? (
@@ -216,7 +222,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
               legend: { data: ['lines written', 'sessions', 'repos'], textStyle: { color: INK_MUTED }, right: 0, top: -2 },
               xAxis: {
                 type: 'category',
-                data: (s?.intensity ?? []).map((p) => label(p.t)),
+                data: intensityBuckets.map(label),
                 axisLabel: { color: AXIS.axisLabel.color },
                 axisLine: { lineStyle: { color: GRID_LINE } },
               },
@@ -239,10 +245,12 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
                 },
               ],
               series: [
-                { name: 'lines written', type: 'bar', itemStyle: { color: CHART_COLORS[0] }, data: (s?.intensity ?? []).map((p) => n(p.lines_added)) },
-                { name: 'sessions', type: 'line', yAxisIndex: 1, smooth: true, symbol: 'circle', symbolSize: 5, itemStyle: { color: OK }, data: (s?.intensity ?? []).map((p) => n(p.sessions)) },
+                { name: 'lines written', type: 'bar', itemStyle: { color: CHART_COLORS[0] }, data: intensityBuckets.map((t) => n(intensityAt.get(t)?.lines_added)) },
+                // A count steps from one whole number to the next; smoothed,
+                // it drew half a session between two buckets (#426).
+                { name: 'sessions', type: 'line', yAxisIndex: 1, step: 'middle', symbol: 'circle', symbolSize: 5, itemStyle: { color: OK }, data: intensityBuckets.map((t) => n(intensityAt.get(t)?.sessions)) },
                 // Dashed, so the sessions line shows through where the two are equal.
-                { name: 'repos', type: 'line', yAxisIndex: 1, smooth: true, symbol: 'circle', symbolSize: 5, itemStyle: { color: CANCEL }, lineStyle: { type: 'dashed' }, data: (s?.intensity ?? []).map((p) => n(p.repos)) },
+                { name: 'repos', type: 'line', yAxisIndex: 1, step: 'middle', symbol: 'circle', symbolSize: 5, itemStyle: { color: CANCEL }, lineStyle: { type: 'dashed' }, data: intensityBuckets.map((t) => n(intensityAt.get(t)?.repos)) },
               ],
             }}
           />

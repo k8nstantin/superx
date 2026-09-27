@@ -32,6 +32,33 @@ export function fmtBytes(v: number | bigint | null | undefined): string {
   return `${(x / (1024 * 1024)).toFixed(1)} MB`
 }
 
+/// The most buckets a filled timeline draws; past it the keys are drawn
+/// as they came, unfilled.
+const TIMELINE_MAX = 5000
+
+/// Every bucket from the first key to the last (#426), so a quiet day or
+/// hour is drawn empty instead of vanishing and its neighbours reading as
+/// consecutive. Keys are the page's own — `YYYY-MM-DD` or `YYYY-MM-DDTHH`,
+/// already on the viewer's clock — so they are walked as labels, in UTC
+/// arithmetic, which has no daylight-saving hour to skip or repeat.
+export function timeline(keys: string[]): string[] {
+  const sorted = [...new Set(keys)].sort()
+  if (sorted.length < 2) return sorted
+  const hourly = sorted[0].length > 10
+  const at = (k: string) =>
+    Date.UTC(Number(k.slice(0, 4)), Number(k.slice(5, 7)) - 1, Number(k.slice(8, 10)), hourly ? Number(k.slice(11, 13)) : 0)
+  const step = hourly ? 3_600_000 : 86_400_000
+  const first = at(sorted[0])
+  const last = at(sorted[sorted.length - 1])
+  if (!Number.isFinite(first) || !Number.isFinite(last) || (last - first) / step >= TIMELINE_MAX) return sorted
+  const out: string[] = []
+  for (let t = first; t <= last; t += step) {
+    const iso = new Date(t).toISOString()
+    out.push(hourly ? iso.slice(0, 13) : iso.slice(0, 10))
+  }
+  return out
+}
+
 /// A clock that ticks once a second, so an age on the page counts up
 /// instead of standing still between polls (#400). Every panel reading
 /// it shows the same age at the same moment, whatever its own refresh
