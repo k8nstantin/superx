@@ -122,7 +122,9 @@ impl Answers {
                         map.remove(&key);
                     }
                     // Nobody watching is fine: the answer is cached.
-                    let _ = tx.send(Some(answer));
+                    if tx.send(Some(answer)).is_err() {
+                        tracing::debug!(target: "ui", key = %key, "answer finished with nobody waiting; cached");
+                    }
                 });
                 pending
             }
