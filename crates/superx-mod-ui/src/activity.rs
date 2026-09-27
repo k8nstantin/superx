@@ -221,15 +221,18 @@ fn page_query(table: &str, scope: Option<&str>, before: Before, q: Query, keywor
 /// Run a page query with only the bindings its clauses actually use.
 macro_rules! page {
     ($kernel:expr, $sql:expr, $limit:expr, $before:expr, $q:expr $(, $extra:expr)*) => {{
-        let mut stmt = $kernel.db().query(&$sql).bind(("limit", $limit));
-        $( stmt = stmt.bind($extra); )*
-        if let Some(cut) = $before {
-            stmt = stmt.bind(("before", cut));
-        }
-        if let Some(k) = $q {
-            stmt = stmt.bind(("q", k.to_lowercase()));
-        }
-        stmt.await?.take(0)?
+        crate::answered("activity page", || async {
+            let mut stmt = $kernel.db().query(&$sql).bind(("limit", $limit));
+            $( stmt = stmt.bind($extra); )*
+            if let Some(cut) = $before {
+                stmt = stmt.bind(("before", cut));
+            }
+            if let Some(k) = $q {
+                stmt = stmt.bind(("q", k.to_lowercase()));
+            }
+            Ok(stmt.await?.take(0)?)
+        })
+        .await?
     }};
 }
 
@@ -243,12 +246,15 @@ async fn recent_messages(
     q: Query<'_>,
 ) -> Result<Vec<MessageRecord>> {
     if before.is_none() && q.is_none() {
-        let rows: Vec<MessageRecord> = kernel
+        let rows: Vec<MessageRecord> = crate::answered("recent messages", || async {
+            Ok(kernel
             .db()
             .query("SELECT * FROM message ORDER BY valid_from DESC LIMIT $limit")
             .bind(("limit", limit))
             .await?
-            .take(0)?;
+            .take(0)?)
+        })
+        .await?;
         return Ok(rows);
     }
     let sql = page_query("message", None, before, q, MSG_MATCH);
@@ -335,11 +341,11 @@ pub async fn session_activity(
             limit,
             before,
             q,
-            ("sess", session),
-            ("agent", agent),
-            ("src", src_key)
+            ("sess", session.clone()),
+            ("agent", agent.clone()),
+            ("src", src_key.clone())
         ),
-        None => page!(kernel, act_sql, limit, before, q, ("sess", session)),
+        None => page!(kernel, act_sql, limit, before, q, ("sess", session.clone())),
     };
     Ok(merge_newest(&messages, &actions, limit))
 }
@@ -415,7 +421,8 @@ pub async fn session_model_effort(
             _ => None,
         })
     };
-    let model: Vec<Value> = kernel
+    let model: Vec<Value> = crate::answered("session model", || async {
+        Ok(kernel
         .db()
         .query(newest(
             "raw.message.model ?? raw.model",
@@ -423,13 +430,18 @@ pub async fn session_model_effort(
         ))
         .bind(("sess", session.clone()))
         .await?
-        .take(0)?;
-    let effort: Vec<Value> = kernel
+        .take(0)?)
+    })
+    .await?;
+    let effort: Vec<Value> = crate::answered("session effort", || async {
+        Ok(kernel
         .db()
         .query(newest("raw.effort", "raw.effort != NONE"))
-        .bind(("sess", session))
+        .bind(("sess", session.clone()))
         .await?
-        .take(0)?;
+        .take(0)?)
+    })
+    .await?;
     Ok((pick(model), pick(effort)))
 }
 
@@ -445,15 +457,18 @@ pub async fn session_last_emitted(
     kernel: &Kernel,
     session: RecordId,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-    let rows: Vec<Value> = kernel
+    let rows: Vec<Value> = crate::answered("session last active", || async {
+        Ok(kernel
         .db()
         .query(
             "SELECT (emitted_at ?? valid_from) AS at, valid_from FROM message \
              WHERE session = $sess ORDER BY valid_from DESC LIMIT 1",
         )
-        .bind(("sess", session))
+        .bind(("sess", session.clone()))
         .await?
-        .take(0)?;
+        .take(0)?)
+    })
+    .await?;
     Ok(rows.first().and_then(|row| match row {
         Value::Object(o) => match o.get("at") {
             Some(Value::Datetime(d)) => Some(**d),
@@ -473,7 +488,8 @@ pub async fn session_token_stats(
 ) -> Result<(Option<i64>, Option<i64>)> {
     // Once per reply (#409): a reply's usage rides every line Claude Code
     // writes for it, and Gemini re-emits a record as it streams.
-    let rows: Vec<Value> = kernel
+    let rows: Vec<Value> = crate::answered("session output tokens", || async {
+        Ok(kernel
         .db()
         .query(format!(
             "SELECT math::sum(o) AS toks FROM (\
@@ -486,7 +502,9 @@ pub async fn session_token_stats(
         ))
         .bind(("sess", session.clone()))
         .await?
-        .take(0)?;
+        .take(0)?)
+    })
+    .await?;
     let output_total = rows
         .first()
         .and_then(|row| match row {
@@ -499,7 +517,8 @@ pub async fn session_token_stats(
     // reads it (#415 review). A `<synthetic>` reply — the runtime's own
     // stand-in for an API error — carries all-zero usage, and taking it
     // blanked the bar; so does a reply whose usage reads zero.
-    let rows: Vec<Value> = kernel
+    let rows: Vec<Value> = crate::answered("session context", || async {
+        Ok(kernel
         .db()
         .query(format!(
             "SELECT raw.message.usage AS cu, raw.tokens AS gu, (emitted_at ?? valid_from) AS at \
@@ -508,9 +527,11 @@ pub async fn session_token_stats(
                AND (raw.message.model ?? raw.model ?? '') != '<synthetic>' \
              ORDER BY at DESC LIMIT {CONTEXT_PROBE}"
         ))
-        .bind(("sess", session))
+        .bind(("sess", session.clone()))
         .await?
-        .take(0)?;
+        .take(0)?)
+    })
+    .await?;
     let context = rows.iter().find_map(|row| {
         let Value::Object(o) = row else { return None };
         let usage = |key: &str| match o.get(key) {
@@ -544,7 +565,8 @@ pub async fn session_action_count(
 ) -> Result<i64> {
     let rows: Vec<Value> = match scope {
         Some((agent, src_key)) => {
-            kernel
+            crate::answered("session events", || async {
+                Ok(kernel
                 .db()
                 .query(
                     "SELECT count() AS c FROM telemetry_stream \
@@ -552,22 +574,27 @@ pub async fn session_action_count(
                         OR (agent = $agent AND payload.session = $src) \
                      GROUP ALL",
                 )
-                .bind(("sess", session))
-                .bind(("agent", agent))
-                .bind(("src", src_key))
+                .bind(("sess", session.clone()))
+                .bind(("agent", agent.clone()))
+                .bind(("src", src_key.clone()))
                 .await?
-                .take(0)?
+                .take(0)?)
+            })
+            .await?
         }
         None => {
-            kernel
+            crate::answered("session events", || async {
+                Ok(kernel
                 .db()
                 .query(
                     "SELECT count() AS c FROM telemetry_stream \
                      WHERE subject = $sess GROUP ALL",
                 )
-                .bind(("sess", session))
+                .bind(("sess", session.clone()))
                 .await?
-                .take(0)?
+                .take(0)?)
+            })
+            .await?
         }
     };
     // Row shape: {c: <count>} — read through the kernel's re-exported

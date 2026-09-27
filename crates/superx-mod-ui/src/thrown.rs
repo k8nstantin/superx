@@ -136,20 +136,19 @@ pub async fn session_runs(
     name: &str,
     idle_secs: i64,
 ) -> Result<Vec<ModelRun>> {
-    let rows: Vec<Value> = kernel
-        .db()
-        .query(format!(
-            "SELECT (emitted_at ?? valid_from) AS at, (raw.message.model ?? raw.model) AS model, \
-                 {} AS k, raw.cwd AS cwd, \
-                 raw.message.usage AS cu, raw.tokens AS gu, valid_from \
-             FROM message WHERE session = $sess \
-                 AND (raw.message.model != NONE OR raw.model != NONE) \
-             ORDER BY valid_from ASC",
-            crate::stats::REPLY_KEY_SQL
-        ))
-        .bind(("sess", session.clone()))
-        .await?
-        .take(0)?;
+    let runs_query = format!(
+        "SELECT (emitted_at ?? valid_from) AS at, (raw.message.model ?? raw.model) AS model, \
+             {} AS k, raw.cwd AS cwd, \
+             raw.message.usage AS cu, raw.tokens AS gu, valid_from \
+         FROM message WHERE session = $sess \
+             AND (raw.message.model != NONE OR raw.model != NONE) \
+         ORDER BY valid_from ASC",
+        crate::stats::REPLY_KEY_SQL
+    );
+    let rows: Vec<Value> = crate::answered("session replies", || async {
+        Ok(kernel.db().query(runs_query.as_str()).bind(("sess", session.clone())).await?.take(0)?)
+    })
+    .await?;
     // Fold a reply's rows: they share a key, and the last of them is the
     // fullest (a Gemini record re-emitted as it streamed).
     let mut replies: Vec<Reply> = Vec::new();
@@ -188,16 +187,19 @@ pub async fn session_runs(
 
     // The operator's turns, each answered by the run that was going when
     // it was written (#414): the one that started last before it.
-    let turns: Vec<(DateTime<Utc>, String)> = kernel
-        .db()
-        .query(
-            "SELECT (emitted_at ?? valid_from) AS at, content, valid_from FROM message \
-             WHERE session = $sess AND role = 'user' ORDER BY valid_from ASC",
-        )
-        .bind(("sess", session))
-        .await?
-        .take::<Vec<Value>>(0)?
-        .iter()
+    let turns: Vec<(DateTime<Utc>, String)> = crate::answered("session turns", || async {
+        Ok(kernel
+            .db()
+            .query(
+                "SELECT (emitted_at ?? valid_from) AS at, content, valid_from FROM message \
+                 WHERE session = $sess AND role = 'user' ORDER BY valid_from ASC",
+            )
+            .bind(("sess", session.clone()))
+            .await?
+            .take::<Vec<Value>>(0)?)
+    })
+    .await?
+    .iter()
         .filter_map(obj)
         .filter_map(|o| Some((time_of(o, "at")?, str_of(o, "content").unwrap_or("").to_string())))
         .collect();

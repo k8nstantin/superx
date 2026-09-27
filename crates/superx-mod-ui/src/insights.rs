@@ -82,7 +82,8 @@ const SIZE_SAMPLE: usize = 64; // skill-allow: §9-const — read-path bound, no
 async fn table_stats(kernel: &Kernel) -> Result<Vec<TableStat>> {
     // The table list comes from the engine, so a module's own tables
     // are counted without this knowing their names.
-    let info: Vec<Value> = kernel.db().query("INFO FOR DB").await?.take(0)?;
+    let info: Vec<Value> =
+        crate::answered("table list", || async { Ok(kernel.db().query("INFO FOR DB").await?.take(0)?) }).await?;
     let mut names: Vec<String> = info
         .first()
         .and_then(obj)
@@ -96,11 +97,10 @@ async fn table_stats(kernel: &Kernel) -> Result<Vec<TableStat>> {
     for name in names {
         // The name comes from the engine's own catalogue, never from a
         // request, so it cannot carry anything but a table name.
-        let count: Vec<Value> = kernel
-            .db()
-            .query(format!("SELECT count() AS c FROM {name} GROUP ALL"))
-            .await?
-            .take(0)?;
+        let count: Vec<Value> = crate::answered("table rows", || async {
+            Ok(kernel.db().query(format!("SELECT count() AS c FROM {name} GROUP ALL")).await?.take(0)?)
+        })
+        .await?;
         let rows = count
             .first()
             .and_then(obj)
@@ -110,11 +110,10 @@ async fn table_stats(kernel: &Kernel) -> Result<Vec<TableStat>> {
             out.push(TableStat { name, rows: 0, bytes_est: 0, avg_row_bytes: 0, sampled: 0 });
             continue;
         }
-        let sample: Vec<Value> = kernel
-            .db()
-            .query(format!("SELECT * FROM {name} LIMIT {SIZE_SAMPLE}"))
-            .await?
-            .take(0)?;
+        let sample: Vec<Value> = crate::answered("table sample", || async {
+            Ok(kernel.db().query(format!("SELECT * FROM {name} LIMIT {SIZE_SAMPLE}")).await?.take(0)?)
+        })
+        .await?;
         let measured: Vec<usize> = sample
             .iter()
             .filter_map(|r| serde_json::to_string(r).ok().map(|s| s.len()))
@@ -169,9 +168,7 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
     // viewer's offset from UTC, so the days and hours are the viewer's.
     let shift = clock.local_minus_utc();
     let at = if shift >= 0 { format!("(at + {shift}s)") } else { format!("(at - {}s)", -shift) };
-    let mut res = kernel
-        .db()
-        .query(format!(
+    let pass = format!(
             "LET $r = (SELECT agent, (raw.message.model ?? raw.model) AS model, {REPLY_KEY_SQL} AS k,
                     time::min(emitted_at ?? valid_from) AS at,
                     math::max(raw.message.usage.input_tokens
@@ -188,8 +185,8 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
                 FROM $r GROUP ALL;
              SELECT model, count() AS value FROM $r WHERE model != NONE GROUP BY model;
              SELECT agent, count() AS messages, math::sum(output) AS output FROM $r GROUP BY agent;"
-        ))
-        .await?;
+    );
+    let mut res = crate::answered("insights pass", || async { Ok(kernel.db().query(pass.as_str()).await?) }).await?;
     let days: Vec<Value> = res.take(1)?;
     let cells: Vec<Value> = res.take(2)?;
     let totals: Vec<Value> = res.take(3)?;
@@ -283,17 +280,20 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
     // how each module is and what it cost to start.
     let now = chrono::Utc::now();
     let cutoff = now - chrono::Duration::seconds(RECENT_SECS);
-    let groups: Vec<Value> = kernel
-        .db()
-        .query(
-            // `count(cond)` counts the rows where `cond` holds.
-            "SELECT lifecycle_event AS kind, payload.name AS name, count() AS n,
-                    time::max(valid_from) AS newest, count(valid_from > $cutoff) AS recent
-             FROM telemetry_stream GROUP BY kind, name",
-        )
-        .bind(("cutoff", cutoff))
-        .await?
-        .take(0)?;
+    let groups: Vec<Value> = crate::answered("telemetry groups", || async move {
+        Ok(kernel
+            .db()
+            .query(
+                // `count(cond)` counts the rows where `cond` holds.
+                "SELECT lifecycle_event AS kind, payload.name AS name, count() AS n,
+                        time::max(valid_from) AS newest, count(valid_from > $cutoff) AS recent
+                 FROM telemetry_stream GROUP BY kind, name",
+            )
+            .bind(("cutoff", cutoff))
+            .await?
+            .take(0)?)
+    })
+    .await?;
     let mut kinds: HashMap<String, i64> = HashMap::new();
     let mut failures_total: HashMap<String, i64> = HashMap::new();
     let mut last_event_at_dt: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -325,12 +325,10 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
     let recent_cut = now - chrono::Duration::seconds(HEALTH_RECENT_SECS);
     let mut health: Vec<ModuleHealth> = Vec::new();
     let mut module_startup: Vec<NameCount> = Vec::new();
-    let lifecycle: Vec<Value> = kernel
-        .db()
-        .query(HEALTH_QUERY)
-        .bind(("limit", HEALTH_SCAN))
-        .await?
-        .take(0)?;
+    let lifecycle: Vec<Value> = crate::answered("module health", || async move {
+        Ok(kernel.db().query(HEALTH_QUERY).bind(("limit", HEALTH_SCAN)).await?.take(0)?)
+    })
+    .await?;
     for row in lifecycle.iter().filter_map(obj) {
         let (Some(name), Some(event)) = (get_str(row, "name"), get_str(row, "event")) else {
             continue;

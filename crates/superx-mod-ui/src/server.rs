@@ -102,16 +102,21 @@ async fn bounded(
     let Some(budget) = budget else {
         return next.run(request).await;
     };
+    let path = request.uri().to_string();
     match tokio::time::timeout(budget, next.run(request)).await {
         Ok(response) => response,
-        Err(_) => (
+        Err(_) => {
+            // Logged, so a hang leaves a trace (#415 QA).
+            tracing::warn!(target: "ui", path = %path, budget = ?budget, "request got no answer within the budget");
+            (
             StatusCode::GATEWAY_TIMEOUT,
             Json(serde_json::json!({
                 "output": format!("no answer within {budget:?} ({})", crate::READ_TIMEOUT_SECS_PARAM),
                 "is_error": true,
             })),
         )
-            .into_response(),
+            .into_response()
+        }
     }
 }
 
@@ -127,6 +132,8 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
     // substrate that might not answer.
     let secs = crate::resolved_read_timeout_secs(&kernel).await;
     let budget = (secs > 0).then(|| Duration::from_secs(secs));
+    // Each substrate query gets a quarter of it, and one retry (#415 QA).
+    crate::set_query_timeout(budget);
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/agents", get(api_agents))
@@ -600,7 +607,10 @@ async fn api_stats(
             }
             Err(e) => err_response(&e.to_string()).into_response(),
         },
-        Err(e) => err_response(&e.to_string()).into_response(),
+        Err(e) => {
+            tracing::warn!(target: "ui", range = %range, error = %e, "stats read failed");
+            err_response(&e.to_string()).into_response()
+        }
     }
 }
 
@@ -626,7 +636,10 @@ async fn api_insights(State(state): State<AppState>, Query(q): Query<ClockQuery>
             }
             Err(e) => err_response(&e.to_string()).into_response(),
         },
-        Err(e) => err_response(&e.to_string()).into_response(),
+        Err(e) => {
+            tracing::warn!(target: "ui", error = %e, "insights read failed");
+            err_response(&e.to_string()).into_response()
+        }
     }
 }
 
@@ -640,7 +653,10 @@ async fn api_compare(State(state): State<AppState>) -> axum::response::Response 
     }
     let runs = match crate::thrown::model_runs(&state.kernel).await {
         Ok(r) => r,
-        Err(e) => return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
+        Err(e) => {
+            tracing::warn!(target: "ui", error = %e, "model comparison read failed");
+            return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string())));
+        }
     };
     let mainlines = crate::resolved_mainline_refs(&state.kernel).await;
     let c = crate::compare::compare(&runs, &mainlines).await;
@@ -851,6 +867,30 @@ mod tests {
         assert_eq!(cut.status(), StatusCode::GATEWAY_TIMEOUT, "slower than the budget, inside the layer");
         let compare = call(app(Some(BUDGET)), "/compare").await.expect("response");
         assert_eq!(compare.status(), StatusCode::OK, "the same wait, outside the layer, finishes");
+    }
+
+    /// A substrate read that gets no answer is asked once more, and a second
+    /// miss is an error, not a wait without end (#415 QA).
+    #[tokio::test]
+    async fn a_substrate_read_that_gets_no_answer_is_asked_again() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const LIMIT: Duration = Duration::from_millis(20); // skill-allow: §9-duration — test fixture, not a policy
+        let calls = AtomicU32::new(0);
+        let first_hangs = || async {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::future::pending::<()>().await;
+            }
+            Ok(7)
+        };
+        let answer = crate::answered_within(Some(LIMIT), "test read", first_hangs).await;
+        assert_eq!(answer.expect("answered on the retry"), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "asked twice");
+
+        let never = crate::answered_within(Some(LIMIT), "test read", std::future::pending::<Result<i32>>).await;
+        assert!(never.is_err_and(|e| e.to_string().contains("twice")));
+
+        let unbounded = crate::answered_within(None, "test read", || async { Ok(1) }).await;
+        assert_eq!(unbounded.expect("no bound, no timeout"), 1);
     }
 
     async fn get(path: &str) -> axum::response::Response {
