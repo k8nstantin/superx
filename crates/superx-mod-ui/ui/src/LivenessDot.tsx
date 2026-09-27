@@ -42,13 +42,7 @@ const STYLES: Record<Liveness, React.CSSProperties> = {
 export function LivenessDot({ state, size = 10 }: { state: Liveness; size?: number }) {
   return (
     <>
-      {/* `href` + `precedence` is what makes React 19 hoist this to
-          <head> and dedupe it. A bare <style> renders in place, once
-          per dot — and the Sessions list draws one per session (#343
-          review). */}
-      <style href="sx-glow" precedence="low">
-        {'@keyframes sx-glow { 0%, 100% { box-shadow: 0 0 4px 1px rgba(48,209,88,0.5); } 50% { box-shadow: 0 0 10px 4px rgba(48,209,88,0.9); } }'}
-      </style>
+      {/* The `sx-glow` pulse is in global.css (#349). */}
       <Tooltip label={state} withArrow>
         <span
           style={{

@@ -2,7 +2,7 @@ import { useCallback, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useDebouncedValue } from '@mantine/hooks'
 import { Title } from '@mantine/core'
-import { fetchActivity, fetchAgents, fetchSessions } from '../api'
+import { fetchActivity, fetchAgents, fetchSessions, type FeedCursor } from '../api'
 import { useSse } from '../useSse'
 import { Feed, MAX_FEED_ROWS, matchesSearch, mergeFeed } from '../Feed'
 import { useFeedHistory } from '../useFeedHistory'
@@ -25,15 +25,19 @@ export default function ActivityPage() {
   const sessions = useQuery({ queryKey: ['sessions'], queryFn: () => fetchSessions(), refetchInterval: 10000 })
   const agents = useQuery({ queryKey: ['agents'], queryFn: fetchAgents, refetchInterval: 30000 })
 
-  useSse((batch) => {
-    // While a search is on, only matching rows may join the feed —
-    // otherwise live traffic would quietly break the filter.
-    const keep = batch.filter((e) => matchesSearch(e, q))
-    if (keep.length) setLiveRows((prev) => [...prev, ...keep].slice(-MAX_FEED_ROWS))
-  }, paused)
+  useSse(
+    (batch) => {
+      // While a search is on, only matching rows may join the feed —
+      // otherwise live traffic would quietly break the filter.
+      const keep = batch.filter((e) => matchesSearch(e, q))
+      if (keep.length) setLiveRows((prev) => [...prev, ...keep].slice(-MAX_FEED_ROWS))
+    },
+    paused,
+    () => void backlog.refetch(),
+  )
 
   const page = useCallback(
-    (before: string, limit: number) => fetchActivity(limit, before, q),
+    (before: FeedCursor, limit: number) => fetchActivity(limit, before, q),
     [q],
   )
   const { older, loadOlder, loadingOlder, exhausted } = useFeedHistory(`global:${q}`, page)

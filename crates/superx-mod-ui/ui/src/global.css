@@ -1,0 +1,14 @@
+/* Global rules the whole dashboard shares (#349). A keyframe is global
+   CSS: rendered from a component it was a per-instance resource React had
+   to hoist and dedupe for every liveness dot on the page. */
+
+/* The live dot's pulse (LivenessDot.tsx). */
+@keyframes sx-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 4px 1px rgba(48, 209, 88, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 10px 4px rgba(48, 209, 88, 0.9);
+  }
+}

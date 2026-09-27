@@ -19,12 +19,18 @@ const HIDDEN_FLUSH_MS = 1000
  *  EventSource reconnects by itself only after a network error. A
  *  response that is not a 200 event stream — a 503 from anything in
  *  between — closes it for good, and the feed went quiet until a
- *  reload; a closed stream is opened again. */
-export function useSse(onEvents: (batch: SseEvent[]) => void, paused = false) {
+ *  reload; a closed stream is opened again.
+ *
+ *  `onGap` runs whenever the stream opens and whenever the server says
+ *  it dropped frames: the backlog and the stream were fetched side by
+ *  side, and whatever happened between the two was in neither (#183). */
+export function useSse(onEvents: (batch: SseEvent[]) => void, paused = false, onGap?: () => void) {
   const pausedRef = useRef(paused)
   pausedRef.current = paused
   const handlerRef = useRef(onEvents)
   handlerRef.current = onEvents
+  const gapRef = useRef(onGap)
+  gapRef.current = onGap
   useEffect(() => {
     let es: EventSource | null = null
     let reopen: ReturnType<typeof setTimeout> | undefined
@@ -41,6 +47,11 @@ export function useSse(onEvents: (batch: SseEvent[]) => void, paused = false) {
     const open = () => {
       const stream = new EventSource('/api/events')
       es = stream
+      // A gap the stream cannot fill (#183): what happened before it
+      // (re)opened, and what the server dropped for a client too slow
+      // to keep up. The page reads its backlog again; ids dedupe.
+      stream.onopen = () => gapRef.current?.()
+      stream.addEventListener('resync', () => gapRef.current?.())
       stream.onmessage = (m) => {
         if (pausedRef.current) return
         try {

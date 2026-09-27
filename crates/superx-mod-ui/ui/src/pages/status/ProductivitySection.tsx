@@ -67,6 +67,14 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
   // Fronts open, on a timeline of their own, quiet buckets drawn empty.
   const intensityAt = new Map((s?.intensity ?? []).map((p) => [p.t, p]))
   const intensityBuckets = timeline([...intensityAt.keys()])
+  // The typical bucket beside the peak (#395): the median over the
+  // buckets where anything happened, so a quiet night does not drag it to 0.
+  const median = (vals: number[]) => {
+    const v = [...vals].sort((a, b) => a - b)
+    return v.length === 0 ? 0 : v[Math.floor(v.length / 2)]
+  }
+  const medianSessions = median((s?.intensity ?? []).map((p) => n(p.sessions)))
+  const medianRepos = median((s?.intensity ?? []).map((p) => n(p.repos)))
 
   const pairs = s?.model_effort ?? []
   const biggest = pairs.reduce((a, p) => Math.max(a, n(p.messages)), 0)
@@ -205,7 +213,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
         title="How hard it was working — fronts open, and what moved"
         scope="range"
         range={range}
-        note={`${long ? 'per day' : 'per hour'} · your time · peak ${n(s?.peak_sessions)} session${n(s?.peak_sessions) === 1 ? '' : 's'} and ${n(s?.peak_repos)} repositor${n(s?.peak_repos) === 1 ? 'y' : 'ies'} in one ${long ? 'day' : 'hour'}`}
+        note={`${long ? 'per day' : 'per hour'} · your time · sessions: median ${medianSessions}, peak ${n(s?.peak_sessions)} · repositories: median ${medianRepos}, peak ${n(s?.peak_repos)}, in one ${long ? 'day' : 'hour'}`}
         mb="md"
       >
         {(s?.intensity?.length ?? 0) === 0 ? (
@@ -218,8 +226,25 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
             option={{
               // The legend sits above the plot, not on its top line (#415 QA).
               grid: { left: 58, right: 48, top: 30, bottom: 26 },
-              tooltip: { ...TOOLTIP, trigger: 'axis' },
-              legend: { data: ['lines written', 'sessions', 'repos'], textStyle: { color: INK_MUTED }, right: 0, top: -2 },
+              // Tokens ride the tooltip (#395): a fourth measure in a third
+              // unit would need a third axis, and the burn chart above draws
+              // them on this same timeline.
+              tooltip: {
+                ...TOOLTIP,
+                trigger: 'axis',
+                formatter: (ps: { dataIndex: number }[]) => {
+                  const t = intensityBuckets[ps[0]?.dataIndex ?? 0]
+                  const p = t == null ? undefined : intensityAt.get(t)
+                  if (t == null) return ''
+                  return [
+                    label(t),
+                    `${fmtCompact(n(p?.lines_added))} lines written · ${fmtCompact(n(p?.lines_removed))} removed`,
+                    `${n(p?.sessions)} session${n(p?.sessions) === 1 ? '' : 's'} · ${n(p?.repos)} repositor${n(p?.repos) === 1 ? 'y' : 'ies'}`,
+                    `${fmtCompact(n(p?.out_tokens))} output tokens`,
+                  ].join('<br/>')
+                },
+              },
+              legend: { data: ['lines written', 'lines removed', 'sessions', 'repos'], textStyle: { color: INK_MUTED }, right: 0, top: -2 },
               xAxis: {
                 type: 'category',
                 data: intensityBuckets.map(label),
@@ -246,6 +271,10 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
               ],
               series: [
                 { name: 'lines written', type: 'bar', itemStyle: { color: CHART_COLORS[0] }, data: intensityBuckets.map((t) => n(intensityAt.get(t)?.lines_added)) },
+                // Beside what was written, not below the axis (#395): under
+                // zero it dropped this axis's zero beneath the fronts-open
+                // axis's zero, and "no session" read as one.
+                { name: 'lines removed', type: 'bar', itemStyle: { color: FAIL }, data: intensityBuckets.map((t) => n(intensityAt.get(t)?.lines_removed)) },
                 // A count steps from one whole number to the next; smoothed,
                 // it drew half a session between two buckets (#426).
                 { name: 'sessions', type: 'line', yAxisIndex: 1, step: 'middle', symbol: 'circle', symbolSize: 5, itemStyle: { color: OK }, data: intensityBuckets.map((t) => n(intensityAt.get(t)?.sessions)) },

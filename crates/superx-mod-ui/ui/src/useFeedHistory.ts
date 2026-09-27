@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { FeedCursor } from './api'
 import type { SseEvent } from './generated/SseEvent'
 
 // Scrolling back through history (issue #241). The feed's first page
-// is the newest N rows; each further page is the newest N rows STRICTLY
-// older than the oldest row on screen, so reading backwards never ends
-// until the substrate does.
+// is the newest N rows; each further page is the newest N rows before
+// the oldest row on screen, by capture time and then id (#273), so
+// reading backwards never ends until the substrate does.
 //
 // `scopeKey` is the feed's identity (global, or a session id): changing
 // it throws the accumulated history away rather than mixing two feeds.
@@ -13,7 +14,7 @@ export const HISTORY_PAGE = 300
 
 export function useFeedHistory(
   scopeKey: string,
-  fetchPage: (before: string, limit: number) => Promise<SseEvent[]>,
+  fetchPage: (before: FeedCursor, limit: number) => Promise<SseEvent[]>,
 ) {
   const [older, setOlder] = useState<SseEvent[]>([])
   const [loadingOlder, setLoadingOlder] = useState(false)
@@ -29,7 +30,7 @@ export function useFeedHistory(
   }, [scopeKey])
 
   const loadOlder = useCallback(
-    (before: string | undefined) => {
+    (before: FeedCursor | undefined) => {
       if (!before || busy.current || exhausted) return
       busy.current = true
       setLoadingOlder(true)

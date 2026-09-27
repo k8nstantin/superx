@@ -33,12 +33,16 @@ export const fetchSessions = (agent?: string) =>
 // than that instant — how the feeds scroll into history. `q` filters
 // in the ENGINE, so it searches all history rather than the loaded
 // page (issue #241).
-const feedArgs = (before?: string, q?: string) =>
-  (before ? `&before=${encodeURIComponent(before)}` : '') +
+/// Where a backwards page starts: the oldest row held, by its capture
+/// time AND its id. Two rows can share an instant, and a page edge
+/// between them lost one when the time alone was the cursor (#273).
+export type FeedCursor = { at: string; id: string }
+const feedArgs = (before?: FeedCursor, q?: string) =>
+  (before ? `&before=${encodeURIComponent(before.at)}&before_id=${encodeURIComponent(before.id)}` : '') +
   (q && q.trim() ? `&q=${encodeURIComponent(q.trim())}` : '')
-export const fetchSessionActivity = (id: string, limit = 500, before?: string, q?: string) =>
+export const fetchSessionActivity = (id: string, limit = 500, before?: FeedCursor, q?: string) =>
   get<SseEvent[]>(`/api/sessions/${id}/activity?limit=${limit}${feedArgs(before, q)}`)
-export const fetchActivity = (limit = 500, before?: string, q?: string) =>
+export const fetchActivity = (limit = 500, before?: FeedCursor, q?: string) =>
   get<SseEvent[]>(`/api/activity?limit=${limit}${feedArgs(before, q)}`)
 /// The viewer's offset from UTC in minutes east, so the page's hours and
 /// days are the viewer's own (#415 review).
