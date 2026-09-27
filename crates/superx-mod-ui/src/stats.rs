@@ -2916,12 +2916,10 @@ pub async fn stats_for_range_capped(
     .await?;
     let sessions_active = rows.len() as i64;
 
-    let agents = kernel
-        .list_named_entities("node_agent", "attr_agent_descriptor")
+    let agents = crate::answered("agents", || kernel.list_named_entities("node_agent", "attr_agent_descriptor"))
         .await?
         .len() as i64;
-    let sessions = kernel
-        .list_named_entities("node_session", "attr_session_descriptor")
+    let sessions = crate::answered("sessions", || kernel.list_named_entities("node_session", "attr_session_descriptor"))
         .await?;
     let sessions_total = sessions.len() as i64;
     // uuid → the agent that owns the session (#337).
@@ -2948,7 +2946,7 @@ pub async fn stats_for_range_capped(
     let mut modules_total = 0i64;
     let mut modules_active = 0i64;
     for kind in [NodeKind::KernelModule, NodeKind::Adapter] {
-        if let Ok(list) = kernel.list_with_status(kind).await {
+        if let Ok(list) = crate::answered("module list", || kernel.list_with_status(kind)).await {
             for s in &list {
                 modules_total += 1;
                 if s.lifecycle.short_tag() == "active" {
@@ -4580,7 +4578,7 @@ pub async fn stats_for_range_capped(
         .collect();
 
     // ── timeline / roles / boots (the former charts endpoint's data) ─
-    let events = kernel.recent_telemetry(EVENT_WINDOW).await?;
+    let events = crate::answered("recent telemetry", || kernel.recent_telemetry(EVENT_WINDOW)).await?;
     // Keyed by the FULL timestamp: bucketing on "%H:%M" alone sorts
     // 00:03 before 23:59, so any window spanning midnight came out
     // scrambled. The label stays short; only the sort key is whole.
@@ -5356,14 +5354,8 @@ pub async fn stats_for_range_capped(
 /// Resolve the active-session threshold from the ui module's
 /// parameter, else the default.
 pub(crate) async fn resolved_active_secs(kernel: &Kernel) -> i64 {
-    let Ok(Some(entity)) = kernel
-        .find_module_by_name(NodeKind::KernelModule, crate::MODULE_NAME)
-        .await
-    else {
-        return DEFAULT_ACTIVE_SECS;
-    };
-    match kernel.get_parameter(entity, ACTIVE_SECS_PARAM).await {
-        Ok(Some(Value::Number(n))) => n.to_int().filter(|&v| v > 0).unwrap_or(DEFAULT_ACTIVE_SECS),
+    match crate::module_parameter(kernel, ACTIVE_SECS_PARAM).await {
+        Some(Value::Number(n)) => n.to_int().filter(|&v| v > 0).unwrap_or(DEFAULT_ACTIVE_SECS),
         _ => DEFAULT_ACTIVE_SECS,
     }
 }

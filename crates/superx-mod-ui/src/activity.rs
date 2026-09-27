@@ -243,9 +243,10 @@ async fn descriptor_parts(
     kernel: &Kernel,
     session: RecordId,
 ) -> Result<(Option<String>, Option<String>)> {
-    let desc = kernel
-        .current_state(session, "attr_session_descriptor")
-        .await?;
+    let desc = crate::answered("session descriptor", || {
+        kernel.current_state(session.clone(), "attr_session_descriptor")
+    })
+    .await?;
     let Some(Value::Object(o)) = desc else {
         return Ok((None, None));
     };
@@ -270,9 +271,10 @@ async fn session_scope(
     let (src, agent_name) = descriptor_parts(kernel, session).await?;
     let agent = match agent_name {
         Some(ref name) => {
-            kernel
-                .find_entity_by_name("node_agent", "attr_agent_descriptor", name)
-                .await?
+            crate::answered("session agent", || {
+                kernel.find_entity_by_name("node_agent", "attr_agent_descriptor", name)
+            })
+            .await?
         }
         None => None,
     };
@@ -451,7 +453,7 @@ async fn recent_actions(
     q: Query<'_>,
 ) -> Result<Vec<TelemetryRecord>> {
     if before.is_none() && q.is_none() {
-        return kernel.recent_telemetry(limit).await;
+        return crate::answered("recent actions", || kernel.recent_telemetry(limit)).await;
     }
     let sql = page_query("telemetry_stream", None, before, q, &act_match());
     let rows: Vec<TelemetryRecord> = page!(kernel, "telemetry_stream", sql, limit, before, q);

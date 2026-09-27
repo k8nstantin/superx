@@ -299,9 +299,8 @@ fn build_run(session: &str, fam: &str, replies: &[Reply], idle_secs: i64) -> Mod
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
 pub async fn model_runs(kernel: &Kernel) -> Result<Vec<ModelRun>> {
-    let sessions = kernel
-        .list_named_entities("node_session", "attr_session_descriptor")
-        .await?;
+    let sessions =
+        crate::answered("sessions", || kernel.list_named_entities("node_session", "attr_session_descriptor")).await?;
     let idle = crate::stats::resolved_active_secs(kernel).await;
     let mut out = Vec::new();
     for s in sessions {
