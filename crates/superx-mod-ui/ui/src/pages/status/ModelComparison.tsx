@@ -60,6 +60,10 @@ type Metric = {
 
 const per = (a: number, b: number, mult = 1) => (b > 0 ? Math.round((a * mult) / b) : 0)
 
+/// An axis tick, short: "10k", not "10.0k". At a third of a laptop screen
+/// the longer ticks ran into each other (operator QA).
+const tick = (x: number) => fmtCompact(x).replace(/\.0(?=[kMBT]$)/, '')
+
 /// The twenty measures, in reading order: what you GET, what you SPEND
 /// per unit, what was WASTED, how the work WENT, and the totals that
 /// put the rates in context.
@@ -80,7 +84,7 @@ function metrics(): Metric[] {
   // thrown away — a model that lost 94% of what it landed placed third.
   return [
     { title: 'Lasting lines per 1M tokens', note: 'what the spend left in the code', good: 'high', fmt: fmtCompact, pick: (d) => n(d.alive_per_mtok) },
-    { title: 'Lasting lines per hour', note: 'what an hour of work left in the code', good: 'high', pick: (d) => n(d.alive_per_hour) },
+    { title: 'Lasting lines per hour', note: 'what an hour left in the code', good: 'high', pick: (d) => n(d.alive_per_hour) },
     { title: 'Lines still in the code', note: 'the lasting output, in total', good: 'high', fmt: fmtCompact, pick: (d) => n(d.alive) },
     { title: 'Lines removed per 100 added', note: 'churn while working', good: 'low', pick: (d) => n(d.removed_per_100_added) },
     { title: 'Files returned to 3+ times', note: 'per 100 commits', good: 'low', pick: (d) => n(d.thrash_per_100_commits) },
@@ -177,6 +181,7 @@ function dumbbell(
   bName: string,
   axis: string,
   fmt: (v: number) => string,
+  log = false,
 ) {
   const names = rows.map((r) => r.model)
   // The caller picks the rows: a rate of code is drawn for the ranked
@@ -190,12 +195,15 @@ function dumbbell(
     grid: { left: 8, right: 88, top: 30, bottom: 40, containLabel: true },
     xAxis: {
       ...AXIS,
-      type: 'value',
+      // A log scale where one model's gap is a hundred times another's:
+      // on a linear one, 67 and 116 tokens sat on top of each other beside
+      // 3.7k (operator QA).
+      type: log ? 'log' : 'value',
       name: axis,
       nameLocation: 'middle',
       nameGap: 22,
       nameTextStyle: { color: INK_MUTED, fontSize: 12 },
-      axisLabel: { color: INK_MUTED, fontSize: 11, formatter: (x: number) => fmt(x) },
+      axisLabel: { color: INK_MUTED, fontSize: 11, formatter: (x: number) => fmt(x).replace(/\.0(?=[kMBT]$)/, '') },
       splitLine: { lineStyle: { color: GRID_LINE } },
     },
     yAxis: {
@@ -225,7 +233,9 @@ function dumbbell(
           return {
             type: 'line',
             shape: { x1: lo[0], y1: lo[1], x2: hi[0], y2: hi[1] },
-            style: { stroke: GRID_LINE, lineWidth: 2 },
+            // In the grid's colour the gap, the reason for this form,
+            // could barely be seen (operator QA).
+            style: { stroke: INK_MUTED, lineWidth: 2, opacity: 0.6 },
           }
         },
         data: rows.map((r, i) => [i, a(r), b(r)]),
@@ -334,7 +344,7 @@ function fate(rows: Row[]) {
       nameLocation: 'middle',
       nameGap: 24,
       nameTextStyle: { color: INK_MUTED },
-      axisLabel: { color: INK_MUTED, formatter: (x: number) => fmtCompact(x) },
+      axisLabel: { color: INK_MUTED, formatter: (x: number) => tick(x) },
       splitLine: { lineStyle: { color: GRID_LINE } },
     },
     yAxis: {
@@ -383,7 +393,7 @@ function buys(rows: Row[]) {
       nameLocation: 'middle',
       nameGap: 26,
       nameTextStyle: { color: INK_MUTED, fontSize: 12 },
-      axisLabel: { color: INK_MUTED, fontSize: 11, formatter: (x: number) => fmtCompact(x) },
+      axisLabel: { color: INK_MUTED, fontSize: 11, formatter: (x: number) => tick(x) },
       splitLine: { lineStyle: { color: GRID_LINE } },
     },
     yAxis: {
@@ -445,7 +455,12 @@ function buys(rows: Row[]) {
 /// bar chart.
 function quadrant(rows: Row[]) {
   const colour = colours(rows)
-  const xmax = Math.max(1, ...rows.map((r) => n(r.tokens_per_line_kept)))
+  // A log scale (operator QA): tokens per surviving line ran from 116 to
+  // 3.7k, and on a linear axis the one dear model pushed the other five
+  // into its left quarter, bubbles and labels on top of each other.
+  const cost = (r: Row) => Math.max(1, n(r.tokens_per_line_kept))
+  const logs = rows.map((r) => Math.log10(cost(r)))
+  const [lo, hi] = [Math.min(...logs), Math.max(...logs)]
   return {
     tooltip: {
       ...TOOLTIP,
@@ -453,18 +468,17 @@ function quadrant(rows: Row[]) {
         `${p.data[2]}<br/>${fmtCompact(p.data[0])} tokens per surviving line<br/>${p.data[1]}% survived · ${fmtCompact(p.data[3])} lines landed`,
     },
     // The legend says whose bubble is whose; a label names it where it
-    // fits and gives way where it would land on another (#415 QA — six
-    // two-line labels sat on each other and on the axis name).
+    // fits and gives way where it would land on another (#415 QA).
     legend: { data: rows.map((r) => r.model), textStyle: { color: INK_MUTED }, top: 0, right: 0 },
     grid: { left: 58, right: 40, top: 40, bottom: 46 },
     xAxis: {
       ...AXIS,
-      type: 'value',
+      type: 'log',
       name: 'tokens per surviving line  →  dearer',
       nameLocation: 'middle',
       nameGap: 26,
       nameTextStyle: { color: INK_MUTED },
-      axisLabel: { color: INK_MUTED, formatter: (x: number) => fmtCompact(x) },
+      axisLabel: { color: INK_MUTED, formatter: (x: number) => tick(x) },
       splitLine: { lineStyle: { color: GRID_LINE } },
     },
     yAxis: {
@@ -480,18 +494,19 @@ function quadrant(rows: Row[]) {
     series: rows.map((r, i) => ({
       name: r.model,
       type: 'scatter',
-      symbolSize: (d: number[]) => Math.max(14, Math.min(54, Math.sqrt(d[3]) / 3)),
+      // The largest bubble kept to 40 px, so two neighbours do not cover each other.
+      symbolSize: (d: number[]) => Math.max(12, Math.min(40, Math.sqrt(d[3]) / 4)),
       itemStyle: { color: colour[i], opacity: 0.85, borderColor: '#150420', borderWidth: 2 },
       labelLayout: { hideOverlap: true },
       label: {
         show: true,
         // Near the right edge a label on the right would be cut off.
-        position: n(r.tokens_per_line_kept) > 0.6 * xmax ? 'left' : 'right',
+        position: hi > lo && (logs[i] - lo) / (hi - lo) > 0.6 ? 'left' : 'right',
         color: INK,
         fontSize: 11,
         formatter: () => r.model,
       },
-      data: [[n(r.tokens_per_line_kept), n(r.survived_pct), r.model, n(r.added)]],
+      data: [[cost(r), n(r.survived_pct), r.model, n(r.added)]],
     })),
   }
 }
@@ -508,15 +523,18 @@ function stacked(
   return {
     tooltip: { ...TOOLTIP, trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: (v: number) => fmt(v) },
     legend: { data: [keptName, goneName], textStyle: { color: INK_MUTED }, top: 0, right: 0 },
-    grid: { left: 150, right: 84, top: 32, bottom: 42 },
+    // The name column is as wide as the names, not a fixed 150 px: at a
+    // third of a laptop screen that left the bars 40 px (operator QA).
+    grid: { left: 8, right: 84, top: 32, bottom: 42, containLabel: true },
     xAxis: {
       ...AXIS,
       type: 'value',
+      splitNumber: 4,
       name: unit,
       nameLocation: 'middle',
       nameGap: 24,
       nameTextStyle: { color: INK_MUTED },
-      axisLabel: { color: INK_MUTED, formatter: (x: number) => fmtCompact(x) },
+      axisLabel: { color: INK_MUTED, formatter: (x: number) => tick(x) },
       splitLine: { lineStyle: { color: GRID_LINE } },
     },
     yAxis: {
@@ -827,7 +845,9 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
         </Text>
       </Panel>
 
-      <SimpleGrid cols={{ base: 1, lg: 3 }} mb="md">
+      {/* Three across only on a wide screen: at a laptop's width each was
+          296 px and its bars a sliver (operator QA). */}
+      <SimpleGrid cols={{ base: 1, xl: 3 }} mb="md">
         <Panel title="Of what it landed" scope="all" range={null} note="still there against gone">
           <EChart
             option={stacked(fams, (d) => n(d.alive), (d) => Math.max(0, n(d.added) - n(d.alive)), 'lines', 'still there', 'gone')}
@@ -859,7 +879,7 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
       </SimpleGrid>
 
       <SimpleGrid cols={{ base: 1, lg: 2 }} mb="md">
-        <Panel title="What a million tokens buys" scope="all" range={null} note="lines landed per 1M output tokens, and how many are still there">
+        <Panel title="What a million tokens buys" scope="all" range={null} note="per 1M output tokens: landed, and still there">
           {ranked.length === 0 ? nothingRanked : <EChart option={buys(ranked)} height={80 + ranked.length * 48} />}
           {unrankedNote && (
             <Text size="xs" c="dimmed" mt={4}>
@@ -868,14 +888,19 @@ export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
           )}
         </Panel>
         <Panel title="Cheap against good" scope="all" range={null} note="bubble is lines landed · bottom right is the worst place to be">
-          <EChart option={quadrant(fams)} height={230} />
+          {ranked.length === 0 ? nothingRanked : <EChart option={quadrant(ranked)} height={260} />}
+          {unrankedNote && (
+            <Text size="xs" c="dimmed" mt={4}>
+              {unrankedNote}
+            </Text>
+          )}
         </Panel>
         <Panel title="What a line cost, before and after rework" scope="all" range={null} note="the gap is the rework tax">
           {ranked.length === 0 ? (
             nothingRanked
           ) : (
             <EChart
-              option={dumbbell(ranked, (d) => n(d.tokens_per_line_landed), (d) => n(d.tokens_per_line_kept), 'per line landed', 'per line still there', 'output tokens per line', fmtCompact)}
+              option={dumbbell(ranked, (d) => Math.max(1, n(d.tokens_per_line_landed)), (d) => Math.max(1, n(d.tokens_per_line_kept)), 'per line landed', 'per line still there', 'output tokens per line', fmtCompact, true)}
               height={80 + ranked.length * 44}
             />
           )}

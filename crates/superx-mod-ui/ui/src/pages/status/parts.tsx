@@ -300,15 +300,23 @@ export function Panel({
 }) {
   return (
     <Card withBorder h={h} mb={mb} p={p}>
-      <Group justify="space-between" mb="xs" wrap="nowrap" gap="xs">
-        <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
-          <Title order={5} style={{ whiteSpace: 'nowrap' }}>
+      {/* The title and its badge never shrink; the note sits beside them
+          where there is room and takes its own line where there is not.
+          Held on one line, a narrow card squeezed the badge to a sliver
+          and drew the note over it (operator QA). */}
+      <Group justify="space-between" mb="xs" wrap="wrap" gap="xs" style={{ rowGap: 2 }}>
+        {/* A title longer than a narrow card wraps rather than pushing
+            its badge off the card's edge. */}
+        <Group gap="xs" wrap="nowrap" style={{ flex: '0 1 auto', minWidth: 0 }}>
+          <Title order={5} style={{ minWidth: 0 }}>
             {title}
           </Title>
-          <ScopeBadge scope={scope} range={range} />
+          <span style={{ flexShrink: 0, display: 'inline-flex' }}>
+            <ScopeBadge scope={scope} range={range} />
+          </span>
         </Group>
         {note && (
-          <Text size="xs" c="dimmed" ta="right" lineClamp={1} style={{ minWidth: 0 }}>
+          <Text size="xs" c="dimmed" ta="right" lineClamp={2} style={{ flex: '1 1 180px', minWidth: 0 }}>
             {note}
           </Text>
         )}

@@ -133,8 +133,11 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
         </Grid.Col>
       </Grid>
 
+      {/* Side by side only on a wide screen: at a laptop's width the token
+          mix was 296 px, its title pushed its badge off the card and its
+          legend lay on the plot (operator QA). */}
       <Grid mb="md" gap="md">
-        <Grid.Col span={{ base: 12, lg: 8 }}>
+        <Grid.Col span={{ base: 12, xl: 8 }}>
           <Panel
             title="Burn over time — output tokens by repository"
             scope="range"
@@ -170,7 +173,7 @@ export function ProductivitySection({ s, range }: { s: StatsSummary | undefined;
             )}
           </Panel>
         </Grid.Col>
-        <Grid.Col span={{ base: 12, lg: 4 }}>
+        <Grid.Col span={{ base: 12, xl: 4 }}>
           <Panel title="The token mix, over the same hours" scope="range" range={range} h="100%">
             {burn.length === 0 ? (
               <Text size="xs" c="dimmed">

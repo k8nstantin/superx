@@ -205,7 +205,10 @@ export function SystemsSection({
               option={{
                 grid: { left: 44, right: 8, top: 8, bottom: 24 },
                 tooltip: { trigger: 'axis', ...TOOLTIP },
-                xAxis: { type: 'category', data: (s?.message_roles ?? []).map((r) => r.name), ...AXIS, splitLine: { show: false } },
+                // Every bar named, tilted so neighbours do not run together:
+                // left to itself the axis hid every other role in a narrow
+                // card (operator QA).
+                xAxis: { type: 'category', data: (s?.message_roles ?? []).map((r) => r.name), ...AXIS, axisLabel: { ...AXIS.axisLabel, interval: 0, rotate: 30 }, splitLine: { show: false } },
                 yAxis: { type: 'value', ...AXIS },
                 series: [
                   {

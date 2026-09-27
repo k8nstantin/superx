@@ -61,7 +61,9 @@ export function Annunciator({
   const v = (x: number | bigint | null | undefined) => (loading ? '…' : fmtCompact(x))
 
   return (
-    <SimpleGrid cols={{ base: 2, sm: 4, lg: 7 }} spacing="xs" mb="md">
+    // Seven across only on a wide screen: at a laptop's width the lamps'
+    // names cut to "LAST…" and "COMPILE…" (operator QA).
+    <SimpleGrid cols={{ base: 2, sm: 4, lg: 5, xl: 7 }} spacing="xs" mb="md">
       <Lamp
         label={down ? 'Capture stopped' : 'Last captured'}
         value={
