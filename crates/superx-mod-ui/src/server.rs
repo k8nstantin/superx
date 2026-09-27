@@ -39,14 +39,40 @@ const SSE_BATCH: u32 = 200; // skill-allow: §9-const — poll page bound
 struct AppState {
     kernel: Kernel,
     events: broadcast::Sender<String>,
-    /// Answers already computed, by key, with when they were (#390).
-    /// The long ranges cost ten seconds and the page polls every
-    /// fifteen; between two polls the answer barely moves, and two
-    /// pilots on the same range should not each pay for it.
-    cache: std::sync::Arc<std::sync::Mutex<HashMap<String, (std::time::Instant, String)>>>,
+    answers: Answers,
 }
 
 impl AppState {
+    fn cached(&self, key: &str, ttl: u64) -> Option<String> {
+        self.answers.cached(key, ttl)
+    }
+
+    fn remember(&self, key: &str, body: &str) {
+        self.answers.remember(key, body);
+    }
+}
+
+/// An answer still being computed: every request for it watches the one
+/// computation.
+type Pending = tokio::sync::watch::Receiver<Option<std::result::Result<String, String>>>;
+
+/// Answers computed and being computed, by key.
+#[derive(Clone, Default)]
+struct Answers {
+    /// Answers already computed, with when they were (#390). The long
+    /// ranges cost ten seconds and the page polls every fifteen; between
+    /// two polls the answer barely moves, and two pilots on the same range
+    /// should not each pay for it.
+    cache: std::sync::Arc<std::sync::Mutex<HashMap<String, (std::time::Instant, String)>>>,
+    /// Answers being computed (#415 QA). Under load a range took longer
+    /// than the read budget: it was cut off, its work thrown away, and every
+    /// poll after began it again from nothing, so it never showed. Now each
+    /// key is computed once, whoever asks joins it, and it runs to its end
+    /// and is kept even when the request that started it has given up.
+    inflight: std::sync::Arc<std::sync::Mutex<HashMap<String, Pending>>>,
+}
+
+impl Answers {
     /// A body computed less than `ttl` ago, if there is one.
     fn cached(&self, key: &str, ttl: u64) -> Option<String> {
         if ttl == 0 {
@@ -65,6 +91,49 @@ impl AppState {
                 map.clear();
             }
             map.insert(key.to_string(), (std::time::Instant::now(), body.to_string()));
+        }
+    }
+
+    /// The answer for `key`: from the cache, else from the computation
+    /// already under way, else from `work`, started on its own task so it
+    /// finishes, and is kept, whether or not this request waits for it.
+    async fn computed<F>(&self, key: &str, ttl: u64, work: F) -> std::result::Result<String, String>
+    where
+        F: std::future::Future<Output = std::result::Result<String, String>> + Send + 'static,
+    {
+        if let Some(body) = self.cached(key, ttl) {
+            return Ok(body);
+        }
+        let mut pending = {
+            let Ok(mut map) = self.inflight.lock() else { return work.await };
+            if let Some(pending) = map.get(key) {
+                pending.clone()
+            } else {
+                let (tx, pending) = tokio::sync::watch::channel(None);
+                map.insert(key.to_string(), pending.clone());
+                let answers = self.clone();
+                let key = key.to_string();
+                tokio::spawn(async move {
+                    let answer = work.await;
+                    if let Ok(body) = &answer {
+                        answers.remember(&key, body);
+                    }
+                    if let Ok(mut map) = answers.inflight.lock() {
+                        map.remove(&key);
+                    }
+                    // Nobody watching is fine: the answer is cached.
+                    let _ = tx.send(Some(answer));
+                });
+                pending
+            }
+        };
+        loop {
+            if let Some(answer) = pending.borrow_and_update().clone() {
+                return answer;
+            }
+            if pending.changed().await.is_err() {
+                return Err("the computation ended without an answer".to_string());
+            }
         }
     }
 }
@@ -126,7 +195,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
     let state = AppState {
         kernel: kernel.clone(),
         events: events.clone(),
-        cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        answers: Answers::default(),
     };
     // Read once, here: resolving it per request would itself await the
     // substrate that might not answer.
@@ -596,20 +665,18 @@ async fn api_stats(
     let clock = viewer_clock(q.tz);
     let ttl = crate::resolved_cache_secs(kernel).await;
     let key = format!("stats:{range}:{window}:{}", clock.local_minus_utc());
-    if let Some(body) = state.cached(&key, ttl) {
-        return json_body(body);
-    }
-    match crate::stats::stats_for_range_on(kernel, window, &range, clock).await {
-        Ok(s) => match serde_json::to_string(&s) {
-            Ok(body) => {
-                state.remember(&key, &body);
-                json_body(body)
-            }
-            Err(e) => err_response(&e.to_string()).into_response(),
-        },
+    let (kernel, walk) = (kernel.clone(), range.clone());
+    let work = async move {
+        let s = crate::stats::stats_for_range_on(&kernel, window, &walk, clock)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&s).map_err(|e| e.to_string())
+    };
+    match state.answers.computed(&key, ttl, work).await {
+        Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", range = %range, error = %e, "stats read failed");
-            err_response(&e.to_string()).into_response()
+            err_response(&e).into_response()
         }
     }
 }
@@ -625,20 +692,16 @@ async fn api_insights(State(state): State<AppState>, Query(q): Query<ClockQuery>
     let clock = viewer_clock(q.tz);
     let ttl = crate::resolved_cache_secs(&state.kernel).await;
     let key = format!("insights:{}", clock.local_minus_utc());
-    if let Some(body) = state.cached(&key, ttl) {
-        return json_body(body);
-    }
-    match crate::insights::insights_summary_on(&state.kernel, clock).await {
-        Ok(s) => match serde_json::to_string(&s) {
-            Ok(body) => {
-                state.remember(&key, &body);
-                json_body(body)
-            }
-            Err(e) => err_response(&e.to_string()).into_response(),
-        },
+    let kernel = state.kernel.clone();
+    let work = async move {
+        let s = crate::insights::insights_summary_on(&kernel, clock).await.map_err(|e| e.to_string())?;
+        serde_json::to_string(&s).map_err(|e| e.to_string())
+    };
+    match state.answers.computed(&key, ttl, work).await {
+        Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", error = %e, "insights read failed");
-            err_response(&e.to_string()).into_response()
+            err_response(&e).into_response()
         }
     }
 }
@@ -891,6 +954,30 @@ mod tests {
 
         let unbounded = crate::answered_within(None, "test read", || async { Ok(1) }).await;
         assert_eq!(unbounded.expect("no bound, no timeout"), 1);
+    }
+
+    /// An answer is computed once however many ask, and kept when the one
+    /// who started it gives up (#415 QA): under load a range outran the
+    /// budget, and every poll began it again from nothing.
+    #[tokio::test]
+    async fn an_answer_is_computed_once_and_kept_when_its_asker_gives_up() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const STEP: Duration = Duration::from_millis(30); // skill-allow: §9-duration — test fixture, not a policy
+        let answers = Answers::default();
+        let runs = std::sync::Arc::new(AtomicU32::new(0));
+        let slow = |runs: std::sync::Arc<AtomicU32>| async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(STEP * 2).await;
+            Ok::<_, String>("body".to_string())
+        };
+        let gave_up = tokio::time::timeout(STEP, answers.computed("k", 60, slow(runs.clone()))).await;
+        assert!(gave_up.is_err(), "the first asker gives up before the answer");
+        let joined = answers.computed("k", 60, slow(runs.clone())).await;
+        assert_eq!(joined.as_deref(), Ok("body"), "the next joins the computation under way");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "computed once");
+        let cached = answers.computed("k", 60, slow(runs.clone())).await;
+        assert_eq!(cached.as_deref(), Ok("body"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "and then from the cache");
     }
 
     async fn get(path: &str) -> axum::response::Response {
