@@ -4221,6 +4221,41 @@ async fn a_new_version_is_credited_as_itself() {
     );
 }
 
+/// A binary is no lines written, and none still standing. git counts no
+/// lines in one, but its blame counts every byte that happens to be a
+/// newline: a SQLite database and 28 `.tar.gz` archives in
+/// gryphon-data-lake made a model that wrote 169 lines read as 810,360
+/// still standing — the best model on every chart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_binary_is_never_counted_as_lines_still_standing() {
+    let kernel = fresh_kernel().await;
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let repo = TestRepo::new_dated("lake", "main", t0 - chrono::Duration::hours(1));
+    let main = repo.cwd();
+    // A database and an archive committed alongside the work: binary to
+    // git, and full of bytes that happen to be newlines for blame to count.
+    let sqlite: Vec<u8> = b"SQLite format 3\0".iter().copied().chain(b"\0\x01row\n".repeat(2_000)).collect();
+    let tar_gz: Vec<u8> = [0x1f, 0x8b, 0x08, 0x00].into_iter().chain(b"\xff\n".repeat(1_000)).collect();
+    std::fs::write(repo.file("estate.sqlite"), sqlite).expect("database");
+    std::fs::create_dir_all(repo.file("sources")).expect("sources dir");
+    std::fs::write(repo.file("sources/host.tar.gz"), tar_gz).expect("archive");
+    repo.commit(main, h(1.0), "t@t", "feat: metadata, archive sources", &[("notes.md", "one\ntwo\nthree\n")]);
+
+    let (agent, pilot) = seed_agent_and_session(&kernel, "claude_code", "pilot").await;
+    for (id, at) in [("a1", h(0.5)), ("a2", h(1.5))] {
+        log_tool_message_at(&kernel, &pilot, &agent, serde_json::json!({
+            "cwd": main, "message": {"id": id, "model": "claude-opus-5-5", "usage": {"output_tokens": 100},
+                "content": [{"type": "text", "text": "working"}]}}), at).await;
+    }
+    let runs = superx_mod_ui::thrown::model_runs(&kernel).await.expect("runs");
+    let c = superx_mod_ui::compare::compare(&runs, &std::collections::HashMap::new()).await;
+    let row = c.deviations.iter().find(|d| d.model == "opus 5.5").expect("opus 5.5 row");
+    assert_eq!((row.added, row.commits), (3, 1), "the database and the archive add no lines");
+    assert_eq!(row.alive, 3, "and none of their newline bytes are still standing");
+    assert_eq!(row.survived_pct, 100);
+}
+
 /// A branch that lives on lands every squash (#415 QA). The main line is
 /// merged back into it after each squash: reading the tip against the merge
 /// base saw only the newest stretch, so every earlier squash matched no

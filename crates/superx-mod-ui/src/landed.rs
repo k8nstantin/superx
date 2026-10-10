@@ -191,6 +191,10 @@ pub struct WorkCommit {
     pub subject: String,
     /// `(path, added, removed)` per file. A binary reads `0, 0`.
     pub files: Vec<(String, i64, i64)>,
+    /// The files git counted no lines in: binaries, and anything a
+    /// `.gitattributes` marks `-diff`. Their "lines" are whatever bytes
+    /// happen to be newlines, so they are never blamed for survival.
+    pub binary: Vec<String>,
 }
 
 impl WorkCommit {
@@ -263,6 +267,7 @@ fn parse_work_log(out: &str) -> Vec<WorkCommit> {
                 author: author.to_string(),
                 subject: parts.next().unwrap_or("").to_ascii_lowercase(),
                 files: Vec::new(),
+                binary: Vec::new(),
             });
             continue;
         }
@@ -272,7 +277,11 @@ fn parse_work_log(out: &str) -> Vec<WorkCommit> {
         if path.is_empty() {
             continue;
         }
-        // A binary file prints `-` for both.
+        // A binary file prints `-` for both: no lines written, and none to
+        // blame later.
+        if a.trim() == "-" {
+            c.binary.push(path.to_string());
+        }
         c.files.push((
             path.to_string(),
             a.trim().parse::<i64>().unwrap_or(0),
@@ -571,12 +580,20 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
     let via: HashSet<&str> = work.landed_via.values().map(String::as_str).collect();
     let creditable =
         |c: &&WorkCommit| work.identity.as_deref() == Some(c.author.as_str()) || via.contains(c.hash.as_str());
+    // A file git counted no lines in is not blamed: its blame counts the
+    // bytes that happen to be newlines. A SQLite database and 28 `.tar.gz`
+    // archives made 169 lines written read as 810,360 still standing.
+    let binary: HashSet<&str> = work
+        .landed
+        .iter()
+        .flat_map(|c| c.binary.iter().map(String::as_str))
+        .collect();
     let mut files: Vec<String> = work
         .landed
         .iter()
         .filter(creditable)
         .flat_map(|c| c.files.iter().map(|f| f.0.clone()))
-        .filter(|f| !skip_for_survival(f) && present.contains(f))
+        .filter(|f| !skip_for_survival(f) && !binary.contains(f.as_str()) && present.contains(f))
         .collect();
     files.sort_unstable();
     files.dedup();
@@ -608,6 +625,20 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
             }
         }
     }
+    // A commit cannot still have more lines than it wrote. If blame says it
+    // does, the count is wrong, not the work: hold it to what was written,
+    // and log it, so the next such mismatch is found in the log rather than
+    // on a chart.
+    for c in &work.landed {
+        let added = c.added();
+        if let Some(alive) = work.alive.get_mut(&c.hash) {
+            if *alive > added {
+                tracing::warn!(target: "ui", repo = %dir.display(), commit = %c.hash, alive = *alive, added,
+                    "blame credits a commit with more lines than it wrote; held to what it wrote");
+                *alive = added;
+            }
+        }
+    }
     Some(work)
 }
 
@@ -636,5 +667,17 @@ mod tests {
         assert_eq!(raw_entry(&deleted), None, "every deletion shares the null blob");
         assert_eq!(raw_entry(&added), Some(("src/new.rs", new.as_str())));
         assert_eq!(raw_entry("\u{1}abc123"), None);
+    }
+
+    /// git counts no lines in a binary, and says so with `-`: it is no
+    /// lines written, and it is named so survival never blames it.
+    #[test]
+    fn a_binary_is_no_lines_written_and_is_named() {
+        let hash = "a".repeat(40);
+        let log = format!("\u{1}{hash} 1700000000 t@t feat: archive\n3\t0\tnotes.md\n-\t-\tsources/host.tar.gz\n");
+        let commits = parse_work_log(&log);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].added(), 3, "the binary adds nothing");
+        assert_eq!(commits[0].binary, vec!["sources/host.tar.gz".to_string()]);
     }
 }
