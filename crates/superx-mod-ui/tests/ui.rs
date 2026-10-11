@@ -4577,14 +4577,20 @@ async fn a_commit_goes_to_the_task_that_printed_it() {
     assert_eq!(pilot_log.printed.iter().filter(|p| head.starts_with(&p.hash)).count(), 1,
                "only the git call's output is read");
 
-    let s = superx_mod_ui::tasks::join(&logs, &std::collections::HashMap::new(), 300, 1_800, 1_800).await;
+    let s = superx_mod_ui::tasks::join(&logs, &std::collections::HashMap::new(), 300, 1_800, 1_800, 60).await;
     let c = s.commits.iter().find(|c| c.subject == "feat: the join").expect("the commit");
     assert_eq!(c.rule, Some(superx_mod_ui::tasks::Rule::Exact), "{c:?}");
     let task = &s.tasks[usize::try_from(c.task.expect("credited")).expect("index")];
     assert!(task.session.ends_with("pilot"), "the pilot made it, not the rival: {task:?}");
-    assert_eq!((task.models.clone(), task.files_written, task.commits), (vec!["opus 5.5".to_string()], 1, 1));
+    let models: Vec<&str> = task.models.iter().map(|m| m.model.as_str()).collect();
+    assert_eq!((models, task.files_written, task.commits), (vec!["opus 5.5"], 1, 1));
     assert_eq!((c.written, c.standing), (3, 3));
     assert_eq!((s.coverage.exact, s.coverage.uncredited), (1, 0));
+    // Nothing has been worked on in the repository since: the lines are
+    // counted, not judged (#436).
+    assert_eq!(task.exposure_minutes, 0);
+    let opus = s.models.iter().find(|m| m.model == "opus 5.5").expect("opus row");
+    assert_eq!((opus.tasks, opus.untested_written, opus.written, opus.standing_pct), (1, 3, 0, -1));
     // The operator's time: the rival's turn came 3 minutes after the pilot's.
     let rival_task = s.tasks.iter().find(|t| t.session.ends_with("rival")).expect("rival task");
     assert_eq!(rival_task.operator_secs, 180);
@@ -4617,7 +4623,7 @@ async fn files_settle_a_commit_and_a_subagent_is_unsupervised() {
     log_as(&kernel, &lead, &agent, "user", "no, that is wrong", serde_json::json!({"cwd": main}), h(1.5)).await;
 
     let logs = superx_mod_ui::tasks::session_logs(&kernel).await.expect("logs");
-    let s = superx_mod_ui::tasks::join(&logs, &std::collections::HashMap::new(), 300, 1_800, 1_800).await;
+    let s = superx_mod_ui::tasks::join(&logs, &std::collections::HashMap::new(), 300, 1_800, 1_800, 60).await;
     let c = s.commits.iter().find(|c| c.subject == "feat: the sub part").expect("the commit");
     assert_eq!(c.rule, Some(superx_mod_ui::tasks::Rule::Files), "two tasks open; the files say which: {c:?}");
     let task = &s.tasks[usize::try_from(c.task.expect("credited")).expect("index")];
