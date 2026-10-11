@@ -2371,6 +2371,16 @@ impl TestRepo {
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
+    /// The full hash of the commit `HEAD` names in the checkout at `dir`.
+    fn head(&self, dir: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", dir, "rev-parse", "HEAD"])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "rev-parse: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     /// The checkout's root, as a transcript's `cwd` carries it. Paths are
     /// leaked into `&'static str` so a fixture closure can take them as
     /// the `&str` a transcript field is — a test process is short-lived.
@@ -4504,4 +4514,118 @@ async fn the_live_stream_resumes_inside_an_instant_and_catches_a_late_row() {
     assert_eq!(third.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), vec![late], "the late row, and only it");
     let fourth = live.read::<superx_kernel::TelemetryRecord>(&kernel, 3).await.expect("fourth poll");
     assert!(fourth.is_empty(), "sent once: {fourth:?}");
+}
+
+/// A message as the capture records it: `role` set the way the adapter
+/// classifies the transcript line, at the agent's own time.
+async fn log_as(kernel: &Kernel, session: &superx_kernel::types::RecordId, agent: &superx_kernel::types::RecordId,
+                role: &str, content: &str, raw: serde_json::Value, at: chrono::DateTime<chrono::Utc>) {
+    kernel
+        .log_message(superx_kernel::NewMessage {
+            session: session.clone(),
+            agent: agent.clone(),
+            role: role.to_string(),
+            content: content.to_string(),
+            raw: Some(superx_kernel::message::json_to_object(&raw)),
+            seq: None,
+            emitted_at: Some(at),
+        })
+        .await
+        .expect("message");
+}
+
+/// The join reads what the agent wrote and what git printed to it, and a
+/// commit printed with its subject goes to the task that printed it, even
+/// while another session's task was open in the same repository (#434).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_goes_to_the_task_that_printed_it() {
+    let kernel = fresh_kernel().await;
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let repo = TestRepo::new_dated("superx", "main", t0 - chrono::Duration::hours(1));
+    let main = repo.cwd();
+    let (agent, pilot) = seed_agent_and_session(&kernel, "claude_code", "pilot").await;
+    let (_, rival) = seed_agent_and_session(&kernel, "claude_code", "rival").await;
+
+    log_as(&kernel, &pilot, &agent, "user", "build the join", serde_json::json!({"cwd": main}), h(0.5)).await;
+    // The rival session is at work in the same repository at the same time.
+    log_as(&kernel, &rival, &agent, "user", "look at the logs", serde_json::json!({"cwd": main}), h(0.55)).await;
+    log_as(&kernel, &rival, &agent, "assistant", "", serde_json::json!({
+        "cwd": main, "message": {"id": "r1", "model": "claude-fable-5-1", "usage": {"output_tokens": 5},
+            "content": [{"type": "text", "text": "reading"}]}}), h(0.65)).await;
+    // The pilot writes a file and commits it. A `Write` carries the whole
+    // file; only its path may come back from the engine.
+    log_as(&kernel, &pilot, &agent, "assistant", "", serde_json::json!({
+        "cwd": main, "message": {"id": "p1", "model": "claude-opus-5-5", "usage": {"output_tokens": 100},
+            "content": [
+                {"type": "tool_use", "id": "w1", "name": "Write",
+                 "input": {"file_path": repo.file("src/join.rs"), "content": "one\ntwo\nthree\n"}},
+                {"type": "tool_use", "id": "g1", "name": "Bash",
+                 "input": {"command": "git add -A && git commit -m 'feat: the join'"}},
+                {"type": "tool_use", "id": "l1", "name": "Bash", "input": {"command": "ls"}}]}}), h(0.6)).await;
+    repo.commit(main, h(0.7), "t@t", "feat: the join", &[("src/join.rs", "one\ntwo\nthree\n")]);
+    let head = repo.head(main);
+    log_as(&kernel, &pilot, &agent, "tool", "", serde_json::json!({
+        "cwd": main, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "g1", "content": format!("[main {}] feat: the join\n 1 file changed", &head[..7])},
+            {"type": "tool_result", "tool_use_id": "l1", "content": format!("{} not a commit print", &head[..7])}]}}), h(0.71)).await;
+
+    let logs = superx_mod_ui::tasks::session_logs(&kernel).await.expect("logs");
+    let pilot_log = logs.iter().find(|l| l.name.ends_with("pilot")).expect("pilot log");
+    assert_eq!(pilot_log.writes.len(), 1);
+    assert_eq!(pilot_log.writes[0].paths, vec![repo.file("src/join.rs").to_string()], "the path, not the body");
+    assert_eq!(pilot_log.printed.iter().filter(|p| head.starts_with(&p.hash)).count(), 1,
+               "only the git call's output is read");
+
+    let s = superx_mod_ui::tasks::join(&logs, &std::collections::HashMap::new(), 300, 1_800, 1_800).await;
+    let c = s.commits.iter().find(|c| c.subject == "feat: the join").expect("the commit");
+    assert_eq!(c.rule, Some(superx_mod_ui::tasks::Rule::Exact), "{c:?}");
+    let task = &s.tasks[usize::try_from(c.task.expect("credited")).expect("index")];
+    assert!(task.session.ends_with("pilot"), "the pilot made it, not the rival: {task:?}");
+    assert_eq!((task.models.clone(), task.files_written, task.commits), (vec!["opus 5.5".to_string()], 1, 1));
+    assert_eq!((c.written, c.standing), (3, 3));
+    assert_eq!((s.coverage.exact, s.coverage.uncredited), (1, 0));
+    // The operator's time: the rival's turn came 3 minutes after the pilot's.
+    let rival_task = s.tasks.iter().find(|t| t.session.ends_with("rival")).expect("rival task");
+    assert_eq!(rival_task.operator_secs, 180);
+    assert_eq!(s.sittings.len(), 1);
+}
+
+/// Without a print, the files settle it; a session no operator turn opened
+/// is unsupervised work; and a correction marks the task before it (#434).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_settle_a_commit_and_a_subagent_is_unsupervised() {
+    let kernel = fresh_kernel().await;
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(10);
+    let h = |x: f64| t0 + chrono::Duration::seconds((x * 3600.0) as i64);
+    let repo = TestRepo::new_dated("superx", "main", t0 - chrono::Duration::hours(1));
+    let main = repo.cwd();
+    let (agent, lead) = seed_agent_and_session(&kernel, "claude_code", "lead").await;
+    let (_, sub) = seed_agent_and_session(&kernel, "claude_code", "sub").await;
+    let edit = |id: &str, file: &str, model: &str| serde_json::json!({
+        "cwd": main, "message": {"id": id, "model": model, "usage": {"output_tokens": 10},
+            "content": [{"type": "tool_use", "id": format!("e-{id}"), "name": "Edit",
+                         "input": {"file_path": repo.file(file), "old_string": "a", "new_string": "b"}}]}});
+
+    log_as(&kernel, &lead, &agent, "user", "split the work", serde_json::json!({"cwd": main}), h(1.0)).await;
+    log_as(&kernel, &lead, &agent, "assistant", "", edit("a1", "src/lead.rs", "claude-opus-5-5"), h(1.05)).await;
+    // A subagent: its own session, no operator turn, at work at the same time.
+    log_as(&kernel, &sub, &agent, "assistant", "", edit("s1", "src/sub.rs", "claude-haiku-5-5"), h(1.1)).await;
+    // While the subagent is still at work: within the idle threshold of its
+    // last activity.
+    repo.commit(main, h(1.15), "t@t", "feat: the sub part", &[("src/sub.rs", "x\ny\n")]);
+    log_as(&kernel, &lead, &agent, "user", "no, that is wrong", serde_json::json!({"cwd": main}), h(1.5)).await;
+
+    let logs = superx_mod_ui::tasks::session_logs(&kernel).await.expect("logs");
+    let s = superx_mod_ui::tasks::join(&logs, &std::collections::HashMap::new(), 300, 1_800, 1_800).await;
+    let c = s.commits.iter().find(|c| c.subject == "feat: the sub part").expect("the commit");
+    assert_eq!(c.rule, Some(superx_mod_ui::tasks::Rule::Files), "two tasks open; the files say which: {c:?}");
+    let task = &s.tasks[usize::try_from(c.task.expect("credited")).expect("index")];
+    assert!(task.session.ends_with("sub"));
+    assert_eq!(task.driver, superx_mod_ui::tasks::Driver::Unsupervised);
+    assert_eq!(task.unsupervised_out_tokens, 10);
+    let lead_tasks: Vec<_> = s.tasks.iter().filter(|t| t.session.ends_with("lead")).collect();
+    assert_eq!(lead_tasks.len(), 2);
+    assert!(lead_tasks[0].needed_correcting, "the turn after it pulled it back");
+    assert_eq!(lead_tasks[1].driver, superx_mod_ui::tasks::Driver::Corrected);
 }

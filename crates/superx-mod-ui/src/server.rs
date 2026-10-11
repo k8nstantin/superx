@@ -221,6 +221,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         // and a slow walk cut off would never finish to be cached. A route
         // added after `route_layer` is outside it.
         .route("/api/compare", get(api_compare))
+        .route("/api/tasks", get(api_tasks))
         .fallback(get(static_assets))
         .with_state(state);
     let addr = format!("127.0.0.1:{port}");
@@ -732,6 +733,30 @@ async fn api_compare(State(state): State<AppState>) -> axum::response::Response 
         repos: c.repos,
         unjudged: c.unjudged,
         computed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match serde_json::to_string(&summary) {
+        Ok(body) => {
+            state.remember(KEY, &body);
+            json_body(body)
+        }
+        Err(e) => json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
+    }
+}
+
+/// The join (#434): every task, every commit matched to it, and the
+/// operator's sittings. Cached for [`THROWN_CACHE_SECS`], as the comparison
+/// is: it walks git and every session.
+async fn api_tasks(State(state): State<AppState>) -> axum::response::Response {
+    const KEY: &str = "tasks";
+    if let Some(body) = state.cached(KEY, THROWN_CACHE_SECS) {
+        return json_body(body);
+    }
+    let summary = match crate::tasks::tasks(&state.kernel).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(target: "ui", error = %e, "task join read failed");
+            return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string())));
+        }
     };
     match serde_json::to_string(&summary) {
         Ok(body) => {

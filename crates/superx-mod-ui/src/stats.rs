@@ -2064,7 +2064,7 @@ fn recorded_diff(raw: &Object, failed: bool) -> Option<RecordedDiff> {
 /// A tool result's text: the string, or the text blocks of a list (#413).
 /// Agent, ToolSearch and MCP results arrive as lists — 16% of results —
 /// and were invisible to the byte count and the secret scan.
-fn tool_result_text(block: &Object) -> Option<String> {
+pub(crate) fn tool_result_text(block: &Object) -> Option<String> {
     match block.get("content") {
         Some(Value::String(s)) => Some(s.clone()),
         Some(Value::Array(parts)) => {

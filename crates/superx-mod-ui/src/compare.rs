@@ -56,7 +56,7 @@ const TAKEOVER_SECS: i64 = 3 * 3600; // skill-allow: §9-const — read-path bou
 /// than authored work. Counting one of these as a model's own churn
 /// moves every ratio by more than the entire rest of the history, and
 /// it did exactly that before this bound existed.
-const BULK_COMMIT: i64 = 5_000; // skill-allow: §9-const — read-path bound, not a policy tunable
+pub(crate) const BULK_COMMIT: i64 = 5_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
 fn is_rework(subject: &str) -> bool {
     REWORK_SUBJECTS.iter().any(|w| subject.starts_with(w))
@@ -73,7 +73,7 @@ fn top_dir(path: &str) -> &str {
 
 /// Split `total` over `weights` in proportion, in whole units, so the
 /// shares add up to `total` exactly — the remainder goes to the largest.
-fn split(total: i64, weights: &[i64]) -> Vec<i64> {
+pub(crate) fn split(total: i64, weights: &[i64]) -> Vec<i64> {
     let sum: i64 = weights.iter().sum();
     if sum <= 0 {
         return vec![0; weights.len()];

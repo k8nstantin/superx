@@ -27,6 +27,7 @@ pub mod insights;
 pub mod landed;
 mod server;
 pub mod stats;
+pub mod tasks;
 pub mod thrown;
 
 pub const MODULE_NAME: &str = "ui";
