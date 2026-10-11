@@ -399,7 +399,7 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
 /// `num` as a whole percentage of `den`, rounded to the nearest — the
 /// page's own rule. Floored here and rounded there, one share read 10% in
 /// the table and 11% on the bar beside it (#426).
-fn pct(num: i64, den: i64) -> i64 {
+pub(crate) fn pct(num: i64, den: i64) -> i64 {
     if den > 0 { (200 * num + den) / (2 * den) } else { 0 }
 }
 

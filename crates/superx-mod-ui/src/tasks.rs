@@ -102,6 +102,18 @@ pub enum Rule {
     Time,
 }
 
+/// One model's part in a task: what it spent there.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct ModelSpend {
+    /// The model family (`opus 5.5`).
+    pub model: String,
+    pub out_tokens: i64,
+    /// Of those, the ones spent more than the leash after the turn, or in
+    /// work no turn opened.
+    pub unsupervised_out_tokens: i64,
+}
+
 // ---------------------------------------------------------------------------
 // One session, as read from the substrate
 // ---------------------------------------------------------------------------
@@ -365,8 +377,9 @@ pub struct Task {
     /// The next turn pulled this work back.
     pub needed_correcting: bool,
     pub opening: String,
-    /// Model families that replied, in order of first reply.
-    pub models: Vec<String>,
+    /// The model families that replied, in order of first reply, with what
+    /// each spent.
+    pub models: Vec<ModelSpend>,
     pub out_tokens: i64,
     /// Output tokens spent more than the leash after the turn.
     pub unsupervised_out: i64,
@@ -456,11 +469,18 @@ pub fn build_tasks(log: &SessionLog, idle_secs: i64, leash_secs: i64) -> Vec<Tas
     for r in &log.replies {
         let i = owner(r.at);
         let t = &mut tasks[i];
-        if !t.models.contains(&r.model) {
-            t.models.push(r.model.clone());
+        let unsupervised = t.driver == Driver::Unsupervised || r.at > t.opened + Duration::seconds(leash_secs);
+        if !t.models.iter().any(|m| m.model == r.model) {
+            t.models.push(ModelSpend { model: r.model.clone(), ..ModelSpend::default() });
+        }
+        if let Some(m) = t.models.iter_mut().find(|m| m.model == r.model) {
+            m.out_tokens += r.out_tokens;
+            if unsupervised {
+                m.unsupervised_out_tokens += r.out_tokens;
+            }
         }
         t.out_tokens += r.out_tokens;
-        if t.driver == Driver::Unsupervised || r.at > t.opened + Duration::seconds(leash_secs) {
+        if unsupervised {
             t.unsupervised_out += r.out_tokens;
         }
         let since = prev_reply[i].unwrap_or(t.opened);
@@ -646,12 +666,17 @@ pub struct TaskRow {
     pub driver: Driver,
     pub needed_correcting: bool,
     pub opening: String,
-    pub models: Vec<String>,
+    pub models: Vec<ModelSpend>,
     pub out_tokens: i64,
     pub unsupervised_out_tokens: i64,
-    pub working_minutes: i64,
+    /// The agent's working time. Seconds, so that hours summed over
+    /// thousands of tasks lose nothing to rounding.
+    pub working_secs: i64,
     /// The operator's time on the turn that opened it, in seconds.
     pub operator_secs: i64,
+    /// Working minutes later tasks spent in the repositories it worked in:
+    /// how far its work has been tested.
+    pub exposure_minutes: i64,
     pub repos: Vec<String>,
     pub files_written: i64,
     pub commits: i64,
@@ -705,6 +730,10 @@ pub struct TasksSummary {
     pub commits: Vec<CommitRow>,
     pub coverage: Coverage,
     pub sittings: Vec<Sitting>,
+    /// One row per model, cut from the tasks (#436).
+    pub models: Vec<crate::models::ModelRow>,
+    /// The later work, in minutes, that makes a task's work tested.
+    pub tested_minutes: i64,
     pub computed_at: String,
 }
 
@@ -779,13 +808,15 @@ fn fates(work: &RepoWork, ours: &dyn Fn(&str) -> bool) -> HashMap<String, Fate> 
 }
 
 /// The join over every session's log. `mainlines` is the operator's
-/// `attr_ui_mainline_refs`.
+/// `attr_ui_mainline_refs`; `tested_minutes` is the later work that makes a
+/// task's work tested, for the model rows.
 pub async fn join(
     logs: &[SessionLog],
     mainlines: &HashMap<String, String>,
     idle_secs: i64,
     leash_secs: i64,
     break_secs: i64,
+    tested_minutes: i64,
 ) -> TasksSummary {
     let mut tasks: Vec<Task> = logs.iter().flat_map(|l| build_tasks(l, idle_secs, leash_secs)).collect();
     tasks.sort_by(|a, b| a.opened.cmp(&b.opened).then_with(|| a.session.cmp(&b.session)));
@@ -831,6 +862,27 @@ pub async fn join(
             }
         }
     }
+
+    // A task's exposure: the working time of every task opened after it
+    // closed, in any repository it worked in, each counted once.
+    let mut task_keys: Vec<Vec<&str>> = vec![Vec::new(); tasks.len()];
+    for (key, r) in &repos {
+        for &i in &r.tasks {
+            task_keys[i].push(key.as_str());
+        }
+    }
+    let task_exposure: Vec<i64> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let later: HashSet<usize> = task_keys[i]
+                .iter()
+                .flat_map(|k| repos[*k].tasks.iter().copied())
+                .filter(|&k| k != i && tasks[k].opened >= t.until)
+                .collect();
+            later.iter().map(|&k| tasks[k].working_secs).sum::<i64>() / 60
+        })
+        .collect();
 
     let mut coverage = Coverage::default();
     let mut commits: Vec<CommitRow> = Vec::new();
@@ -908,8 +960,9 @@ pub async fn join(
             models: t.models.clone(),
             out_tokens: t.out_tokens,
             unsupervised_out_tokens: t.unsupervised_out,
-            working_minutes: t.working_secs / 60,
+            working_secs: t.working_secs,
             operator_secs: operator.get(&(t.session.as_str(), t.opened)).copied().unwrap_or(0),
+            exposure_minutes: task_exposure[i],
             repos: task_repos[i].clone(),
             files_written: t.files.len() as i64,
             commits: 0,
@@ -930,11 +983,13 @@ pub async fn join(
         row.lines_never_landed += c.never_landed;
         row.lines_in_flight += c.in_flight;
     }
-    TasksSummary { tasks: rows, commits, coverage, sittings, computed_at: Utc::now().to_rfc3339() }
+    let models = crate::models::model_rows(&rows, tested_minutes);
+    TasksSummary { tasks: rows, commits, coverage, sittings, models, tested_minutes, computed_at: Utc::now().to_rfc3339() }
 }
 
-/// Resolve a positive seconds parameter on the ui module, else `default`.
-async fn resolved_secs(kernel: &Kernel, param: &str, default: i64) -> i64 {
+/// Resolve a positive whole-number parameter on the ui module, else
+/// `default`.
+pub(crate) async fn resolved_positive(kernel: &Kernel, param: &str, default: i64) -> i64 {
     match crate::module_parameter(kernel, param).await {
         Some(Value::Number(n)) => n.to_int().filter(|&v| v > 0).unwrap_or(default),
         _ => default,
@@ -943,12 +998,12 @@ async fn resolved_secs(kernel: &Kernel, param: &str, default: i64) -> i64 {
 
 /// The leash: how long after a turn the work still counts as steered.
 pub async fn resolved_leash_secs(kernel: &Kernel) -> i64 {
-    resolved_secs(kernel, LEASH_SECS_PARAM, DEFAULT_LEASH_SECS).await
+    resolved_positive(kernel, LEASH_SECS_PARAM, DEFAULT_LEASH_SECS).await
 }
 
 /// The break threshold: the longest gap between turns that is still work.
 pub async fn resolved_break_secs(kernel: &Kernel) -> i64 {
-    resolved_secs(kernel, BREAK_SECS_PARAM, DEFAULT_BREAK_SECS).await
+    resolved_positive(kernel, BREAK_SECS_PARAM, DEFAULT_BREAK_SECS).await
 }
 
 /// Everything `/api/tasks` serves, read and joined.
@@ -962,7 +1017,8 @@ pub async fn tasks(kernel: &Kernel) -> Result<TasksSummary> {
     let idle = crate::stats::resolved_active_secs(kernel).await;
     let leash = resolved_leash_secs(kernel).await;
     let brk = resolved_break_secs(kernel).await;
-    Ok(join(&logs, &mainlines, idle, leash, brk).await)
+    let tested = crate::models::resolved_tested_minutes(kernel).await;
+    Ok(join(&logs, &mainlines, idle, leash, brk, tested).await)
 }
 
 #[cfg(test)]
@@ -1015,7 +1071,9 @@ mod tests {
         assert_eq!(tasks[0].unsupervised_out, 50, "the reply 45 minutes in is past a 30-minute leash");
         assert_eq!(tasks[0].working_secs, 60 + 300, "gaps capped at the idle threshold");
         assert_eq!(tasks[0].until, t("2026-10-01T11:00:00Z"));
-        assert_eq!(tasks[1].models, vec!["fable 5.1".to_string()]);
+        assert_eq!(tasks[1].models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(), vec!["fable 5.1"]);
+        assert_eq!((tasks[0].models[0].out_tokens, tasks[0].models[0].unsupervised_out_tokens), (150, 50),
+                   "each model's own spend, past the leash counted apart");
     }
 
     #[test]
