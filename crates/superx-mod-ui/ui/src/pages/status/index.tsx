@@ -1,17 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { Alert, Box, Button, Group, Loader, Text } from '@mantine/core'
-import { fetchInsights, fetchStats, fetchStatus, fetchTasks } from '../../api'
+import { fetchCompare, fetchInsights, fetchStats, fetchStatus } from '../../api'
 import { useBreadcrumb } from '../../Breadcrumbs'
 import { Annunciator } from './Annunciator'
 import { CodeSection } from './CodeSection'
 import { CostSection } from './CostSection'
 import { DeviationsSection } from './DeviationsSection'
 import { FleetSection } from './FleetSection'
+import { ModelComparison } from './ModelComparison'
 import { FlightDeck } from './FlightDeck'
 import { Gauges } from './Gauges'
 import { HistorySection } from './HistorySection'
-import { ModelsSection } from './ModelsSection'
 import { ProductivitySection } from './ProductivitySection'
 import { QualitySection } from './QualitySection'
 import { Section, rangeLabel } from './parts'
@@ -19,22 +19,21 @@ import { readHash, writeHash } from '../../route'
 import { SystemsSection } from './SystemsSection'
 
 // The cockpit (#367). One sticky bar carries the sections and the
-// range; below it, the bands in the order a pilot reads them: what is
-// wrong, who is in the air, which model to reach for (#436, read from the
-// join over all history), the primary instruments, then the code,
+// range; below it, ten bands in the order a pilot reads them: what is
+// wrong, who is in the air, the primary instruments, then the code,
 // its quality, the fleet, what it all cost against what came back, the
 // cost itself, the long view and the machine.
 
 const SECTIONS = [
   ['warnings', 'Warnings'],
   ['deck', 'Flight deck'],
-  ['models', 'Models'],
   ['gauges', 'Gauges'],
   ['code', 'Code'],
   ['quality', 'Quality'],
   ['deviations', 'Deviations'],
   ['fleet', 'Fleet'],
   ['productivity', 'Productivity'],
+  ['models', 'Model comparison'],
   ['cost', 'Cost'],
   ['history', 'History'],
   ['systems', 'Systems'],
@@ -88,9 +87,9 @@ export default function StatusPage() {
     retry: false,
   })
   const insights = useQuery({ queryKey: ['insights'], queryFn: fetchInsights, refetchInterval: 60000 })
-  // Read from git and every session, cached server-side for minutes: it
-  // moves when commits land, not when the page polls.
-  const tasks = useQuery({ queryKey: ['tasks'], queryFn: fetchTasks, refetchInterval: 300000 })
+  // Read from git, cached server-side for minutes: it moves when
+  // commits land, not when the page polls.
+  const compare = useQuery({ queryKey: ['compare'], queryFn: fetchCompare, refetchInterval: 300000 })
 
   const s = stats.data
   const i = insights.data
@@ -185,13 +184,6 @@ export default function StatusPage() {
       <Section id="deck" title="Flight deck" blurb="who is in the air right now, and how each one is flying">
         <FlightDeck s={s} i={i} status={status.data} loading={stats.isFetching && !s} />
       </Section>
-      <Section
-        id="models"
-        title="Models"
-        blurb="which model to reach for — every turn, the commits it led to, and what is still standing"
-      >
-        <ModelsSection t={tasks.data} />
-      </Section>
       <Section id="gauges" title="Gauges" blurb="the primary instruments — attitude, heading, whether the work holds">
         <Gauges s={stale ? undefined : s} i={i} range={range} />
       </Section>
@@ -217,6 +209,13 @@ export default function StatusPage() {
         blurb="effort divided by outcome — and the human half of the loop"
       >
         <ProductivitySection s={s} range={s?.range ?? range} />
+      </Section>
+      <Section
+        id="models"
+        title="Model comparison"
+        blurb="which model to reach for — what its work is worth, how hard it churns, and what happens when the model is switched"
+      >
+        <ModelComparison c={compare.data} />
       </Section>
       <Section id="cost" title="Cost" blurb="what the tokens bought, and what left this machine">
         <CostSection s={s} i={i} range={s?.range ?? range} />
