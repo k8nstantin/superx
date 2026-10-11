@@ -84,21 +84,21 @@ fn version_word(w: &str) -> bool {
         && w.split('.').all(|d| !d.is_empty() && d.len() <= 2)
 }
 
-fn obj(v: &Value) -> Option<&Object> {
+pub(crate) fn obj(v: &Value) -> Option<&Object> {
     match v {
         Value::Object(o) => Some(o),
         _ => None,
     }
 }
 
-fn str_of<'a>(o: &'a Object, key: &str) -> Option<&'a str> {
+pub(crate) fn str_of<'a>(o: &'a Object, key: &str) -> Option<&'a str> {
     match o.get(key) {
         Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
         _ => None,
     }
 }
 
-fn time_of(o: &Object, key: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn time_of(o: &Object, key: &str) -> Option<DateTime<Utc>> {
     match o.get(key) {
         Some(Value::Datetime(d)) => Some(**d),
         _ => None,
@@ -107,7 +107,7 @@ fn time_of(o: &Object, key: &str) -> Option<DateTime<Utc>> {
 
 /// The reply a row belongs to: Claude's `message.id` or Gemini's record
 /// `id` (strings), or the row's own id when it carries neither.
-fn key_of(o: &Object) -> Option<String> {
+pub(crate) fn key_of(o: &Object) -> Option<String> {
     match o.get("k") {
         Some(Value::String(s)) => Some(s.clone()),
         Some(Value::RecordId(r)) => Some(superx_ops::record_uuid(r)),
