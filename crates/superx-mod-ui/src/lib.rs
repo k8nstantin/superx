@@ -43,16 +43,25 @@ pub const SCHEMA_DDL: &str = include_str!("../schema/ui.surql");
 
 pub struct UiModule;
 
+/// A parameter on the ui module's registry entity, read with the timeout
+/// and retry every other substrate read has (#430). The two kernel verbs
+/// were read bare, and a lost reply here held every request that resolves
+/// a parameter until the read budget cut it off.
+pub(crate) async fn module_parameter(kernel: &Kernel, param: &str) -> Option<Value> {
+    let entity = answered("ui module", || kernel.find_module_by_name(NodeKind::KernelModule, MODULE_NAME))
+        .await
+        .ok()
+        .flatten()?;
+    answered("ui module parameter", || kernel.get_parameter(entity.clone(), param))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Resolve the UI port: parameter on the module entity, else default.
 pub async fn resolved_port(kernel: &Kernel) -> u16 {
-    let Ok(Some(entity)) = kernel
-        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
-        .await
-    else {
-        return DEFAULT_PORT;
-    };
-    match kernel.get_parameter(entity, PORT_PARAM).await {
-        Ok(Some(Value::Number(n))) => n
+    match module_parameter(kernel, PORT_PARAM).await {
+        Some(Value::Number(n)) => n
             .to_int()
             .and_then(|i| u16::try_from(i).ok())
             .filter(|&p| p > 0)
@@ -83,14 +92,8 @@ pub const DEFAULT_STATS_WINDOW: u32 = 500; // skill-allow: §9-const — bootstr
 /// Resolve the stats window: parameter on the module entity, else
 /// default.
 pub async fn resolved_stats_window(kernel: &Kernel) -> u32 {
-    let Ok(Some(entity)) = kernel
-        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
-        .await
-    else {
-        return DEFAULT_STATS_WINDOW;
-    };
-    match kernel.get_parameter(entity, STATS_WINDOW_PARAM).await {
-        Ok(Some(Value::Number(n))) => n
+    match module_parameter(kernel, STATS_WINDOW_PARAM).await {
+        Some(Value::Number(n)) => n
             .to_int()
             .and_then(|v| u32::try_from(v).ok())
             .filter(|&v| v > 0)
@@ -137,14 +140,8 @@ pub const RANGES: [&str; 7] = ["window", "1h", "6h", "24h", "7d", "30d", "all"];
 /// Resolve the landing range: parameter on the module entity when it
 /// names a known range, else the fallback.
 pub async fn resolved_default_range(kernel: &Kernel) -> String {
-    let Ok(Some(entity)) = kernel
-        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
-        .await
-    else {
-        return DEFAULT_RANGE.to_string();
-    };
-    match kernel.get_parameter(entity, DEFAULT_RANGE_PARAM).await {
-        Ok(Some(Value::String(r))) if RANGES.contains(&r.as_str()) => r,
+    match module_parameter(kernel, DEFAULT_RANGE_PARAM).await {
+        Some(Value::String(r)) if RANGES.contains(&r.as_str()) => r,
         _ => DEFAULT_RANGE.to_string(),
     }
 }
@@ -202,14 +199,8 @@ pub async fn resolved_read_timeout_secs(kernel: &Kernel) -> u64 {
 /// A count of seconds on the module entity: the parameter when it is a
 /// whole number of zero or more, else the fallback.
 async fn resolved_secs(kernel: &Kernel, param: &str, fallback: u64) -> u64 {
-    let Ok(Some(entity)) = kernel
-        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
-        .await
-    else {
-        return fallback;
-    };
-    match kernel.get_parameter(entity, param).await {
-        Ok(Some(Value::Number(n))) => n
+    match module_parameter(kernel, param).await {
+        Some(Value::Number(n)) => n
             .to_int()
             .filter(|&v| v >= 0)
             .map_or(fallback, |v| v as u64),
@@ -287,14 +278,8 @@ async fn mainline_cli(kernel: &Kernel, args: &[String]) -> Result<String> {
 
 /// Resolve the main-line overrides; none when the parameter is unset.
 pub async fn resolved_mainline_refs(kernel: &Kernel) -> std::collections::HashMap<String, String> {
-    let Ok(Some(entity)) = kernel
-        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
-        .await
-    else {
-        return std::collections::HashMap::new();
-    };
-    match kernel.get_parameter(entity, MAINLINE_REFS_PARAM).await {
-        Ok(Some(Value::Object(o))) => o
+    match module_parameter(kernel, MAINLINE_REFS_PARAM).await {
+        Some(Value::Object(o)) => o
             .iter()
             .filter_map(|(k, v)| match v {
                 Value::String(r) if !r.is_empty() => Some((k.clone(), r.clone())),
@@ -308,14 +293,8 @@ pub async fn resolved_mainline_refs(kernel: &Kernel) -> std::collections::HashMa
 /// Resolve the context-window size: parameter on the module entity,
 /// else default.
 pub async fn resolved_context_window(kernel: &Kernel) -> i64 {
-    let Ok(Some(entity)) = kernel
-        .find_module_by_name(NodeKind::KernelModule, MODULE_NAME)
-        .await
-    else {
-        return DEFAULT_CONTEXT_WINDOW;
-    };
-    match kernel.get_parameter(entity, CONTEXT_WINDOW_PARAM).await {
-        Ok(Some(Value::Number(n))) => n
+    match module_parameter(kernel, CONTEXT_WINDOW_PARAM).await {
+        Some(Value::Number(n)) => n
             .to_int()
             .filter(|&v| v > 0)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW),

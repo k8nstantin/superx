@@ -244,10 +244,7 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
 
     // ── per agent: message.agent is indexed and, until now, unread ──
     let mut agent_name: HashMap<String, String> = HashMap::new();
-    for a in kernel
-        .list_named_entities("node_agent", "attr_agent_descriptor")
-        .await?
-    {
+    for a in crate::answered("agents", || kernel.list_named_entities("node_agent", "attr_agent_descriptor")).await? {
         let name = match &a.payload {
             Value::Object(o) => get_str(o, "name").unwrap_or("?").to_string(),
             _ => "?".to_string(),

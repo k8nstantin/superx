@@ -352,10 +352,9 @@ async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let kernel = &state.kernel;
     let mut modules = Vec::new();
     for kind in [NodeKind::KernelModule, NodeKind::Adapter] {
-        if let Ok(list) = kernel.list_with_status(kind).await {
+        if let Ok(list) = crate::answered("module list", || kernel.list_with_status(kind)).await {
             for s in list {
-                let provisioned = kernel
-                    .latest_module_record(&s.name)
+                let provisioned = crate::answered("module record", || kernel.latest_module_record(&s.name))
                     .await
                     .ok()
                     .flatten()
@@ -366,9 +365,10 @@ async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
                 let ui_url = if s.name == crate::MODULE_NAME {
                     None
                 } else {
-                    match kernel
-                        .get_parameter(s.entity_id.clone(), "attr_module_ui_url")
-                        .await
+                    match crate::answered("module ui url", || {
+                        kernel.get_parameter(s.entity_id.clone(), "attr_module_ui_url")
+                    })
+                    .await
                     {
                         Ok(Some(superx_kernel::types::Value::String(u))) => Some(u),
                         _ => None,
@@ -386,8 +386,7 @@ async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
             }
         }
     }
-    let agents = kernel
-        .list_named_entities("node_agent", "attr_agent_descriptor")
+    let agents = crate::answered("agents", || kernel.list_named_entities("node_agent", "attr_agent_descriptor"))
         .await
         .map(|a| a.len())
         .unwrap_or(0);
@@ -405,15 +404,9 @@ async fn api_agents(State(state): State<AppState>) -> Json<Vec<AgentView>> {
     let kernel = &state.kernel;
     let mut out = Vec::new();
     let (Ok(agents), Ok(sessions), Ok(sources)) = (
-        kernel
-            .list_named_entities("node_agent", "attr_agent_descriptor")
-            .await,
-        kernel
-            .list_named_entities("node_session", "attr_session_descriptor")
-            .await,
-        kernel
-            .list_named_entities("node_source", "attr_source_descriptor")
-            .await,
+        crate::answered("agents", || kernel.list_named_entities("node_agent", "attr_agent_descriptor")).await,
+        crate::answered("sessions", || kernel.list_named_entities("node_session", "attr_session_descriptor")).await,
+        crate::answered("sources", || kernel.list_named_entities("node_source", "attr_source_descriptor")).await,
     ) else {
         return Json(out);
     };
@@ -463,9 +456,8 @@ async fn api_sessions(
         return json_body(body);
     }
     let mut out = Vec::new();
-    let Ok(sessions) = kernel
-        .list_named_entities("node_session", "attr_session_descriptor")
-        .await
+    let Ok(sessions) =
+        crate::answered("sessions", || kernel.list_named_entities("node_session", "attr_session_descriptor")).await
     else {
         return json_body(serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string()));
     };
@@ -480,9 +472,8 @@ async fn api_sessions(
     // re-resolving agents per row (review finding, issue #187).
     let mut agent_ids: std::collections::HashMap<String, superx_kernel::types::RecordId> =
         std::collections::HashMap::new();
-    if let Ok(agents) = kernel
-        .list_named_entities("node_agent", "attr_agent_descriptor")
-        .await
+    if let Ok(agents) =
+        crate::answered("agents", || kernel.list_named_entities("node_agent", "attr_agent_descriptor")).await
     {
         for a in &agents {
             if let superx_kernel::types::Value::Object(o) = &a.payload {
@@ -514,8 +505,7 @@ async fn api_sessions(
         } else {
             agent_ids.get(&agent).map(|id| (id.clone(), src.clone()))
         };
-        let count = kernel
-            .session_message_count(s.entity_id.clone())
+        let count = crate::answered("session messages", || kernel.session_message_count(s.entity_id.clone()))
             .await
             .unwrap_or(0)
             + crate::activity::session_action_count(kernel, s.entity_id.clone(), scope)
