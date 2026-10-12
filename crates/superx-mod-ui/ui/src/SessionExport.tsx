@@ -4,8 +4,11 @@ import type { SessionView } from './generated/SessionView'
 import {
   DEFAULT_EXPORT,
   TRIMMED_TOOL_LINES,
+  canChooseWhere,
+  chooseWhere,
   collectSession,
   download,
+  writeTo,
   exportFileName,
   formatSession,
   type ExportOptions,
@@ -38,6 +41,7 @@ export function SessionExport({ session, search }: { session: SessionView; searc
   const [o, setO] = useState<ExportOptions>(storedOptions)
   const [busy, setBusy] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [saved, setSaved] = useState<string | null>(null)
   const q = search.trim()
   const set = (patch: Partial<ExportOptions>) =>
     setO((prev) => {
@@ -46,15 +50,29 @@ export function SessionExport({ session, search }: { session: SessionView; searc
       return next
     })
 
+  const choose = canChooseWhere()
   const run = async () => {
     setError(null)
-    setBusy(0)
+    setSaved(null)
     try {
+      const now = new Date()
+      const name = exportFileName(session, o, now)
+      // The dialog first, straight off the click: the browser only opens
+      // it inside the reader's gesture, and reading a long session first
+      // could outlast that.
+      const target = choose ? await chooseWhere(name, o.format) : null
+      if (choose && !target) return // cancelled
+      setBusy(0)
       const filter = o.matching && q ? q : undefined
       const rows = await collectSession(session.session_id, filter, setBusy)
-      const now = new Date()
-      download(exportFileName(session, o, now), formatSession(session, rows, o, filter, now), o.format)
-      setOpened(false)
+      const text = formatSession(session, rows, o, filter, now)
+      if (target) {
+        await writeTo(target, text, o.format)
+        setSaved(target.name)
+      } else {
+        download(name, text, o.format)
+        setOpened(false)
+      }
     } catch (e) {
       setError(String(e))
     } finally {
@@ -144,12 +162,21 @@ export function SessionExport({ session, search }: { session: SessionView; searc
               could not export: {error}
             </Text>
           )}
+          {saved && busy == null && (
+            <Text size="xs" c="teal.4">
+              saved as {saved}
+            </Text>
+          )}
           <Group justify="space-between">
             <Text size="xs" c="dimmed">
-              {busy == null ? 'the whole session, back to its first row' : `reading… ${busy.toLocaleString()} rows`}
+              {busy != null
+                ? `reading… ${busy.toLocaleString()} rows`
+                : choose
+                  ? 'the whole session — you pick the folder and name'
+                  : 'the whole session, to your downloads folder (this browser has no save dialog)'}
             </Text>
             <Button size="xs" onClick={() => void run()} loading={busy != null}>
-              Download
+              {choose ? 'Save as…' : 'Download'}
             </Button>
           </Group>
         </Stack>
