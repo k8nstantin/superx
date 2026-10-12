@@ -218,3 +218,49 @@ async fn disabled_adapter_is_skipped_live_and_resumes() -> Result<(), Box<dyn Er
     assert_eq!(cc_sources(&kernel).await?.len(), 1, "re-enabled → back");
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_listed_root_is_captured_under_its_own_source() -> Result<(), Box<dyn Error>> {
+    // A session started under CLAUDE_CONFIG_DIR writes to that dir's
+    // projects folder (#440). The same project folder name sits under
+    // both roots; each must keep its own source and read position.
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    common::isolate_adapters(&kernel, &tmp.path().join("isolated-empty")).await?;
+    let first = tmp.path().join("projects");
+    let later = tmp.path().join("other-config").join("projects");
+    fs::create_dir_all(first.join("-tmp-proj"))?;
+    fs::write(first.join("-tmp-proj").join("sess-1.jsonl"), FIXTURE_LINES)?;
+    fs::create_dir_all(later.join("-tmp-proj"))?;
+    fs::write(later.join("-tmp-proj").join("sess-2.jsonl"), FIXTURE_LINES.replace("sess-1", "sess-2"))?;
+
+    let entity = kernel.register_module(&ClaudeCodeAdapter.descriptor()).await?;
+    let roots: Vec<Value> = [first, later.clone(), tmp.path().join("not-on-this-machine")]
+        .iter()
+        .map(|p| Value::String(p.to_string_lossy().to_string()))
+        .collect();
+    kernel
+        .set_parameter(entity, PROJECTS_ROOT_PARAM, Value::Array(superx_kernel::types::Array::from(roots)))
+        .await?;
+
+    let sources = cc_sources(&kernel).await?;
+    let names: Vec<&str> = sources.iter().map(|(_, s)| s.name.as_str()).collect();
+    let by_path = format!("claude_code/{}", later.join("-tmp-proj").to_string_lossy());
+    assert_eq!(names.len(), 2, "a root not on this machine is skipped: {names:?}");
+    assert!(names.contains(&"claude_code/-tmp-proj"), "the first root keeps its names: {names:?}");
+    assert!(names.contains(&by_path.as_str()), "a later root's folder is named by its path: {names:?}");
+
+    let report = capture_tick(&kernel, &sources, None).await?;
+    assert!(report.errors.is_empty(), "no capture errors: {:?}", report.errors);
+    assert_eq!(report.total(), 10, "both transcripts captured");
+    for name in ["claude_code/sess-1", "claude_code/sess-2"] {
+        let session = kernel
+            .find_entity_by_name("node_session", "attr_session_descriptor", name)
+            .await?
+            .expect("session captured");
+        assert_eq!(kernel.session_messages(session, 10).await?.len(), 3, "{name}");
+    }
+    let quiet = capture_tick(&kernel, &sources, None).await?;
+    assert_eq!(quiet.total(), 0, "each source keeps its own read position");
+    Ok(())
+}

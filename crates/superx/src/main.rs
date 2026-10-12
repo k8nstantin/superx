@@ -167,6 +167,10 @@ async fn run(cli: Cli, config: Config) -> Result<(), String> {
             superx::emit(&superx::run_agents(&kernel).await?);
             Ok(())
         }
+        Command::Param { action } => {
+            superx::emit(&superx::run_param(&kernel, action).await?);
+            Ok(())
+        }
         Command::Sessions { agent } => {
             superx::emit(&superx::run_sessions(&kernel, agent.as_deref()).await?);
             Ok(())
