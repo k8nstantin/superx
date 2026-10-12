@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useDebouncedValue } from '@mantine/hooks'
 import { Alert, Badge, Button, Card, Group, Progress, ScrollArea, Table, Text, Title, Tooltip } from '@mantine/core'
@@ -6,6 +6,7 @@ import { fetchAgents, fetchSessionActivity, fetchSessions, type FeedCursor } fro
 import { useSse } from '../useSse'
 import { Feed, MAX_FEED_ROWS, matchesSearch, mergeFeed } from '../Feed'
 import { useFeedHistory } from '../useFeedHistory'
+import { SessionExport } from '../SessionExport'
 import type { SseEvent } from '../generated/SseEvent'
 import type { SessionView } from '../generated/SessionView'
 import { useBreadcrumb } from '../Breadcrumbs'
@@ -230,6 +231,20 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
     [older, backlog.data, liveRows],
   )
 
+  // A session reads all the way back on its own (#442): page after page
+  // until its first captured row, so scrolling up never stops to wait.
+  // A cursor is asked for once; a page that adds nothing older ends it.
+  const oldest = rows[0]
+  const asked = useRef<string | null>(null)
+  useEffect(() => {
+    asked.current = null
+  }, [session.session_id, q])
+  useEffect(() => {
+    if (backlog.isLoading || loadingOlder || exhausted || !oldest || asked.current === oldest.id) return
+    asked.current = oldest.id
+    loadOlder({ at: oldest.valid_from, id: oldest.id })
+  }, [backlog.isLoading, loadingOlder, exhausted, oldest, loadOlder])
+
   return (
     <Feed
       header={
@@ -252,6 +267,7 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
               </Badge>
             </Tooltip>
           )}
+          <SessionExport session={session} search={search} />
         </Group>
       }
       rows={rows}

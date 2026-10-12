@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   Badge,
+  Box,
   Card,
   CloseButton,
   Group,
@@ -20,6 +21,93 @@ import type { AgentView } from './generated/AgentView'
 // same pinned-to-bottom auto-scroll. Only the scope differs.
 
 export const MAX_FEED_ROWS = 500
+
+// The feed box's height is the reader's to set (#442): dragged from the
+// bar under it, remembered per viewer, the same in every feed.
+const FEED_HEIGHT_KEY = 'superx.feed.height'
+const FEED_HEIGHT_DEFAULT = 580
+const FEED_HEIGHT_MIN = 160
+const FEED_HEIGHT_STEP = 40
+
+function storedFeedHeight(): number {
+  try {
+    const v = Number(localStorage.getItem(FEED_HEIGHT_KEY))
+    return Number.isFinite(v) && v >= FEED_HEIGHT_MIN ? v : FEED_HEIGHT_DEFAULT
+  } catch {
+    return FEED_HEIGHT_DEFAULT
+  }
+}
+
+function storeFeedHeight(h: number) {
+  try {
+    localStorage.setItem(FEED_HEIGHT_KEY, String(Math.round(h)))
+  } catch {
+    // A blocked store only loses the remembered height.
+  }
+}
+
+/// The bar under the feed box: drag it to resize, double-click it to fit
+/// the box to the window, or focus it and use the arrow keys.
+function ResizeBar({ height, onHeight, box }: { height: number; onHeight: (h: number) => void; box: React.RefObject<HTMLDivElement | null> }) {
+  const set = (h: number) => onHeight(Math.max(FEED_HEIGHT_MIN, Math.round(h)))
+  const drag = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    const from = e.clientY
+    const start = height
+    let last = start
+    const move = (ev: PointerEvent) => {
+      last = Math.max(FEED_HEIGHT_MIN, Math.round(start + ev.clientY - from))
+      onHeight(last)
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      storeFeedHeight(last)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+  }
+  const fit = () => {
+    const top = box.current?.getBoundingClientRect().top ?? 0
+    const h = Math.max(FEED_HEIGHT_MIN, window.innerHeight - Math.max(top, 0) - 48)
+    set(h)
+    storeFeedHeight(h)
+  }
+  const key = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const d = e.key === 'ArrowDown' ? FEED_HEIGHT_STEP : e.key === 'ArrowUp' ? -FEED_HEIGHT_STEP : 0
+    if (!d) return
+    e.preventDefault()
+    const h = Math.max(FEED_HEIGHT_MIN, height + d)
+    set(h)
+    storeFeedHeight(h)
+  }
+  return (
+    <Tooltip label="drag to resize · double-click to fit the window" withArrow openDelay={400}>
+      <Box
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="resize the feed"
+        aria-valuenow={height}
+        tabIndex={0}
+        onPointerDown={drag}
+        onDoubleClick={fit}
+        onKeyDown={key}
+        style={{
+          height: 12,
+          marginTop: 4,
+          cursor: 'ns-resize',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          borderTop: '1px solid var(--mantine-color-dark-4)',
+          touchAction: 'none',
+        }}
+      >
+        <Box style={{ width: 48, height: 4, borderRadius: 2, background: 'var(--mantine-color-dark-3)' }} />
+      </Box>
+    </Tooltip>
+  )
+}
 
 // Merge backlog + live rows: dedupe by the event's REAL id (every row
 // carries its UUIDv7 — no heuristics), backlog copy wins, then sort
@@ -233,35 +321,40 @@ export function Feed({
   // restores it.
   const viewport = useRef<HTMLDivElement>(null)
   const bottom = useRef<HTMLDivElement>(null)
+  const box = useRef<HTMLDivElement>(null)
   const following = useRef(true)
+  const [height, setHeight] = useState(storedFeedHeight)
   const lastId = visible.length > 0 ? visible[visible.length - 1].id : ''
+  // A resize keeps a pinned feed pinned.
   useEffect(() => {
     if (following.current) {
       bottom.current?.scrollIntoView({ block: 'end' })
     }
-  }, [lastId, loading])
+  }, [lastId, loading, height])
 
   // Scrolling back (issue #241). Reaching the top asks for the page
-  // before the oldest row; when those rows land the viewport is
-  // rebased so the row you were reading stays under your eyes instead
-  // of being shoved down by everything prepended above it.
+  // before the oldest row. Whenever rows land above — asked for, or
+  // read back on their own (#442) — the viewport is rebased by what was
+  // added, so the row you were reading stays under your eyes instead of
+  // being shoved down; a feed pinned to the bottom stays pinned.
   const firstId = visible.length > 0 ? visible[0].id : ''
-  const anchor = useRef<{ height: number; top: number } | null>(null)
+  const lastHeight = useRef(0)
   const askOlder = () => {
     const v = viewport.current
     if (!v || !onLoadOlder || loadingOlder || exhausted) return
     if (v.scrollHeight <= v.clientHeight + 40) return // nothing to scroll yet
-    anchor.current = { height: v.scrollHeight, top: v.scrollTop }
     onLoadOlder(visible[0] ? { at: visible[0].valid_from, id: visible[0].id } : undefined)
   }
   useLayoutEffect(() => {
     const v = viewport.current
-    const a = anchor.current
-    if (v && a) {
-      v.scrollTop = v.scrollHeight - a.height + a.top
-      anchor.current = null
-    }
+    if (!v) return
+    if (following.current) bottom.current?.scrollIntoView({ block: 'end' })
+    else v.scrollTop += v.scrollHeight - lastHeight.current
   }, [firstId])
+  // The height the next rebase measures from: recorded after every render.
+  useLayoutEffect(() => {
+    if (viewport.current) lastHeight.current = viewport.current.scrollHeight
+  })
 
   return (
     <Card withBorder>
@@ -300,7 +393,8 @@ export function Feed({
         </Group>
       </Group>
       <ScrollArea
-        h={580}
+        ref={box}
+        h={height}
         viewportRef={viewport}
         onScrollPositionChange={({ y }) => {
           const v = viewport.current
@@ -374,6 +468,7 @@ export function Feed({
         })}
         <div ref={bottom} />
       </ScrollArea>
+      <ResizeBar height={height} onHeight={setHeight} box={box} />
     </Card>
   )
 }
