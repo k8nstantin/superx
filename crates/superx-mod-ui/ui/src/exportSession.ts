@@ -175,9 +175,54 @@ export function exportFileName(session: SessionView, o: ExportOptions, now: Date
   return `${session.agent}-${session.short_id}-${day}.${o.format}`
 }
 
-/// Hand the text to the browser as a download.
+const mimeOf = (format: ExportOptions['format']) => (format === 'md' ? 'text/markdown' : 'text/plain')
+
+// Where the file goes is the reader's to choose (#444): the browser's own
+// save dialog (File System Access), where it has one. Typed here, not
+// from lib.dom, which does not carry the picker.
+type SaveTarget = {
+  name: string
+  createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }>
+}
+type SavePicker = (options: {
+  suggestedName: string
+  id?: string
+  types?: { description: string; accept: Record<string, string[]> }[]
+}) => Promise<SaveTarget>
+
+const savePicker = (): SavePicker | undefined =>
+  (window as unknown as { showSaveFilePicker?: SavePicker }).showSaveFilePicker
+
+/// Does this browser let the reader choose where a file is saved?
+export const canChooseWhere = () => savePicker() != null
+
+/// Ask where to save: the chosen file, or null when the reader cancelled.
+/// The picker's id makes the browser reopen the folder used last.
+export async function chooseWhere(name: string, format: ExportOptions['format']): Promise<SaveTarget | null> {
+  const pick = savePicker()
+  if (!pick) return null
+  try {
+    return await pick({
+      suggestedName: name,
+      id: 'superx-export',
+      types: [{ description: format === 'md' ? 'Markdown' : 'Plain text', accept: { [mimeOf(format)]: [`.${format}`] } }],
+    })
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') return null
+    throw e
+  }
+}
+
+/// Write the text to the file the reader chose.
+export async function writeTo(target: SaveTarget, text: string, format: ExportOptions['format']) {
+  const out = await target.createWritable()
+  await out.write(new Blob([text], { type: `${mimeOf(format)};charset=utf-8` }))
+  await out.close()
+}
+
+/// Hand the text to the browser as a download (no save dialog here).
 export function download(name: string, text: string, format: ExportOptions['format']) {
-  const blob = new Blob([text], { type: format === 'md' ? 'text/markdown;charset=utf-8' : 'text/plain;charset=utf-8' })
+  const blob = new Blob([text], { type: `${mimeOf(format)};charset=utf-8` })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
