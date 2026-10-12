@@ -115,6 +115,12 @@ pub enum Command {
     Status,
     /// Discovered agents with their session and source counts.
     Agents,
+    /// Read or set a module's or adapter's parameter: the substrate
+    /// value every "operator overrides via the parameter" default reads.
+    Param {
+        #[command(subcommand)]
+        action: ParamAction,
+    },
     /// The action stream (telemetry), newest first.
     Actions {
         /// How many recent events to show.
@@ -162,6 +168,46 @@ pub enum ModulesAction {
     /// Restart a module in place: shutdown() then startup(), inside
     /// one capture tick. The OS keeps running.
     Restart { name: String },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum ParamAction {
+    /// Show a parameter's current value.
+    Get { owner: String, name: String },
+    /// Set a parameter. VALUE is JSON: `'["/a","/b"]'`, `60`, `'"text"'`.
+    Set { owner: String, name: String, value: String },
+}
+
+/// `superx param get|set`: OWNER is an adapter or kernel module name
+/// (`adapter_claude_code`). The write is the kernel's own
+/// `set_parameter` (append-only, latest wins); a running OS reads it
+/// on its next tick.
+///
+/// # Errors
+///
+/// No such owner, VALUE is not JSON, or the substrate refused.
+pub async fn run_param(kernel: &Kernel, action: ParamAction) -> Result<String, String> {
+    let (ParamAction::Get { owner, name } | ParamAction::Set { owner, name, .. }) = &action;
+    let mut entity = None;
+    for kind in [superx_kernel::NodeKind::Adapter, superx_kernel::NodeKind::KernelModule] {
+        entity = kernel.find_module_by_name(kind, owner).await.map_err(|e| e.to_string())?;
+        if entity.is_some() {
+            break;
+        }
+    }
+    let entity = entity.ok_or_else(|| format!("no adapter or module named '{owner}'"))?;
+    if let ParamAction::Set { value, .. } = &action {
+        let json: serde_json::Value =
+            serde_json::from_str(value).map_err(|e| format!("VALUE is not JSON: {e}"))?;
+        kernel
+            .set_parameter(entity.clone(), name, superx_kernel::message::value_from_json(&json))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(match kernel.get_parameter(entity, name).await.map_err(|e| e.to_string())? {
+        Some(v) => format!("{owner} {name} = {v:?}"),
+        None => format!("{owner} {name} is not set"),
+    })
 }
 
 /// Connect + signin with an actionable hint on auth refusal. The

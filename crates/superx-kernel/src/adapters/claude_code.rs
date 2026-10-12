@@ -7,6 +7,8 @@
 //!
 //! - Projects root: `~/.claude/projects/<mangled-cwd>/`; each
 //!   `<sessionId>.jsonl` at the top level is one session transcript.
+//!   A session started under `CLAUDE_CONFIG_DIR=<dir>` writes to
+//!   `<dir>/projects/` instead, so the root can be several folders.
 //! - Conversation lines carry `type` (`user` / `assistant`), a
 //!   `message` envelope (string content for typed prompts; block
 //!   arrays for assistant text / tool_use / tool_result), `sessionId`,
@@ -43,8 +45,9 @@ pub const ADAPTER_NAME: &str = "adapter_claude_code";
 pub const AGENT_NAME: &str = "claude_code";
 
 /// Parameter (on this adapter's registry entity) overriding the
-/// projects root. Tests inject fixture dirs through this — no env
-/// hacks.
+/// projects root: one path, or a list of paths when Claude Code also
+/// runs under another `CLAUDE_CONFIG_DIR`. Tests inject fixture dirs
+/// through this — no env hacks.
 pub const PROJECTS_ROOT_PARAM: &str = "attr_claude_code_projects_root";
 
 /// Cursor type uid for transcript read positions.
@@ -91,22 +94,31 @@ impl AgentAdapter for ClaudeCodeAdapter {
     }
 
     async fn discover(&self, kernel: &Kernel) -> Result<Vec<DiscoveredSource>> {
-        let root = self.projects_root(kernel).await?;
-        let Some(root) = root else {
-            return Ok(vec![]); // agent not present on this machine
-        };
         let mut out = Vec::new();
-        let entries = std::fs::read_dir(&root).map_err(|e| {
-            KernelError::Module(format!("cannot read projects root {}: {e}", root.display()))
-        })?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                out.push(DiscoveredSource {
-                    name,
-                    locator: path.to_string_lossy().to_string(),
-                });
+        for (i, root) in self.projects_roots(kernel).await?.iter().enumerate() {
+            if !root.is_dir() {
+                continue; // that config dir is not on this machine
+            }
+            let entries = std::fs::read_dir(root).map_err(|e| {
+                KernelError::Module(format!("cannot read projects root {}: {e}", root.display()))
+            })?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let locator = path.to_string_lossy().to_string();
+                    // Two config dirs hold the same project folder name
+                    // (both have `-Users-…-gryphon-data-lake`), and a
+                    // source is known by its name. The first root keeps
+                    // the names its sources already carry; a later
+                    // root's are named by their full path, so each gets
+                    // its own source and read position.
+                    let name = if i == 0 {
+                        entry.file_name().to_string_lossy().to_string()
+                    } else {
+                        locator.clone()
+                    };
+                    out.push(DiscoveredSource { name, locator });
+                }
             }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -168,18 +180,28 @@ impl AgentAdapter for ClaudeCodeAdapter {
 }
 
 impl ClaudeCodeAdapter {
-    /// Resolve the projects root: the substrate parameter if set,
-    /// else `$HOME/.claude/projects` when it exists, else `None`
-    /// (agent absent).
-    async fn projects_root(&self, kernel: &Kernel) -> Result<Option<PathBuf>> {
+    /// Resolve the projects roots: the substrate parameter if set (one
+    /// path, or a list), else `$HOME/.claude/projects`. A root that does
+    /// not exist is skipped by discovery (agent absent there).
+    async fn projects_roots(&self, kernel: &Kernel) -> Result<Vec<PathBuf>> {
         if let Some(entity) = kernel
             .find_module_by_name(NodeKind::Adapter, ADAPTER_NAME)
             .await?
         {
-            if let Some(Value::String(p)) =
-                kernel.get_parameter(entity, PROJECTS_ROOT_PARAM).await?
-            {
-                return Ok(Some(PathBuf::from(p)));
+            match kernel.get_parameter(entity, PROJECTS_ROOT_PARAM).await? {
+                Some(Value::String(p)) => return Ok(vec![PathBuf::from(p)]),
+                Some(Value::Array(paths)) => {
+                    return paths
+                        .iter()
+                        .map(|v| match v {
+                            Value::String(p) => Ok(PathBuf::from(p)),
+                            other => Err(KernelError::Config(format!(
+                                "{PROJECTS_ROOT_PARAM}: every entry must be a path, got {other:?}"
+                            ))),
+                        })
+                        .collect();
+                }
+                _ => {}
             }
         }
         // Default location is format knowledge this adapter owns.
@@ -187,8 +209,7 @@ impl ClaudeCodeAdapter {
         let home = std::env::var("HOME").map_err(|_| {
             KernelError::Config("HOME is not set; cannot locate ~/.claude/projects".into())
         })?;
-        let root = Path::new(&home).join(".claude").join("projects");
-        Ok(root.is_dir().then_some(root))
+        Ok(vec![Path::new(&home).join(".claude").join("projects")])
     }
 
     /// Capture one transcript line: conversation lines become
