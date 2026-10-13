@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rules product="Fixture" version="0" date="2026-10-13">
+  <rule id="kickoff">
+    <from>the operator</from>
+    <text>A build starts with a model pointed at one task file. Nothing else is said at kickoff.</text>
+    <breach>review of the branch name</breach>
+  </rule>
+  <rule id="one-door">
+    <from>the design</from>
+    <text>Every command runs through the one door.</text>
+    <breach>the lint</breach>
+  </rule>
+</rules>
