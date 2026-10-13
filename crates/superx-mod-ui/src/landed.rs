@@ -8,7 +8,8 @@
 //! repositories on this machine, READ-ONLY, through `git`. Roots come
 //! from the `cwd` the agents' transcripts carry, which the substrate
 //! already holds. Anything unreadable degrades to `—` and is counted,
-//! never invented. Nothing is written anywhere.
+//! never invented. Nothing is written anywhere, and nothing the
+//! repository names is run (#447).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -32,10 +33,41 @@ const BLAMES_AT_ONCE: usize = 8; // skill-allow: §9-const — read-path bound, 
 /// A git call slower than this is abandoned and counted unreadable.
 const GIT_TIMEOUT_MS: u64 = 4_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
+/// Configuration under which a read would run a program the repository
+/// names, overridden on every call (#447): `log.showSignature` hands each
+/// signed commit `log` and `reflog` show to the repository's `gpg.program`,
+/// and `core.fsmonitor` names a hook `fsck` runs. `-c` overrides the
+/// repository's own configuration (git(1)).
+const NO_REPOSITORY_PROGRAMS: [&str; 4] = ["-c", "log.showSignature=false", "-c", "core.fsmonitor=false"];
+
+/// The flags that keep a subcommand off the repository's diff drivers
+/// (#447): `blame` runs a textconv filter by default, `log` and `diff` run
+/// one when they print a patch (git-log(1)), and an external diff would
+/// run too. Only these subcommands take the flags; the others refuse them.
+fn no_diff_drivers(subcommand: &str) -> &'static [&'static str] {
+    match subcommand {
+        "blame" => &["--no-textconv"],
+        "log" | "diff" => &["--no-textconv", "--no-ext-diff"],
+        _ => &[],
+    }
+}
+
 /// `git -C dir args…`, stdout on success, `None` on any failure or on
 /// the timeout. No shell is involved: arguments are passed as given.
+/// Read-only in the strong sense (#447): no program the repository names
+/// runs, and no optional lock is taken, so no index refresh is written
+/// back (git(1), `GIT_OPTIONAL_LOCKS`).
 pub(crate) async fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let run = Command::new("git").arg("-C").arg(dir).args(args).output();
+    let (subcommand, rest) = args.split_first()?;
+    let run = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(NO_REPOSITORY_PROGRAMS)
+        .arg(subcommand)
+        .args(no_diff_drivers(subcommand))
+        .args(rest)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output();
     let out = tokio::time::timeout(Duration::from_millis(GIT_TIMEOUT_MS), run)
         .await
         .ok()?

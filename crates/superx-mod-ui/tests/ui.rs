@@ -2678,6 +2678,143 @@ async fn landed_lines_are_read_from_the_repositories() {
     assert!(!s.landed.series.is_empty(), "an hourly point for the commit hour");
 }
 
+/// SuperX reads a repository and runs nothing the repository names
+/// (#447). A repository's own configuration can make a read run a
+/// program: a textconv driver under `blame`, its `gpg.program` under `log`
+/// and `reflog` when `log.showSignature` is set, its `core.fsmonitor` hook
+/// under `fsck`. Each trap is armed and proven live with plain git first;
+/// then every read the UI makes runs over the repository, and nothing
+/// fires and not one byte of it changes.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repository_is_read_and_nothing_it_names_is_run() {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::os::unix::fs::PermissionsExt;
+
+    let stamp = format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .expect("temp dir")
+        .join(format!("superx-read-only-{stamp}"));
+    let dir = base.join("repo");
+    std::fs::create_dir_all(&dir).expect("repo dir");
+    // The traps live outside the repository and record every run in one
+    // marker file. The signer also answers git the way gpg does, so the
+    // fixture can make a signed commit.
+    let marker = base.join("ran");
+    let trap = base.join("trap.sh");
+    let signer = base.join("gpg.sh");
+    std::fs::write(&trap, format!("#!/bin/sh\necho \"trap $*\" >> '{}'\n", marker.display())).expect("trap");
+    std::fs::write(&signer, format!(
+        "#!/bin/sh\necho \"gpg $*\" >> '{}'\ncat >/dev/null\necho '[GNUPG:] SIG_CREATED D 1 8 00 0 X' >&2\n\
+         printf -- '-----BEGIN PGP SIGNATURE-----\\n\\nx\\n-----END PGP SIGNATURE-----\\n'\n",
+        marker.display(),
+    ))
+    .expect("signer");
+    for script in [&trap, &signer] {
+        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let (trap, signer) = (trap.to_string_lossy().into_owned(), signer.to_string_lossy().into_owned());
+
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C").arg(&dir)
+            .args(["-c", "user.name=t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git runs")
+    };
+    let git = |args: &[&str]| {
+        let out = run(args);
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "me@x"]);
+    // This machine's commit: its file is blamed.
+    std::fs::write(dir.join("a.txt"), "one\ntwo\n").expect("write");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "mine"]);
+    // Someone else's signed commit: no branch work explains it, which
+    // sends the read to `fsck`, and `log` has a signature to check.
+    std::fs::write(dir.join("b.txt"), "x\ny\n").expect("write");
+    git(&["add", "b.txt"]);
+    git(&[
+        "-c", "user.email=other@x", "-c", "commit.gpgsign=true", "-c", "user.signingkey=X",
+        "-c", &format!("gpg.program={signer}"), "commit", "-q", "-m", "theirs, signed",
+    ]);
+    // Work that has not landed: the read walks the branch, its merge base
+    // and its diff.
+    git(&["checkout", "-q", "-b", "side"]);
+    std::fs::write(dir.join("c.txt"), "side\n").expect("write");
+    git(&["add", "c.txt"]);
+    git(&["commit", "-q", "-m", "side work"]);
+    git(&["checkout", "-q", "main"]);
+
+    // Arm every trap, in the repository's own configuration.
+    std::fs::write(dir.join(".git/info/attributes"), "* diff=trap\n").expect("attributes");
+    git(&["config", "diff.trap.textconv", &trap]);
+    git(&["config", "gpg.program", &signer]);
+    git(&["config", "log.showSignature", "true"]);
+    git(&["config", "core.fsmonitor", &trap]);
+    for args in [
+        &["blame", "--line-porcelain", "main", "--", "a.txt"][..],
+        &["log", "--format=%H", "main"][..],
+        &["reflog", "show", "--format=%gd", "HEAD"][..],
+        &["fsck", "--unreachable", "--no-reflogs", "--no-progress"][..],
+    ] {
+        let _ = std::fs::remove_file(&marker);
+        let out = run(args);
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(marker.exists(), "the trap is armed: plain `git {}` runs it", args.join(" "));
+    }
+    let _ = std::fs::remove_file(&marker);
+
+    fn snapshot(root: &std::path::Path, out: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(root).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                snapshot(&path, out);
+            } else {
+                out.insert(path.clone(), std::fs::read(&path).expect("read file"));
+            }
+        }
+    }
+    let mut before = BTreeMap::new();
+    snapshot(&dir, &mut before);
+
+    let cwd = dir.to_string_lossy().into_owned();
+    let cwds: HashSet<String> = HashSet::from([cwd.clone()]);
+    let checkouts = superx_mod_ui::checkout::Checkouts::resolve(&cwds).await;
+    assert!(checkouts.of(&cwd).is_some(), "the checkout is read");
+    let landed = superx_mod_ui::landed::landed(
+        &cwds,
+        &checkouts,
+        None,
+        chrono::FixedOffset::east_opt(0).expect("utc"),
+        &HashMap::new(),
+    )
+    .await;
+    let work = superx_mod_ui::landed::repo_work(&dir, "main", None).await.expect("the repository is read");
+
+    let ran = std::fs::read_to_string(&marker).unwrap_or_default();
+    let mut after = BTreeMap::new();
+    snapshot(&dir, &mut after);
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert_eq!(ran, "", "a read ran a program the repository names");
+    assert!(before == after, "a read changed the repository");
+    assert_eq!(landed.commits, 2, "the reads did their work: both main-line commits");
+    assert_eq!(work.landed.len(), 2, "both main-line commits");
+    assert!(
+        work.landed.iter().any(|c| c.author == "other@x"),
+        "the commit no branch explains, which sends the read to fsck"
+    );
+    assert!(!work.alive.is_empty(), "blame ran");
+    assert!(
+        work.off_mainline.iter().any(|c| c.subject == "side work"),
+        "the side branch was walked"
+    );
+}
+
 /// Steering is the half of churn a shell edit can still answer (#388).
 /// The lines it replaced are unknown, but whether anyone asked for it
 /// is not — so the split is counted in edits when it cannot be counted
