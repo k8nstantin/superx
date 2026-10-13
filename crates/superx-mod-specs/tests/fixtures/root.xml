@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A root in the shape of the build spec format, with its own words. -->
+<root product="Fixture" version="0" date="2026-10-13">
+  <identity>
+    <platform path="app/core/">The merged code under app/core is the platform.</platform>
+  </identity>
+  <method>
+    <note>How a task is done.</note>
+    <read>A build starts at the task file; its start element sends the model here. Then, in this order, whole: the code merged under app/core (the platform); this root; rules.xml; your task file; the design files your task file names, by the keys it lists. Nothing else: no earlier spec. The order is required: a session that reads a file out of this order reads again from the first file in order before it writes anything.</read>
+    <ownership>Create, modify and touch only the paths the task file lists under <em>owns</em>.</ownership>
+  </method>
+</root>
