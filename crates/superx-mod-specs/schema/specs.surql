@@ -22,6 +22,9 @@
 --   spec_run       one row per build: a session opened with a kickoff
 --                  line naming a task file
 --   spec_finding   one row per check of a run against a clause
+--   spec_revision  one row per spec version a commit in a session named
+--   branch_event   one row per branch a session's git created, pushed,
+--                  merged or deleted
 --
 -- EVERY ROW IS DERIVED. Each one is computed from the kernel's captured
 -- sessions, so provisioning over an existing database loses nothing an
@@ -155,3 +158,56 @@ DEFINE FIELD evidence   ON TABLE spec_finding TYPE array<string>;
 DEFINE FIELD valid_from ON TABLE spec_finding TYPE datetime;
 
 DEFINE INDEX idx_finding_run ON TABLE spec_finding FIELDS run;
+
+
+-- 5 ─── spec_revision ───────────────── a spec version, as a session committed it ───
+-- A successful `git commit` in any session whose message names
+-- `<KEY> file version <N>` — how the design sessions commit a spec
+-- file's new version. `reviewed` is the build whose review it came from
+-- (`… of its v5 build`); `line` the message line naming it; `commit` the
+-- hash the session printed for it, when it printed one. `model` is the
+-- model that made the call; `call` its tool call id.
+
+DEFINE TABLE spec_revision SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
+
+DEFINE FIELD session     ON TABLE spec_revision TYPE record<entity>;
+DEFINE FIELD session_key ON TABLE spec_revision TYPE string;
+DEFINE FIELD model       ON TABLE spec_revision TYPE option<string>;
+DEFINE FIELD key         ON TABLE spec_revision TYPE string;
+DEFINE FIELD version     ON TABLE spec_revision TYPE int;
+DEFINE FIELD reviewed    ON TABLE spec_revision TYPE option<int>;
+DEFINE FIELD line        ON TABLE spec_revision TYPE string;
+DEFINE FIELD message     ON TABLE spec_revision TYPE string;
+DEFINE FIELD commit      ON TABLE spec_revision TYPE option<string>;
+DEFINE FIELD at          ON TABLE spec_revision TYPE datetime;
+DEFINE FIELD call        ON TABLE spec_revision TYPE string;
+DEFINE FIELD valid_from  ON TABLE spec_revision TYPE datetime;
+
+DEFINE INDEX idx_revision_call ON TABLE spec_revision FIELDS call, key, version UNIQUE;
+DEFINE INDEX idx_revision_key  ON TABLE spec_revision FIELDS key, version;
+
+
+-- 6 ─── branch_event ─────────────────── what a session's git did to a branch ───
+-- Read from the text of the session's shell calls: what the command
+-- says, never inferred. (No `committed`: a line's `gitBranch` is the
+-- branch of the directory the session was launched in, not of the
+-- worktree a call may have changed into.) `ok` is whether the call succeeded,
+-- absent when its result was not captured. A branch's fate is its
+-- newest event; one no session touched is unknown.
+
+DEFINE TABLE branch_event SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
+
+DEFINE FIELD session     ON TABLE branch_event TYPE record<entity>;
+DEFINE FIELD session_key ON TABLE branch_event TYPE string;
+DEFINE FIELD model       ON TABLE branch_event TYPE option<string>;
+DEFINE FIELD branch      ON TABLE branch_event TYPE string;
+DEFINE FIELD event       ON TABLE branch_event TYPE string
+    ASSERT $value INSIDE ['created', 'pushed', 'merged', 'deleted', 'deleted-remote'];
+DEFINE FIELD command     ON TABLE branch_event TYPE string;
+DEFINE FIELD ok          ON TABLE branch_event TYPE option<bool>;
+DEFINE FIELD at          ON TABLE branch_event TYPE datetime;
+DEFINE FIELD call        ON TABLE branch_event TYPE string;
+DEFINE FIELD valid_from  ON TABLE branch_event TYPE datetime;
+
+DEFINE INDEX idx_branch_call ON TABLE branch_event FIELDS call, branch, event UNIQUE;
+DEFINE INDEX idx_branch_name ON TABLE branch_event FIELDS branch, at;

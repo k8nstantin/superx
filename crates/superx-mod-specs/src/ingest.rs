@@ -6,11 +6,13 @@
 //! file in it (rules.xml kickoff). Design sessions open with a
 //! conversation, not a kickoff line, and are not builds.
 //!
-//! TWO PASSES. The first records every spec file every build read; the
-//! second judges each build. A build that never read the root still owed
-//! it its order, so it is judged against the root other sessions had
-//! read by the time it started — which the first pass makes sure is
-//! recorded, whatever order the sessions come in.
+//! TWO PASSES. The first goes through EVERY session — design sessions
+//! included — and records the spec files it read whole, the spec
+//! versions its commits named (`spec_revision`) and what its git did to
+//! branches (`branch_event`). The second judges each build. A build that
+//! never read the root still owed it its order, so it is judged against
+//! the root sessions had read by the time it started — which the first
+//! pass makes sure is recorded, whatever order the sessions come in.
 //!
 //! Every row this writes is derived from the kernel's sessions, and a
 //! session that has not changed since the last ingest writes nothing.
@@ -21,6 +23,7 @@ use chrono::{DateTime, Utc};
 use superx_kernel::types::RecordId;
 use superx_kernel::{Db, Kernel, Result};
 
+use crate::git;
 use crate::read_order::{self, Context, Judgement};
 use crate::session::{self, get_str, Event, Read, Row};
 use crate::spec::{self, Kind, SpecDoc};
@@ -37,6 +40,8 @@ pub struct Report {
     pub runs_written: usize,
     pub runs_unchanged: usize,
     pub docs_written: usize,
+    pub revisions_written: usize,
+    pub branch_events_written: usize,
     /// Builds longer than the read bound, judged on their first rows.
     pub cut_short: usize,
 }
@@ -65,22 +70,16 @@ struct Seen {
 pub async fn ingest(kernel: &Kernel, db: &Db) -> Result<Report> {
     let mut report = Report::default();
     let mut kickoffs: Vec<Kickoff> = Vec::new();
+    // Pass 1: every session — what it read, committed and did to branches.
     for s in kernel.list_named_entities("node_session", "attr_session_descriptor").await? {
         report.sessions += 1;
+        let key = get_str(&s.payload, "session").unwrap_or_default();
+        let reads = store::spec_reads(kernel, &s.entity_id).await?;
+        seen_docs(db, &session::events(&reads), &mut report).await?;
+        git_activity(kernel, db, &s.entity_id, &key, &mut report).await?;
         let Some((line, at)) = store::kickoff(kernel, &s.entity_id).await? else { continue };
         let Some(task_path) = spec::kickoff_task_path(&line) else { continue };
-        kickoffs.push(Kickoff {
-            session: s.entity_id.clone(),
-            key: get_str(&s.payload, "session").unwrap_or_default(),
-            line,
-            task_path,
-            at,
-        });
-    }
-    // Pass 1: every spec file every build read.
-    for k in &kickoffs {
-        let (rows, _) = store::timeline(kernel, &k.session).await?;
-        seen_docs(db, &session::events(&rows), &mut report).await?;
+        kickoffs.push(Kickoff { session: s.entity_id.clone(), key, line, task_path, at });
     }
     // Pass 2: judge each build.
     for k in &kickoffs {
@@ -88,6 +87,126 @@ pub async fn ingest(kernel: &Kernel, db: &Db) -> Result<Report> {
     }
     tracing::info!(target: "specs", ?report, "ingest done");
     Ok(report)
+}
+
+/// Record what a session's git calls did: the spec versions its commits
+/// named, and what it did to branches. A commit message given by file
+/// (`-F`) is the one the session wrote last under that file name, with
+/// the Write tool or a `cat > … <<EOF` in a shell call.
+async fn git_activity(kernel: &Kernel, db: &Db, session: &RecordId, key: &str, report: &mut Report) -> Result<()> {
+    let calls = store::git_calls(kernel, session).await?;
+    if calls.is_empty() {
+        return Ok(());
+    }
+    let bash: Vec<String> = calls
+        .iter()
+        .flat_map(|c| c.uses.iter())
+        .filter(|u| get_str(u, "name").as_deref() == Some("Bash"))
+        .filter_map(|u| get_str(u, "id"))
+        .collect();
+    let results = store::call_results(kernel, session, bash).await?;
+    let mut written: HashMap<String, String> = HashMap::new();
+    for c in &calls {
+        for u in &c.uses {
+            let input = field(u, "input");
+            match get_str(u, "name").as_deref() {
+                Some("Write") => {
+                    if let (Some(path), Some(content)) = (
+                        input.as_ref().and_then(|i| get_str(i, "file_path")),
+                        input.as_ref().and_then(|i| get_str(i, "content")),
+                    ) {
+                        written.insert(basename(&path).to_string(), content);
+                    }
+                }
+                Some("Bash") => {
+                    let (Some(command), Some(call)) = (input.as_ref().and_then(|i| get_str(i, "command")), get_str(u, "id"))
+                    else {
+                        continue;
+                    };
+                    for (path, body) in git::written_files(&command) {
+                        written.insert(basename(&path).to_string(), body);
+                    }
+                    let (failed, stdout) = results.get(&call).cloned().unwrap_or((None, String::new()));
+                    let ok = failed.map(|f| !f);
+                    let activity = git::activity(&command);
+                    for e in activity.branches {
+                        let new = store::ensure_branch_event(
+                            db,
+                            &store::NewBranchEvent {
+                                session: session.clone(),
+                                session_key: key.to_string(),
+                                model: c.model.clone(),
+                                branch: e.branch,
+                                event: e.event,
+                                command: e.command,
+                                ok,
+                                at: c.at,
+                                call: call.clone(),
+                            },
+                        )
+                        .await?;
+                        report.branch_events_written += usize::from(new);
+                    }
+                    if ok != Some(true) {
+                        continue;
+                    }
+                    let printed = git::printed_commits(&stdout);
+                    for commit in activity.commits {
+                        let mut message = commit.message.clone();
+                        if let Some(body) = commit.message_file.as_deref().and_then(|f| written.get(basename(f))) {
+                            if !message.is_empty() {
+                                message.push_str("\n\n");
+                            }
+                            message.push_str(body);
+                        }
+                        let mut revisions = git::revisions(&message);
+                        if revisions.is_empty() {
+                            // The message is out of reach; what the session
+                            // printed of the commit is not.
+                            let subjects: Vec<&str> = printed.iter().map(|(_, s)| s.as_str()).collect();
+                            message = subjects.join("\n");
+                            revisions = git::revisions(&message);
+                        }
+                        for r in revisions {
+                            let named = format!("{} file version {}", r.key, r.version);
+                            let commit = printed.iter().find(|(_, s)| s.contains(&named)).map(|(h, _)| h.clone());
+                            let new = store::ensure_revision(
+                                db,
+                                &store::NewRevision {
+                                    session: session.clone(),
+                                    session_key: key.to_string(),
+                                    model: c.model.clone(),
+                                    key: r.key,
+                                    version: r.version,
+                                    reviewed: r.reviewed,
+                                    line: r.line,
+                                    message: message.clone(),
+                                    commit,
+                                    at: c.at,
+                                    call: call.clone(),
+                                },
+                            )
+                            .await?;
+                            report.revisions_written += usize::from(new);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn field(v: &superx_kernel::types::Value, key: &str) -> Option<superx_kernel::types::Value> {
+    match v {
+        superx_kernel::types::Value::Object(o) => o.get(key).cloned(),
+        _ => None,
+    }
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// The spec files a session read whole, recorded once per content, with
