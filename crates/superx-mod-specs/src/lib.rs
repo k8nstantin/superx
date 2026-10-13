@@ -18,12 +18,15 @@
 //!   own database   `superx/specs`, its own service account
 //!   own schema     `schema/specs.surql`, applied at provision
 //!   own log        `target: "specs"`
-//!   own CLI        `superx specs ingest`, `superx specs runs`
+//!   own CLI        `superx specs ingest`, `superx specs runs`,
+//!                  `superx specs ledger [KEY]`
 //!
 //! Nothing else in the workspace names this crate except the binary's
 //! link line: removing it removes the module and changes nothing else.
 
+pub mod git;
 pub mod ingest;
+pub mod ledger;
 pub mod read_order;
 pub mod session;
 pub mod spec;
@@ -42,7 +45,7 @@ pub const MODULE_NAME: &str = "specs";
 /// into `superx/specs` (kernel schema untouched — §7).
 pub const SCHEMA_DDL: &str = include_str!("../schema/specs.surql");
 
-const USAGE: &str = "usage: superx specs ingest | superx specs runs";
+const USAGE: &str = "usage: superx specs ingest | superx specs runs | superx specs ledger [KEY]";
 
 /// The specs module. A ZST — all state lives in the substrate.
 pub struct SpecsModule;
@@ -86,20 +89,29 @@ impl KernelModule for SpecsModule {
                     ("runs_written", r.runs_written),
                     ("runs_unchanged", r.runs_unchanged),
                     ("docs_written", r.docs_written),
+                    ("revisions_written", r.revisions_written),
+                    ("branch_events_written", r.branch_events_written),
                     ("cut_short", r.cut_short),
                 ] {
                     payload.insert(k.to_string(), Value::Number(i64::try_from(v).unwrap_or(i64::MAX).into()));
                 }
                 kernel.log_telemetry("specs_ingested", Value::Object(payload), None).await?;
                 Ok(format!(
-                    "{} sessions read, {} builds found: {} runs written, {} unchanged, {} new spec files{}\n",
+                    "{} sessions read, {} builds found: {} runs written, {} unchanged, {} new spec files, \
+                     {} new spec revisions, {} new branch events{}\n",
                     r.sessions,
                     r.builds,
                     r.runs_written,
                     r.runs_unchanged,
                     r.docs_written,
+                    r.revisions_written,
+                    r.branch_events_written,
                     if r.cut_short > 0 { format!(", {} judged on their first rows only", r.cut_short) } else { String::new() }
                 ))
+            }
+            Some("ledger") => {
+                let db = kernel.module_db(MODULE_NAME).await?;
+                ledger::render(&db, args.get(1).map(String::as_str)).await
             }
             Some("runs") => {
                 let db = kernel.module_db(MODULE_NAME).await?;

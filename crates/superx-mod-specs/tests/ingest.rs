@@ -36,11 +36,17 @@ struct Session<'k> {
     kernel: &'k Kernel,
     agent: RecordId,
     id: RecordId,
+    key: String,
+    model: &'static str,
     n: usize,
 }
 
 impl<'k> Session<'k> {
     async fn new(kernel: &'k Kernel, key: &str) -> Self {
+        Self::with_model(kernel, key, "claude-sonnet-5-5").await
+    }
+
+    async fn with_model(kernel: &'k Kernel, key: &str, model: &'static str) -> Self {
         let agent = kernel.create_entity("node_agent").await.expect("agent");
         let id = kernel.create_entity("node_session").await.expect("session");
         let mut desc = Object::new();
@@ -48,7 +54,7 @@ impl<'k> Session<'k> {
         desc.insert("session".to_string(), Value::String(key.to_string()));
         desc.insert("locator".to_string(), Value::String("/tmp/x.jsonl".to_string()));
         kernel.supersede_state(id.clone(), "attr_session_descriptor", Value::Object(desc)).await.expect("descriptor");
-        Self { kernel, agent, id, n: 0 }
+        Self { kernel, agent, id, key: key.to_string(), model, n: 0 }
     }
 
     async fn line(&self, role: &str, content: &str, raw: Json) {
@@ -73,12 +79,17 @@ impl<'k> Session<'k> {
     }
 
     /// A Read call and its result, the file's bytes as the tool returns them.
-    async fn read(&mut self, path: &str, content: &str, whole: bool) {
+    /// A fresh call id, unique across sessions as real ones are.
+    fn call(&mut self) -> String {
         self.n += 1;
-        let id = format!("toolu_{}", self.n);
+        format!("toolu_{}_{}", self.key, self.n)
+    }
+
+    async fn read(&mut self, path: &str, content: &str, whole: bool) {
+        let id = self.call();
         let lines = content.lines().count();
         self.line("assistant", "", json!({"type": "assistant", "gitBranch": BRANCH,
-            "message": {"model": "claude-sonnet-5-5", "content": [
+            "message": {"model": self.model, "content": [
                 {"type": "tool_use", "id": id, "name": "Read", "input": {"file_path": path}}]}}))
             .await;
         self.line("tool", "", json!({"type": "user", "gitBranch": BRANCH,
@@ -89,12 +100,35 @@ impl<'k> Session<'k> {
     }
 
     async fn edit(&mut self, path: &str) {
-        self.n += 1;
+        let id = self.call();
         self.line("assistant", "", json!({"type": "assistant", "gitBranch": BRANCH,
-            "message": {"model": "claude-sonnet-5-5", "content": [
+            "message": {"model": self.model, "content": [
                 {"type": "text", "text": "Writing the tool."},
-                {"type": "tool_use", "id": format!("toolu_{}", self.n), "name": "Edit",
+                {"type": "tool_use", "id": id, "name": "Edit",
                  "input": {"file_path": path, "old_string": "a", "new_string": "b"}}]}}))
+            .await;
+    }
+
+    /// A Write call: a whole file's content.
+    async fn write(&mut self, path: &str, content: &str) {
+        let id = self.call();
+        self.line("assistant", "", json!({"type": "assistant", "gitBranch": "sandbox",
+            "message": {"model": self.model, "content": [
+                {"type": "tool_use", "id": id, "name": "Write", "input": {"file_path": path, "content": content}}]}}))
+            .await;
+    }
+
+    /// A shell call and its result.
+    async fn bash(&mut self, command: &str, stdout: &str, failed: bool) {
+        let id = self.call();
+        self.line("assistant", "", json!({"type": "assistant", "gitBranch": "sandbox",
+            "message": {"model": self.model, "content": [
+                {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}}))
+            .await;
+        self.line("tool", "", json!({"type": "user", "gitBranch": "sandbox",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": stdout, "is_error": failed}]},
+            "toolUseResult": {"stdout": stdout, "stderr": "", "interrupted": false}}))
             .await;
     }
 }
@@ -253,4 +287,82 @@ async fn a_long_session_is_read_page_by_page() {
     let runs = store::current_runs(&db).await.expect("runs");
     let first_write = superx_mod_specs::session::get_str(&runs[0].0, "first_write");
     assert_eq!(first_write.as_deref(), Some("/r/app/tool.py"), "the write after the page boundary is found");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_ledger_ties_spec_versions_builds_and_branches() {
+    let kernel = fresh_kernel().await;
+    let db = specs_db().await;
+    let task_v4 = TASK.replace("version=\"3\"", "version=\"4\"").replace("proves=\"step 1\"", "proves=\"step 1, on the config\"");
+
+    // The design session writes version 3, by a message file.
+    let mut design = Session::with_model(&kernel, "design-1", "claude-opus-5-5").await;
+    design.say("lets write version 3").await;
+    design.read("/w/specs/root.xml", ROOT, true).await;
+    design.read("/w/specs/tasks/ENG-1.xml", TASK, true).await;
+    design.write("/s/scratch/commit_msg.txt", "ENG-7811 spec v0: ENG-1 file version 3\n\nThe first version.").await;
+    design
+        .bash(
+            "S=/s/scratch; cd /w && git add specs/tasks/ENG-1.xml && git commit -q -F $S/commit_msg.txt && git log --oneline -1",
+            "abc1234 ENG-7811 spec v0: ENG-1 file version 3",
+            false,
+        )
+        .await;
+
+    // A build of version 3, on its branch, that follows its read order.
+    let mut build = Session::new(&kernel, "build-v3").await;
+    build.say("Build specs/tasks/ENG-1.xml").await;
+    build.read("/r/specs/tasks/ENG-1.xml", TASK, true).await;
+    build.read("/r/app/core/door.py", "x\n", true).await;
+    build.read("/r/specs/root.xml", ROOT, true).await;
+    build.read("/r/specs/rules.xml", RULES, true).await;
+    build.read("/r/specs/tasks/ENG-1.xml", TASK, true).await;
+    build.read("/r/config/app.json", "{}\n", true).await;
+    build.bash("cd /r && git checkout -b ENG-1-the-tool-v3-sonnet-5-5-max", "", false).await;
+    build.edit("/r/app/tool.py").await;
+
+    // The design session reviews it, deletes its branch, writes version 4
+    // by a here-document — and a commit that failed names a version 9.
+    design.bash("git push origin --delete ENG-1-the-tool-v3-sonnet-5-5-max", " - [deleted] ENG-1-the-tool-v3-sonnet-5-5-max", false).await;
+    design
+        .bash(
+            "cat > $S/m4.txt <<'EOF'\nENG-7811 spec v0: ENG-1 file version 4 from the review of its v3 build: G2 runs on the config\nEOF\ngit commit -q -F $S/m4.txt && git log --oneline -1",
+            "def5678 ENG-7811 spec v0: ENG-1 file version 4 from the review of its v3 build: G2 runs on the config",
+            false,
+        )
+        .await;
+    design.read("/w/specs/tasks/ENG-1.xml", &task_v4, true).await;
+    design.bash("git commit -q -m \"ENG-7811 spec v0: ENG-1 file version 9\"", "nothing to commit", true).await;
+
+    let report = ingest::ingest(&kernel, &db).await.expect("ingest");
+    assert_eq!((report.builds, report.revisions_written, report.branch_events_written), (1, 2, 2), "{report:?}");
+
+    let revisions: Vec<Value> =
+        db.query("SELECT * FROM spec_revision ORDER BY version ASC").await.expect("revisions").take(0).expect("rows");
+    let s = |r: &Value, k: &str| superx_mod_specs::session::get_str(r, k);
+    let i = |r: &Value, k: &str| superx_mod_specs::session::get_int(r, k);
+    assert_eq!(revisions.len(), 2, "a failed commit is no revision");
+    assert_eq!((i(&revisions[0], "version"), s(&revisions[0], "commit").as_deref()), (Some(3), Some("abc1234")));
+    assert_eq!(s(&revisions[0], "model").as_deref(), Some("claude-opus-5-5"));
+    assert!(s(&revisions[0], "message").unwrap_or_default().contains("The first version."), "the message comes from the file the session wrote");
+    assert_eq!((i(&revisions[1], "version"), i(&revisions[1], "reviewed")), (Some(4), Some(3)));
+    assert_eq!(s(&revisions[1], "commit").as_deref(), Some("def5678"));
+
+    let ledger = superx_mod_specs::ledger::render(&db, Some("ENG-1")).await.expect("ledger");
+    for want in [
+        "v3  committed",
+        "by claude-opus-5-5 (session design-1)",
+        "read-order: complied",
+        "branch ENG-1-the-tool-v3-sonnet-5-5-max: deleted on the remote",
+        "v4  committed",
+        "from the review of its v3 build",
+        "changed: gate G2",
+        "1 builds, 0 merged; read order followed by 1, broken by 0; 1 spec versions committed after a build — committed by claude-opus-5-5 ×1",
+    ] {
+        assert!(ledger.contains(want), "the ledger lacks {want:?}:\n{ledger}");
+    }
+
+    // A second ingest adds nothing.
+    let again = ingest::ingest(&kernel, &db).await.expect("again");
+    assert_eq!((again.revisions_written, again.branch_events_written, again.runs_written), (0, 0, 0), "{again:?}");
 }

@@ -121,11 +121,12 @@ pub fn parse(content: &str) -> Option<SpecDoc> {
         }
         Kind::Rules => {
             for rule in elements(top).filter(|n| n.has_tag_name("rule")) {
-                let words = elements(rule).find(|n| n.has_tag_name("text")).map_or_else(|| text_of(rule), text_of);
+                // The whole rule — where it comes from and what catches a
+                // breach of it bind as much as its words do.
                 spec.clauses.push(Clause {
                     kind: "rule",
                     ident: rule.attribute("id").map(str::to_string),
-                    text: words,
+                    text: clause_text(rule, "id"),
                 });
             }
         }
@@ -139,7 +140,7 @@ pub fn parse(content: &str) -> Option<SpecDoc> {
                             if let Some(p) = &path {
                                 spec.named.push(p.clone());
                             }
-                            spec.clauses.push(Clause { kind, ident: path, text: text_of(file) });
+                            spec.clauses.push(Clause { kind, ident: path, text: clause_text(file, "path") });
                         }
                     }
                     "gates" => {
@@ -147,7 +148,7 @@ pub fn parse(content: &str) -> Option<SpecDoc> {
                             spec.clauses.push(Clause {
                                 kind: "gate",
                                 ident: gate.attribute("id").map(str::to_string),
-                                text: text_of(gate),
+                                text: clause_text(gate, "id"),
                             });
                         }
                     }
@@ -188,6 +189,23 @@ pub fn kickoff_task_path(message: &str) -> Option<String> {
         return None;
     }
     Some(path.to_string())
+}
+
+/// A clause's words: the element's attributes other than the one that
+/// names it (a gate's `kind` and `proves`, a file's `keys` and
+/// `through`), then all of its text. An attribute binds as much as text
+/// does, so a change to one is a change to the clause.
+fn clause_text(node: Node<'_, '_>, naming: &str) -> String {
+    let mut parts: Vec<String> = node
+        .attributes()
+        .filter(|a| a.name() != naming)
+        .map(|a| format!("{}=\"{}\"", a.name(), a.value()))
+        .collect();
+    let text = text_of(node);
+    if !text.is_empty() {
+        parts.push(text);
+    }
+    parts.join(" ")
 }
 
 /// The element children of a node.

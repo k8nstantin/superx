@@ -87,4 +87,6 @@ async fn main() {
     let report = ingest::ingest(&kernel, &db).await.expect("ingest");
     println!("{report:?}\n");
     print!("{}", render_runs(&store::current_runs(&db).await.expect("runs")));
+    println!();
+    print!("{}", superx_mod_specs::ledger::render(&db, None).await.expect("ledger"));
 }

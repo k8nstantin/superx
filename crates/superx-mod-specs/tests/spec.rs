@@ -27,12 +27,17 @@ fn a_spec_file_is_known_by_its_document_element() {
     assert_eq!(rules.kind, Kind::Rules);
     let ids: Vec<_> = rules.clauses.iter().map(|c| c.ident.as_deref().unwrap_or("")).collect();
     assert_eq!(ids, ["kickoff", "one-door"]);
-    assert_eq!(rules.clauses[1].text, "Every command runs through the one door.", "a rule's words are its text");
+    assert_eq!(
+        rules.clauses[1].text, "the design Every command runs through the one door. the lint",
+        "a rule's clause is the whole rule: where it comes from, its words, what catches a breach"
+    );
 
     let task = spec::parse(TASK).expect("task parses");
     assert_eq!(task.kind, Kind::Task);
     assert_eq!((task.key.as_deref(), task.name.as_deref(), task.version), (Some("ENG-1"), Some("the tool"), Some(3)));
     assert_eq!(task.named, ["design/a.json", "config/"]);
+    let gate = task.clauses.iter().find(|c| c.ident.as_deref() == Some("G2")).expect("G2");
+    assert!(gate.text.starts_with("kind=\"door\" proves=\"step 1\""), "a gate's attributes are part of it: {}", gate.text);
     let kinds: Vec<_> = task.clauses.iter().map(|c| (c.kind, c.ident.as_deref())).collect();
     assert_eq!(
         kinds,

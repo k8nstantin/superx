@@ -380,3 +380,211 @@ pub async fn current_runs(db: &Db) -> Result<Vec<(Value, Vec<Value>)>> {
     out.sort_by_key(|(row, _)| get_datetime(row, "started_at"));
     Ok(out)
 }
+
+/// A session's replies that call git through the shell or write a file,
+/// in captured order, with only those calls projected. Filtered in the
+/// engine, so a session without one returns nothing.
+pub const GIT_CALLS: &str = "SELECT id, emitted_at, valid_from, raw.gitBranch AS branch, raw.message.model AS model, \
+     raw.message.content[WHERE type = 'tool_use' AND (name = 'Write' OR (name = 'Bash' AND string::contains(input.command ?? '', 'git ')))] AS uses \
+     FROM message WHERE session = $sess AND role = 'assistant' \
+     AND array::len(raw.message.content[WHERE type = 'tool_use' AND (name = 'Write' OR (name = 'Bash' AND string::contains(input.command ?? '', 'git ')))]) > 0 \
+     ORDER BY valid_from ASC, id ASC";
+
+/// The results of given calls: whether each failed, and what it printed.
+pub const CALL_RESULTS: &str = "SELECT raw.message.content[0].tool_use_id AS call, raw.message.content[0].is_error AS is_error, \
+     raw.toolUseResult.stdout AS stdout FROM message \
+     WHERE session = $sess AND role = 'tool' AND raw.message.content[0].tool_use_id INSIDE $calls";
+
+/// A session's whole-file Read results of XML files, in captured order.
+pub const SPEC_READS: &str = "SELECT id, emitted_at, valid_from, raw.toolUseResult.type AS result_type, \
+     raw.toolUseResult.file AS file, raw.message.content[0].tool_use_id AS tool_use_id, role \
+     FROM message WHERE session = $sess AND role = 'tool' AND raw.toolUseResult.type = 'text' \
+     AND string::ends_with(raw.toolUseResult.file.filePath ?? '', '.xml') ORDER BY valid_from ASC, id ASC";
+
+/// One reply's git and write calls.
+#[derive(Debug, Clone)]
+pub struct Calls {
+    pub at: DateTime<Utc>,
+    pub branch: Option<String>,
+    pub model: Option<String>,
+    pub uses: Vec<Value>,
+}
+
+/// A session's git and write calls.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn git_calls(kernel: &Kernel, session: &RecordId) -> Result<Vec<Calls>> {
+    let rows: Vec<Value> = kernel.db().query(GIT_CALLS).bind(("sess", session.clone())).await?.take(0)?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            Some(Calls {
+                at: get_datetime(r, "emitted_at").or_else(|| get_datetime(r, "valid_from"))?,
+                branch: get_str(r, "branch"),
+                model: get_str(r, "model"),
+                uses: match r {
+                    Value::Object(o) => match o.get("uses") {
+                        Some(Value::Array(a)) => a.iter().cloned().collect(),
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                },
+            })
+        })
+        .collect())
+}
+
+/// Whether each call failed and what it printed, by call id.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn call_results(
+    kernel: &Kernel,
+    session: &RecordId,
+    calls: Vec<String>,
+) -> Result<std::collections::HashMap<String, (Option<bool>, String)>> {
+    if calls.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<Value> =
+        kernel.db().query(CALL_RESULTS).bind(("sess", session.clone())).bind(("calls", calls)).await?.take(0)?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let failed = match r {
+                Value::Object(o) => match o.get("is_error") {
+                    Some(Value::Bool(b)) => Some(*b),
+                    _ => None,
+                },
+                _ => None,
+            };
+            Some((get_str(r, "call")?, (failed, get_str(r, "stdout").unwrap_or_default())))
+        })
+        .collect())
+}
+
+/// A session's whole-file reads of XML files, as timeline rows.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn spec_reads(kernel: &Kernel, session: &RecordId) -> Result<Vec<Row>> {
+    let rows: Vec<Value> = kernel.db().query(SPEC_READS).bind(("sess", session.clone())).await?.take(0)?;
+    Ok(rows.iter().map(row_of).collect())
+}
+
+/// What one commit call says about one spec version.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRevision {
+    pub session: RecordId,
+    pub session_key: String,
+    pub model: Option<String>,
+    pub key: String,
+    pub version: i64,
+    pub reviewed: Option<i64>,
+    pub line: String,
+    pub message: String,
+    pub commit: Option<String>,
+    pub at: DateTime<Utc>,
+    pub call: String,
+}
+
+/// Record a revision, once per call. The flag says whether it was new.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn ensure_revision(db: &Db, r: &NewRevision) -> Result<bool> {
+    let found: Vec<RecordId> = db
+        .query("SELECT VALUE id FROM spec_revision WHERE call = $call AND key = $key AND version = $version LIMIT 1")
+        .bind(("call", r.call.clone()))
+        .bind(("key", r.key.clone()))
+        .bind(("version", r.version))
+        .await?
+        .take(0)?;
+    if !found.is_empty() {
+        return Ok(false);
+    }
+    let mut row = Object::new();
+    row.insert("session".to_string(), Value::RecordId(r.session.clone()));
+    row.insert("session_key".to_string(), Value::String(r.session_key.clone()));
+    if let Some(m) = &r.model {
+        row.insert("model".to_string(), Value::String(m.clone()));
+    }
+    row.insert("key".to_string(), Value::String(r.key.clone()));
+    row.insert("version".to_string(), Value::Number(r.version.into()));
+    if let Some(v) = r.reviewed {
+        row.insert("reviewed".to_string(), Value::Number(v.into()));
+    }
+    row.insert("line".to_string(), Value::String(r.line.clone()));
+    row.insert("message".to_string(), Value::String(r.message.clone()));
+    if let Some(c) = &r.commit {
+        row.insert("commit".to_string(), Value::String(c.clone()));
+    }
+    row.insert("at".to_string(), Value::Datetime(r.at.into()));
+    row.insert("call".to_string(), Value::String(r.call.clone()));
+    row.insert("valid_from".to_string(), Value::Datetime(Utc::now().into()));
+    db.query("CREATE $id CONTENT $row")
+        .bind(("id", new_id("spec_revision")))
+        .bind(("row", Value::Object(row)))
+        .await?
+        .check()?;
+    Ok(true)
+}
+
+/// What one call did to one branch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewBranchEvent {
+    pub session: RecordId,
+    pub session_key: String,
+    pub model: Option<String>,
+    pub branch: String,
+    pub event: &'static str,
+    pub command: String,
+    pub ok: Option<bool>,
+    pub at: DateTime<Utc>,
+    pub call: String,
+}
+
+/// Record a branch event, once per call. The flag says whether it was
+/// new.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn ensure_branch_event(db: &Db, e: &NewBranchEvent) -> Result<bool> {
+    let found: Vec<RecordId> = db
+        .query("SELECT VALUE id FROM branch_event WHERE call = $call AND branch = $branch AND event = $event LIMIT 1")
+        .bind(("call", e.call.clone()))
+        .bind(("branch", e.branch.clone()))
+        .bind(("event", e.event.to_string()))
+        .await?
+        .take(0)?;
+    if !found.is_empty() {
+        return Ok(false);
+    }
+    let mut row = Object::new();
+    row.insert("session".to_string(), Value::RecordId(e.session.clone()));
+    row.insert("session_key".to_string(), Value::String(e.session_key.clone()));
+    if let Some(m) = &e.model {
+        row.insert("model".to_string(), Value::String(m.clone()));
+    }
+    row.insert("branch".to_string(), Value::String(e.branch.clone()));
+    row.insert("event".to_string(), Value::String(e.event.to_string()));
+    row.insert("command".to_string(), Value::String(e.command.clone()));
+    if let Some(ok) = e.ok {
+        row.insert("ok".to_string(), Value::Bool(ok));
+    }
+    row.insert("at".to_string(), Value::Datetime(e.at.into()));
+    row.insert("call".to_string(), Value::String(e.call.clone()));
+    row.insert("valid_from".to_string(), Value::Datetime(Utc::now().into()));
+    db.query("CREATE $id CONTENT $row")
+        .bind(("id", new_id("branch_event")))
+        .bind(("row", Value::Object(row)))
+        .await?
+        .check()?;
+    Ok(true)
+}
