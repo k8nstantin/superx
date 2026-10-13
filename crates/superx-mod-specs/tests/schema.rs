@@ -1,7 +1,11 @@
-//! Does the database end up looking like the file? Apply the schema,
-//! read it back OUT of the engine, and diff it against the file: every
-//! table and field it declares, and nothing else (the check the entities
-//! module learned it needed, epic #353).
+//! Does the database end up looking like the schema? Apply the module's
+//! schema file, read the result back OUT of the engine, and compare it
+//! with the contract below: every table and field, and nothing else (the
+//! check the entities module learned it needed, epic #353).
+//!
+//! The contract is written out here rather than parsed from the file, so
+//! this test holds no schema statement of its own (§7): a change to the
+//! file that is not made here too fails it.
 
 use std::collections::BTreeSet;
 
@@ -9,6 +13,21 @@ use superx_kernel::types::Value;
 use superx_mod_specs::SCHEMA_DDL;
 
 const PW: &str = "test-password";
+
+/// Every table and its fields. An array field also gets an element
+/// definition from the engine, `field.*`, which INFO reports.
+const CONTRACT: &[(&str, &[&str])] = &[
+    ("spec_doc", &["sha256", "kind", "key", "name", "version", "path", "content", "first_read_at", "valid_from"]),
+    ("spec_clause", &["doc", "kind", "ident", "position", "text", "valid_from"]),
+    (
+        "spec_run",
+        &[
+            "session", "session_key", "kickoff", "task_path", "task_doc", "root_doc", "rules_doc", "key", "version",
+            "branch", "label", "model", "reads", "reads.*", "first_write", "started_at", "valid_from",
+        ],
+    ),
+    ("spec_finding", &["run", "clause", "check", "result", "note", "evidence", "evidence.*", "valid_from"]),
+];
 
 fn keys_of(v: &Value, section: &str) -> BTreeSet<String> {
     let Value::Object(top) = v else { return BTreeSet::new() };
@@ -18,55 +37,37 @@ fn keys_of(v: &Value, section: &str) -> BTreeSet<String> {
     }
 }
 
-async fn provisioned() -> superx_kernel::Db {
+async fn connect() -> superx_kernel::Db {
     let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
     db.use_ns("superx").use_db("specs").await.expect("nsdb");
-    let ddl = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", PW);
-    db.query(ddl).await.expect("provision").check().expect("provision is clean");
     db
 }
 
-/// What the file declares, parsed from the DDL so the expectation cannot
-/// drift from the thing it checks. An array field gets a second
-/// definition from the engine, `field.*`, which INFO reports.
-fn declared() -> (BTreeSet<String>, BTreeSet<(String, String)>) {
-    let mut tables = BTreeSet::new();
-    let mut fields = BTreeSet::new();
-    for line in SCHEMA_DDL.lines().map(str::trim) {
-        if let Some(rest) = line.strip_prefix("DEFINE TABLE ") {
-            if let Some(name) = rest.split_whitespace().next() {
-                tables.insert(name.to_string());
-            }
-        }
-        if let Some(rest) = line.strip_prefix("DEFINE FIELD ") {
-            let mut it = rest.split_whitespace();
-            if let (Some(field), Some("ON"), Some("TABLE"), Some(table)) = (it.next(), it.next(), it.next(), it.next()) {
-                fields.insert((table.to_string(), field.to_string()));
-                if rest.contains("array") {
-                    fields.insert((table.to_string(), format!("{field}.*")));
-                }
-            }
-        }
-    }
-    (tables, fields)
+async fn provision(db: &superx_kernel::Db) {
+    let ddl = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", PW);
+    db.query(ddl).await.expect("provision").check().expect("provision is clean");
+}
+
+async fn tables(db: &superx_kernel::Db) -> BTreeSet<String> {
+    let info: Value = db.query("INFO FOR DB").await.expect("info").take(0).expect("decodes");
+    keys_of(&info, "tables")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn provisioning_leaves_the_database_exactly_as_this_file_describes() {
-    let db = provisioned().await;
-    let (want_tables, want_fields) = declared();
+async fn provisioning_leaves_the_database_exactly_as_the_contract_says() {
+    let db = connect().await;
+    provision(&db).await;
 
-    let info: Value = db.query("INFO FOR DB").await.expect("info").take(0).expect("decodes");
-    let got_tables = keys_of(&info, "tables");
-    assert_eq!(got_tables, want_tables, "the database's tables are not the file's");
+    let want: BTreeSet<String> = CONTRACT.iter().map(|(t, _)| (*t).to_string()).collect();
+    assert_eq!(tables(&db).await, want, "the database's tables are not the contract's");
 
-    for table in &want_tables {
+    for (table, fields) in CONTRACT {
         let info: Value = db.query(format!("INFO FOR TABLE {table}")).await.expect("info").take(0).expect("decodes");
         let got = keys_of(&info, "fields");
-        let want: BTreeSet<String> = want_fields.iter().filter(|(t, _)| t == table).map(|(_, f)| f.clone()).collect();
+        let want: BTreeSet<String> = fields.iter().map(|f| (*f).to_string()).collect();
         assert_eq!(
             got, want,
-            "table `{table}` is not the file's.\n  in the file only: {:?}\n  in the database only: {:?}",
+            "table `{table}` is not the contract's.\n  in the contract only: {:?}\n  in the database only: {:?}",
             want.difference(&got).collect::<Vec<_>>(),
             got.difference(&want).collect::<Vec<_>>(),
         );
@@ -76,26 +77,23 @@ async fn provisioning_leaves_the_database_exactly_as_this_file_describes() {
 /// Provisioning over a database that already holds something leaves
 /// nothing of it behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_older_shape_does_not_survive_underneath() {
-    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
-    db.use_ns("superx").use_db("specs").await.expect("nsdb");
-    db.query("DEFINE TABLE leftover SCHEMAFULL; DEFINE FIELD junk ON TABLE leftover TYPE string;")
-        .await
-        .expect("junk")
-        .check()
-        .expect("junk defined");
-    let ddl = SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", PW);
-    db.query(ddl).await.expect("provision").check().expect("provision is clean");
+async fn nothing_that_was_there_survives_provisioning() {
+    let db = connect().await;
+    // A table the schema never declares, made the way any write makes one.
+    db.query("CREATE leftover:1 SET junk = 'x'").await.expect("junk").check().expect("junk written");
+    assert!(tables(&db).await.contains("leftover"));
 
-    let info: Value = db.query("INFO FOR DB").await.expect("info").take(0).expect("decodes");
-    assert_eq!(keys_of(&info, "tables"), declared().0, "an older table survived provisioning");
+    provision(&db).await;
+    let want: BTreeSet<String> = CONTRACT.iter().map(|(t, _)| (*t).to_string()).collect();
+    assert_eq!(tables(&db).await, want, "a table from before survived provisioning");
 }
 
 /// The engine holds the constraints the code relies on: one row per
-/// content, links that point at rows that exist, results from the list.
+/// content, links that point at rows that exist, values from the list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_engine_refuses_what_the_schema_forbids() {
-    let db = provisioned().await;
+    let db = connect().await;
+    provision(&db).await;
     let doc = "CREATE spec_doc CONTENT { sha256: 'a', kind: 'task', path: 'p', content: 'c', \
                first_read_at: time::now(), valid_from: time::now() }";
     db.query(doc).await.expect("first").check().expect("the first row is taken");
