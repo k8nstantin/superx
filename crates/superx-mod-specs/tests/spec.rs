@@ -81,6 +81,18 @@ fn the_order_is_the_roots_own_words() {
         "a root that reorders its list is judged by its own list"
     );
     assert_eq!(read_order::steps("Read whatever helps.", Some("app/core/")), None, "no list, no judgement");
+
+    // The root of 2026-10-13 lists the first four with commas and "and",
+    // and names "its task file" again after the list.
+    let commas = "A build starts at the task file (rules.xml kickoff); its start element sends the model here. Then, in \
+                  this order: the code merged on sandbox under app/core (the platform), this root, rules.xml and your task \
+                  file, each whole; then the design and structure files your task file names, by the keys it lists. The \
+                  request of every API call a task makes is written in its task file. Nothing else: no earlier spec.";
+    assert_eq!(
+        read_order::steps(commas, Some("app/core/")).expect("order"),
+        [Step::Platform, Step::Root, Step::Rules, Step::Task, Step::Named],
+        "the order is where each item is named, whatever separates them"
+    );
 }
 
 fn read(path: &str, n: usize, whole: bool) -> Read {
@@ -154,6 +166,20 @@ fn another_tasks_spec_and_a_partial_read_are_breaches() {
     assert!(j.note.contains("another task's spec"), "{}", j.note);
 
     let j = judge(&[PLATFORM, ("/r/specs/root.xml", false), RULES_FILE, TASK_FILE, NAMED]);
+    assert_eq!(j.result, "breached");
+    assert!(j.note.contains("read part of a spec file"), "{}", j.note);
+}
+
+#[test]
+fn a_part_read_in_an_abandoned_pass_does_not_count() {
+    // The sonnet ENG-8071 v7 shape: rules, root, part of the task file, the
+    // platform — then root, rules and the whole task file, in order.
+    let j = judge(&[RULES_FILE, ROOT_FILE, ("/r/specs/tasks/ENG-1.xml", false), PLATFORM, ROOT_FILE, RULES_FILE, TASK_FILE, NAMED]);
+    assert_eq!(j.result, "complied", "{}", j.note);
+    assert!(j.note.contains("after starting again"), "{}", j.note);
+
+    // Read in part in the final pass and never whole: that counts.
+    let j = judge(&[PLATFORM, ROOT_FILE, RULES_FILE, ("/r/specs/tasks/ENG-1.xml", false), NAMED]);
     assert_eq!(j.result, "breached");
     assert!(j.note.contains("read part of a spec file"), "{}", j.note);
 }

@@ -14,8 +14,11 @@
 //! > session that reads a file out of this order reads again from the
 //! > first file in order before it writes anything …
 //!
-//! So: the list after "in this order" is split at `;`, and each item is
-//! recognised by what it names. Reads of the task file before the first
+//! So: after "in this order", each item is found where its text first
+//! names it — the platform's path, "this root", "rules.xml", "your task
+//! file", "your task file names" — and the order is the order they are
+//! named in. Separators do not matter: the root of 2026-10-13 lists the
+//! first four with commas and "and", the earlier one with semicolons. Reads of the task file before the first
 //! other step are the kickoff's start. A read of an earlier step after a
 //! later one breaks the order, and only a read of the FIRST step mends
 //! it: everything is then read again in order. A spec file of another
@@ -59,30 +62,29 @@ impl Step {
 #[must_use]
 pub fn steps(read_text: &str, platform: Option<&str>) -> Option<Vec<Step>> {
     let lower = read_text.to_lowercase();
-    let start = lower.find("in this order")?;
-    let list = &read_text[start..];
-    let list = list.split_once(':').map_or(list, |(_, rest)| rest);
-    let platform = platform.map(|p| p.trim_end_matches('/').to_lowercase());
-    let mut out: Vec<Step> = Vec::new();
-    for item in list.split(';') {
-        let item = item.to_lowercase();
-        let step = if platform.as_deref().is_some_and(|p| item.contains(p)) {
-            Step::Platform
-        } else if item.contains("rules.xml") {
-            Step::Rules
-        } else if item.contains("task file") && item.contains("names") {
-            Step::Named
-        } else if item.contains("task file") {
-            Step::Task
-        } else if item.contains("root") {
-            Step::Root
-        } else {
-            continue;
-        };
-        if !out.contains(&step) {
-            out.push(step);
-        }
-    }
+    let list = &lower[lower.find("in this order")?..];
+    let first = |needle: &str| list.find(needle);
+    let platform = platform.map(|p| p.trim_end_matches('/').to_lowercase()).filter(|p| !p.is_empty());
+    // "your task file" names the task; "your task file names" the files it
+    // names, so the task is the first mention not followed by "names".
+    let task = list
+        .match_indices("task file")
+        .find(|(at, m)| !list[at + m.len()..].trim_start().starts_with("names"))
+        .map(|(at, _)| at);
+    let named = first("task file names");
+    let root = first("this root").or_else(|| first("root"));
+    let mut found: Vec<(usize, Step)> = [
+        (platform.as_deref().and_then(first), Step::Platform),
+        (root, Step::Root),
+        (first("rules.xml"), Step::Rules),
+        (task, Step::Task),
+        (named, Step::Named),
+    ]
+    .into_iter()
+    .filter_map(|(at, step)| at.map(|at| (at, step)))
+    .collect();
+    found.sort_by_key(|(at, _)| *at);
+    let out: Vec<Step> = found.into_iter().map(|(_, s)| s).collect();
     let core = [Step::Platform, Step::Root, Step::Rules, Step::Task];
     core.iter().all(|s| out.contains(s)).then_some(out)
 }
@@ -180,7 +182,9 @@ pub fn judge(reads: &[&Read], steps: &[Step], required_named: bool, cx: &Context
     let mut mended: Vec<String> = Vec::new();
     let mut evidence: Vec<String> = Vec::new();
     let mut foreign: Vec<String> = Vec::new();
-    let mut partial: Vec<String> = Vec::new();
+    // Partial reads of a spec file in the pass in progress, with their step:
+    // one counts only if that file is never read whole in the final pass.
+    let mut partial: Vec<(&Read, Step)> = Vec::new();
 
     for read in reads {
         let step = match classify(read, cx) {
@@ -198,8 +202,7 @@ pub fn judge(reads: &[&Read], steps: &[Step], required_named: bool, cx: &Context
         started = true;
         let Some(pos) = steps.iter().position(|s| *s == step) else { continue };
         if !read.whole && matches!(step, Step::Root | Step::Rules | Step::Task) {
-            partial.push(read.path.clone());
-            evidence.extend(read.tool_use_id.clone());
+            partial.push((read, step));
             continue;
         }
         if pos == 0 && (broken.is_some() || current > 0) {
@@ -208,6 +211,8 @@ pub fn judge(reads: &[&Read], steps: &[Step], required_named: bool, cx: &Context
                 mended.push(b.path.clone());
             }
             visited.clear();
+            // What the abandoned pass read, part or whole, no longer counts.
+            partial.clear();
             current = 0;
             visited.push(step);
             pass_start = Some(read);
@@ -250,8 +255,13 @@ pub fn judge(reads: &[&Read], steps: &[Step], required_named: bool, cx: &Context
     if !foreign.is_empty() {
         problems.push(format!("read another task's spec: {}", foreign.iter().map(|p| short(p)).collect::<Vec<_>>().join(", ")));
     }
+    let partial: Vec<&Read> = partial.into_iter().filter(|(_, s)| !visited.contains(s)).map(|(r, _)| r).collect();
     if !partial.is_empty() {
-        problems.push(format!("read part of a spec file, not the whole: {}", partial.iter().map(|p| short(p)).collect::<Vec<_>>().join(", ")));
+        evidence.extend(partial.iter().filter_map(|r| r.tool_use_id.clone()));
+        problems.push(format!(
+            "read part of a spec file, not the whole: {}",
+            partial.iter().map(|r| short(&r.path)).collect::<Vec<_>>().join(", ")
+        ));
     }
     if problems.is_empty() {
         let note = if mended.is_empty() {
