@@ -39,6 +39,9 @@ pub struct Report {
     pub builds: usize,
     pub runs_written: usize,
     pub runs_unchanged: usize,
+    /// Unchanged runs whose check now says something else — the module
+    /// learned to read better — and got a new finding.
+    pub rejudged: usize,
     pub docs_written: usize,
     pub revisions_written: usize,
     pub branch_events_written: usize,
@@ -255,10 +258,7 @@ async fn record_run(kernel: &Kernel, db: &Db, k: &Kickoff, report: &mut Report) 
     }
 
     let run = run_of(k, &rows, task, root, rules, &before, first_write.map(|w| w.path.clone()));
-    if store::latest_run(db, &k.session).await?.as_ref() == Some(&run) {
-        report.runs_unchanged += 1;
-        return Ok(());
-    }
+    let stored = store::latest_run(db, &k.session).await?;
 
     let (clause, judgement) = if first_write.is_none() {
         // The order binds what is read "before it writes anything": a
@@ -275,6 +275,19 @@ async fn record_run(kernel: &Kernel, db: &Db, k: &Kickoff, report: &mut Report) 
         }
         j
     };
+    // The same facts: the run stands, and only a verdict that changed —
+    // because the check did — is appended.
+    if let Some((run_id, _)) = stored.filter(|(_, facts)| *facts == run) {
+        report.runs_unchanged += 1;
+        let same = store::latest_finding(db, &run_id, READ_ORDER).await?.is_some_and(|(result, note, evidence, cited)| {
+            result == judgement.result && note == judgement.note && evidence == judgement.evidence && cited == clause
+        });
+        if !same {
+            store::create_finding(db, &run_id, clause.as_ref(), READ_ORDER, &judgement).await?;
+            report.rejudged += 1;
+        }
+        return Ok(());
+    }
     let run_id = store::create_run(db, &run).await?;
     store::create_finding(db, &run_id, clause.as_ref(), READ_ORDER, &judgement).await?;
     report.runs_written += 1;

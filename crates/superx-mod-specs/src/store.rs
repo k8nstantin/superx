@@ -275,18 +275,58 @@ fn run_of(v: &Value) -> Option<Run> {
     })
 }
 
-/// The newest stored run of a session.
+/// The newest stored run of a session: its id and its facts.
 ///
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
-pub async fn latest_run(db: &Db, session: &RecordId) -> Result<Option<Run>> {
+pub async fn latest_run(db: &Db, session: &RecordId) -> Result<Option<(RecordId, Run)>> {
     let rows: Vec<Value> = db
         .query("SELECT * FROM spec_run WHERE session = $sess ORDER BY valid_from DESC LIMIT 1")
         .bind(("sess", session.clone()))
         .await?
         .take(0)?;
-    Ok(rows.first().and_then(run_of))
+    Ok(rows.first().and_then(|r| Some((get_record(r, "id")?, run_of(r)?))))
+}
+
+/// The newest finding of one check on one run, as a judgement and the
+/// clause it cites.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn latest_finding(
+    db: &Db,
+    run: &RecordId,
+    check: &str,
+) -> Result<Option<(String, String, Vec<String>, Option<RecordId>)>> {
+    let rows: Vec<Value> = db
+        .query("SELECT * FROM spec_finding WHERE run = $run AND check = $check ORDER BY valid_from DESC LIMIT 1")
+        .bind(("run", run.clone()))
+        .bind(("check", check.to_string()))
+        .await?
+        .take(0)?;
+    Ok(rows.first().map(|r| {
+        let evidence = match r {
+            Value::Object(o) => match o.get("evidence") {
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|x| match x {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        (
+            get_str(r, "result").unwrap_or_default(),
+            get_str(r, "note").unwrap_or_default(),
+            evidence,
+            get_record(r, "clause"),
+        )
+    }))
 }
 
 /// Append a run.
@@ -354,7 +394,9 @@ pub async fn create_finding(
     Ok(id)
 }
 
-/// Every session's newest run with its findings, oldest build first.
+/// Every session's newest run with the newest finding of each check,
+/// oldest build first. A check re-judged after the module improved
+/// appends a finding; the newest is the one that stands.
 ///
 /// # Errors
 ///
@@ -370,11 +412,20 @@ pub async fn current_runs(db: &Db) -> Result<Vec<(Value, Vec<Value>)>> {
         }
         seen.push(session);
         let Some(id) = get_record(&row, "id") else { continue };
-        let findings: Vec<Value> = db
-            .query("SELECT * FROM spec_finding WHERE run = $run ORDER BY valid_from ASC")
+        let all: Vec<Value> = db
+            .query("SELECT * FROM spec_finding WHERE run = $run ORDER BY valid_from DESC")
             .bind(("run", id))
             .await?
             .take(0)?;
+        let mut checks: Vec<String> = Vec::new();
+        let mut findings: Vec<Value> = Vec::new();
+        for f in all {
+            let check = get_str(&f, "check").unwrap_or_default();
+            if !checks.contains(&check) {
+                checks.push(check);
+                findings.push(f);
+            }
+        }
         out.push((row, findings));
     }
     out.sort_by_key(|(row, _)| get_datetime(row, "started_at"));
