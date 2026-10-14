@@ -88,6 +88,7 @@ impl KernelModule for SpecsModule {
                     ("builds", r.builds),
                     ("runs_written", r.runs_written),
                     ("runs_unchanged", r.runs_unchanged),
+                    ("rejudged", r.rejudged),
                     ("docs_written", r.docs_written),
                     ("revisions_written", r.revisions_written),
                     ("branch_events_written", r.branch_events_written),
@@ -97,12 +98,13 @@ impl KernelModule for SpecsModule {
                 }
                 kernel.log_telemetry("specs_ingested", Value::Object(payload), None).await?;
                 Ok(format!(
-                    "{} sessions read, {} builds found: {} runs written, {} unchanged, {} new spec files, \
-                     {} new spec revisions, {} new branch events{}\n",
+                    "{} sessions read, {} builds found: {} runs written, {} unchanged ({} re-judged), {} new spec \
+                     files, {} new spec revisions, {} new branch events{}\n",
                     r.sessions,
                     r.builds,
                     r.runs_written,
                     r.runs_unchanged,
+                    r.rejudged,
                     r.docs_written,
                     r.revisions_written,
                     r.branch_events_written,

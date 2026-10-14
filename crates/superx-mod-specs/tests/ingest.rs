@@ -244,11 +244,37 @@ async fn a_build_is_recorded_with_what_it_read_and_judged() {
     assert!(note.contains("did not read, in order: the platform code, root.xml, rules.xml"), "{note}");
     assert!(note.contains("judged against the root first read by another session"), "{note}");
 
+    // A verdict the module no longer gives — as after the check learned to
+    // read better — is re-judged: a new finding is appended to the same
+    // run, and it is the one that stands.
+    let good_run: Vec<superx_kernel::types::RecordId> = db
+        .query("SELECT VALUE id FROM spec_run WHERE session_key = 'good-build'")
+        .await
+        .expect("run")
+        .take(0)
+        .expect("ids");
+    db.query("CREATE spec_finding CONTENT { run: $run, check: 'read-order', result: 'no-evidence', \
+              note: 'an older verdict', evidence: [], valid_from: time::now() }")
+        .bind(("run", good_run[0].clone()))
+        .await
+        .expect("stale")
+        .check()
+        .expect("stale finding written");
+    let rejudge = ingest::ingest(&kernel, &db).await.expect("rejudge");
+    assert_eq!((rejudge.runs_written, rejudge.rejudged), (0, 1), "{rejudge:?}");
+    let runs = store::current_runs(&db).await.expect("runs");
+    let (_, findings) = runs
+        .iter()
+        .find(|(r, _)| superx_mod_specs::session::get_str(r, "session_key").as_deref() == Some("good-build"))
+        .expect("run");
+    assert_eq!(findings.len(), 1, "one finding per check: the newest");
+    assert_eq!(superx_mod_specs::session::get_str(&findings[0], "result").as_deref(), Some("complied"));
+
     // Nothing changed: a second ingest writes nothing.
     let again = ingest::ingest(&kernel, &db).await.expect("ingest again");
     assert_eq!((again.runs_written, again.runs_unchanged, again.docs_written), (0, 4, 0), "{again:?}");
     assert_eq!(count(&db, "spec_run").await, 4);
-    assert_eq!(count(&db, "spec_finding").await, 4);
+    assert_eq!(count(&db, "spec_finding").await, 4 + 2, "the stale finding and its re-judgement are kept: append-only");
 
     // The finding cites the clause it was checked against.
     let clause: Vec<Value> = db
