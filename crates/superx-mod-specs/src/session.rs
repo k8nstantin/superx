@@ -56,6 +56,8 @@ pub struct Row {
     pub file: Option<Value>,
     pub tool_use_id: Option<String>,
     pub uses: Vec<Value>,
+    /// What a shell call printed, on its result line.
+    pub stdout: Option<String>,
 }
 
 /// The tools that write a file.
@@ -104,6 +106,58 @@ pub fn events(rows: &[Row]) -> Vec<Event> {
         }
     }
     out
+}
+
+/// What a session wrote or printed as documents, in order: every Write
+/// tool's content, every here-document a shell call wrote to a file, and
+/// what each shell call printed — a build's PR body among them, however
+/// it was made.
+#[must_use]
+pub fn documents(rows: &[Row]) -> Vec<String> {
+    let mut out = Vec::new();
+    for row in rows {
+        if row.role == "tool" {
+            out.extend(row.stdout.clone());
+            continue;
+        }
+        for block in row.uses.iter() {
+            let input = match block {
+                Value::Object(o) => o.get("input").cloned(),
+                _ => None,
+            };
+            let Some(input) = input else { continue };
+            match get_str(block, "name").as_deref() {
+                Some("Write") => out.extend(get_str(&input, "content")),
+                Some("Bash") => {
+                    if let Some(cmd) = get_str(&input, "command") {
+                        out.extend(crate::git::written_files(&cmd).into_iter().map(|(_, body)| body));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// A session's shell calls, in order.
+#[must_use]
+pub fn commands(rows: &[Row]) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.role == "assistant")
+        .flat_map(|r| r.uses.iter())
+        .filter(|b| get_str(b, "name").as_deref() == Some("Bash"))
+        .filter_map(|b| match b {
+            Value::Object(o) => o.get("input").and_then(|i| get_str(i, "command")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What a session's shell calls printed, in order.
+#[must_use]
+pub fn outputs(rows: &[Row]) -> Vec<String> {
+    rows.iter().filter_map(|r| r.stdout.clone()).collect()
 }
 
 /// The reads before the first write, and that write.

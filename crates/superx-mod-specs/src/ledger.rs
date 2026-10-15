@@ -298,6 +298,7 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
         };
         let checks = tally
             .iter()
+            .filter(|(_, (kept, broke))| kept + broke > 0)
             .map(|(check, (kept, broke))| format!("{check} kept by {kept}, broken by {broke}"))
             .collect::<Vec<_>>()
             .join("; ");

@@ -72,6 +72,8 @@ pub struct SpecDoc {
     pub owns: Vec<String>,
     /// The paths a task's `<forbid>` names.
     pub forbid: Vec<String>,
+    /// A task's gates: id, kind, commands, expectation.
+    pub gates: Vec<crate::gates::Gate>,
     pub clauses: Vec<Clause>,
 }
 
@@ -106,6 +108,7 @@ pub fn parse(content: &str) -> Option<SpecDoc> {
         named: Vec::new(),
         owns: Vec::new(),
         forbid: Vec::new(),
+        gates: Vec::new(),
         clauses: Vec::new(),
     };
     match kind {
@@ -151,6 +154,12 @@ pub fn parse(content: &str) -> Option<SpecDoc> {
                     }
                     "gates" => {
                         for gate in elements(part).filter(|n| n.has_tag_name("gate")) {
+                            spec.gates.push(crate::gates::Gate {
+                                id: gate.attribute("id").unwrap_or_default().to_string(),
+                                kind: gate.attribute("kind").unwrap_or_default().to_string(),
+                                cmds: elements(gate).filter(|n| n.has_tag_name("cmd")).map(text_of).collect(),
+                                expect: elements(gate).find(|n| n.has_tag_name("expect")).map(text_of).unwrap_or_default(),
+                            });
                             spec.clauses.push(Clause {
                                 kind: "gate",
                                 ident: gate.attribute("id").map(str::to_string),

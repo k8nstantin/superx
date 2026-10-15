@@ -23,6 +23,7 @@ use chrono::{DateTime, Utc};
 use superx_kernel::types::RecordId;
 use superx_kernel::{Db, Kernel, Result};
 
+use crate::gates;
 use crate::git;
 use crate::ownership;
 use crate::read_order::{self, Context, Judgement};
@@ -33,6 +34,7 @@ use crate::store::{self, Run};
 /// The checks this ingest makes, as `spec_finding.check` names them.
 pub const READ_ORDER: &str = "read-order";
 pub const OWNERSHIP: &str = "ownership";
+pub const GATES: &str = "gates";
 
 /// What an ingest did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -292,7 +294,16 @@ async fn record_run(kernel: &Kernel, db: &Db, k: &Kickoff, report: &mut Report) 
         owned.note.push_str(&format!(" (judged on the session's first {} rows)", store::SESSION_ROWS));
     }
     let owns_clause = store::clause_of_kind(db, &task.id, "owns").await?;
-    let checks = [(READ_ORDER, read_order.0, read_order.1), (OWNERSHIP, owns_clause, owned)];
+    // Level 3: the gate table the build wrote, held against the task and
+    // against the session's own commands and output.
+    let documents = session::documents(&rows);
+    let commands = session::commands(&rows);
+    let outputs = session::outputs(&rows);
+    let mut gated = gates::judge(&task.doc.gates, &strs(&documents), &strs(&commands), &strs(&outputs));
+    if cut {
+        gated.note.push_str(&format!(" (judged on the session's first {} rows)", store::SESSION_ROWS));
+    }
+    let checks = [(READ_ORDER, read_order.0, read_order.1), (OWNERSHIP, owns_clause, owned), (GATES, None, gated)];
 
     // The same facts: the run stands, and only a verdict that changed —
     // because the check did, or the session wrote more — is appended.
@@ -401,6 +412,10 @@ fn no_root() -> Judgement {
             .to_string(),
         evidence: Vec::new(),
     }
+}
+
+fn strs(v: &[String]) -> Vec<&str> {
+    v.iter().map(String::as_str).collect()
 }
 
 /// A read path is the kickoff's task file.
