@@ -11,7 +11,7 @@ use crate::session::{get_str, Row};
 use crate::spec::SpecDoc;
 
 /// A session's first human message: the kickoff line, when it is one.
-pub const KICKOFF: &str = "SELECT content, emitted_at, valid_from FROM message \
+pub const KICKOFF: &str = "SELECT content, emitted_at, valid_from, raw.cwd AS cwd FROM message \
      WHERE session = $sess AND role = 'user' ORDER BY valid_from ASC LIMIT 1";
 
 /// A session's replies and tool results, one page at a time, in the
@@ -54,17 +54,17 @@ fn get_record(v: &Value, key: &str) -> Option<RecordId> {
     }
 }
 
-/// The kickoff line and when it was sent, when the session has a human
-/// message at all.
+/// The kickoff line, when it was sent, and the directory the session
+/// was launched in, when the session has a human message at all.
 ///
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
-pub async fn kickoff(kernel: &Kernel, session: &RecordId) -> Result<Option<(String, DateTime<Utc>)>> {
+pub async fn kickoff(kernel: &Kernel, session: &RecordId) -> Result<Option<(String, DateTime<Utc>, Option<String>)>> {
     let rows: Vec<Value> = kernel.db().query(KICKOFF).bind(("sess", session.clone())).await?.take(0)?;
     Ok(rows.first().and_then(|r| {
         let at = get_datetime(r, "emitted_at").or_else(|| get_datetime(r, "valid_from"))?;
-        Some((get_str(r, "content")?, at))
+        Some((get_str(r, "content")?, at, get_str(r, "cwd")))
     }))
 }
 
@@ -217,6 +217,21 @@ pub async fn clause(db: &Db, doc: &RecordId, kind: &str, ident: &str) -> Result<
         .bind(("doc", doc.clone()))
         .bind(("kind", kind.to_string()))
         .bind(("ident", ident.to_string()))
+        .await?
+        .take(0)?;
+    Ok(found.into_iter().next())
+}
+
+/// The first clause of a kind in a spec file — the one `<owns>` of a task.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn clause_of_kind(db: &Db, doc: &RecordId, kind: &str) -> Result<Option<RecordId>> {
+    let found: Vec<RecordId> = db
+        .query("SELECT VALUE id FROM spec_clause WHERE doc = $doc AND kind = $kind ORDER BY position ASC LIMIT 1")
+        .bind(("doc", doc.clone()))
+        .bind(("kind", kind.to_string()))
         .await?
         .take(0)?;
     Ok(found.into_iter().next())
@@ -413,20 +428,20 @@ pub async fn current_runs(db: &Db) -> Result<Vec<(Value, Vec<Value>)>> {
         seen.push(session);
         let Some(id) = get_record(&row, "id") else { continue };
         let all: Vec<Value> = db
-            .query("SELECT * FROM spec_finding WHERE run = $run ORDER BY valid_from DESC")
+            .query("SELECT * FROM spec_finding WHERE run = $run ORDER BY valid_from ASC")
             .bind(("run", id))
             .await?
             .take(0)?;
-        let mut checks: Vec<String> = Vec::new();
-        let mut findings: Vec<Value> = Vec::new();
+        // Each check in the order it was first recorded, its newest finding.
+        let mut findings: Vec<(String, Value)> = Vec::new();
         for f in all {
             let check = get_str(&f, "check").unwrap_or_default();
-            if !checks.contains(&check) {
-                checks.push(check);
-                findings.push(f);
+            match findings.iter_mut().find(|(c, _)| *c == check) {
+                Some((_, newest)) => *newest = f,
+                None => findings.push((check, f)),
             }
         }
-        out.push((row, findings));
+        out.push((row, findings.into_iter().map(|(_, f)| f).collect()));
     }
     out.sort_by_key(|(row, _)| get_datetime(row, "started_at"));
     Ok(out)

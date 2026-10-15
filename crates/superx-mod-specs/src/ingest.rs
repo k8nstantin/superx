@@ -24,13 +24,15 @@ use superx_kernel::types::RecordId;
 use superx_kernel::{Db, Kernel, Result};
 
 use crate::git;
+use crate::ownership;
 use crate::read_order::{self, Context, Judgement};
 use crate::session::{self, get_str, Event, Read, Row};
 use crate::spec::{self, Kind, SpecDoc};
 use crate::store::{self, Run};
 
-/// The check this ingest makes, as `spec_finding.check` names it.
+/// The checks this ingest makes, as `spec_finding.check` names them.
 pub const READ_ORDER: &str = "read-order";
+pub const OWNERSHIP: &str = "ownership";
 
 /// What an ingest did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -56,6 +58,8 @@ struct Kickoff {
     line: String,
     task_path: String,
     at: DateTime<Utc>,
+    /// The directory the build was launched in: its repository.
+    cwd: Option<String>,
 }
 
 /// A spec file one read of a session found.
@@ -80,9 +84,9 @@ pub async fn ingest(kernel: &Kernel, db: &Db) -> Result<Report> {
         let reads = store::spec_reads(kernel, &s.entity_id).await?;
         seen_docs(db, &session::events(&reads), &mut report).await?;
         git_activity(kernel, db, &s.entity_id, &key, &mut report).await?;
-        let Some((line, at)) = store::kickoff(kernel, &s.entity_id).await? else { continue };
+        let Some((line, at, cwd)) = store::kickoff(kernel, &s.entity_id).await? else { continue };
         let Some(task_path) = spec::kickoff_task_path(&line) else { continue };
-        kickoffs.push(Kickoff { session: s.entity_id.clone(), key, line, task_path, at });
+        kickoffs.push(Kickoff { session: s.entity_id.clone(), key, line, task_path, at, cwd });
     }
     // Pass 2: judge each build.
     for k in &kickoffs {
@@ -260,7 +264,7 @@ async fn record_run(kernel: &Kernel, db: &Db, k: &Kickoff, report: &mut Report) 
     let run = run_of(k, &rows, task, root, rules, &before, first_write.map(|w| w.path.clone()));
     let stored = store::latest_run(db, &k.session).await?;
 
-    let (clause, judgement) = if first_write.is_none() {
+    let read_order = if first_write.is_none() {
         // The order binds what is read "before it writes anything": a
         // session that wrote nothing — a build that stopped at its
         // kickoff, as the kickoff rule asks of one that holds anything
@@ -275,21 +279,42 @@ async fn record_run(kernel: &Kernel, db: &Db, k: &Kickoff, report: &mut Report) 
         }
         j
     };
+    // Level 2: every write of the session, against what the task owns.
+    let writes: Vec<&session::Write> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Write(w) => Some(w),
+            Event::Read(_) => None,
+        })
+        .collect();
+    let mut owned = ownership::judge(&writes, k.cwd.as_deref(), &task.doc.owns, &task.doc.forbid);
+    if cut {
+        owned.note.push_str(&format!(" (judged on the session's first {} rows)", store::SESSION_ROWS));
+    }
+    let owns_clause = store::clause_of_kind(db, &task.id, "owns").await?;
+    let checks = [(READ_ORDER, read_order.0, read_order.1), (OWNERSHIP, owns_clause, owned)];
+
     // The same facts: the run stands, and only a verdict that changed —
-    // because the check did — is appended.
+    // because the check did, or the session wrote more — is appended.
     if let Some((run_id, _)) = stored.filter(|(_, facts)| *facts == run) {
         report.runs_unchanged += 1;
-        let same = store::latest_finding(db, &run_id, READ_ORDER).await?.is_some_and(|(result, note, evidence, cited)| {
-            result == judgement.result && note == judgement.note && evidence == judgement.evidence && cited == clause
-        });
-        if !same {
-            store::create_finding(db, &run_id, clause.as_ref(), READ_ORDER, &judgement).await?;
-            report.rejudged += 1;
+        let mut changed = false;
+        for (check, clause, judgement) in &checks {
+            let same = store::latest_finding(db, &run_id, check).await?.is_some_and(|(result, note, evidence, cited)| {
+                result == judgement.result && note == judgement.note && evidence == judgement.evidence && cited == *clause
+            });
+            if !same {
+                store::create_finding(db, &run_id, clause.as_ref(), check, judgement).await?;
+                changed = true;
+            }
         }
+        report.rejudged += usize::from(changed);
         return Ok(());
     }
     let run_id = store::create_run(db, &run).await?;
-    store::create_finding(db, &run_id, clause.as_ref(), READ_ORDER, &judgement).await?;
+    for (check, clause, judgement) in &checks {
+        store::create_finding(db, &run_id, clause.as_ref(), check, judgement).await?;
+    }
     report.runs_written += 1;
     Ok(())
 }

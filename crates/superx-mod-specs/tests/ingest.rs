@@ -73,7 +73,8 @@ impl<'k> Session<'k> {
     }
 
     async fn say(&self, text: &str) {
-        self.line("user", text, json!({"type": "user", "origin": {"kind": "human"}, "gitBranch": "main",
+        // Launched in the repository `/r`, as a build is.
+        self.line("user", text, json!({"type": "user", "origin": {"kind": "human"}, "gitBranch": "main", "cwd": "/r",
             "message": {"role": "user", "content": text}}))
             .await;
     }
@@ -133,6 +134,18 @@ impl<'k> Session<'k> {
     }
 }
 
+/// The result and note of one check among a run's findings.
+fn verdict(findings: &[Value], check: &str) -> (String, String) {
+    let f = findings
+        .iter()
+        .find(|f| superx_mod_specs::session::get_str(f, "check").as_deref() == Some(check))
+        .unwrap_or_else(|| panic!("no {check} finding"));
+    (
+        superx_mod_specs::session::get_str(f, "result").unwrap_or_default(),
+        superx_mod_specs::session::get_str(f, "note").unwrap_or_default(),
+    )
+}
+
 async fn count(db: &superx_kernel::Db, table: &str) -> i64 {
     let rows: Vec<Value> = db.query(format!("SELECT count() AS c FROM {table} GROUP ALL")).await.expect("count").take(0).expect("rows");
     rows.first()
@@ -162,6 +175,8 @@ async fn a_build_is_recorded_with_what_it_read_and_judged() {
     good.read("/r/config/app.json", "{}\n", true).await;
     good.edit("/r/app/tool.py").await;
     good.read("/r/app/tool.py", "x\n", true).await;
+    // A scratch file outside the repository is not the repository's.
+    good.write("/s/scratch/pr_body.md", "the PR body").await;
 
     // A build that reads the platform last, and never reads the spec again.
     let mut late = Session::new(&kernel, "late-platform").await;
@@ -185,6 +200,20 @@ async fn a_build_is_recorded_with_what_it_read_and_judged() {
     skipped.read("/r/specs/tasks/ENG-1.xml", TASK, true).await;
     skipped.edit("/r/app/tool.py").await;
 
+    // A build that reads in order, then writes what its task forbids and
+    // what it does not own.
+    let mut overreach = Session::new(&kernel, "overreach").await;
+    overreach.say("Build specs/tasks/ENG-1.xml").await;
+    overreach.read("/r/app/core/door.py", "x\n", true).await;
+    overreach.read("/r/specs/root.xml", ROOT, true).await;
+    overreach.read("/r/specs/rules.xml", RULES, true).await;
+    overreach.read("/r/specs/tasks/ENG-1.xml", TASK, true).await;
+    overreach.read("/r/config/app.json", "{}\n", true).await;
+    overreach.edit("/r/app/tool.py").await;
+    overreach.edit("/r/design/a.json").await;
+    overreach.write("/r/README.md", "notes").await;
+    overreach.edit("/r/design/a.json").await;
+
     // A design session: it reads the same files, but it opened with a
     // conversation, not a kickoff line.
     let mut design = Session::new(&kernel, "design").await;
@@ -193,13 +222,13 @@ async fn a_build_is_recorded_with_what_it_read_and_judged() {
     design.edit("/r/specs/tasks/ENG-1.xml").await;
 
     let report = ingest::ingest(&kernel, &db).await.expect("ingest");
-    assert_eq!((report.sessions, report.builds, report.runs_written), (5, 4, 4), "{report:?}");
+    assert_eq!((report.sessions, report.builds, report.runs_written), (6, 5, 5), "{report:?}");
     assert_eq!(report.docs_written, 3, "root, rules and task, once each however often they were read");
     assert_eq!(count(&db, "spec_doc").await, 3);
     assert_eq!(count(&db, "spec_clause").await, 2 + 2 + 9, "the root's steps, the rules, the task's clauses");
 
     let runs = store::current_runs(&db).await.expect("runs");
-    assert_eq!(runs.len(), 4, "the design session is no build");
+    assert_eq!(runs.len(), 5, "the design session is no build");
     let by_key = |key: &str| {
         runs.iter()
             .find(|(r, _)| superx_mod_specs::session::get_str(r, "session_key").as_deref() == Some(key))
@@ -221,26 +250,47 @@ async fn a_build_is_recorded_with_what_it_read_and_judged() {
         },
         _ => panic!("row"),
     }
-    assert_eq!(findings.len(), 1);
-    let f = |k: &str| superx_mod_specs::session::get_str(&findings[0], k);
-    assert_eq!(f("check").as_deref(), Some("read-order"));
-    assert_eq!(f("result").as_deref(), Some("complied"), "{:?}", f("note"));
+    let checks: Vec<String> = findings.iter().filter_map(|f| superx_mod_specs::session::get_str(f, "check")).collect();
+    assert_eq!(checks, ["read-order", "ownership"], "both checks, in the order they were first recorded");
+    let (result, note) = verdict(findings, "read-order");
+    assert_eq!(result, "complied", "{note}");
+    let (result, note) = verdict(findings, "ownership");
+    assert_eq!(result, "complied", "{note}");
+    assert!(note.contains("(1 writes in the repository)"), "the scratch file outside it is not judged: {note}");
 
     let (_, findings) = by_key("late-platform");
-    let f = |k: &str| superx_mod_specs::session::get_str(&findings[0], k);
-    assert_eq!(f("result").as_deref(), Some("breached"));
-    assert!(f("note").unwrap_or_default().contains("root.xml, rules.xml, the task file"), "{:?}", f("note"));
+    let (result, note) = verdict(findings, "read-order");
+    assert_eq!(result, "breached");
+    assert!(note.contains("root.xml, rules.xml, the task file"), "{note}");
+    assert_eq!(verdict(findings, "ownership").0, "complied", "a check is judged on its own");
 
     let (run, findings) = by_key("stopped");
     assert_eq!(superx_mod_specs::session::get_str(run, "first_write"), None);
-    let f = |k: &str| superx_mod_specs::session::get_str(&findings[0], k);
-    assert_eq!(f("result").as_deref(), Some("no-evidence"), "a build that wrote nothing broke no order: {:?}", f("note"));
+    let (result, note) = verdict(findings, "read-order");
+    assert_eq!(result, "no-evidence", "a build that wrote nothing broke no order: {note}");
+    assert_eq!(verdict(findings, "ownership").0, "no-evidence", "nor wrote anything it did not own");
+
+    let (_, findings) = by_key("overreach");
+    assert_eq!(verdict(findings, "read-order").0, "complied");
+    let (result, note) = verdict(findings, "ownership");
+    assert_eq!(result, "breached", "{note}");
+    assert_eq!(note, "wrote what the task file forbids: design/a.json; wrote what the task file does not own: README.md");
+    let ownership = findings
+        .iter()
+        .find(|f| superx_mod_specs::session::get_str(f, "check").as_deref() == Some("ownership"))
+        .expect("ownership");
+    match ownership {
+        Value::Object(o) => match o.get("evidence") {
+            Some(Value::Array(a)) => assert_eq!(a.len(), 2, "one call per path, the first that wrote it"),
+            other => panic!("evidence: {other:?}"),
+        },
+        _ => panic!("finding"),
+    }
 
     let (run, findings) = by_key("skipped-root");
     assert_eq!(superx_mod_specs::session::get_str(run, "root_doc"), None, "the session read no root");
-    let f = |k: &str| superx_mod_specs::session::get_str(&findings[0], k);
-    assert_eq!(f("result").as_deref(), Some("breached"), "{:?}", f("note"));
-    let note = f("note").unwrap_or_default();
+    let (result, note) = verdict(findings, "read-order");
+    assert_eq!(result, "breached", "{note}");
     assert!(note.contains("did not read, in order: the platform code, root.xml, rules.xml"), "{note}");
     assert!(note.contains("judged against the root first read by another session"), "{note}");
 
@@ -267,18 +317,18 @@ async fn a_build_is_recorded_with_what_it_read_and_judged() {
         .iter()
         .find(|(r, _)| superx_mod_specs::session::get_str(r, "session_key").as_deref() == Some("good-build"))
         .expect("run");
-    assert_eq!(findings.len(), 1, "one finding per check: the newest");
-    assert_eq!(superx_mod_specs::session::get_str(&findings[0], "result").as_deref(), Some("complied"));
+    assert_eq!(findings.len(), 2, "one finding per check: the newest");
+    assert_eq!(verdict(findings, "read-order").0, "complied");
 
     // Nothing changed: a second ingest writes nothing.
     let again = ingest::ingest(&kernel, &db).await.expect("ingest again");
-    assert_eq!((again.runs_written, again.runs_unchanged, again.docs_written), (0, 4, 0), "{again:?}");
-    assert_eq!(count(&db, "spec_run").await, 4);
-    assert_eq!(count(&db, "spec_finding").await, 4 + 2, "the stale finding and its re-judgement are kept: append-only");
+    assert_eq!((again.runs_written, again.runs_unchanged, again.rejudged, again.docs_written), (0, 5, 0, 0), "{again:?}");
+    assert_eq!(count(&db, "spec_run").await, 5);
+    assert_eq!(count(&db, "spec_finding").await, 5 * 2 + 2, "the stale finding and its re-judgement are kept: append-only");
 
     // The finding cites the clause it was checked against.
     let clause: Vec<Value> = db
-        .query("SELECT VALUE clause.text FROM spec_finding WHERE result = 'complied'")
+        .query("SELECT VALUE clause.text FROM spec_finding WHERE result = 'complied' AND check = 'read-order'")
         .await
         .expect("clause")
         .take(0)
@@ -383,7 +433,7 @@ async fn the_ledger_ties_spec_versions_builds_and_branches() {
         "v4  committed",
         "from the review of its v3 build",
         "changed: gate G2",
-        "1 builds, 0 merged; read order followed by 1, broken by 0; 1 spec versions committed after a build — committed by claude-opus-5-5 ×1",
+        "1 builds, 0 merged; ownership kept by 1, broken by 0; read-order kept by 1, broken by 0; 1 spec versions committed after a build — committed by claude-opus-5-5 ×1",
     ] {
         assert!(ledger.contains(want), "the ledger lacks {want:?}:\n{ledger}");
     }

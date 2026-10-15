@@ -172,8 +172,8 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
 
         let mut previous: Option<BTreeMap<String, String>> = None;
         let mut builds = 0usize;
-        let mut followed = 0usize;
-        let mut broke = 0usize;
+        // Per check: (complied, breached).
+        let mut tally: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         let mut merged = 0usize;
         let mut after_build: Vec<String> = Vec::new();
         let mut last_build_at: Option<DateTime<Utc>> = None;
@@ -255,9 +255,10 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
                 );
                 for f in findings {
                     let result = get_str(f, "result").unwrap_or_default();
+                    let entry = tally.entry(get_str(f, "check").unwrap_or_default()).or_default();
                     match result.as_str() {
-                        "complied" => followed += 1,
-                        "breached" => broke += 1,
+                        "complied" => entry.0 += 1,
+                        "breached" => entry.1 += 1,
                         _ => {}
                     }
                     let _ = writeln!(
@@ -295,10 +296,15 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
                 by_model.iter().map(|(m, n)| format!("{m} ×{n}")).collect::<Vec<_>>().join(", ")
             )
         };
+        let checks = tally
+            .iter()
+            .map(|(check, (kept, broke))| format!("{check} kept by {kept}, broken by {broke}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let checks = if checks.is_empty() { String::new() } else { format!("; {checks}") };
         let _ = writeln!(
             out,
-            "  so far: {builds} builds, {merged} merged; read order followed by {followed}, broken by {broke}; \
-             {} spec versions committed after a build{authors}\n",
+            "  so far: {builds} builds, {merged} merged{checks}; {} spec versions committed after a build{authors}\n",
             after_build.len()
         );
     }
