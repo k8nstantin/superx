@@ -27,6 +27,7 @@
 pub mod git;
 pub mod ingest;
 pub mod ledger;
+pub mod ownership;
 pub mod read_order;
 pub mod session;
 pub mod spec;

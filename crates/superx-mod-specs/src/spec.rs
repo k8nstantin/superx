@@ -68,6 +68,10 @@ pub struct SpecDoc {
     /// The files a task names: every `<file path>` of its `<reflects>`
     /// and `<reads>`.
     pub named: Vec<String>,
+    /// The paths a task's `<owns>` names: files, directories, globs.
+    pub owns: Vec<String>,
+    /// The paths a task's `<forbid>` names.
+    pub forbid: Vec<String>,
     pub clauses: Vec<Clause>,
 }
 
@@ -100,6 +104,8 @@ pub fn parse(content: &str) -> Option<SpecDoc> {
         version: top.attribute("version").and_then(|v| v.trim().parse().ok()),
         platform: None,
         named: Vec::new(),
+        owns: Vec::new(),
+        forbid: Vec::new(),
         clauses: Vec::new(),
     };
     match kind {
@@ -152,8 +158,16 @@ pub fn parse(content: &str) -> Option<SpecDoc> {
                             });
                         }
                     }
-                    "owns" => spec.clauses.push(Clause { kind: "owns", ident: None, text: text_of(part) }),
-                    "forbid" => spec.clauses.push(Clause { kind: "forbid", ident: None, text: text_of(part) }),
+                    "owns" => {
+                        let text = text_of(part);
+                        spec.owns = paths_in(&text);
+                        spec.clauses.push(Clause { kind: "owns", ident: None, text });
+                    }
+                    "forbid" => {
+                        let text = text_of(part);
+                        spec.forbid = paths_in(&text);
+                        spec.clauses.push(Clause { kind: "forbid", ident: None, text });
+                    }
                     "agent-decides" => {
                         spec.clauses.push(Clause { kind: "agent-decides", ident: None, text: text_of(part) });
                     }
@@ -206,6 +220,22 @@ fn clause_text(node: Node<'_, '_>, naming: &str) -> String {
         parts.push(text);
     }
     parts.join(" ")
+}
+
+/// The repository paths a sentence names: words with a `/` in them,
+/// trailing punctuation dropped. `<owns>` and `<forbid>` are written as
+/// prose ("a.py; b.py, c.py and d.py, the changes … and nothing else"),
+/// and a path is the only word in them with a slash. A URL is not a path.
+#[must_use]
+pub fn paths_in(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split(|c: char| c.is_whitespace() || c == ';' || c == ',') {
+        let word = word.trim_matches(|c: char| matches!(c, '.' | ':' | '(' | ')' | '"' | '\'' | '`'));
+        if word.contains('/') && !word.contains("://") && !out.iter().any(|w| w == word) {
+            out.push(word.to_string());
+        }
+    }
+    out
 }
 
 /// The element children of a node.
