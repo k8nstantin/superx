@@ -20,6 +20,7 @@ pub const KICKOFF: &str = "SELECT content, emitted_at, valid_from, raw.cwd AS cw
 pub const TIMELINE: &str = "SELECT id, role, emitted_at, valid_from, \
      raw.gitBranch AS branch, raw.message.model AS model, \
      raw.toolUseResult.type AS result_type, raw.toolUseResult.file AS file, \
+     raw.toolUseResult.stdout AS stdout, \
      raw.message.content[0].tool_use_id AS tool_use_id, \
      raw.message.content[WHERE type = 'tool_use'] AS uses \
      FROM message WHERE session = $sess AND role INSIDE ['assistant', 'tool'] \
@@ -112,6 +113,7 @@ fn row_of(v: &Value) -> Row {
         result_type: get_str(v, "result_type"),
         file: field("file").filter(|f| matches!(f, Value::Object(_))),
         tool_use_id: get_str(v, "tool_use_id"),
+        stdout: get_str(v, "stdout"),
         uses: match field("uses") {
             Some(Value::Array(a)) => a.into_iter().collect(),
             _ => Vec::new(),

@@ -24,6 +24,7 @@
 //! Nothing else in the workspace names this crate except the binary's
 //! link line: removing it removes the module and changes nothing else.
 
+pub mod gates;
 pub mod git;
 pub mod ingest;
 pub mod ledger;

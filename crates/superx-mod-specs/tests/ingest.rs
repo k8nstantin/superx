@@ -175,8 +175,16 @@ async fn a_build_is_recorded_with_what_it_read_and_judged() {
     good.read("/r/config/app.json", "{}\n", true).await;
     good.edit("/r/app/tool.py").await;
     good.read("/r/app/tool.py", "x\n", true).await;
-    // A scratch file outside the repository is not the repository's.
-    good.write("/s/scratch/pr_body.md", "the PR body").await;
+    // Its gates, run in the session, and its PR body with the gate table —
+    // a scratch file outside the repository, which is not the repository's.
+    good.bash("cd /r && python -m lint --check", "0 violations", false).await;
+    good.bash("gcloud run jobs execute door --args app,tool,check --wait", "Execution door-1 completed: run 20261015t010000z", false).await;
+    good.write(
+        "/s/scratch/pr_body.md",
+        "## Gates\n\n| id | kind | exit | matched | run id |\n|---|---|---|---|---|\n\
+         | G1 | local | 0 | 0 violations | local |\n| G2 | door | 0 | the finding line | `20261015t010000z` |\n",
+    )
+    .await;
 
     // A build that reads the platform last, and never reads the spec again.
     let mut late = Session::new(&kernel, "late-platform").await;
@@ -251,7 +259,9 @@ async fn a_build_is_recorded_with_what_it_read_and_judged() {
         _ => panic!("row"),
     }
     let checks: Vec<String> = findings.iter().filter_map(|f| superx_mod_specs::session::get_str(f, "check")).collect();
-    assert_eq!(checks, ["read-order", "ownership"], "both checks, in the order they were first recorded");
+    assert_eq!(checks, ["read-order", "ownership", "gates"], "every check, in the order they were first recorded");
+    let (result, note) = verdict(findings, "gates");
+    assert_eq!(result, "complied", "{note}");
     let (result, note) = verdict(findings, "read-order");
     assert_eq!(result, "complied", "{note}");
     let (result, note) = verdict(findings, "ownership");
@@ -272,6 +282,7 @@ async fn a_build_is_recorded_with_what_it_read_and_judged() {
 
     let (_, findings) = by_key("overreach");
     assert_eq!(verdict(findings, "read-order").0, "complied");
+    assert_eq!(verdict(findings, "gates").0, "no-evidence", "it never wrote a gate table");
     let (result, note) = verdict(findings, "ownership");
     assert_eq!(result, "breached", "{note}");
     assert_eq!(note, "wrote what the task file forbids: design/a.json; wrote what the task file does not own: README.md");
@@ -317,14 +328,14 @@ async fn a_build_is_recorded_with_what_it_read_and_judged() {
         .iter()
         .find(|(r, _)| superx_mod_specs::session::get_str(r, "session_key").as_deref() == Some("good-build"))
         .expect("run");
-    assert_eq!(findings.len(), 2, "one finding per check: the newest");
+    assert_eq!(findings.len(), 3, "one finding per check: the newest");
     assert_eq!(verdict(findings, "read-order").0, "complied");
 
     // Nothing changed: a second ingest writes nothing.
     let again = ingest::ingest(&kernel, &db).await.expect("ingest again");
     assert_eq!((again.runs_written, again.runs_unchanged, again.rejudged, again.docs_written), (0, 5, 0, 0), "{again:?}");
     assert_eq!(count(&db, "spec_run").await, 5);
-    assert_eq!(count(&db, "spec_finding").await, 5 * 2 + 2, "the stale finding and its re-judgement are kept: append-only");
+    assert_eq!(count(&db, "spec_finding").await, 5 * 3 + 2, "the stale finding and its re-judgement are kept: append-only");
 
     // The finding cites the clause it was checked against.
     let clause: Vec<Value> = db
