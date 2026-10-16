@@ -449,6 +449,19 @@ async fn the_ledger_ties_spec_versions_builds_and_branches() {
         assert!(ledger.contains(want), "the ledger lacks {want:?}:\n{ledger}");
     }
 
+    // The page reads the same ledger as data.
+    let tasks = superx_mod_specs::ledger::build(&db, Some("ENG-1")).await.expect("build");
+    assert_eq!(tasks.len(), 1);
+    let t = &tasks[0];
+    assert_eq!((t.summary.builds, t.summary.merged, t.summary.after_build), (1, 0, 1));
+    assert_eq!(t.versions.iter().map(|v| v.version).collect::<Vec<_>>(), [3, 4]);
+    let v3 = &t.versions[0];
+    assert_eq!(v3.commit.as_ref().and_then(|c| c.model.as_deref()), Some("claude-opus-5-5"));
+    let b = &v3.builds[0];
+    assert_eq!(b.checks.iter().map(|c| c.check.as_str()).collect::<Vec<_>>(), ["read-order", "ownership", "gates"]);
+    assert_eq!(b.fate_event.as_deref(), Some("deleted-remote"));
+    assert_eq!(t.versions[1].changed.as_deref(), Some(&["gate G2".to_string()][..]));
+
     // A second ingest adds nothing.
     let again = ingest::ingest(&kernel, &db).await.expect("again");
     assert_eq!((again.revisions_written, again.branch_events_written, again.runs_written), (0, 0, 0), "{again:?}");

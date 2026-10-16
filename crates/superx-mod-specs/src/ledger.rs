@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
+use ts_rs::TS;
 use superx_kernel::types::{RecordId, Value};
 use superx_kernel::{Db, Result};
 
@@ -123,15 +125,16 @@ fn about<'a>(events: &'a [Value], branch: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-/// What became of a branch: its newest successful event, in words. One
-/// call that deletes a branch here and on the remote reads as the
-/// remote deletion.
-fn fate(events: &[&Value]) -> String {
+/// What became of a branch: its newest successful event, in words, and
+/// that event's kind. One call that deletes a branch here and on the
+/// remote reads as the remote deletion.
+fn fate(events: &[&Value]) -> (String, Option<String>) {
     let done: Vec<&&Value> = events.iter().filter(|e| boolean(e, "ok") != Some(false)).collect();
     let Some(last) = done.iter().max_by_key(|e| (get_datetime(e, "at"), weight(get_str(e, "event").as_deref()))) else {
-        return "fate unknown: no session's git touched it".to_string();
+        return ("fate unknown: no session's git touched it".to_string(), None);
     };
-    let what = match get_str(last, "event").as_deref() {
+    let event = get_str(last, "event");
+    let what = match event.as_deref() {
         Some("deleted-remote") => "deleted on the remote",
         Some("deleted") => "deleted locally",
         Some("merged") => "merged",
@@ -140,15 +143,117 @@ fn fate(events: &[&Value]) -> String {
         Some("created") => "created, then nothing a session did",
         _ => "touched",
     };
-    format!("{what} {} by {}", when(last, "at"), who(last))
+    (format!("{what} {} by {}", when(last, "at"), who(last)), event)
 }
 
-/// The ledger, for one task key or all of them.
+/// One task's ledger: its versions in order, and what they add up to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct TaskLedger {
+    pub key: String,
+    pub versions: Vec<VersionLedger>,
+    pub summary: Summary,
+}
+
+/// One spec version: its commit, what changed, and its builds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct VersionLedger {
+    #[ts(type = "number")]
+    pub version: i64,
+    /// The first commit a session made of it, when one was seen.
+    pub commit: Option<CommitLine>,
+    /// The clauses that differ from the version before; `None` when no
+    /// build or session read this version whole, so its clauses are
+    /// unknown.
+    pub changed: Option<Vec<String>>,
+    pub builds: Vec<BuildLine>,
+}
+
+/// Who committed a version, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct CommitLine {
+    pub at: String,
+    pub model: Option<String>,
+    pub session: String,
+    /// The message line that names the version.
+    pub line: String,
+    /// The body's first paragraph, when the subject names only the
+    /// version.
+    pub why: Option<String>,
+    /// How many commits named this version.
+    #[ts(type = "number")]
+    pub commits: usize,
+}
+
+/// One build of a version: its checks, and its branch's fate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct BuildLine {
+    pub started_at: String,
+    pub label: String,
+    pub session: String,
+    pub checks: Vec<CheckLine>,
+    pub branch: Option<String>,
+    pub fate: String,
+    /// The kind of the event the fate rests on (`merged`, `reverted`,
+    /// `deleted-remote`, …).
+    pub fate_event: Option<String>,
+    pub merged: bool,
+}
+
+/// One check's newest finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct CheckLine {
+    pub check: String,
+    /// `complied`, `breached` or `no-evidence`.
+    pub result: String,
+    pub note: String,
+}
+
+/// What a task's ledger adds up to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct Summary {
+    #[ts(type = "number")]
+    pub builds: usize,
+    #[ts(type = "number")]
+    pub merged: usize,
+    /// Per check that judged anything: kept and broken.
+    pub checks: Vec<CheckTally>,
+    /// Spec versions first committed after a build of the task.
+    #[ts(type = "number")]
+    pub after_build: usize,
+    /// Who committed those, by model.
+    pub authors: Vec<AuthorCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct CheckTally {
+    pub check: String,
+    #[ts(type = "number")]
+    pub kept: usize,
+    #[ts(type = "number")]
+    pub broken: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct AuthorCount {
+    pub model: String,
+    #[ts(type = "number")]
+    pub versions: usize,
+}
+
+/// The ledger, for one task key or all of them, as data.
 ///
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
-pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
+pub async fn build(db: &Db, only: Option<&str>) -> Result<Vec<TaskLedger>> {
     let revisions: Vec<Value> = db.query("SELECT * FROM spec_revision ORDER BY at ASC").await?.take(0)?;
     let events: Vec<Value> = db.query("SELECT * FROM branch_event ORDER BY at ASC").await?.take(0)?;
     let docs: Vec<Value> =
@@ -161,17 +266,14 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
     keys.extend(revisions.iter().filter_map(|r| get_str(r, "key")));
     keys.extend(runs.iter().filter_map(|(r, _)| get_str(r, "key")));
     keys.retain(|k| only.is_none_or(|o| o == k));
-    if keys.is_empty() {
-        return Ok("nothing recorded — run `superx specs ingest`\n".to_string());
-    }
 
-    let mut out = String::new();
+    let mut out = Vec::new();
     for key in keys {
-        let _ = writeln!(out, "{key}");
-        let mut versions: BTreeSet<i64> = BTreeSet::new();
-        versions.extend(revisions.iter().filter(|r| get_str(r, "key").as_deref() == Some(&key)).filter_map(|r| get_int(r, "version")));
-        versions.extend(runs.iter().filter(|(r, _)| get_str(r, "key").as_deref() == Some(&key)).filter_map(|(r, _)| get_int(r, "version")));
+        let mut numbers: BTreeSet<i64> = BTreeSet::new();
+        numbers.extend(revisions.iter().filter(|r| get_str(r, "key").as_deref() == Some(&key)).filter_map(|r| get_int(r, "version")));
+        numbers.extend(runs.iter().filter(|(r, _)| get_str(r, "key").as_deref() == Some(&key)).filter_map(|(r, _)| get_int(r, "version")));
 
+        let mut versions: Vec<VersionLedger> = Vec::new();
         let mut previous: Option<BTreeMap<String, String>> = None;
         let mut builds = 0usize;
         // Per check: (complied, breached).
@@ -179,7 +281,7 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
         let mut merged = 0usize;
         let mut after_build: Vec<String> = Vec::new();
         let mut last_build_at: Option<DateTime<Utc>> = None;
-        for v in versions {
+        for v in numbers {
             let commits: Vec<&Value> = revisions
                 .iter()
                 .filter(|r| get_str(r, "key").as_deref() == Some(&key) && get_int(r, "version") == Some(v))
@@ -188,33 +290,35 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
                 .iter()
                 .filter(|(r, _)| get_str(r, "key").as_deref() == Some(&key) && get_int(r, "version") == Some(v))
                 .collect();
-            match commits.first() {
-                Some(first) => {
-                    let more = if commits.len() > 1 { format!(" ({} commits)", commits.len()) } else { String::new() };
-                    let _ = writeln!(out, "  v{v}  committed {} by {}{more}", when(first, "at"), who(first));
-                    let line = get_str(first, "line").unwrap_or_default();
-                    let _ = writeln!(out, "      \"{line}\"");
-                    // A subject that names only the version keeps its
-                    // reason in the body (the design sessions' rule from
-                    // 2026-10-13): show the body's first paragraph.
-                    let message = get_str(first, "message").unwrap_or_default();
-                    if let Some(body) = message.split("\n\n").map(str::trim).find(|p| !p.is_empty() && !p.contains(&line) && !line.contains(*p)) {
+            let commit = commits.first().map(|first| {
+                let line = get_str(first, "line").unwrap_or_default();
+                // A subject that names only the version keeps its reason
+                // in the body (the design sessions' rule from 2026-10-13):
+                // the body's first paragraph is the why.
+                let message = get_str(first, "message").unwrap_or_default();
+                let why = message
+                    .split("\n\n")
+                    .map(str::trim)
+                    .find(|p| !p.is_empty() && !p.contains(&line) && !line.contains(*p))
+                    .map(|body| {
                         let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
                         let cut: String = flat.chars().take(400).collect();
-                        let more = if flat.chars().count() > 400 { "…" } else { "" };
-                        let _ = writeln!(out, "      why: {cut}{more}");
-                    }
-                    let first_at = get_datetime(first, "at");
-                    if let (Some(built), Some(at)) = (last_build_at, first_at) {
-                        if at > built {
-                            after_build.push(get_str(first, "model").unwrap_or_else(|| "an unknown model".to_string()));
-                        }
+                        if flat.chars().count() > 400 { format!("{cut}…") } else { cut }
+                    });
+                if let (Some(built), Some(at)) = (last_build_at, get_datetime(first, "at")) {
+                    if at > built {
+                        after_build.push(get_str(first, "model").unwrap_or_else(|| "an unknown model".to_string()));
                     }
                 }
-                None => {
-                    let _ = writeln!(out, "  v{v}  no commit of it was seen in a session");
+                CommitLine {
+                    at: when(first, "at"),
+                    model: get_str(first, "model"),
+                    session: short(&get_str(first, "session_key").unwrap_or_default()),
+                    line,
+                    why,
+                    commits: commits.len(),
                 }
-            }
+            });
 
             // The file this version's builds read, else any recorded copy.
             let doc = these
@@ -230,48 +334,32 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
                 Some(d) => Some(clauses(db, d).await?),
                 None => None,
             };
-            match (&previous, &current) {
-                (Some(before), Some(after)) => {
-                    let diff = changed(before, after);
-                    if !diff.is_empty() {
-                        let _ = writeln!(out, "      changed: {}", diff.join("; "));
-                    }
-                }
-                (_, None) => {
-                    let _ = writeln!(out, "      (no build or session read this version whole; its clauses are unknown)");
-                }
-                _ => {}
-            }
+            let changed_clauses = match (&previous, &current) {
+                (Some(before), Some(after)) => Some(changed(before, after)),
+                (None, Some(_)) => Some(Vec::new()),
+                (_, None) => None,
+            };
             if current.is_some() {
                 previous = current;
             }
 
+            let mut lines = Vec::new();
             for (run, findings) in these {
                 builds += 1;
-                let label = get_str(run, "label").or_else(|| get_str(run, "model")).unwrap_or_else(|| "?".to_string());
-                let _ = writeln!(
-                    out,
-                    "      build {}  {label}  (session {})",
-                    when(run, "started_at"),
-                    short(&get_str(run, "session_key").unwrap_or_default())
-                );
+                let mut checks = Vec::new();
                 for f in findings {
                     let result = get_str(f, "result").unwrap_or_default();
-                    let entry = tally.entry(get_str(f, "check").unwrap_or_default()).or_default();
+                    let check = get_str(f, "check").unwrap_or_default();
+                    let entry = tally.entry(check.clone()).or_default();
                     match result.as_str() {
                         "complied" => entry.0 += 1,
                         "breached" => entry.1 += 1,
                         _ => {}
                     }
-                    let _ = writeln!(
-                        out,
-                        "        {}: {result} — {}",
-                        get_str(f, "check").unwrap_or_default(),
-                        get_str(f, "note").unwrap_or_default()
-                    );
+                    checks.push(CheckLine { check, result, note: get_str(f, "note").unwrap_or_default() });
                 }
                 let branch = get_str(run, "branch");
-                let line = match &branch {
+                let (fate_text, fate_event, is_merged) = match &branch {
                     Some(b) => {
                         let mine = about(&events, b);
                         // Merged, unless its newest merge or revert is a revert.
@@ -280,41 +368,119 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
                             .filter(|e| boolean(e, "ok") != Some(false))
                             .filter(|e| matches!(get_str(e, "event").as_deref(), Some("merged" | "reverted")))
                             .max_by_key(|e| get_datetime(e, "at"));
-                        if last.is_some_and(|e| get_str(e, "event").as_deref() == Some("merged")) {
-                            merged += 1;
-                        }
-                        format!("branch {b}: {}", fate(&mine))
+                        let is_merged = last.is_some_and(|e| get_str(e, "event").as_deref() == Some("merged"));
+                        let (text, event) = fate(&mine);
+                        (text, event, is_merged)
                     }
-                    None => "no build branch named for this version was seen".to_string(),
+                    None => ("no build branch named for this version was seen".to_string(), None, false),
                 };
-                let _ = writeln!(out, "        {line}");
-                let started = get_datetime(run, "started_at");
-                last_build_at = last_build_at.max(started);
+                merged += usize::from(is_merged);
+                lines.push(BuildLine {
+                    started_at: when(run, "started_at"),
+                    label: get_str(run, "label").or_else(|| get_str(run, "model")).unwrap_or_else(|| "?".to_string()),
+                    session: short(&get_str(run, "session_key").unwrap_or_default()),
+                    checks,
+                    branch,
+                    fate: fate_text,
+                    fate_event,
+                    merged: is_merged,
+                });
+                last_build_at = last_build_at.max(get_datetime(run, "started_at"));
             }
+            versions.push(VersionLedger { version: v, commit, changed: changed_clauses, builds: lines });
         }
         let mut by_model: BTreeMap<String, usize> = BTreeMap::new();
         for m in &after_build {
             *by_model.entry(m.clone()).or_default() += 1;
         }
-        let authors = if by_model.is_empty() {
+        out.push(TaskLedger {
+            key,
+            versions,
+            summary: Summary {
+                builds,
+                merged,
+                checks: tally
+                    .into_iter()
+                    .filter(|(_, (kept, broke))| kept + broke > 0)
+                    .map(|(check, (kept, broken))| CheckTally { check, kept, broken })
+                    .collect(),
+                after_build: after_build.len(),
+                authors: by_model.into_iter().map(|(model, versions)| AuthorCount { model, versions }).collect(),
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// The ledger, for one task key or all of them, as text.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
+    let tasks = build(db, only).await?;
+    if tasks.is_empty() {
+        return Ok("nothing recorded — run `superx specs ingest`\n".to_string());
+    }
+    let mut out = String::new();
+    for task in &tasks {
+        let _ = writeln!(out, "{}", task.key);
+        for v in &task.versions {
+            match &v.commit {
+                Some(c) => {
+                    let more = if c.commits > 1 { format!(" ({} commits)", c.commits) } else { String::new() };
+                    let by = c.model.as_deref().unwrap_or("an unknown model");
+                    let _ = writeln!(out, "  v{}  committed {} by {by} (session {}){more}", v.version, c.at, c.session);
+                    let _ = writeln!(out, "      \"{}\"", c.line);
+                    if let Some(why) = &c.why {
+                        let _ = writeln!(out, "      why: {why}");
+                    }
+                }
+                None => {
+                    let _ = writeln!(out, "  v{}  no commit of it was seen in a session", v.version);
+                }
+            }
+            match &v.changed {
+                Some(diff) if !diff.is_empty() => {
+                    let _ = writeln!(out, "      changed: {}", diff.join("; "));
+                }
+                Some(_) => {}
+                None => {
+                    let _ = writeln!(out, "      (no build or session read this version whole; its clauses are unknown)");
+                }
+            }
+            for b in &v.builds {
+                let _ = writeln!(out, "      build {}  {}  (session {})", b.started_at, b.label, b.session);
+                for c in &b.checks {
+                    let _ = writeln!(out, "        {}: {} — {}", c.check, c.result, c.note);
+                }
+                let line = match &b.branch {
+                    Some(branch) => format!("branch {branch}: {}", b.fate),
+                    None => b.fate.clone(),
+                };
+                let _ = writeln!(out, "        {line}");
+            }
+        }
+        let s = &task.summary;
+        let authors = if s.authors.is_empty() {
             String::new()
         } else {
             format!(
                 " — committed by {}",
-                by_model.iter().map(|(m, n)| format!("{m} ×{n}")).collect::<Vec<_>>().join(", ")
+                s.authors.iter().map(|a| format!("{} ×{}", a.model, a.versions)).collect::<Vec<_>>().join(", ")
             )
         };
-        let checks = tally
+        let checks = s
+            .checks
             .iter()
-            .filter(|(_, (kept, broke))| kept + broke > 0)
-            .map(|(check, (kept, broke))| format!("{check} kept by {kept}, broken by {broke}"))
+            .map(|c| format!("{} kept by {}, broken by {}", c.check, c.kept, c.broken))
             .collect::<Vec<_>>()
             .join("; ");
         let checks = if checks.is_empty() { String::new() } else { format!("; {checks}") };
         let _ = writeln!(
             out,
-            "  so far: {builds} builds, {merged} merged{checks}; {} spec versions committed after a build{authors}\n",
-            after_build.len()
+            "  so far: {} builds, {} merged{checks}; {} spec versions committed after a build{authors}\n",
+            s.builds, s.merged, s.after_build
         );
     }
     Ok(out)

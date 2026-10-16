@@ -3819,15 +3819,21 @@ name = "superx-mod-specs"
 version = "1.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "chrono",
  "linkme",
+ "mime_guess",
  "roxmltree",
+ "rust-embed",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "superx-kernel",
  "surrealdb",
  "tokio",
+ "tower",
  "tracing",
+ "ts-rs",
  "uuid",
 ]
 
