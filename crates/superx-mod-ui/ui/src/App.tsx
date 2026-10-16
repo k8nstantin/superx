@@ -8,6 +8,7 @@ import StatusPage from './pages/status'
 import ActivityPage from './pages/Activity'
 import SessionsPage from './pages/Sessions'
 import ConsolePage from './pages/Console'
+import { CaptureBanner } from './CaptureBanner'
 
 export default function App() {
   return (
@@ -78,6 +79,7 @@ function Shell() {
         )}
       </AppShell.Navbar>
       <AppShell.Main>
+        <CaptureBanner />
         {page === 'Status' && <StatusPage />}
         {page === 'Activity' && <ActivityPage />}
         {page === 'Sessions' && <SessionsPage />}
