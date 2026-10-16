@@ -453,3 +453,54 @@ async fn the_ledger_ties_spec_versions_builds_and_branches() {
     let again = ingest::ingest(&kernel, &db).await.expect("again");
     assert_eq!((again.revisions_written, again.branch_events_written, again.runs_written), (0, 0, 0), "{again:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_that_was_reverted_is_not_merged() {
+    let kernel = fresh_kernel().await;
+    let db = specs_db().await;
+    let mut build = Session::new(&kernel, "build-v3").await;
+    build.say("Build specs/tasks/ENG-1.xml").await;
+    build.read("/r/specs/tasks/ENG-1.xml", TASK, true).await;
+    build.bash("cd /r && git checkout -b ENG-1-the-tool-v3-sonnet-5-5-max", "", false).await;
+    build.edit("/r/app/tool.py").await;
+
+    // The design session merges the build, and shows the merge commit…
+    let mut design = Session::with_model(&kernel, "design-1", "claude-opus-5-5").await;
+    design.say("merge it").await;
+    design
+        .bash(
+            "git merge --no-ff -q -m \"Merge branch 'ENG-1-the-tool-v3-sonnet-5-5-max' into sandbox\" origin/ENG-1-the-tool-v3-sonnet-5-5-max",
+            "",
+            false,
+        )
+        .await;
+    // The hash is printed as a reflog entry first, then as the merge.
+    design.bash("git reflog -1 origin/sandbox", "60d21202 refs/remotes/origin/sandbox@{0}: update by push", false).await;
+    design.bash("git log --oneline -1", "60d21202 Merge branch 'ENG-1-the-tool-v3-sonnet-5-5-max' into sandbox", false).await;
+    let ledger = {
+        ingest::ingest(&kernel, &db).await.expect("ingest");
+        superx_mod_specs::ledger::render(&db, Some("ENG-1")).await.expect("ledger")
+    };
+    assert!(ledger.contains("branch ENG-1-the-tool-v3-sonnet-5-5-max: merged"), "{ledger}");
+    assert!(ledger.contains("1 builds, 1 merged"), "{ledger}");
+
+    // …and later reverts it, naming only the commit.
+    design.bash("git switch -c revert-v3 origin/sandbox && git revert -m 1 --no-edit 60d21202", "", false).await;
+    let report = ingest::ingest(&kernel, &db).await.expect("ingest");
+    assert_eq!(
+        (report.branch_events_written, report.reverts_unresolved),
+        (2, 0),
+        "revert-v3 created, and the build's branch's merge reverted: {report:?}"
+    );
+    let ledger = superx_mod_specs::ledger::render(&db, Some("ENG-1")).await.expect("ledger");
+    assert!(
+        ledger.contains("branch ENG-1-the-tool-v3-sonnet-5-5-max: merged, then its merge reverted"),
+        "{ledger}"
+    );
+    assert!(ledger.contains("1 builds, 0 merged"), "a reverted merge does not count as merged:\n{ledger}");
+
+    // A revert of a commit no session ever showed stays unresolved.
+    design.bash("git revert --no-edit abcdef12", "", false).await;
+    let report = ingest::ingest(&kernel, &db).await.expect("ingest");
+    assert_eq!(report.reverts_unresolved, 1, "{report:?}");
+}

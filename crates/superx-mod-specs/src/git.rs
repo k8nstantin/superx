@@ -46,11 +46,31 @@ pub struct Revision {
     pub line: String,
 }
 
+/// One `git revert` a call makes: the commit it reverts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revert {
+    /// The commit as the call names it: a hash, abbreviated or whole.
+    pub sha: String,
+    /// The git command as written.
+    pub command: String,
+}
+
 /// What one shell call says about git.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Activity {
     pub branches: Vec<BranchEvent>,
     pub commits: Vec<Commit>,
+    pub reverts: Vec<Revert>,
+}
+
+/// The branch a merge commit's subject names: `Merge branch '<b>' …`, or
+/// the default subject of its revert, `Revert "Merge branch '<b>' …"`.
+#[must_use]
+pub fn merged_branch(subject: &str) -> Option<String> {
+    let s = subject.trim().trim_start_matches("Revert ").trim_start_matches('"');
+    let rest = s.strip_prefix("Merge branch '")?;
+    let name = rest.split('\'').next()?;
+    (!name.is_empty() && is_literal_name(name)).then(|| name.to_string())
 }
 
 /// Parse one shell call.
@@ -128,6 +148,25 @@ pub fn activity(command: &str) -> Activity {
                     }
                     if !a.starts_with('-') && is_literal_name(a) {
                         push(a.clone(), "merged");
+                    }
+                }
+            }
+            "revert" => {
+                if args.iter().any(|a| matches!(a.as_str(), "--continue" | "--abort" | "--quit" | "--skip")) {
+                    continue;
+                }
+                let mut skip = false;
+                for a in args {
+                    if skip {
+                        skip = false;
+                        continue;
+                    }
+                    if a == "-m" || a == "--mainline" {
+                        skip = true;
+                        continue;
+                    }
+                    if !a.starts_with('-') && a.len() >= 7 && a.len() <= 40 && a.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        out.reverts.push(Revert { sha: a.to_lowercase(), command: segment.trim().to_string() });
                     }
                 }
             }

@@ -120,4 +120,14 @@ async fn the_engine_refuses_what_the_schema_forbids() {
         .expect("query")
         .check();
     assert!(dangling.is_err(), "a clause of a spec file that does not exist must be refused");
+
+    let event = |kind: &str| {
+        format!(
+            "CREATE branch_event CONTENT {{ session: entity:x, session_key: 's', branch: 'b', event: '{kind}', \
+             command: 'git revert 60d21202', at: time::now(), call: 'toolu_{kind}', valid_from: time::now() }}"
+        )
+    };
+    db.query(event("reverted")).await.expect("query").check().expect("a reverted merge is an event (2026-10-16)");
+    let committed = db.query(event("committed")).await.expect("query").check();
+    assert!(committed.is_err(), "an event kind outside the list must be refused");
 }

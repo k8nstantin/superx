@@ -24,7 +24,7 @@
 --   spec_finding   one row per check of a run against a clause
 --   spec_revision  one row per spec version a commit in a session named
 --   branch_event   one row per branch a session's git created, pushed,
---                  merged or deleted
+--                  merged, reverted the merge of, or deleted
 --
 -- EVERY ROW IS DERIVED. Each one is computed from the kernel's captured
 -- sessions, so provisioning over an existing database loses nothing an
@@ -189,7 +189,9 @@ DEFINE INDEX idx_revision_key  ON TABLE spec_revision FIELDS key, version;
 
 -- 6 ─── branch_event ─────────────────── what a session's git did to a branch ───
 -- Read from the text of the session's shell calls: what the command
--- says, never inferred. (No `committed`: a line's `gitBranch` is the
+-- says, never inferred. `reverted` is a `git revert` of a commit whose
+-- printed subject is `Merge branch '<branch>'` (operator-approved
+-- 2026-10-16). (No `committed`: a line's `gitBranch` is the
 -- branch of the directory the session was launched in, not of the
 -- worktree a call may have changed into.) `ok` is whether the call succeeded,
 -- absent when its result was not captured. A branch's fate is its
@@ -202,7 +204,7 @@ DEFINE FIELD session_key ON TABLE branch_event TYPE string;
 DEFINE FIELD model       ON TABLE branch_event TYPE option<string>;
 DEFINE FIELD branch      ON TABLE branch_event TYPE string;
 DEFINE FIELD event       ON TABLE branch_event TYPE string
-    ASSERT $value INSIDE ['created', 'pushed', 'merged', 'deleted', 'deleted-remote'];
+    ASSERT $value INSIDE ['created', 'pushed', 'merged', 'reverted', 'deleted', 'deleted-remote'];
 DEFINE FIELD command     ON TABLE branch_event TYPE string;
 DEFINE FIELD ok          ON TABLE branch_event TYPE option<bool>;
 DEFINE FIELD at          ON TABLE branch_event TYPE datetime;
