@@ -95,6 +95,7 @@ impl KernelModule for SpecsModule {
                     ("revisions_written", r.revisions_written),
                     ("branch_events_written", r.branch_events_written),
                     ("cut_short", r.cut_short),
+                    ("reverts_unresolved", r.reverts_unresolved),
                 ] {
                     payload.insert(k.to_string(), Value::Number(i64::try_from(v).unwrap_or(i64::MAX).into()));
                 }
@@ -110,7 +111,14 @@ impl KernelModule for SpecsModule {
                     r.docs_written,
                     r.revisions_written,
                     r.branch_events_written,
-                    if r.cut_short > 0 { format!(", {} judged on their first rows only", r.cut_short) } else { String::new() }
+                    [
+                        (r.cut_short, "judged on their first rows only"),
+                        (r.reverts_unresolved, "reverts whose merged branch no session printed"),
+                    ]
+                    .iter()
+                    .filter(|(n, _)| *n > 0)
+                    .map(|(n, what)| format!(", {n} {what}"))
+                    .collect::<String>()
                 ))
             }
             Some("ledger") => {

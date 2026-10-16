@@ -104,8 +104,9 @@ fn changed(before: &BTreeMap<String, String>, after: &BTreeMap<String, String>) 
 /// How much an event settles a branch's fate, for events of one call.
 fn weight(event: Option<&str>) -> u8 {
     match event {
-        Some("deleted-remote") => 4,
-        Some("deleted") => 3,
+        Some("deleted-remote") => 5,
+        Some("deleted") => 4,
+        Some("reverted") => 3,
         Some("merged") => 2,
         Some("pushed") => 1,
         _ => 0,
@@ -134,6 +135,7 @@ fn fate(events: &[&Value]) -> String {
         Some("deleted-remote") => "deleted on the remote",
         Some("deleted") => "deleted locally",
         Some("merged") => "merged",
+        Some("reverted") => "merged, then its merge reverted",
         Some("pushed") => "pushed, then nothing a session did",
         Some("created") => "created, then nothing a session did",
         _ => "touched",
@@ -272,7 +274,13 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
                 let line = match &branch {
                     Some(b) => {
                         let mine = about(&events, b);
-                        if mine.iter().any(|e| get_str(e, "event").as_deref() == Some("merged") && boolean(e, "ok") != Some(false)) {
+                        // Merged, unless its newest merge or revert is a revert.
+                        let last = mine
+                            .iter()
+                            .filter(|e| boolean(e, "ok") != Some(false))
+                            .filter(|e| matches!(get_str(e, "event").as_deref(), Some("merged" | "reverted")))
+                            .max_by_key(|e| get_datetime(e, "at"));
+                        if last.is_some_and(|e| get_str(e, "event").as_deref() == Some("merged")) {
                             merged += 1;
                         }
                         format!("branch {b}: {}", fate(&mine))

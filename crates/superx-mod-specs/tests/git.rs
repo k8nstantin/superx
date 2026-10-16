@@ -90,3 +90,26 @@ fn printed_commits_are_read_from_a_oneline_log() {
     let c = git::printed_commits("aef287d7 ENG-7811 spec v0: ENG-8072 file version 6\nwrote kn-specs/build_spec.html\n");
     assert_eq!(c, [("aef287d7".to_string(), "ENG-7811 spec v0: ENG-8072 file version 6".to_string())]);
 }
+
+#[test]
+fn a_revert_names_the_commit_it_reverts() {
+    let a = git::activity("cd $W && git switch -q -c ENG-8071-revert-v5 origin/sandbox && git revert -m 1 --no-edit 60d21202 && git log --oneline -1");
+    assert_eq!(a.reverts.len(), 1);
+    assert_eq!(a.reverts[0].sha, "60d21202", "the -m value is not the commit");
+    assert!(git::activity("git revert --continue").reverts.is_empty());
+    assert!(git::activity("git revert -m 1 HEAD").reverts.is_empty(), "a ref name is not a printed commit to look up");
+}
+
+#[test]
+fn a_merge_subject_names_its_branch() {
+    assert_eq!(
+        git::merged_branch("Merge branch 'ENG-8071-source-v5-sonnet-5-5-max' into sandbox: the source tool").as_deref(),
+        Some("ENG-8071-source-v5-sonnet-5-5-max")
+    );
+    assert_eq!(
+        git::merged_branch("Revert \"Merge branch 'ENG-1-x-v3-y' into sandbox\"").as_deref(),
+        Some("ENG-1-x-v3-y"),
+        "a revert's default subject names the same branch"
+    );
+    assert_eq!(git::merged_branch("ENG-7811 spec v0: ENG-8072 file version 7"), None);
+}

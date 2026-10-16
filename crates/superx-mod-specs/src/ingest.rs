@@ -49,8 +49,20 @@ pub struct Report {
     pub docs_written: usize,
     pub revisions_written: usize,
     pub branch_events_written: usize,
+    /// `git revert`s whose commit no session ever printed with a
+    /// `Merge branch '…'` subject: what they reverted is unknown.
+    pub reverts_unresolved: usize,
     /// Builds longer than the read bound, judged on their first rows.
     pub cut_short: usize,
+}
+
+/// What pass 1 gathers across sessions to resolve reverts: every line any
+/// session printed after a commit hash (hash → every such line: a log
+/// subject, a reflog entry, …), and every revert awaiting its branch.
+#[derive(Default)]
+struct GitSeen {
+    printed: HashMap<String, Vec<String>>,
+    reverts: Vec<(String, store::NewBranchEvent)>,
 }
 
 /// A session that opened with a kickoff line.
@@ -79,16 +91,35 @@ struct Seen {
 pub async fn ingest(kernel: &Kernel, db: &Db) -> Result<Report> {
     let mut report = Report::default();
     let mut kickoffs: Vec<Kickoff> = Vec::new();
+    let mut git_seen = GitSeen::default();
     // Pass 1: every session — what it read, committed and did to branches.
     for s in kernel.list_named_entities("node_session", "attr_session_descriptor").await? {
         report.sessions += 1;
         let key = get_str(&s.payload, "session").unwrap_or_default();
         let reads = store::spec_reads(kernel, &s.entity_id).await?;
         seen_docs(db, &session::events(&reads), &mut report).await?;
-        git_activity(kernel, db, &s.entity_id, &key, &mut report).await?;
+        git_activity(kernel, db, &s.entity_id, &key, &mut git_seen, &mut report).await?;
         let Some((line, at, cwd)) = store::kickoff(kernel, &s.entity_id).await? else { continue };
         let Some(task_path) = spec::kickoff_task_path(&line) else { continue };
         kickoffs.push(Kickoff { session: s.entity_id.clone(), key, line, task_path, at, cwd });
+    }
+    // A revert names a commit; the branch is the one that commit's printed
+    // subject merged — printed by whichever session showed it.
+    for (sha, mut event) in git_seen.reverts {
+        // The same hash prints as a log subject, a reflog entry, a list of
+        // refs: the line that says which branch it merged is the one.
+        let branch = git_seen
+            .printed
+            .iter()
+            .filter(|(h, _)| h.starts_with(sha.as_str()) || sha.starts_with(h.as_str()))
+            .flat_map(|(_, lines)| lines.iter())
+            .find_map(|s| git::merged_branch(s));
+        let Some(branch) = branch else {
+            report.reverts_unresolved += 1;
+            continue;
+        };
+        event.branch = branch;
+        report.branch_events_written += usize::from(store::ensure_branch_event(db, &event).await?);
     }
     // Pass 2: judge each build.
     for k in &kickoffs {
@@ -102,7 +133,14 @@ pub async fn ingest(kernel: &Kernel, db: &Db) -> Result<Report> {
 /// named, and what it did to branches. A commit message given by file
 /// (`-F`) is the one the session wrote last under that file name, with
 /// the Write tool or a `cat > … <<EOF` in a shell call.
-async fn git_activity(kernel: &Kernel, db: &Db, session: &RecordId, key: &str, report: &mut Report) -> Result<()> {
+async fn git_activity(
+    kernel: &Kernel,
+    db: &Db,
+    session: &RecordId,
+    key: &str,
+    git_seen: &mut GitSeen,
+    report: &mut Report,
+) -> Result<()> {
     let calls = store::git_calls(kernel, session).await?;
     if calls.is_empty() {
         return Ok(());
@@ -138,6 +176,28 @@ async fn git_activity(kernel: &Kernel, db: &Db, session: &RecordId, key: &str, r
                     let (failed, stdout) = results.get(&call).cloned().unwrap_or((None, String::new()));
                     let ok = failed.map(|f| !f);
                     let activity = git::activity(&command);
+                    for (hash, subject) in git::printed_commits(&stdout) {
+                        let lines = git_seen.printed.entry(hash.to_lowercase()).or_default();
+                        if !lines.contains(&subject) {
+                            lines.push(subject);
+                        }
+                    }
+                    for r in &activity.reverts {
+                        git_seen.reverts.push((
+                            r.sha.clone(),
+                            store::NewBranchEvent {
+                                session: session.clone(),
+                                session_key: key.to_string(),
+                                model: c.model.clone(),
+                                branch: String::new(),
+                                event: "reverted",
+                                command: r.command.clone(),
+                                ok,
+                                at: c.at,
+                                call: call.clone(),
+                            },
+                        ));
+                    }
                     for e in activity.branches {
                         let new = store::ensure_branch_event(
                             db,
