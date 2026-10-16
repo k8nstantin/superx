@@ -18,6 +18,8 @@
 //!   own database   `superx/specs`, its own service account
 //!   own schema     `schema/specs.surql`, applied at provision
 //!   own log        `target: "specs"`
+//!   own UI         the ledger as a page, on `attr_specs_ui_port`, its URL
+//!                  published as `attr_module_ui_url`
 //!   own CLI        `superx specs ingest`, `superx specs runs`,
 //!                  `superx specs ledger [KEY]`
 //!
@@ -30,6 +32,7 @@ pub mod ingest;
 pub mod ledger;
 pub mod ownership;
 pub mod read_order;
+pub mod server;
 pub mod session;
 pub mod spec;
 pub mod store;
@@ -39,6 +42,53 @@ use std::fmt::Write as _;
 use async_trait::async_trait;
 use superx_kernel::types::Value;
 use superx_kernel::{Kernel, KernelError, KernelModule, KernelModuleDescriptor, NodeKind, Result, KERNEL_MODULES};
+
+/// Port parameter for this module's OWN service, on its own registry
+/// entity.
+pub const UI_PORT_PARAM: &str = "attr_specs_ui_port";
+
+/// Where it listens when the parameter is unset.
+pub const DEFAULT_UI_PORT: u16 = 5152; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
+/// The convention every module with a UI follows (D-UI2): publish the URL
+/// on its own registry entity, so the core dashboard finds it in the
+/// substrate and never through code.
+pub const MODULE_UI_URL_PARAM: &str = "attr_module_ui_url";
+
+/// The core dashboard's registry name and port parameter: SUBSTRATE
+/// COORDINATES, not a dependency — this crate imports no other module.
+const CORE_UI_MODULE: &str = "ui";
+const CORE_UI_PORT_PARAM: &str = "attr_ui_port";
+
+/// Where the core dashboard listens when its port parameter is unset.
+const CORE_UI_DEFAULT_PORT: u16 = 5150; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
+fn port_of(v: Option<Value>) -> Option<u16> {
+    match v {
+        Some(Value::Number(n)) => n.to_int().and_then(|i| u16::try_from(i).ok()).filter(|&p| p > 0),
+        _ => None,
+    }
+}
+
+/// This module's port: the parameter on its registry entity, else the
+/// fallback.
+pub async fn resolved_ui_port(kernel: &Kernel) -> u16 {
+    let Ok(Some(entity)) = kernel.find_module_by_name(NodeKind::KernelModule, MODULE_NAME).await else {
+        return DEFAULT_UI_PORT;
+    };
+    port_of(kernel.get_parameter(entity, UI_PORT_PARAM).await.ok().flatten()).unwrap_or(DEFAULT_UI_PORT)
+}
+
+/// Where the core dashboard lives, for the page's way back: the URL it
+/// publishes, else its port.
+pub async fn core_dashboard_url(kernel: &Kernel) -> Option<String> {
+    let entity = kernel.find_module_by_name(NodeKind::KernelModule, CORE_UI_MODULE).await.ok().flatten()?;
+    if let Ok(Some(Value::String(url))) = kernel.get_parameter(entity.clone(), MODULE_UI_URL_PARAM).await {
+        return Some(url);
+    }
+    let port = port_of(kernel.get_parameter(entity, CORE_UI_PORT_PARAM).await.ok().flatten()).unwrap_or(CORE_UI_DEFAULT_PORT);
+    Some(format!("http://127.0.0.1:{port}"))
+}
 
 /// The module's name — db name, CLI namespace, log target.
 pub const MODULE_NAME: &str = "specs";
@@ -66,12 +116,23 @@ impl KernelModule for SpecsModule {
 
     async fn startup(&self, kernel: &Kernel) -> Result<()> {
         // Provisioning is an operator step; an unprovisioned module must
-        // not fail the boot walk. Nothing runs at boot: an ingest is asked
-        // for.
-        match kernel.module_db(MODULE_NAME).await {
-            Ok(_) => tracing::info!(target: "specs", "substrate ready"),
-            Err(e) => tracing::warn!(target: "specs", "own db unavailable — module idle until provisioned: {e}"),
+        // not fail the boot walk. No ingest runs at boot: one is asked for.
+        let db = match kernel.module_db(MODULE_NAME).await {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!(target: "specs", "own db unavailable — module idle until provisioned: {e}");
+                return Ok(());
+            }
+        };
+        // The ledger as a page, on this module's own port, its URL
+        // published where the core dashboard looks for module UIs (D-UI2).
+        let port = resolved_ui_port(kernel).await;
+        server::spawn(kernel, db, port).await?;
+        let url = format!("http://127.0.0.1:{port}");
+        if let Ok(Some(entity)) = kernel.find_module_by_name(NodeKind::KernelModule, MODULE_NAME).await {
+            kernel.set_parameter(entity, MODULE_UI_URL_PARAM, Value::String(url.clone())).await?;
         }
+        tracing::info!(target: "specs", %url, "ledger page listening");
         Ok(())
     }
 
