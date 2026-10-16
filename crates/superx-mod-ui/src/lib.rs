@@ -22,6 +22,7 @@ use superx_kernel::{
 pub mod activity;
 pub mod checkout;
 pub mod compare;
+pub mod health;
 pub mod api;
 pub mod insights;
 pub mod landed;
@@ -149,6 +150,12 @@ pub async fn resolved_default_range(kernel: &Kernel) -> String {
 }
 
 /// Resolve how long an answer may be reused, in seconds.
+/// How long transcripts may change past the OS's newest record before the
+/// page says capture is stalled (#452).
+pub async fn resolved_stall_secs(kernel: &Kernel) -> u64 {
+    resolved_secs(kernel, health::STALL_SECS_PARAM, health::DEFAULT_STALL_SECS).await
+}
+
 pub async fn resolved_cache_secs(kernel: &Kernel) -> u64 {
     resolved_secs(kernel, CACHE_SECS_PARAM, DEFAULT_CACHE_SECS).await
 }

@@ -7,6 +7,7 @@ import type { SseEvent } from './generated/SseEvent'
 import type { StatsSummary } from './generated/StatsSummary'
 import type { InsightsSummary } from './generated/InsightsSummary'
 import type { CompareSummary } from './generated/CompareSummary'
+import type { CaptureView } from './generated/CaptureView'
 
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(path)
@@ -26,6 +27,8 @@ async function get<T>(path: string): Promise<T> {
 }
 
 export const fetchStatus = () => get<StatusResponse>('/api/status')
+// Is capture keeping up (#452)?
+export const fetchCapture = () => get<CaptureView>('/api/capture')
 export const fetchAgents = () => get<AgentView[]>('/api/agents')
 export const fetchSessions = (agent?: string) =>
   get<SessionView[]>(`/api/sessions${agent ? `?agent=${agent}` : ''}`)

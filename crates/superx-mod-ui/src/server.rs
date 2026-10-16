@@ -207,6 +207,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
     crate::set_query_timeout(budget);
     let app = Router::new()
         .route("/api/status", get(api_status))
+        .route("/api/capture", get(api_capture))
         .route("/api/agents", get(api_agents))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/{id}/activity", get(api_session_activity))
@@ -347,6 +348,31 @@ async fn static_assets(uri: axum::http::Uri) -> axum::response::Response {
 /// under `assets/`, or whose last segment carries an extension.
 fn names_a_file(path: &str) -> bool {
     path.starts_with("assets/") || path.rsplit('/').next().is_some_and(|last| last.contains('.'))
+}
+
+/// Is capture keeping up (#452)? Cached like the session list: every page
+/// asks, and the answer moves slowly.
+async fn api_capture(State(state): State<AppState>) -> axum::response::Response {
+    let kernel = &state.kernel;
+    let ttl = crate::resolved_cache_secs(kernel).await;
+    if let Some(body) = state.cached("capture", ttl) {
+        return json_body(body);
+    }
+    let stall = crate::resolved_stall_secs(kernel).await;
+    match crate::health::read(kernel, stall).await {
+        Ok(view) => {
+            let body = serde_json::to_string(&view).unwrap_or_else(|_| "{}".to_string());
+            state.remember("capture", &body);
+            json_body(body)
+        }
+        Err(e) => {
+            use axum::response::IntoResponse as _;
+            // The same `{ output, is_error }` the budget layer answers with,
+            // so the page shows the engine's own words.
+            (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({ "output": e.to_string(), "is_error": true })))
+                .into_response()
+        }
+    }
 }
 
 async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {

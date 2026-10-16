@@ -20,6 +20,23 @@ pub struct StatusResponse {
     pub default_range: String,
 }
 
+/// Is capture keeping up (#452)? `/api/capture`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct CaptureView {
+    /// RFC3339: when the OS last recorded anything.
+    pub last_written: Option<String>,
+    /// RFC3339: when a session's transcript last changed.
+    pub transcripts_changed: Option<String>,
+    /// That session, as `<agent>/<session key>`.
+    pub transcript: Option<String>,
+    /// How long transcripts may change past the newest record before
+    /// this says stalled (`attr_ui_capture_stall_secs`).
+    pub stall_secs: i64,
+    /// Transcripts kept changing longer than that after the last record.
+    pub stalled: bool,
+}
+
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct ModuleView {
