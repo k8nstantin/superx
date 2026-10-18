@@ -17,11 +17,16 @@ transcripts_changed: string | null,
  */
 transcript: string | null, 
 /**
+ * RFC3339: since when a change has been waiting to be taken in, as
+ * far as this server has seen; absent while capture keeps up.
+ */
+waiting_since: string | null, 
+/**
  * How long transcripts may change past the newest record before
  * this says stalled (`attr_ui_capture_stall_secs`).
  */
 stall_secs: bigint, 
 /**
- * Transcripts kept changing longer than that after the last record.
+ * A change has waited longer than that.
  */
 stalled: boolean, };

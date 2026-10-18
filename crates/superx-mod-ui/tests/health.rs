@@ -1,33 +1,57 @@
-//! Is capture keeping up (#452)? The rule, and the transcripts' times.
+//! Is capture keeping up (#452)? The rule, over polls, and the
+//! transcripts' times.
 
-use chrono::{Duration, TimeZone, Utc};
-use superx_mod_ui::health::{judge, newest_change};
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use superx_mod_ui::health::{judge, newest_change, Facts};
 
-fn at(minute: u32) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 10, 13, 10, minute, 0).single().expect("time")
+fn t(h: u32, m: u32, s: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 18, h, m, s).single().expect("time")
+}
+
+fn facts(written: Option<DateTime<Utc>>, changed: Option<DateTime<Utc>>) -> Facts {
+    Facts { last_written: written, newest: changed.map(|c| (c, "claude_code/44658088".to_string())) }
 }
 
 #[test]
-fn transcripts_that_kept_changing_past_the_last_record_mean_capture_stalled() {
-    // 2026-10-13: the last record at 10:58, transcripts still written at 11:30.
-    let v = judge(Some(at(58) - Duration::minutes(0)), Some((at(58) + Duration::minutes(32), "claude_code/b6338687".into())), 300);
-    assert!(v.stalled);
-    assert_eq!(v.transcript.as_deref(), Some("claude_code/b6338687"));
-    assert_eq!(v.stall_secs, 300);
-
-    // Capture a few seconds behind a live transcript is keeping up.
-    let v = judge(Some(at(30)), Some((at(30) + Duration::seconds(4), "claude_code/x".into())), 300);
-    assert!(!v.stalled, "{v:?}");
-
-    // Nobody working: the transcripts stopped before the last record.
-    let v = judge(Some(at(30)), Some((at(10), "claude_code/x".into())), 300);
+fn a_quiet_spell_then_a_late_line_is_no_stall() {
+    // 2026-10-18: the last record 11:44:55, quiet, the operator's line at
+    // 11:49:58, taken in at 11:51:19 behind a hung connection. Polled at
+    // 11:50:11 (where the first rule cried stall) and after.
+    let (v, since) = judge(&facts(Some(t(11, 44, 55)), Some(t(11, 49, 58))), None, t(11, 50, 11), 300);
+    assert!(!v.stalled, "a line waiting 13 s is not a stall: {v:?}");
+    assert_eq!(since, Some(t(11, 49, 58)));
+    let (v, since) = judge(&facts(Some(t(11, 49, 58)), Some(t(11, 49, 58))), since, t(11, 51, 20), 300);
     assert!(!v.stalled);
+    assert_eq!(since, None, "taken in: nothing is waiting");
+    assert_eq!(v.waiting_since, None);
+}
 
-    // Transcripts, and nothing ever recorded.
-    assert!(judge(None, Some((at(10), "claude_code/x".into())), 300).stalled);
-    // No transcript to compare: nothing to say.
-    assert!(!judge(Some(at(10)), None, 300).stalled);
-    assert!(!judge(None, None, 300).stalled);
+#[test]
+fn a_dead_capture_under_busy_work_is_a_stall_once_the_wait_passes_the_limit() {
+    // 2026-10-13: the last record 10:58; the sessions kept writing.
+    let written = Some(Utc.with_ymd_and_hms(2026, 10, 13, 10, 58, 0).single().expect("t"));
+    let at = |m: u32| Utc.with_ymd_and_hms(2026, 10, 13, 11, m, 0).single().expect("t");
+    let mut since = None;
+    // The first poll sees a change just made: it starts the clock there.
+    let (v, s) = judge(&facts(written, Some(at(0))), since, at(0) + Duration::seconds(5), 300);
+    assert!(!v.stalled);
+    since = s;
+    // Polls go on; the newest change keeps moving; the wait does not reset.
+    let (v, s) = judge(&facts(written, Some(at(3))), since, at(3), 300);
+    assert!(!v.stalled, "3 minutes waiting");
+    since = s;
+    let (v, s) = judge(&facts(written, Some(at(6))), since, at(6), 300);
+    assert!(v.stalled, "6 minutes waiting: {v:?}");
+    assert_eq!(s, Some(at(0)), "waiting since the first change seen untaken");
+    assert_eq!(v.waiting_since.as_deref(), Some(at(0).to_rfc3339().as_str()));
+}
+
+#[test]
+fn nothing_ever_recorded_or_nothing_to_compare() {
+    let (v, _) = judge(&facts(None, Some(t(10, 0, 0))), None, t(10, 6, 0), 300);
+    assert!(v.stalled, "transcripts, and nothing ever recorded");
+    let (v, since) = judge(&facts(Some(t(10, 0, 0)), None), Some(t(9, 0, 0)), t(10, 6, 0), 300);
+    assert!(!v.stalled && since.is_none(), "no transcript: nothing waits");
 }
 
 #[test]
