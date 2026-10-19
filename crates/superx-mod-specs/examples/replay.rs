@@ -85,6 +85,9 @@ async fn main() {
         }
     }
     let report = ingest::ingest(&kernel, &db).await.expect("ingest");
+    // The builds' repositories, read-only, as last fetched.
+    let crawled = superx_mod_specs::crawl::crawl(&kernel, &db).await.expect("crawl");
+    println!("{crawled:?}");
     println!("{report:?}\n");
     print!("{}", render_runs(&store::current_runs(&db).await.expect("runs")));
     println!();

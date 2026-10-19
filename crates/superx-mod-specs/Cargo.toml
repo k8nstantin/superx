@@ -18,7 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 superx-kernel = { path = "../superx-kernel" }
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "process", "time"] }
 tracing.workspace = true
 ts-rs.workspace = true
 uuid.workspace = true

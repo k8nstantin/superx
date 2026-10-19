@@ -11,8 +11,9 @@
 -- WHAT THIS DATABASE HOLDS -------------------------------------------
 --
 -- What an agent session was told and what it did, both read from the
--- sessions the kernel already captured. Nothing here is read from a
--- repository, and nothing here is judged at write time beyond what one
+-- sessions the kernel already captured — and, in repo_branch alone, what
+-- the read-only crawler reads of the builds' repositories (never a fetch,
+-- never a write). Nothing here is judged at write time beyond what one
 -- check says about one run: whether a build failed because its spec was
 -- wrong or because the agent did not follow it is computed when it is
 -- read, from these facts.
@@ -25,6 +26,8 @@
 --   spec_revision  one row per spec version a commit in a session named
 --   branch_event   one row per branch a session's git created, pushed,
 --                  merged, reverted the merge of, or deleted
+--   repo_branch    one row per change in what a build branch's repository
+--                  shows of it, read by the read-only crawler
 --
 -- EVERY ROW IS DERIVED. Each one is computed from the kernel's captured
 -- sessions, so provisioning over an existing database loses nothing an
@@ -213,3 +216,32 @@ DEFINE FIELD valid_from  ON TABLE branch_event TYPE datetime;
 
 DEFINE INDEX idx_branch_call ON TABLE branch_event FIELDS call, branch, event UNIQUE;
 DEFINE INDEX idx_branch_name ON TABLE branch_event FIELDS branch, at;
+
+
+-- 7 ─── repo_branch ──────────────── a build branch, as its repository shows it ───
+-- What the read-only crawler finds in the build's repository, as last
+-- fetched (it never fetches): whether the branch is still there, the
+-- commit that merged it — a pull request merged on the host, or a merge
+-- in a session — when, which remote branches hold that merge, and a
+-- revert of it. `repo` is the repository's top-level path; `host` comes
+-- from its remote (bitbucket.org, github.com, …). A crawl appends a row
+-- only when something changed; the newest `valid_from` is the branch's
+-- state. Operator-approved 2026-10-19.
+
+DEFINE TABLE repo_branch SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
+
+DEFINE FIELD repo          ON TABLE repo_branch TYPE string;
+DEFINE FIELD host          ON TABLE repo_branch TYPE option<string>;
+DEFINE FIELD branch        ON TABLE repo_branch TYPE string;
+DEFINE FIELD on_local      ON TABLE repo_branch TYPE bool;
+DEFINE FIELD on_remote     ON TABLE repo_branch TYPE bool;
+DEFINE FIELD merge_commit  ON TABLE repo_branch TYPE option<string>;
+DEFINE FIELD merged_at     ON TABLE repo_branch TYPE option<datetime>;
+DEFINE FIELD merged_into   ON TABLE repo_branch TYPE array<string>;
+DEFINE FIELD pull_request  ON TABLE repo_branch TYPE option<string>;
+DEFINE FIELD revert_commit ON TABLE repo_branch TYPE option<string>;
+DEFINE FIELD reverted_at   ON TABLE repo_branch TYPE option<datetime>;
+DEFINE FIELD observed_at   ON TABLE repo_branch TYPE datetime;
+DEFINE FIELD valid_from    ON TABLE repo_branch TYPE datetime;
+
+DEFINE INDEX idx_repo_branch ON TABLE repo_branch FIELDS repo, branch, valid_from;

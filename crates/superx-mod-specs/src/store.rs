@@ -656,3 +656,123 @@ pub async fn ensure_branch_event(db: &Db, e: &NewBranchEvent) -> Result<bool> {
         .check()?;
     Ok(true)
 }
+
+/// What the crawler found of one branch, as it is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoBranch {
+    pub repo: String,
+    pub host: Option<String>,
+    pub branch: String,
+    pub on_local: bool,
+    pub on_remote: bool,
+    pub merge_commit: Option<String>,
+    pub merged_at: Option<DateTime<Utc>>,
+    pub merged_into: Vec<String>,
+    pub pull_request: Option<String>,
+    pub revert_commit: Option<String>,
+    pub reverted_at: Option<DateTime<Utc>>,
+}
+
+fn strings(v: &Value, key: &str) -> Vec<String> {
+    match v {
+        Value::Object(o) => match o.get(key) {
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|x| match x {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn flag(v: &Value, key: &str) -> bool {
+    matches!(v, Value::Object(o) if matches!(o.get(key), Some(Value::Bool(true))))
+}
+
+/// A stored observation, read back.
+#[must_use]
+pub fn repo_branch_of(v: &Value) -> Option<RepoBranch> {
+    Some(RepoBranch {
+        repo: get_str(v, "repo")?,
+        host: get_str(v, "host"),
+        branch: get_str(v, "branch")?,
+        on_local: flag(v, "on_local"),
+        on_remote: flag(v, "on_remote"),
+        merge_commit: get_str(v, "merge_commit"),
+        merged_at: get_datetime(v, "merged_at"),
+        merged_into: strings(v, "merged_into"),
+        pull_request: get_str(v, "pull_request"),
+        revert_commit: get_str(v, "revert_commit"),
+        reverted_at: get_datetime(v, "reverted_at"),
+    })
+}
+
+/// Record what the crawler found of a branch, when it differs from the
+/// newest observation. The flag says whether a row was written.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn ensure_repo_branch(db: &Db, b: &RepoBranch, observed_at: DateTime<Utc>) -> Result<bool> {
+    let rows: Vec<Value> = db
+        .query("SELECT * FROM repo_branch WHERE repo = $repo AND branch = $branch ORDER BY valid_from DESC LIMIT 1")
+        .bind(("repo", b.repo.clone()))
+        .bind(("branch", b.branch.clone()))
+        .await?
+        .take(0)?;
+    if rows.first().and_then(repo_branch_of).as_ref() == Some(b) {
+        return Ok(false);
+    }
+    let mut row = Object::new();
+    row.insert("repo".to_string(), Value::String(b.repo.clone()));
+    if let Some(h) = &b.host {
+        row.insert("host".to_string(), Value::String(h.clone()));
+    }
+    row.insert("branch".to_string(), Value::String(b.branch.clone()));
+    row.insert("on_local".to_string(), Value::Bool(b.on_local));
+    row.insert("on_remote".to_string(), Value::Bool(b.on_remote));
+    for (name, text) in [("merge_commit", &b.merge_commit), ("pull_request", &b.pull_request), ("revert_commit", &b.revert_commit)] {
+        if let Some(t) = text {
+            row.insert(name.to_string(), Value::String(t.clone()));
+        }
+    }
+    for (name, at) in [("merged_at", b.merged_at), ("reverted_at", b.reverted_at)] {
+        if let Some(t) = at {
+            row.insert(name.to_string(), Value::Datetime(t.into()));
+        }
+    }
+    row.insert(
+        "merged_into".to_string(),
+        Value::Array(b.merged_into.iter().cloned().map(Value::String).collect::<Vec<_>>().into()),
+    );
+    row.insert("observed_at".to_string(), Value::Datetime(observed_at.into()));
+    row.insert("valid_from".to_string(), Value::Datetime(Utc::now().into()));
+    db.query("CREATE $id CONTENT $row")
+        .bind(("id", new_id("repo_branch")))
+        .bind(("row", Value::Object(row)))
+        .await?
+        .check()?;
+    Ok(true)
+}
+
+/// The newest observation of every branch the crawler has read.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn repo_branches(db: &Db) -> Result<Vec<(RepoBranch, DateTime<Utc>)>> {
+    let rows: Vec<Value> = db.query("SELECT * FROM repo_branch ORDER BY valid_from DESC").await?.take(0)?;
+    let mut out: Vec<(RepoBranch, DateTime<Utc>)> = Vec::new();
+    for r in &rows {
+        let Some(b) = repo_branch_of(r) else { continue };
+        if out.iter().any(|(o, _)| o.repo == b.repo && o.branch == b.branch) {
+            continue;
+        }
+        out.push((b, get_datetime(r, "observed_at").unwrap_or_else(Utc::now)));
+    }
+    Ok(out)
+}

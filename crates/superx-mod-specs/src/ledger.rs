@@ -200,7 +200,65 @@ pub struct BuildLine {
     /// The kind of the event the fate rests on (`merged`, `reverted`,
     /// `deleted-remote`, …).
     pub fate_event: Option<String>,
+    /// Merged and not reverted: the repository's word when the crawler
+    /// has read the branch, else the sessions'.
     pub merged: bool,
+    /// What the build's repository shows of its branch, as last fetched.
+    pub repo: Option<RepoLine>,
+}
+
+/// A build branch as its repository shows it (the read-only crawler).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct RepoLine {
+    pub host: Option<String>,
+    pub on_local: bool,
+    pub on_remote: bool,
+    pub merge_commit: Option<String>,
+    pub merged_at: Option<String>,
+    pub merged_into: Vec<String>,
+    pub pull_request: Option<String>,
+    pub revert_commit: Option<String>,
+    pub reverted_at: Option<String>,
+    pub observed_at: String,
+    /// The same, in words.
+    pub text: String,
+}
+
+fn stamp(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn repo_line(b: &crate::store::RepoBranch, observed: DateTime<Utc>) -> RepoLine {
+    let host = b.host.clone().unwrap_or_else(|| "its host".to_string());
+    let mut text = match (&b.merge_commit, b.merged_at) {
+        (Some(commit), at) => {
+            let by = b.pull_request.as_ref().map_or(String::new(), |pr| format!(" by pull request {pr}"));
+            let into = if b.merged_into.is_empty() { String::new() } else { format!(" into {}", b.merged_into.join(", ")) };
+            let when = at.map_or(String::new(), |t| format!(" {}", stamp(t)));
+            format!("merged{by}{into}{when} ({})", &commit[..commit.len().min(8)])
+        }
+        (None, _) if b.on_remote => "on the remote, not merged".to_string(),
+        (None, _) if b.on_local => "only in the local repository, not merged".to_string(),
+        (None, _) => "gone from the remote and the local repository, never merged".to_string(),
+    };
+    if let Some(revert) = &b.revert_commit {
+        let when = b.reverted_at.map_or(String::new(), |t| format!(" {}", stamp(t)));
+        text.push_str(&format!(", then reverted{when} ({})", &revert[..revert.len().min(8)]));
+    }
+    RepoLine {
+        host: b.host.clone(),
+        on_local: b.on_local,
+        on_remote: b.on_remote,
+        merge_commit: b.merge_commit.clone(),
+        merged_at: b.merged_at.map(stamp),
+        merged_into: b.merged_into.clone(),
+        pull_request: b.pull_request.clone(),
+        revert_commit: b.revert_commit.clone(),
+        reverted_at: b.reverted_at.map(stamp),
+        observed_at: stamp(observed),
+        text: format!("{text} — {host}, as of {}", stamp(observed)),
+    }
 }
 
 /// One check's newest finding.
@@ -261,6 +319,7 @@ pub async fn build(db: &Db, only: Option<&str>) -> Result<Vec<TaskLedger>> {
             .await?
             .take(0)?;
     let runs = crate::store::current_runs(db).await?;
+    let repo_branches = crate::store::repo_branches(db).await?;
 
     let mut keys: BTreeSet<String> = BTreeSet::new();
     keys.extend(revisions.iter().filter_map(|r| get_str(r, "key")));
@@ -359,7 +418,7 @@ pub async fn build(db: &Db, only: Option<&str>) -> Result<Vec<TaskLedger>> {
                     checks.push(CheckLine { check, result, note: get_str(f, "note").unwrap_or_default() });
                 }
                 let branch = get_str(run, "branch");
-                let (fate_text, fate_event, is_merged) = match &branch {
+                let (fate_text, fate_event, chat_merged) = match &branch {
                     Some(b) => {
                         let mine = about(&events, b);
                         // Merged, unless its newest merge or revert is a revert.
@@ -374,6 +433,15 @@ pub async fn build(db: &Db, only: Option<&str>) -> Result<Vec<TaskLedger>> {
                     }
                     None => ("no build branch named for this version was seen".to_string(), None, false),
                 };
+                // The repository's word, when the crawler has read the branch.
+                let repo = branch.as_ref().and_then(|b| {
+                    repo_branches.iter().find(|(r, _)| &r.branch == b).map(|(r, observed)| (r, *observed))
+                });
+                let is_merged = match repo {
+                    Some((r, _)) => r.merge_commit.is_some() && r.revert_commit.is_none(),
+                    None => chat_merged,
+                };
+                let repo = repo.map(|(r, observed)| repo_line(r, observed));
                 merged += usize::from(is_merged);
                 lines.push(BuildLine {
                     started_at: when(run, "started_at"),
@@ -384,6 +452,7 @@ pub async fn build(db: &Db, only: Option<&str>) -> Result<Vec<TaskLedger>> {
                     fate: fate_text,
                     fate_event,
                     merged: is_merged,
+                    repo,
                 });
                 last_build_at = last_build_at.max(get_datetime(run, "started_at"));
             }
@@ -459,6 +528,9 @@ pub async fn render(db: &Db, only: Option<&str>) -> Result<String> {
                     None => b.fate.clone(),
                 };
                 let _ = writeln!(out, "        {line}");
+                if let Some(r) = &b.repo {
+                    let _ = writeln!(out, "        in the repository: {}", r.text);
+                }
             }
         }
         let s = &task.summary;

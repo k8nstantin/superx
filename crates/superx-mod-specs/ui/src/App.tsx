@@ -12,10 +12,11 @@ import type { BuildLine } from './generated/BuildLine'
 /// A check's result, as a colour: kept, broken, or nothing to judge by.
 const RESULT_COLOR: Record<string, string> = { complied: 'teal', breached: 'red', 'no-evidence': 'gray' }
 
-/// A branch's fate, as a colour: only a merge that stood is green.
+/// A branch's fate in the sessions, as a colour: only a merge that stood
+/// is green.
 function fateColor(b: BuildLine): string {
   if (b.merged) return 'teal'
-  if (b.fate_event === 'reverted') return 'orange'
+  if (b.fate_event === 'reverted' || b.repo?.revert_commit) return 'orange'
   if (b.fate_event === 'deleted-remote' || b.fate_event === 'deleted') return 'red'
   return 'gray'
 }
@@ -61,6 +62,11 @@ function Builds({ v }: { v: VersionLedger }) {
             {b.branch ? `${b.branch}: ` : ''}
             {b.fate}
           </Text>
+          {b.repo && (
+            <Text size="xs" c={b.merged ? 'teal' : b.repo.revert_commit ? 'orange' : 'dimmed'}>
+              in the repository: {b.repo.text}
+            </Text>
+          )}
         </Box>
       ))}
     </Stack>
@@ -141,8 +147,8 @@ export default function App() {
       </Group>
       <Text size="sm" c="dimmed" mb="md">
         Every spec version and every build of it, read from the captured sessions: who committed each version and
-        why, what changed, how each build did against its checks, and what became of its branch. Hover a check for
-        its finding. The CLI prints the same: <Text span ff="monospace" size="sm">superx specs ledger</Text>.
+        why, what changed, how each build did against its checks, and what became of its branch — in the sessions,
+        and in its repository as last fetched (read-only). Hover a check for its finding. The CLI prints the same: <Text span ff="monospace" size="sm">superx specs ledger</Text>.
       </Text>
       {ledger.isLoading && <Loader size="sm" />}
       {ledger.isError && (
