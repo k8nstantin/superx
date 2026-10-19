@@ -8,15 +8,23 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+axum.workspace = true
 chrono.workspace = true
 linkme.workspace = true
+mime_guess = "2"
 roxmltree = "0.21"
+rust-embed = "8"
+serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 superx-kernel = { path = "../superx-kernel" }
+tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
+ts-rs.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 surrealdb.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `ServiceExt::oneshot` drives the router in tests, as axum documents.
+tower = { version = "0.5", features = ["util"] }
