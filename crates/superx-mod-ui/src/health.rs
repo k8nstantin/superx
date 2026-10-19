@@ -14,9 +14,16 @@
 //!   time among the sessions' transcript files (their `locator`), read
 //!   from the filesystem's metadata only.
 //!
-//! When transcripts kept changing for longer than
-//! `attr_ui_capture_stall_secs` after the OS last recorded anything,
-//! capture is stalled.
+//! A change newer than the newest record has not been taken in yet. That
+//! is normal for the seconds capture takes; it is a stall when it lasts.
+//! Those two facts alone cannot say how long it has lasted — a quiet hour
+//! and one new line look the same as a dead capture under busy work — so
+//! the server remembers, across its polls, since when a change has been
+//! waiting (`waiting_since`), and calls it stalled once that passes
+//! `attr_ui_capture_stall_secs`. It clears the moment capture catches up.
+//! (2026-10-18: a 6-minute quiet spell, then a line taken in 81 s late
+//! behind a hung connection, read as a 5-minute stall under the first
+//! rule, which compared the two times directly.)
 
 use std::path::Path;
 
@@ -49,23 +56,37 @@ pub fn newest_change(files: &[(String, std::path::PathBuf)]) -> Option<(DateTime
         .max_by_key(|(at, _)| *at)
 }
 
-/// Judge the two facts.
+/// The two facts, as one read finds them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Facts {
+    /// When the OS last recorded anything.
+    pub last_written: Option<DateTime<Utc>>,
+    /// The newest transcript change, and whose.
+    pub newest: Option<(DateTime<Utc>, String)>,
+}
+
+/// Judge the facts at `now`, given since when a change was already known
+/// to be waiting. Returns the view and the new `waiting_since` to keep.
 #[must_use]
-pub fn judge(last_written: Option<DateTime<Utc>>, newest: Option<(DateTime<Utc>, String)>, stall_secs: u64) -> CaptureView {
+pub fn judge(facts: &Facts, waiting_since: Option<DateTime<Utc>>, now: DateTime<Utc>, stall_secs: u64) -> (CaptureView, Option<DateTime<Utc>>) {
     let limit = chrono::Duration::seconds(i64::try_from(stall_secs).unwrap_or(i64::MAX));
-    let stalled = match (&newest, last_written) {
-        (Some((changed, _)), Some(written)) => *changed - written > limit,
-        // Transcripts, and nothing ever recorded: nothing is being taken.
-        (Some(_), None) => true,
-        (None, _) => false,
+    // A change newer than the newest record is waiting to be taken in.
+    let waiting = match (&facts.newest, facts.last_written) {
+        (Some((changed, _)), Some(written)) => (*changed > written).then_some(*changed),
+        (Some((changed, _)), None) => Some(*changed),
+        (None, _) => None,
     };
-    CaptureView {
-        last_written: last_written.map(|t| t.to_rfc3339()),
-        transcripts_changed: newest.as_ref().map(|(t, _)| t.to_rfc3339()),
-        transcript: newest.map(|(_, name)| name),
+    // It has waited since the earliest such change seen and not yet taken.
+    let since = waiting.map(|changed| waiting_since.map_or(changed, |s| s.min(changed)));
+    let view = CaptureView {
+        last_written: facts.last_written.map(|t| t.to_rfc3339()),
+        transcripts_changed: facts.newest.as_ref().map(|(t, _)| t.to_rfc3339()),
+        transcript: facts.newest.as_ref().map(|(_, name)| name.clone()),
+        waiting_since: since.map(|t| t.to_rfc3339()),
         stall_secs: i64::try_from(stall_secs).unwrap_or(i64::MAX),
-        stalled,
-    }
+        stalled: since.is_some_and(|s| now - s > limit),
+    };
+    (view, since)
 }
 
 /// Read both facts from the running OS.
@@ -73,7 +94,7 @@ pub fn judge(last_written: Option<DateTime<Utc>>, newest: Option<(DateTime<Utc>,
 /// # Errors
 ///
 /// [`superx_kernel::KernelError`] when the substrate does not answer.
-pub async fn read(kernel: &Kernel, stall_secs: u64) -> Result<CaptureView> {
+pub async fn read(kernel: &Kernel) -> Result<Facts> {
     let rows: Vec<Value> = crate::answered("newest record", || async {
         Ok(kernel
             .db()
@@ -103,5 +124,5 @@ pub async fn read(kernel: &Kernel, stall_secs: u64) -> Result<CaptureView> {
             _ => None,
         })
         .collect();
-    Ok(judge(last_written, newest_change(&files), stall_secs))
+    Ok(Facts { last_written, newest: newest_change(&files) })
 }

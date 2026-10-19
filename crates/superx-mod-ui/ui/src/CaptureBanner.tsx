@@ -32,8 +32,9 @@ export function CaptureBanner() {
   return (
     <Alert color="red" variant="light" mb="md" title="Capture has stalled">
       <Text size="sm">
-        SuperX last recorded anything {since(c.last_written)}, but {c.transcript ?? 'a session'}'s transcript changed{' '}
-        {since(c.transcripts_changed)}. Sessions look idle because nothing new is being taken in. Restart the OS:{' '}
+        A transcript change made {since(c.waiting_since)} has not been taken in yet — the newest is{' '}
+        {c.transcript ?? 'a session'}'s, {since(c.transcripts_changed)} — and SuperX last recorded anything{' '}
+        {since(c.last_written)}. Sessions look idle because nothing new is being taken in. Restart the OS:{' '}
         <Code>{RESTART}</Code>. If it stalls again at once, the database itself may be stuck — a full disk did that on
         2026-10-13.
       </Text>

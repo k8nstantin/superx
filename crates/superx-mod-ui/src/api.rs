@@ -30,10 +30,13 @@ pub struct CaptureView {
     pub transcripts_changed: Option<String>,
     /// That session, as `<agent>/<session key>`.
     pub transcript: Option<String>,
+    /// RFC3339: since when a change has been waiting to be taken in, as
+    /// far as this server has seen; absent while capture keeps up.
+    pub waiting_since: Option<String>,
     /// How long transcripts may change past the newest record before
     /// this says stalled (`attr_ui_capture_stall_secs`).
     pub stall_secs: i64,
-    /// Transcripts kept changing longer than that after the last record.
+    /// A change has waited longer than that.
     pub stalled: bool,
 }
 

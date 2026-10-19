@@ -40,6 +40,9 @@ struct AppState {
     kernel: Kernel,
     events: broadcast::Sender<String>,
     answers: Answers,
+    /// Since when a transcript change has been waiting to be taken in, as
+    /// this server's polls have seen it (#452).
+    capture_waiting: std::sync::Arc<std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
 }
 
 impl AppState {
@@ -198,6 +201,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         kernel: kernel.clone(),
         events: events.clone(),
         answers: Answers::default(),
+        capture_waiting: std::sync::Arc::default(),
     };
     // Read once, here: resolving it per request would itself await the
     // substrate that might not answer.
@@ -359,8 +363,16 @@ async fn api_capture(State(state): State<AppState>) -> axum::response::Response 
         return json_body(body);
     }
     let stall = crate::resolved_stall_secs(kernel).await;
-    match crate::health::read(kernel, stall).await {
-        Ok(view) => {
+    match crate::health::read(kernel).await {
+        Ok(facts) => {
+            let view = match state.capture_waiting.lock() {
+                Ok(mut since) => {
+                    let (view, kept) = crate::health::judge(&facts, *since, chrono::Utc::now(), stall);
+                    *since = kept;
+                    view
+                }
+                Err(_) => crate::health::judge(&facts, None, chrono::Utc::now(), stall).0,
+            };
             let body = serde_json::to_string(&view).unwrap_or_else(|_| "{}".to_string());
             state.remember("capture", &body);
             json_body(body)
