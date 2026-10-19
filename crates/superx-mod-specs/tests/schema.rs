@@ -32,6 +32,13 @@ const CONTRACT: &[(&str, &[&str])] = &[
         &["session", "session_key", "model", "key", "version", "reviewed", "line", "message", "commit", "at", "call", "valid_from"],
     ),
     ("branch_event", &["session", "session_key", "model", "branch", "event", "command", "ok", "at", "call", "valid_from"]),
+    (
+        "repo_branch",
+        &[
+            "repo", "host", "branch", "on_local", "on_remote", "merge_commit", "merged_at", "merged_into", "merged_into.*",
+            "pull_request", "revert_commit", "reverted_at", "observed_at", "valid_from",
+        ],
+    ),
 ];
 
 fn keys_of(v: &Value, section: &str) -> BTreeSet<String> {

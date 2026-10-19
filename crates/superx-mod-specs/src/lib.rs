@@ -20,18 +20,20 @@
 //!   own log        `target: "specs"`
 //!   own UI         the ledger as a page, on `attr_specs_ui_port`, its URL
 //!                  published as `attr_module_ui_url`
-//!   own CLI        `superx specs ingest`, `superx specs runs`,
+//!   own CLI        `superx specs ingest`, `superx specs crawl`, `superx specs runs`,
 //!                  `superx specs ledger [KEY]`
 //!
 //! Nothing else in the workspace names this crate except the binary's
 //! link line: removing it removes the module and changes nothing else.
 
+pub mod crawl;
 pub mod gates;
 pub mod git;
 pub mod ingest;
 pub mod ledger;
 pub mod ownership;
 pub mod read_order;
+pub mod repo;
 pub mod server;
 pub mod session;
 pub mod spec;
@@ -97,7 +99,26 @@ pub const MODULE_NAME: &str = "specs";
 /// into `superx/specs` (kernel schema untouched — §7).
 pub const SCHEMA_DDL: &str = include_str!("../schema/specs.surql");
 
-const USAGE: &str = "usage: superx specs ingest | superx specs runs | superx specs ledger [KEY]";
+const USAGE: &str = "usage: superx specs ingest | superx specs crawl | superx specs runs | superx specs ledger [KEY]";
+
+/// How often the module refreshes itself — an ingest, then a crawl —
+/// while the OS runs, in seconds; 0 is never.
+pub const REFRESH_SECS_PARAM: &str = "attr_specs_refresh_secs";
+
+/// Where it stands when the parameter is unset.
+pub const DEFAULT_REFRESH_SECS: u64 = 900; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
+/// The refresh interval: the parameter on this module's registry entity,
+/// else the fallback.
+pub async fn resolved_refresh_secs(kernel: &Kernel) -> u64 {
+    let Ok(Some(entity)) = kernel.find_module_by_name(NodeKind::KernelModule, MODULE_NAME).await else {
+        return DEFAULT_REFRESH_SECS;
+    };
+    match kernel.get_parameter(entity, REFRESH_SECS_PARAM).await.ok().flatten() {
+        Some(Value::Number(n)) => n.to_int().and_then(|i| u64::try_from(i).ok()).unwrap_or(DEFAULT_REFRESH_SECS),
+        _ => DEFAULT_REFRESH_SECS,
+    }
+}
 
 /// The specs module. A ZST — all state lives in the substrate.
 pub struct SpecsModule;
@@ -127,12 +148,36 @@ impl KernelModule for SpecsModule {
         // The ledger as a page, on this module's own port, its URL
         // published where the core dashboard looks for module UIs (D-UI2).
         let port = resolved_ui_port(kernel).await;
+        let db_for_refresh = db.clone();
         server::spawn(kernel, db, port).await?;
         let url = format!("http://127.0.0.1:{port}");
         if let Ok(Some(entity)) = kernel.find_module_by_name(NodeKind::KernelModule, MODULE_NAME).await {
             kernel.set_parameter(entity, MODULE_UI_URL_PARAM, Value::String(url.clone())).await?;
         }
         tracing::info!(target: "specs", %url, "ledger page listening");
+
+        // Keep the ledger current while the OS runs: an ingest, then a
+        // read-only crawl of the builds' repositories, every so often. The
+        // kernel's stop token ends it with the module.
+        let every = resolved_refresh_secs(kernel).await;
+        if every > 0 {
+            let (kernel, db, stop) = (kernel.clone(), db_for_refresh, kernel.module_token(MODULE_NAME));
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        () = stop.clone().cancelled() => break,
+                        () = tokio::time::sleep(std::time::Duration::from_secs(every)) => {}
+                    }
+                    if let Err(e) = ingest::ingest(&kernel, &db).await {
+                        tracing::warn!(target: "specs", error = %e, "refresh: ingest failed");
+                        continue;
+                    }
+                    if let Err(e) = crawl::crawl(&kernel, &db).await {
+                        tracing::warn!(target: "specs", error = %e, "refresh: crawl failed");
+                    }
+                }
+            });
+        }
         Ok(())
     }
 
@@ -180,6 +225,18 @@ impl KernelModule for SpecsModule {
                     .filter(|(n, _)| *n > 0)
                     .map(|(n, what)| format!(", {n} {what}"))
                     .collect::<String>()
+                ))
+            }
+            Some("crawl") => {
+                let db = kernel.module_db(MODULE_NAME).await?;
+                let r = crawl::crawl(kernel, &db).await?;
+                Ok(format!(
+                    "{} repositories read (read-only, as last fetched): {} build branches, {} changed, {} unchanged{}\n",
+                    r.repos,
+                    r.branches,
+                    r.written,
+                    r.unchanged,
+                    if r.unreadable > 0 { format!(", {} builds whose directory is no repository", r.unreadable) } else { String::new() }
                 ))
             }
             Some("ledger") => {

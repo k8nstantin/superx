@@ -83,6 +83,9 @@ async fn main() {
         }
     }
     let report = ingest::ingest(&kernel, &db).await.expect("ingest");
+    // The builds' repositories, read-only, as last fetched.
+    let crawled = superx_mod_specs::crawl::crawl(&kernel, &db).await.expect("crawl");
+    println!("{crawled:?}");
     println!("{report:?}");
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("bind");
     println!("ledger page on http://127.0.0.1:{port}");
