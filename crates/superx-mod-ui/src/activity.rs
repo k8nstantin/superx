@@ -239,7 +239,7 @@ impl LiveCursor {
 /// `attr_session_descriptor` payload (`{name, session, locator}` —
 /// written by the capture engine's `ensure_session`; `name` is
 /// `<agent>/<key>`).
-async fn descriptor_parts(
+pub(crate) async fn descriptor_parts(
     kernel: &Kernel,
     session: RecordId,
 ) -> Result<(Option<String>, Option<String>)> {
@@ -264,7 +264,7 @@ async fn descriptor_parts(
 /// Resolve a session's scoping handles for action matching: the agent
 /// entity + source key. `None` parts drop the payload.session arm —
 /// it must match nothing, never everything.
-async fn session_scope(
+pub(crate) async fn session_scope(
     kernel: &Kernel,
     session: RecordId,
 ) -> Result<Option<(RecordId, String)>> {
@@ -337,7 +337,7 @@ pub type Query<'a> = Option<&'a str>;
 /// The message-side keyword clause. Searching runs over the captured
 /// text itself, in the engine, so it reaches ALL history rather than
 /// whatever the client happens to be holding.
-const MSG_MATCH: &str = "string::contains(string::lowercase(content), $q)";
+pub(crate) const MSG_MATCH: &str = "string::contains(string::lowercase(content), $q)";
 
 /// The payload fields a keyword search looks inside. A telemetry
 /// payload is `any`, so there is no schema to enumerate — this is the
@@ -352,7 +352,7 @@ const SEARCHED_PAYLOAD_FIELDS: &[&str] = &[
 /// The action-side keyword clause: the event name, plus every payload
 /// field above. A field the payload lacks coalesces to the empty
 /// string rather than dropping the row.
-fn act_match() -> String {
+pub(crate) fn act_match() -> String {
     let fields: Vec<String> = SEARCHED_PAYLOAD_FIELDS
         .iter()
         .map(|f| format!("string::contains(string::lowercase(payload.{f} ?? ''), $q)"))

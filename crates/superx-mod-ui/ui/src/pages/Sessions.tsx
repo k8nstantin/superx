@@ -185,6 +185,16 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
 // controls, and auto-scroll as the global Activity feed.
 function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => void }) {
   const [paused, setPaused] = useState(false)
+  // An export under way has the session to itself (#460): the feed reading
+  // back at the same time shared its connection. A ref, so standing aside
+  // redraws nothing (a redraw of a long feed held the page for seconds);
+  // the tick resumes reading once the export is done.
+  const exporting = useRef(false)
+  const [resumed, setResumed] = useState(0)
+  const onExport = useCallback((busy: boolean) => {
+    exporting.current = busy
+    if (!busy) setResumed((n) => n + 1)
+  }, [])
   const [liveRows, setLiveRows] = useState<SseEvent[]>([])
   const [search, setSearch] = useState('')
   const [q] = useDebouncedValue(search.trim(), 350)
@@ -240,10 +250,10 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
     asked.current = null
   }, [session.session_id, q])
   useEffect(() => {
-    if (backlog.isLoading || loadingOlder || exhausted || !oldest || asked.current === oldest.id) return
+    if (exporting.current || backlog.isLoading || loadingOlder || exhausted || !oldest || asked.current === oldest.id) return
     asked.current = oldest.id
     loadOlder({ at: oldest.valid_from, id: oldest.id })
-  }, [backlog.isLoading, loadingOlder, exhausted, oldest, loadOlder])
+  }, [resumed, backlog.isLoading, loadingOlder, exhausted, oldest, loadOlder])
 
   return (
     <Feed
@@ -267,7 +277,7 @@ function SessionFeed({ session, onBack }: { session: SessionView; onBack: () => 
               </Badge>
             </Tooltip>
           )}
-          <SessionExport session={session} search={search} />
+          <SessionExport session={session} search={search} onBusy={onExport} />
         </Group>
       }
       rows={rows}
