@@ -646,7 +646,7 @@ async fn api_session_activity(
     Query(q): Query<ActivityQuery>,
 ) -> Response<Vec<SseEvent>> {
     let kernel = &state.kernel;
-    let session = match superx_ops::resolve_session(kernel, &id).await {
+    let session = match crate::activity::session_named(kernel, &id).await {
         Ok(s) => s,
         Err(e) => return Response::err(e),
     };
@@ -698,7 +698,7 @@ async fn api_session_export(
         Ok(o) => o,
         Err(e) => return err_response(&e).into_response(),
     };
-    let session = match superx_ops::resolve_session(&state.kernel, &id).await {
+    let session = match crate::activity::session_named(&state.kernel, &id).await {
         Ok(s) => s,
         Err(e) => return err_response(&e).into_response(),
     };

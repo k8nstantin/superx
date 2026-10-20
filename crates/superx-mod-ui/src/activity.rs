@@ -75,6 +75,42 @@ pub fn action_event(a: &TelemetryRecord) -> SseEvent {
     }
 }
 
+/// What a feed read selects from `table`: every field, except a message's
+/// `raw.toolUseResult`, Claude Code's structured copy of a tool's output.
+/// The row already carries that output, and the feed never renders the
+/// copy, which was a fifth of every byte a session's messages read (#461).
+pub(crate) fn projection(table: &str) -> &'static str {
+    if table == "message" {
+        "* OMIT raw.toolUseResult"
+    } else {
+        "*"
+    }
+}
+
+/// The session a request names (#461). The page names a session by its id,
+/// and one read checks that it is a session; `superx_ops::resolve_session`
+/// matches a name against every session (2 + 2×sessions round trips), and
+/// every page of a long session's feed paid for that. A name or a prefix
+/// still goes through it.
+///
+/// # Errors
+///
+/// The resolver's message when nothing matches, or the engine's.
+pub async fn session_named(kernel: &Kernel, id: &str) -> std::result::Result<RecordId, String> {
+    if let Ok(uuid) = id.parse::<superx_kernel::types::Uuid>() {
+        let session = RecordId::new("entity", uuid);
+        let descriptor = crate::answered("session lookup", || {
+            kernel.current_state(session.clone(), "attr_session_descriptor")
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        if descriptor.is_some() {
+            return Ok(session);
+        }
+    }
+    superx_ops::resolve_session(kernel, id).await
+}
+
 /// How far back each live poll looks again (#183). A row is stamped with
 /// its time before it is written, so one stamped before a poll and
 /// committed after it lands behind the cursor, where a read of newer rows
@@ -152,12 +188,14 @@ impl LiveCursor {
             // first, so the time index is walked and the tie is a filter.
             let forward = match self.id {
                 Some(_) => format!(
-                    "SELECT * FROM {} WHERE valid_from >= $at AND (valid_from > $at OR id > $id) \
+                    "SELECT {} FROM {} WHERE valid_from >= $at AND (valid_from > $at OR id > $id) \
                      ORDER BY valid_from ASC, id ASC LIMIT $batch",
+                    projection(self.table),
                     self.table
                 ),
                 None => format!(
-                    "SELECT * FROM {} WHERE valid_from > $at ORDER BY valid_from ASC, id ASC LIMIT $batch",
+                    "SELECT {} FROM {} WHERE valid_from > $at ORDER BY valid_from ASC, id ASC LIMIT $batch",
+                    projection(self.table),
                     self.table
                 ),
             };
@@ -195,14 +233,16 @@ impl LiveCursor {
         let sent: Vec<RecordId> = self.sent.keys().cloned().collect();
         let behind = match self.id {
             Some(_) => format!(
-                "SELECT * FROM {} WHERE valid_from > $lo AND valid_from <= $at \
+                "SELECT {} FROM {} WHERE valid_from > $lo AND valid_from <= $at \
                  AND (valid_from < $at OR id <= $id) AND id NOTINSIDE $sent \
                  ORDER BY valid_from DESC LIMIT $batch",
+                projection(self.table),
                 self.table
             ),
             None => format!(
-                "SELECT * FROM {} WHERE valid_from > $lo AND valid_from <= $at \
+                "SELECT {} FROM {} WHERE valid_from > $lo AND valid_from <= $at \
                  AND id NOTINSIDE $sent ORDER BY valid_from DESC LIMIT $batch",
+                projection(self.table),
                 self.table
             ),
         };
@@ -389,7 +429,7 @@ fn page_query(table: &str, scope: Option<&str>, before: Before, q: Query, keywor
     } else {
         format!("WHERE {} ", wheres.join(" AND "))
     };
-    format!("SELECT * FROM {table} {clause}ORDER BY valid_from DESC, id DESC LIMIT $limit")
+    format!("SELECT {} FROM {table} {clause}ORDER BY valid_from DESC, id DESC LIMIT $limit", projection(table))
 }
 
 /// Run a page query with only the bindings its clauses actually use.
@@ -428,7 +468,7 @@ async fn recent_messages(
         let rows: Vec<MessageRecord> = crate::answered("recent messages", || async {
             Ok(kernel
             .db()
-            .query("SELECT * FROM message ORDER BY valid_from DESC LIMIT $limit")
+            .query(format!("SELECT {} FROM message ORDER BY valid_from DESC LIMIT $limit", projection("message")))
             .bind(("limit", limit))
             .await?
             .take(0)?)
