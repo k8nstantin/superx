@@ -4772,3 +4772,158 @@ async fn files_settle_a_commit_and_a_subagent_is_unsupervised() {
     assert!(lead_tasks[0].needed_correcting, "the turn after it pulled it back");
     assert_eq!(lead_tasks[1].driver, superx_mod_ui::tasks::Driver::Corrected);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// The session export (#460): every row once, in order, and nothing else
+// ─────────────────────────────────────────────────────────────────────
+
+/// A second session of an existing agent: seeding it with its own agent
+/// would make two agents of one name, and the action scope would resolve
+/// the other one.
+async fn seed_session_of(kernel: &Kernel, agent_name: &str, src_key: &str) -> superx_kernel::types::RecordId {
+    use superx_kernel::types::{Object, Value};
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let mut desc = Object::new();
+    desc.insert("name".to_string(), Value::String(format!("{agent_name}/{src_key}")));
+    desc.insert("session".to_string(), Value::String(src_key.to_string()));
+    desc.insert("locator".to_string(), Value::String("/tmp/y.jsonl".to_string()));
+    kernel
+        .supersede_state(session.clone(), "attr_session_descriptor", Value::Object(desc))
+        .await
+        .expect("session descriptor");
+    session
+}
+
+/// `01920000-0000-7000-8000-0000000000NN`: ids whose order is their number.
+fn export_id(table: &str, n: u32) -> superx_kernel::types::RecordId {
+    let uuid: superx_kernel::types::Uuid = format!("01920000-0000-7000-8000-{n:012}").parse().expect("uuid");
+    superx_kernel::types::RecordId::new(table, uuid)
+}
+
+fn export_at(secs: u32) -> chrono::DateTime<chrono::Utc> {
+    format!("2026-10-01T00:00:{secs:02}Z").parse().expect("ts")
+}
+
+/// A message captured at a set time with a set id, so rows can share one
+/// instant across a page edge.
+async fn put_message(kernel: &Kernel, n: u32, session: &superx_kernel::types::RecordId,
+                     agent: &superx_kernel::types::RecordId, secs: u32, text: &str) {
+    let raw = superx_kernel::message::json_to_object(
+        &serde_json::json!({ "message": { "content": [{ "type": "text", "text": text }] } }),
+    );
+    kernel
+        .db()
+        .query("CREATE $id SET session = $sess, agent = $agent, role = 'user', content = $text, raw = $raw, valid_from = $at")
+        .bind(("id", export_id("message", n)))
+        .bind(("sess", session.clone()))
+        .bind(("agent", agent.clone()))
+        .bind(("text", text.to_string()))
+        .bind(("raw", superx_kernel::types::Value::Object(raw)))
+        .bind(("at", export_at(secs)))
+        .await
+        .expect("create")
+        .check()
+        .expect("message row");
+}
+
+/// An action captured at a set time with a set id, emitted by `subject`
+/// for the source key `src`.
+async fn put_action(kernel: &Kernel, n: u32, subject: &superx_kernel::types::RecordId,
+                    agent: &superx_kernel::types::RecordId, src: &str, secs: u32, tool: &str) {
+    let payload = superx_kernel::message::json_to_object(&serde_json::json!({ "session": src, "tool": tool }));
+    kernel
+        .db()
+        .query("CREATE $id SET lifecycle_event = 'tool_call', payload = $payload, subject = $subject, agent = $agent, valid_from = $at")
+        .bind(("id", export_id("telemetry_stream", n)))
+        .bind(("payload", superx_kernel::types::Value::Object(payload)))
+        .bind(("subject", subject.clone()))
+        .bind(("agent", agent.clone()))
+        .bind(("at", export_at(secs)))
+        .await
+        .expect("create")
+        .check()
+        .expect("action row");
+}
+
+/// The whole file, as the response streams it.
+async fn exported(file: impl futures_core::Stream<Item = superx_kernel::Result<axum::body::Bytes>>) -> String {
+    let mut file = std::pin::pin!(file);
+    let mut out = Vec::new();
+    while let Some(chunk) = std::future::poll_fn(|cx| file.as_mut().poll_next(cx)).await {
+        out.extend_from_slice(&chunk.expect("every read answers"));
+    }
+    String::from_utf8(out).expect("utf-8")
+}
+
+/// The rows of a plain-text export without times, by the token each holds:
+/// a message's text (`m3`), an action's tool (`a2`).
+fn exported_rows(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| match line.strip_prefix("action tool_call ") {
+            Some(payload) => serde_json::from_str::<serde_json::Value>(payload)
+                .ok()?
+                .get("tool")?
+                .as_str()
+                .map(str::to_string),
+            None => {
+                let t = line.trim();
+                (t.len() > 1 && t.starts_with('m') && t[1..].chars().all(|c| c.is_ascii_digit()))
+                    .then(|| t.to_string())
+            }
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_export_holds_every_row_once_in_order_and_nothing_else() {
+    use superx_mod_ui::export::{session_export, ExportOptions, Pages};
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-x").await;
+    let other = seed_session_of(&kernel, "claude_code", "src-other").await;
+
+    put_message(&kernel, 1, &session, &agent, 1, "m1").await;
+    // Five messages in one instant: the three-row pages below cut it twice.
+    for n in 2..=6 {
+        put_message(&kernel, n, &session, &agent, 2, &format!("m{n}")).await;
+    }
+    put_message(&kernel, 7, &session, &agent, 3, "m7").await;
+    // Captured after the export began.
+    put_message(&kernel, 8, &session, &agent, 9, "m8").await;
+    // Emitted by the session itself, then by the agent for its source key,
+    // two of them sharing the five messages' instant.
+    put_action(&kernel, 11, &session, &agent, "src-x", 1, "a1").await;
+    put_action(&kernel, 12, &agent, &agent, "src-x", 2, "a2").await;
+    put_action(&kernel, 13, &agent, &agent, "src-x", 2, "a3").await;
+    put_action(&kernel, 14, &agent, &agent, "src-x", 4, "a4").await;
+    // The same agent's other session, in the same instants: never here.
+    put_message(&kernel, 21, &other, &agent, 2, "m21").await;
+    put_action(&kernel, 22, &agent, &agent, "src-other", 2, "a22").await;
+
+    let everything = ExportOptions::parse(Some("everything"), Some("full"), Some("txt"), None, None).expect("options");
+    let pages = Pages { messages: 3, actions: 2 };
+    let text = exported(session_export(kernel.clone(), session.clone(), everything, export_at(5), pages)).await;
+    assert_eq!(
+        exported_rows(&text),
+        ["m1", "a1", "m2", "m3", "m4", "m5", "m6", "a2", "a3", "m7", "a4"],
+        "every row once, by capture time then id, across both tables: {text}"
+    );
+    assert!(!text.contains("m21") && !text.contains("a22"), "another session's rows: {text}");
+    assert!(!text.contains("m8"), "a row captured after the export began: {text}");
+    assert!(
+        text.ends_with("end of export · 11 rows · 7 messages (7 user) · 4 actions\n"),
+        "the last line counts what the file holds: {text}"
+    );
+
+    // The conversation alone reads no actions; a search keeps its rows only.
+    let conversation = ExportOptions::parse(Some("conversation"), Some("full"), Some("txt"), None, None).expect("options");
+    let text = exported(session_export(kernel.clone(), session.clone(), conversation, export_at(5), pages)).await;
+    assert_eq!(exported_rows(&text), ["m1", "m2", "m3", "m4", "m5", "m6", "m7"], "{text}");
+    assert!(text.ends_with("end of export · 7 rows · 7 messages (7 user)\n"), "{text}");
+
+    let matching = ExportOptions::parse(Some("everything"), Some("full"), Some("md"), None, Some("M5")).expect("options");
+    let text = exported(session_export(kernel.clone(), session, matching, export_at(5), pages)).await;
+    assert!(text.contains("\nm5\n") && !text.contains("\nm4\n"), "only the matching row: {text}");
+    assert!(text.contains("- **only rows matching:** “M5”"), "the file says it is filtered: {text}");
+    assert!(text.ends_with("**end of export** · 1 row · 1 message (1 user) · 0 actions\n"), "{text}");
+}

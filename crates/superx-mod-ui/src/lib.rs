@@ -22,6 +22,7 @@ use superx_kernel::{
 pub mod activity;
 pub mod checkout;
 pub mod compare;
+pub mod export;
 pub mod health;
 pub mod api;
 pub mod insights;

@@ -215,6 +215,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         .route("/api/agents", get(api_agents))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/{id}/activity", get(api_session_activity))
+        .route("/api/sessions/{id}/export", get(api_session_export))
         .route("/api/activity", get(api_activity))
         .route("/api/stats", get(api_stats))
         .route("/api/insights", get(api_insights))
@@ -665,6 +666,60 @@ async fn api_session_activity(
     }
 }
 
+/// The session export's choices (#460): the export panel's, as sent.
+#[derive(serde::Deserialize)]
+struct ExportQuery {
+    include: Option<String>,
+    tools: Option<String>,
+    format: Option<String>,
+    /// The reader's IANA zone; absent, the file carries no times.
+    tz: Option<String>,
+    /// Only the rows the session view's search matches.
+    q: Option<String>,
+}
+
+/// One session as one file (#460), streamed as it is written. Choosing
+/// the session answers within the request budget like every other read;
+/// the file then streams page by page for as long as the session takes,
+/// and a read that fails cuts it short of its count line.
+async fn api_session_export(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<ExportQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let options = match crate::export::ExportOptions::parse(
+        q.include.as_deref(),
+        q.tools.as_deref(),
+        q.format.as_deref(),
+        q.tz.as_deref(),
+        q.q.as_deref(),
+    ) {
+        Ok(o) => o,
+        Err(e) => return err_response(&e).into_response(),
+    };
+    let session = match superx_ops::resolve_session(&state.kernel, &id).await {
+        Ok(s) => s,
+        Err(e) => return err_response(&e).into_response(),
+    };
+    let media_type = options.format.media_type();
+    let file = crate::export::session_export(
+        state.kernel.clone(),
+        session,
+        options,
+        chrono::Utc::now(),
+        crate::export::Pages::default(),
+    );
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, media_type),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        axum::body::Body::from_stream(file),
+    )
+        .into_response()
+}
+
 /// The Status page's aggregation (issue #228).
 #[derive(serde::Deserialize)]
 struct RangeQuery {
@@ -1001,6 +1056,34 @@ mod tests {
         assert_eq!(cut.status(), StatusCode::GATEWAY_TIMEOUT, "slower than the budget, inside the layer");
         let compare = call(app(Some(BUDGET)), "/compare").await.expect("response");
         assert_eq!(compare.status(), StatusCode::OK, "the same wait, outside the layer, finishes");
+    }
+
+    /// A file that streams for longer than the budget is not cut (#460):
+    /// the budget bounds the handler, which answers once the session is
+    /// chosen, and the session export's body streams after it.
+    #[tokio::test]
+    async fn a_streamed_file_outlives_the_budget() {
+        use axum::routing::get as route_get;
+        use tower::ServiceExt as _;
+        const BUDGET: Duration = Duration::from_millis(20); // skill-allow: §9-duration — test fixture, not a policy
+        let streamed = || async {
+            let body = async_stream::stream! {
+                yield Ok::<_, Infallible>(axum::body::Bytes::from_static(b"first "));
+                tokio::time::sleep(BUDGET * 5).await;
+                yield Ok(axum::body::Bytes::from_static(b"last"));
+            };
+            axum::body::Body::from_stream(body)
+        };
+        let app = Router::new()
+            .route("/file", route_get(streamed))
+            .route_layer(axum::middleware::from_fn_with_state(Some(BUDGET), bounded));
+        let response = app
+            .oneshot(axum::http::Request::get("/file").body(axum::body::Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        assert_eq!(&body[..], b"first last", "the whole file, five budgets long");
     }
 
     /// A substrate read that gets no answer is asked once more, and a second
