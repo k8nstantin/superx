@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   Badge,
   Box,
@@ -11,6 +11,7 @@ import {
   TextInput,
   Tooltip,
 } from '@mantine/core'
+import { Virtuoso } from 'react-virtuoso'
 import type { FeedCursor } from './api'
 import type { SseEvent } from './generated/SseEvent'
 import type { SessionView } from './generated/SessionView'
@@ -272,6 +273,50 @@ const LABEL_COLORS: Record<string, string> = {
 }
 const labelColor = (label: string) => LABEL_COLORS[label] ?? '#52514e'
 
+/// One row of the feed: its label, its session, its line. Drawn only while
+/// it is near the screen (#461), so it is kept cheap and memoized. Padding,
+/// not a margin, between rows: the list measures each row's box, and a
+/// margin falls outside it.
+const FeedRow = memo(function FeedRow({ r, directory }: { r: SseEvent; directory: Directory }) {
+  const identity = identityOf(r, directory)
+  return (
+    // A div, not the default <p>: a row holds badges, which are
+    // divs, and a div inside a <p> is invalid HTML (#415 QA).
+    <Text component="div" size="sm" ff="monospace" pb={2} c={r.kind === 'action' ? 'dimmed' : undefined}>
+      <Badge size="xs" mr={4} variant="filled" autoContrast color={labelColor(rowLabel(r))}>
+        {rowLabel(r)}
+      </Badge>
+      <Tooltip label={identity ? 'session' : 'no session — OS-level event'} withArrow>
+        <Badge size="xs" mr={6} variant="filled" autoContrast color={identity ? sessionColor(identity.key) : 'yellow'}>
+          {identity?.label ?? 'system'}
+        </Badge>
+      </Tooltip>
+      {localStamp(r)}
+    </Text>
+  )
+})
+
+/// What the line above the rows says, while there is history to read.
+type Edge = { show: boolean; loadingOlder?: boolean; exhausted?: boolean }
+
+function HistoryEdge({ context }: { context?: Edge }) {
+  if (!context?.show) return null
+  return (
+    <Text c="dimmed" size="xs" ta="center" pb={4}>
+      {context.loadingOlder
+        ? 'loading older…'
+        : context.exhausted
+          ? '— the beginning of what the OS captured —'
+          : 'scroll up for more history'}
+    </Text>
+  )
+}
+
+// The list's index of its first row. Rows read back land above it and lower
+// it by as many; rows the live cap drops raise it. A large start keeps it
+// positive however far back a session reads.
+const FIRST_INDEX = 1_000_000_000
+
 export function Feed({
   header,
   rows,
@@ -308,53 +353,118 @@ export function Feed({
   // Chips are the DISTINCT labels present in the feed right now. A
   // selected label whose rows aged out falls back to 'all' — never a
   // silently-filtered empty feed.
-  const labels = [...new Set(rows.map(rowLabel))].sort()
+  const labels = useMemo(() => [...new Set(rows.map(rowLabel))].sort(), [rows])
   const active = label === 'all' || labels.includes(label) ? label : 'all'
-  const visible = rows.filter((r) => active === 'all' || rowLabel(r) === active)
+  const visible = useMemo(() => rows.filter((r) => active === 'all' || rowLabel(r) === active), [rows, active])
 
   const directory = useMemo(() => buildDirectory(sessions, agents), [sessions, agents])
 
-  // Pinned-to-bottom auto-scroll: a sentinel below the last row is
-  // scrolled into view whenever the LAST ROW changes (keying on count
-  // dies once the feed hits its cap — the length stops changing);
-  // the user scrolling up releases the pin, returning near the bottom
-  // restores it.
-  const viewport = useRef<HTMLDivElement>(null)
-  const bottom = useRef<HTMLDivElement>(null)
+  // Only the rows near the screen are drawn (#461): a long session's feed
+  // holds tens of thousands, and drawing them all held the page for
+  // seconds at every page read back. The scroll box stays the ScrollArea's
+  // viewport, so the feed keeps its box, its bar and its height.
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null)
   const box = useRef<HTMLDivElement>(null)
+  // Pinned to the bottom until the reader scrolls up; back near the bottom,
+  // pinned again. The bottom is the box's own, never the list's idea of its
+  // height: that is an estimate until every row has been measured, and a
+  // pin kept by it stopped short of the newest row.
   const following = useRef(true)
   const [height, setHeight] = useState(storedFeedHeight)
-  const lastId = visible.length > 0 ? visible[visible.length - 1].id : ''
-  // A resize keeps a pinned feed pinned.
+  // Only the reader lets go of the bottom. A scroll right after their own
+  // input (wheel, touch, keys, the bar) that leaves the bottom ends the pin;
+  // the list's own scrolls, which hold rows in place by estimated heights
+  // and can stop short of the bottom for a frame, never do. Reaching the
+  // bottom, by any means, pins again.
+  const lastInput = useRef(0)
   useEffect(() => {
-    if (following.current) {
-      bottom.current?.scrollIntoView({ block: 'end' })
+    const root = box.current
+    if (!root) return
+    const mark = () => {
+      lastInput.current = performance.now()
     }
-  }, [lastId, loading, height])
-
-  // Scrolling back (issue #241). Reaching the top asks for the page
-  // before the oldest row. Whenever rows land above — asked for, or
-  // read back on their own (#442) — the viewport is rebased by what was
-  // added, so the row you were reading stays under your eyes instead of
-  // being shoved down; a feed pinned to the bottom stays pinned.
-  const firstId = visible.length > 0 ? visible[0].id : ''
-  const lastHeight = useRef(0)
-  const askOlder = () => {
-    const v = viewport.current
-    if (!v || !onLoadOlder || loadingOlder || exhausted) return
-    if (v.scrollHeight <= v.clientHeight + 40) return // nothing to scroll yet
-    onLoadOlder(visible[0] ? { at: visible[0].valid_from, id: visible[0].id } : undefined)
+    const inputs = ['wheel', 'touchmove', 'keydown', 'pointerdown'] as const
+    for (const e of inputs) root.addEventListener(e, mark, { passive: true, capture: true })
+    return () => {
+      for (const e of inputs) root.removeEventListener(e, mark, { capture: true })
+    }
+  }, [])
+  const onScroll = (y: number) => {
+    if (!scroller) return
+    if (y + scroller.clientHeight >= scroller.scrollHeight - 80) following.current = true
+    // A scroll still carrying the reader's last input, smooth wheels included.
+    else if (performance.now() - lastInput.current < 1000) following.current = false
   }
+  // A new newest row, with the cap dropping the oldest: the box holds the
+  // same height, the list keeps the rows on screen where they were, and
+  // the new row lands below the fold. A feed that was pinned when it came
+  // follows it down. "Was pinned" is read now, before the list's own
+  // scroll to hold its rows in place can say otherwise, and the pin is
+  // kept for the frames the list takes to draw and measure the row.
+  const lastId = visible.length > 0 ? visible[visible.length - 1].id : ''
   useLayoutEffect(() => {
-    const v = viewport.current
-    if (!v) return
-    if (following.current) bottom.current?.scrollIntoView({ block: 'end' })
-    else v.scrollTop += v.scrollHeight - lastHeight.current
-  }, [firstId])
-  // The height the next rebase measures from: recorded after every render.
-  useLayoutEffect(() => {
-    if (viewport.current) lastHeight.current = viewport.current.scrollHeight
-  })
+    if (!scroller || !following.current) return
+    let frames = 0
+    let frame = 0
+    const pin = () => {
+      scroller.scrollTop = scroller.scrollHeight
+      if ((frames += 1) < 3) frame = requestAnimationFrame(pin)
+    }
+    frame = requestAnimationFrame(pin)
+    return () => cancelAnimationFrame(frame)
+  }, [lastId, scroller])
+
+  // Scrolling back (issue #241): reaching the top asks for the page before
+  // the oldest row. Rows that land above, asked for or read back on their
+  // own (#442), lower the list's first index by as many, so the row you
+  // were reading stays under your eyes; rows the live cap drops from the
+  // top raise it. Either way the rows held before are all still there, in
+  // order: that is how the two are told from a new list (another label, a
+  // search, another scope), which starts over at its newest row, pinned.
+  const anchor = useRef({ index: FIRST_INDEX, ids: [] as string[], list: 0 })
+  const { firstItemIndex, list } = useMemo(() => {
+    const before = anchor.current
+    const ids = visible.map((r) => r.id)
+    const held = before.ids.length
+    const last = before.ids[held - 1]
+    let index = FIRST_INDEX
+    let same = false
+    if (held > 0 && ids.length > 0) {
+      const added = ids.indexOf(before.ids[0])
+      const dropped = added < 0 ? before.ids.indexOf(ids[0]) : -1
+      if (added >= 0 && ids[added + held - 1] === last) {
+        index = before.index - added
+        same = true
+      } else if (dropped >= 0 && ids[held - 1 - dropped] === last) {
+        index = before.index + dropped
+        same = true
+      }
+    }
+    if (!same) following.current = true
+    anchor.current = { index, ids, list: same ? before.list : before.list + 1 }
+    return { firstItemIndex: index, list: anchor.current.list }
+  }, [visible])
+  // Whatever the box holds changing size puts a pinned feed back at the
+  // bottom: the list's own height, the box, and the rows drawn at the
+  // bottom, which, measured for the first time, can come out taller or
+  // shorter than the list's estimate and move the bottom without the
+  // list's own height changing. A new list (`list`) draws new rows.
+  useEffect(() => {
+    const content = scroller?.firstElementChild
+    if (!scroller || !content) return
+    const pin = new ResizeObserver(() => {
+      if (following.current) scroller.scrollTop = scroller.scrollHeight
+    })
+    pin.observe(content)
+    pin.observe(scroller)
+    const drawn = scroller.querySelector('[data-testid="virtuoso-item-list"]')
+    if (drawn) pin.observe(drawn)
+    return () => pin.disconnect()
+  }, [scroller, list])
+  const askOlder = () => {
+    if (!onLoadOlder || loadingOlder || exhausted || visible.length === 0) return
+    onLoadOlder({ at: visible[0].valid_from, id: visible[0].id })
+  }
 
   return (
     <Card withBorder>
@@ -395,26 +505,12 @@ export function Feed({
       <ScrollArea
         ref={box}
         h={height}
-        viewportRef={viewport}
-        onScrollPositionChange={({ y }) => {
-          const v = viewport.current
-          if (!v) return
-          following.current = y + v.clientHeight >= v.scrollHeight - 80
-          if (y < 120) askOlder()
-        }}
+        viewportRef={setScroller}
+        onScrollPositionChange={({ y }) => onScroll(y)}
       >
         {loading && (
           <Text c="dimmed" size="sm">
             loading captured activity…
-          </Text>
-        )}
-        {!loading && onLoadOlder && visible.length > 0 && (
-          <Text c="dimmed" size="xs" ta="center" mb={4}>
-            {loadingOlder
-              ? 'loading older…'
-              : exhausted
-                ? '— the beginning of what the OS captured —'
-                : 'scroll up for more history'}
           </Text>
         )}
         {error && (
@@ -429,44 +525,25 @@ export function Feed({
               : 'nothing captured yet — work in any coding agent to see it land here'}
           </Text>
         )}
-        {visible.map((r) => {
-          const identity = identityOf(r, directory)
-          return (
-            // A div, not the default <p>: a row holds badges, which are
-            // divs, and a div inside a <p> is invalid HTML (#415 QA).
-            <Text
-              key={r.id}
-              component="div"
-              size="sm"
-              ff="monospace"
-              mb={2}
-              c={r.kind === 'action' ? 'dimmed' : undefined}
-            >
-              <Badge
-                size="xs"
-                mr={4}
-                variant="filled"
-                autoContrast
-                color={labelColor(rowLabel(r))}
-              >
-                {rowLabel(r)}
-              </Badge>
-              <Tooltip label={identity ? 'session' : 'no session — OS-level event'} withArrow>
-                <Badge
-                  size="xs"
-                  mr={6}
-                  variant="filled"
-                  autoContrast
-                  color={identity ? sessionColor(identity.key) : 'yellow'}
-                >
-                  {identity?.label ?? 'system'}
-                </Badge>
-              </Tooltip>
-              {localStamp(r)}
-            </Text>
-          )
-        })}
-        <div ref={bottom} />
+        {scroller && visible.length > 0 && (
+          <Virtuoso
+            key={list}
+            customScrollParent={scroller}
+            data={visible}
+            firstItemIndex={firstItemIndex}
+            initialTopMostItemIndex={{ index: 'LAST', align: 'end' }}
+            computeItemKey={(_, r) => r.id}
+            startReached={askOlder}
+            // Rows are drawn before they reach the box, above it most: a long
+            // message scrolled up into is measured off screen and moves
+            // nothing the reader sees (drawn only as it came in, the feed
+            // jumped by as much as 225 px).
+            increaseViewportBy={{ top: 800, bottom: 400 }}
+            context={{ show: !loading && !!onLoadOlder, loadingOlder, exhausted }}
+            components={{ Header: HistoryEdge }}
+            itemContent={(_, r) => <FeedRow r={r} directory={directory} />}
+          />
+        )}
       </ScrollArea>
       <ResizeBar height={height} onHeight={setHeight} box={box} />
     </Card>

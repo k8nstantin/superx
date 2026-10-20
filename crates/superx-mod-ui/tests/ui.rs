@@ -4927,3 +4927,32 @@ async fn the_export_holds_every_row_once_in_order_and_nothing_else() {
     assert!(text.contains("- **only rows matching:** “M5”"), "the file says it is filtered: {text}");
     assert!(text.ends_with("**end of export** · 1 row · 1 message (1 user) · 0 actions\n"), "{text}");
 }
+
+/// A session named by its id is found with one read; a name still goes
+/// through the shared resolver, and anything that is not a session says
+/// so as it always has (#461).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_is_found_by_its_id_without_listing_every_session() {
+    use superx_mod_ui::activity::session_named;
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-named").await;
+    let _other = seed_session_of(&kernel, "claude_code", "src-else").await;
+
+    let id = superx_ops::record_uuid(&session);
+    assert_eq!(session_named(&kernel, &id).await.expect("by id"), session, "the id is the session");
+    assert_eq!(
+        session_named(&kernel, "claude_code/src-named").await.expect("by name"),
+        session,
+        "a name still resolves"
+    );
+    let not_a_session = superx_ops::record_uuid(&agent);
+    assert!(
+        session_named(&kernel, &not_a_session).await.is_err(),
+        "an agent's id is not a session's"
+    );
+    assert!(
+        session_named(&kernel, "01920000-0000-7000-8000-000000000999").await.is_err(),
+        "nor is an id nothing carries"
+    );
+}

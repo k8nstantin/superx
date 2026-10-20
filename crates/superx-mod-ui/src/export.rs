@@ -289,8 +289,11 @@ impl<T: LiveRow> Walk<T> {
 
 /// One forward page over a session's rows. `>=` first, so the engine walks
 /// the time index and the tie is only a filter on it (#273); the snapshot
-/// bound keeps rows captured after the export began out of it.
-fn walk_query(table: &str, omit: &str, scope: &str, cursor: bool, keyword: Option<&str>) -> String {
+/// bound keeps rows captured after the export began out of it. The fields
+/// are the feed's (`activity::projection`): a message's `toolUseResult`,
+/// the agent's own structured copy of output the message already carries,
+/// stays in the engine.
+fn walk_query(table: &str, scope: &str, cursor: bool, keyword: Option<&str>) -> String {
     let mut wheres = vec![scope.to_string(), "valid_from <= $until".to_string()];
     if cursor {
         wheres.push("valid_from >= $at AND (valid_from > $at OR id > $id)".to_string());
@@ -299,15 +302,13 @@ fn walk_query(table: &str, omit: &str, scope: &str, cursor: bool, keyword: Optio
         wheres.push(k.to_string());
     }
     format!(
-        "SELECT *{omit} FROM {table} WHERE {} ORDER BY valid_from ASC, id ASC LIMIT $page",
+        "SELECT {} FROM {table} WHERE {} ORDER BY valid_from ASC, id ASC LIMIT $page",
+        crate::activity::projection(table),
         wheres.join(" AND ")
     )
 }
 
-/// The next page of the session's messages. Claude Code's `toolUseResult`
-/// is left in the engine: it is the agent's own structured copy of a tool
-/// result whose output the message already carries, and on one session it
-/// was a fifth of every byte read (#460).
+/// The next page of the session's messages.
 async fn message_page(
     kernel: &Kernel,
     session: &RecordId,
@@ -318,7 +319,6 @@ async fn message_page(
 ) -> Result<Vec<MessageRecord>> {
     let sql = walk_query(
         "message",
-        " OMIT raw.toolUseResult",
         "session = $sess",
         after.is_some(),
         keyword.map(|_| crate::activity::MSG_MATCH),
@@ -361,7 +361,6 @@ async fn action_page(
     let act_match = crate::activity::act_match();
     let sql = walk_query(
         "telemetry_stream",
-        "",
         match scope {
             Some(_) => "(subject = $sess OR (agent = $agent AND payload.session = $src))",
             None => "subject = $sess",
