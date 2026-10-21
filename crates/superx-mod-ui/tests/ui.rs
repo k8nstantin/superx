@@ -4933,6 +4933,12 @@ async fn the_export_holds_every_row_once_in_order_and_nothing_else() {
 /// it: whole under `line` since #471, its kind alone before.
 async fn put_line(kernel: &Kernel, n: u32, agent: &superx_kernel::types::RecordId, src: &str, secs: u32,
                   kind: &str, line: Option<serde_json::Value>) {
+    put_line_at(kernel, n, agent, src, export_at(secs), kind, line).await;
+}
+
+/// The same, at a moment to the microsecond.
+async fn put_line_at(kernel: &Kernel, n: u32, agent: &superx_kernel::types::RecordId, src: &str,
+                     at: chrono::DateTime<chrono::Utc>, kind: &str, line: Option<serde_json::Value>) {
     let mut payload = serde_json::json!({ "kind": kind, "session": src, "file": "/p/s.jsonl" });
     if let Some(line) = line {
         payload["line"] = line;
@@ -4944,7 +4950,7 @@ async fn put_line(kernel: &Kernel, n: u32, agent: &superx_kernel::types::RecordI
         .bind(("id", export_id("telemetry_stream", n)))
         .bind(("payload", superx_kernel::types::Value::Object(payload)))
         .bind(("agent", agent.clone()))
-        .bind(("at", export_at(secs)))
+        .bind(("at", at))
         .await
         .expect("create")
         .check()
@@ -5109,6 +5115,36 @@ async fn a_shallow_build_folder_is_its_repository_and_its_cut_landed_nothing() {
     assert_eq!(landed.repos.len(), 1, "{landed:?}");
     assert_eq!((landed.commits, landed.added), (3, 2001), "every commit once: {landed:?}");
     let _ = std::fs::remove_dir_all(&remote.base);
+}
+
+/// SurrealDB 3.1's index on a datetime orders a shorter fraction after a
+/// longer one within a second — `.178` (178,000 µs) after `.178501` — and
+/// whole seconds right. The export read in index order and wrote a
+/// request's line before the message it sent (#485).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_export_writes_each_second_in_the_order_its_rows_were_captured() {
+    use superx_mod_ui::export::{session_export, ExportOptions, Pages};
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-x").await;
+    let at = |t: &str| -> chrono::DateTime<chrono::Utc> { t.parse().expect("ts") };
+    put_message(&kernel, 1, &session, &agent, 1, "m1").await;
+    let blob = serde_json::json!({ "type": "api-request-blob", "hash": "h1",
+        "message": { "role": "user", "content": [{ "type": "text", "text": "sent" }] } });
+    put_line_at(&kernel, 71, &agent, "src-x", at("2026-10-01T00:00:02.178Z"), "api-request-blob", Some(blob)).await;
+    let request = serde_json::json!({ "type": "api-request", "querySource": "repl_main_thread", "params": { "model": "m" } });
+    put_line_at(&kernel, 72, &agent, "src-x", at("2026-10-01T00:00:02.178501Z"), "api-request", Some(request)).await;
+    let mode = serde_json::json!({ "type": "mode", "mode": "normal" });
+    put_line_at(&kernel, 73, &agent, "src-x", at("2026-10-01T00:00:02.9Z"), "mode", Some(mode)).await;
+    put_message(&kernel, 2, &session, &agent, 3, "m2").await;
+
+    for pages in [Pages { messages: 1, lines: 1, actions: 1 }, Pages::default()] {
+        let options = ExportOptions::parse(Some("conversation"), Some("full"), Some("txt"), None, None).expect("options");
+        let text = exported(session_export(kernel.clone(), session.clone(), options, export_at(5), pages)).await;
+        let found = |s: &str| text.find(s).unwrap_or(usize::MAX);
+        let order = ["    m1", "[context sent · user]", "[request sent · repl_main_thread · m]", "[mode]", "    m2"].map(found);
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "in capture order, {pages:?}: {order:?}\n{text}");
+    }
 }
 
 /// A session named by its id is found with one read; a name still goes

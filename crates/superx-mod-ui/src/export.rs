@@ -28,7 +28,7 @@
 //! line arrived, so a failed export never leaves a short file that looks
 //! whole.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
 use axum::body::Bytes;
@@ -229,16 +229,16 @@ pub fn session_export(
         let mut messages: Walk<MessageRecord> = Walk::new(pages.messages);
         let mut lines: Walk<TelemetryRecord> = Walk::new(pages.lines);
         loop {
-            if messages.wants_page() {
+            while messages.wants_page() {
                 let rows = message_page(
-                    &kernel, &session, keyword.as_deref(), messages.after.clone(), until, messages.page,
+                    &kernel, &session, keyword.as_deref(), messages.after(), until, messages.page,
                 )
                 .await?;
                 messages.take(rows);
             }
-            if lines.wants_page() {
+            while lines.wants_page() {
                 let rows = action_page(
-                    &kernel, &session, scope.as_ref(), Actions::Lines, keyword.as_deref(), lines.after.clone(),
+                    &kernel, &session, scope.as_ref(), Actions::Lines, keyword.as_deref(), lines.after(),
                     until, lines.page,
                 )
                 .await?;
@@ -270,10 +270,10 @@ pub fn session_export(
             file.appendix();
             let mut actions: Walk<TelemetryRecord> = Walk::new(pages.actions);
             loop {
-                if actions.wants_page() {
+                while actions.wants_page() {
                     let rows = action_page(
                         &kernel, &session, scope.as_ref(), Actions::Others, keyword.as_deref(),
-                        actions.after.clone(), until, actions.page,
+                        actions.after(), until, actions.page,
                     )
                     .await?;
                     actions.take(rows);
@@ -299,35 +299,92 @@ pub fn session_export(
     }
 }
 
-/// One table's rows, read a page at a time from the oldest.
+/// One table's rows, read a page at a time from the oldest and handed out
+/// in the order they were captured (#485). SurrealDB 3.1's index on a
+/// datetime keeps whole seconds in order but not the rows within one: a
+/// shorter fraction sorts after a longer one (`.178` after `.178501`). Read
+/// in index order, a request's line came before the message it sent, and
+/// a page edge inside a second lost a row for good. So each page starts at
+/// the second the last one stopped in and reads it whole, a row read
+/// already is skipped, and a second is handed out, in capture order, once
+/// the next one has begun.
 struct Walk<T> {
+    /// Rows to hand out, in capture order.
     rows: VecDeque<T>,
-    /// The last row read, in (capture time, id) order: the next page
-    /// starts after it.
-    after: Option<(DateTime<Utc>, RecordId)>,
+    /// The rows of the second being read.
+    held: Vec<T>,
+    /// That second, and the ids of its rows read so far.
+    open: Option<i64>,
+    seen: HashSet<String>,
+    /// Rows asked for at a time: the page, doubled while a full page
+    /// brings nothing new — a second holding more rows than a page.
     page: u32,
+    base: u32,
     done: bool,
 }
 
 impl<T: LiveRow> Walk<T> {
     fn new(page: u32) -> Self {
-        Self { rows: VecDeque::new(), after: None, page: page.max(1), done: false }
+        let page = page.max(1);
+        Self { rows: VecDeque::new(), held: Vec::new(), open: None, seen: HashSet::new(), page, base: page, done: false }
     }
 
     fn wants_page(&self) -> bool {
         self.rows.is_empty() && !self.done
     }
 
+    /// Where the next page starts: just before the second being read, so
+    /// the page holds that second whole.
+    fn after(&self) -> Option<DateTime<Utc>> {
+        let second = DateTime::<Utc>::from_timestamp(self.open?, 0)?;
+        Some(second - chrono::Duration::microseconds(1))
+    }
+
     /// A page as read. A short one is the end.
     fn take(&mut self, rows: Vec<T>) {
-        if rows.len() < self.page as usize {
+        let full = rows.len() >= self.page as usize;
+        let (mut fresh, mut opened) = (false, false);
+        for row in rows {
+            let (second, uuid) = {
+                let (id, at) = row.key();
+                (at.timestamp(), superx_ops::record_uuid(id))
+            };
+            match self.open {
+                // A second handed out already.
+                Some(open) if second < open => continue,
+                Some(open) if second == open => {
+                    if !self.seen.insert(uuid) {
+                        continue;
+                    }
+                }
+                // The next second: the one before it is whole.
+                _ => {
+                    self.release();
+                    self.open = Some(second);
+                    self.seen.clear();
+                    self.seen.insert(uuid);
+                    opened = true;
+                }
+            }
+            self.held.push(row);
+            fresh = true;
+        }
+        if !full {
             self.done = true;
+            self.release();
         }
-        if let Some(last) = rows.last() {
-            let (id, at) = last.key();
-            self.after = Some((at, id.clone()));
+        if opened {
+            self.page = self.base;
+        } else if full && !fresh {
+            self.page = self.page.saturating_mul(2);
         }
-        self.rows.extend(rows);
+    }
+
+    /// The second being read, handed out in capture order.
+    fn release(&mut self) {
+        let mut second = std::mem::take(&mut self.held);
+        second.sort_by_key(order_of);
+        self.rows.extend(second);
     }
 
     fn pop(&mut self) -> Option<T> {
@@ -356,16 +413,19 @@ enum Actions {
     Others,
 }
 
-/// One forward page over a session's rows. `>=` first, so the engine walks
-/// the time index and the tie is only a filter on it (#273); the snapshot
-/// bound keeps rows captured after the export began out of it. The fields
+/// One forward page over a session's rows, from just before the second
+/// the last page stopped in: a range on the time index, which keeps whole
+/// seconds in order (#485). The snapshot bound keeps rows captured after
+/// the export began out of it. The fields
 /// are the feed's (`activity::projection`): a message's `toolUseResult`,
 /// the agent's own structured copy of output the message already carries,
 /// stays in the engine.
 fn walk_query(table: &str, scope: &str, cursor: bool, keyword: Option<&str>) -> String {
     let mut wheres = vec![scope.to_string(), "valid_from <= $until".to_string()];
+    // From the second the last page stopped in, read whole: the walk
+    // skips what it has read (#485).
     if cursor {
-        wheres.push("valid_from >= $at AND (valid_from > $at OR id > $id)".to_string());
+        wheres.push("valid_from >= $at".to_string());
     }
     if let Some(k) = keyword {
         wheres.push(k.to_string());
@@ -382,7 +442,7 @@ async fn message_page(
     kernel: &Kernel,
     session: &RecordId,
     keyword: Option<&str>,
-    after: Option<(DateTime<Utc>, RecordId)>,
+    after: Option<DateTime<Utc>>,
     until: DateTime<Utc>,
     page: u32,
 ) -> Result<Vec<MessageRecord>> {
@@ -393,7 +453,7 @@ async fn message_page(
         keyword.map(|_| crate::activity::MSG_MATCH),
     );
     crate::answered("export messages", || {
-        let (sql, session, after) = (sql.clone(), session.clone(), after.clone());
+        let (sql, session) = (sql.clone(), session.clone());
         let keyword = keyword.map(str::to_lowercase);
         async move {
             let mut q = kernel
@@ -402,8 +462,8 @@ async fn message_page(
                 .bind(("sess", session))
                 .bind(("until", until))
                 .bind(("page", page));
-            if let Some((at, id)) = after {
-                q = q.bind(("at", at)).bind(("id", id));
+            if let Some(at) = after {
+                q = q.bind(("at", at));
             }
             if let Some(k) = keyword {
                 q = q.bind(("q", k));
@@ -426,7 +486,7 @@ async fn action_page(
     scope: Option<&(RecordId, String)>,
     which: Actions,
     keyword: Option<&str>,
-    after: Option<(DateTime<Utc>, RecordId)>,
+    after: Option<DateTime<Utc>>,
     until: DateTime<Utc>,
     page: u32,
 ) -> Result<Vec<TelemetryRecord>> {
@@ -441,7 +501,7 @@ async fn action_page(
     };
     let sql = walk_query("telemetry_stream", &scope_clause, after.is_some(), keyword.map(|_| act_match.as_str()));
     crate::answered("export actions", || {
-        let (sql, session, after, scope) = (sql.clone(), session.clone(), after.clone(), scope.cloned());
+        let (sql, session, scope) = (sql.clone(), session.clone(), scope.cloned());
         let keyword = keyword.map(str::to_lowercase);
         async move {
             let mut q = kernel
@@ -453,8 +513,8 @@ async fn action_page(
             if let Some((agent, src)) = scope {
                 q = q.bind(("agent", agent)).bind(("src", src));
             }
-            if let Some((at, id)) = after {
-                q = q.bind(("at", at)).bind(("id", id));
+            if let Some(at) = after {
+                q = q.bind(("at", at));
             }
             if let Some(k) = keyword {
                 q = q.bind(("q", k));
