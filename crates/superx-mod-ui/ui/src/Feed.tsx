@@ -418,32 +418,34 @@ export function Feed({
   // the oldest row. Rows that land above, asked for or read back on their
   // own (#442), lower the list's first index by as many, so the row you
   // were reading stays under your eyes; rows the live cap drops from the
-  // top raise it. Either way the rows held before are all still there, in
-  // order: that is how the two are told from a new list (another label, a
-  // search, another scope), which starts over at its newest row, pinned.
-  const anchor = useRef({ index: FIRST_INDEX, ids: [] as string[], list: 0 })
-  const { firstItemIndex, list } = useMemo(() => {
+  // top raise it. A row that lands anywhere else, such as a live row that
+  // committed late, is drawn where it belongs and moves nothing.
+  //
+  // Which list this is comes from what chose it, the label and the search,
+  // never from its rows: read from the rows, a late row looked like a new
+  // list, the view remounted empty, and it blinked on live updates (#469).
+  // A new list starts over at its newest row, pinned.
+  const list = `${active}\u0000${search ?? ''}`
+  const anchor = useRef({ list, index: FIRST_INDEX, ids: [] as string[] })
+  const firstItemIndex = useMemo(() => {
     const before = anchor.current
     const ids = visible.map((r) => r.id)
-    const held = before.ids.length
-    const last = before.ids[held - 1]
     let index = FIRST_INDEX
-    let same = false
-    if (held > 0 && ids.length > 0) {
+    if (before.list === list) {
       const added = ids.indexOf(before.ids[0])
       const dropped = added < 0 ? before.ids.indexOf(ids[0]) : -1
-      if (added >= 0 && ids[added + held - 1] === last) {
-        index = before.index - added
-        same = true
-      } else if (dropped >= 0 && ids[held - 1 - dropped] === last) {
-        index = before.index + dropped
-        same = true
+      if (added >= 0) index = before.index - added
+      else if (dropped >= 0) index = before.index + dropped
+      else {
+        // None of the rows held is left, so the reader's place is gone:
+        // the same list, read again, shows its newest row.
+        index = before.index
+        following.current = true
       }
-    }
-    if (!same) following.current = true
-    anchor.current = { index, ids, list: same ? before.list : before.list + 1 }
-    return { firstItemIndex: index, list: anchor.current.list }
-  }, [visible])
+    } else following.current = true
+    anchor.current = { list, index, ids }
+    return index
+  }, [visible, list])
   // Whatever the box holds changing size puts a pinned feed back at the
   // bottom: the list's own height, the box, and the rows drawn at the
   // bottom, which, measured for the first time, can come out taller or

@@ -29,7 +29,9 @@ export default function SessionsPage() {
     selected ? [{ label: 'Sessions', onClick: back }, { label: selected.identity }] : [{ label: 'Sessions' }],
   )
   if (selected) {
-    return <SessionFeed session={selected} onBack={back} />
+    // One feed per session: switching sessions starts a fresh one, so no
+    // row of the last session's live stream carries over (#469).
+    return <SessionFeed key={selected.session_id} session={selected} onBack={back} />
   }
   return (
     <>
