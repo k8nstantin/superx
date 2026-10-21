@@ -5052,6 +5052,65 @@ async fn the_session_view_shows_each_row_as_the_export_writes_it() {
     assert_eq!((message.request.as_deref(), message.heading.as_deref()), (None, None), "a prompt records no request");
 }
 
+/// A build folder — a shallow clone of a repository's remote — is that
+/// repository (#483): it takes the full clone's name, is read from the full
+/// clone when there is one, and its first commit, where its history was
+/// cut, landed nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shallow_build_folder_is_its_repository_and_its_cut_landed_nothing() {
+    use std::collections::{HashMap, HashSet};
+
+    let remote = TestRepo::new("gryphon-data-lake", "sandbox");
+    let lines: String = (1..=1000).map(|n| format!("{n}\n")).collect();
+    let root = remote.cwd();
+    for f in ["a.txt", "b.txt"] {
+        remote.commit(root, chrono::Utc::now(), "t@t", &format!("add {f}"), &[(f, lines.as_str())]);
+    }
+    let url = format!("file://{}", remote.root.display());
+    let clone = |dir: &std::path::Path, shallow: bool| {
+        let mut git = std::process::Command::new("git");
+        git.args(["clone", "-q"]);
+        if shallow {
+            git.args(["--depth", "1", "--single-branch", "--branch", "sandbox"]);
+        }
+        let out = git.arg(&url).arg(dir).output().expect("git runs");
+        assert!(out.status.success(), "clone: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let full = remote.base.join("main").join("gryphon-data-lake");
+    let build = remote.base.join("kn-build").join("ENG-8071");
+    clone(&full, false);
+    clone(&build, true);
+    let (full_cwd, build_cwd) = (full.to_string_lossy().into_owned(), build.to_string_lossy().into_owned());
+    let utc = chrono::FixedOffset::east_opt(0).expect("utc");
+    let mainlines = HashMap::from([("gryphon-data-lake".to_string(), "origin/sandbox".to_string())]);
+
+    // The build folder alone: its one commit is the cut, not 2,001 lines.
+    let only_build: HashSet<String> = HashSet::from([build_cwd.clone()]);
+    let checkouts = superx_mod_ui::checkout::Checkouts::resolve(&only_build).await;
+    let co = checkouts.of(&build_cwd).expect("the build folder is read");
+    assert!(co.shallow, "a depth-1 clone is shallow");
+    assert_eq!(co.repo, "gryphon-data-lake", "named for its repository, not its folder");
+    let landed = superx_mod_ui::landed::landed(&only_build, &checkouts, None, utc, &mainlines).await;
+    assert_eq!((landed.commits, landed.added), (0, 0), "the cut landed nothing: {landed:?}");
+    // With no setting its main line would be its own HEAD, where the build
+    // commits: refused, and counted unreadable.
+    let landed = superx_mod_ui::landed::landed(&only_build, &checkouts, None, utc, &HashMap::new()).await;
+    assert_eq!((landed.commits, landed.unreadable), (0, 1), "{landed:?}");
+    let work = superx_mod_ui::landed::repo_work(&build, "origin/sandbox", None).await.expect("read");
+    assert!(work.landed.is_empty(), "the cut is no commit that landed: {:?}", work.landed.iter().map(|c| &c.subject).collect::<Vec<_>>());
+
+    // With the full clone beside it: one repository, read from the full clone.
+    let both: HashSet<String> = HashSet::from([full_cwd.clone(), build_cwd.clone()]);
+    let checkouts = superx_mod_ui::checkout::Checkouts::resolve(&both).await;
+    let (f, b) = (checkouts.of(&full_cwd).expect("full"), checkouts.of(&build_cwd).expect("build"));
+    assert_eq!(f.key, b.key, "one repository");
+    assert_eq!(checkouts.reader(b).toplevel, f.toplevel, "read from the full clone");
+    let landed = superx_mod_ui::landed::landed(&both, &checkouts, None, utc, &mainlines).await;
+    assert_eq!(landed.repos.len(), 1, "{landed:?}");
+    assert_eq!((landed.commits, landed.added), (3, 2001), "every commit once: {landed:?}");
+    let _ = std::fs::remove_dir_all(&remote.base);
+}
+
 /// A session named by its id is found with one read; a name still goes
 /// through the shared resolver, and anything that is not a session says
 /// so as it always has (#461).

@@ -18,7 +18,7 @@ use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
 
-use crate::landed::{git, repo_name};
+use crate::landed::{git, name_of_url, repo_name, shallow_boundary};
 
 /// HEAD moves, oldest first: when, and the branch it moved to (`None`
 /// for a detached HEAD).
@@ -33,8 +33,15 @@ pub struct Checkout {
     /// The repository's name: the directory holding the common `.git`,
     /// so every worktree of one repository reads as that repository.
     pub repo: String,
-    /// The repository's common git dir — its identity.
+    /// The checkout's common git dir: its own repository on disk.
     pub common: String,
+    /// The repository it is a checkout of: its `origin` URL when it has
+    /// one, else its common git dir. A build folder cloned from a
+    /// repository's remote is that repository, not a new one (#483).
+    pub key: String,
+    /// A shallow clone: its history stops at the commit it was cloned at,
+    /// whose parents were never fetched (#483).
+    pub shallow: bool,
     /// HEAD moves, oldest first.
     moves: Moves,
     /// The branch before the first recorded move, or — when the reflog
@@ -97,6 +104,20 @@ impl Checkouts {
             };
             out.by_dir.insert(dir.clone(), entry);
         }
+        // A shallow clone takes the name of a full clone of its repository
+        // when there is one: the name the operator's main-line setting and
+        // every page know it by (#483).
+        let full: HashMap<String, String> = out
+            .list
+            .iter()
+            .filter(|c| !c.shallow)
+            .map(|c| (c.key.clone(), c.repo.clone()))
+            .collect();
+        for c in out.list.iter_mut().filter(|c| c.shallow) {
+            if let Some(name) = full.get(&c.key) {
+                c.repo = name.clone();
+            }
+        }
         out
     }
 
@@ -104,6 +125,19 @@ impl Checkouts {
     #[must_use]
     pub fn of(&self, dir: &str) -> Option<&Checkout> {
         self.by_dir.get(dir)?.map(|(i, _)| &self.list[i])
+    }
+
+    /// The checkout to read `co`'s repository's history from (#483): a
+    /// full clone of it when the directories hold one — a shallow clone's
+    /// history stops where it was cloned — the first by path when they
+    /// hold several, else `co` itself.
+    #[must_use]
+    pub fn reader<'a>(&'a self, co: &'a Checkout) -> &'a Checkout {
+        self.list
+            .iter()
+            .filter(|c| c.key == co.key)
+            .min_by(|a, b| a.shallow.cmp(&b.shallow).then_with(|| a.toplevel.cmp(&b.toplevel)))
+            .unwrap_or(co)
     }
 
     /// The branch a directory's checkout was on at `t` — only when the
@@ -172,8 +206,25 @@ async fn read_checkout(toplevel: String, common: String) -> Checkout {
         .await
         .unwrap_or_default();
     let (moves, first_from) = parse_moves(&reflog, &remotes, current.as_deref());
+    // The repository it is a checkout of (#483): a build folder's directory
+    // holding `.git` names the build, not the repository.
+    let origin = if remotes.iter().any(|r| r == "origin") {
+        git(dir, &["config", "--get", "remote.origin.url"])
+            .await
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let shallow = !shallow_boundary(dir).await.is_empty();
+    let repo = match origin.as_deref().filter(|_| shallow).and_then(name_of_url) {
+        Some(name) => name,
+        None => repo_name(&common, &toplevel),
+    };
     Checkout {
-        repo: repo_name(&common, &toplevel),
+        repo,
+        key: origin.unwrap_or_else(|| common.clone()),
+        shallow,
         toplevel,
         common,
         initial: if moves.is_empty() { current } else { first_from },
@@ -271,6 +322,8 @@ mod tests {
             toplevel: "/r".into(),
             repo: "r".into(),
             common: "/r/.git".into(),
+            key: "/r/.git".into(),
+            shallow: false,
             initial: first_from,
             moves,
         };
@@ -303,6 +356,8 @@ mod tests {
             toplevel: "/r".into(),
             repo: "r".into(),
             common: "/r/.git".into(),
+            key: "/r/.git".into(),
+            shallow: false,
             initial: first_from,
             moves,
         };
@@ -325,6 +380,8 @@ mod tests {
             toplevel: "/r".into(),
             repo: "r".into(),
             common: "/r/.git".into(),
+            key: "/r/.git".into(),
+            shallow: false,
             initial: first_from,
             moves,
         };
