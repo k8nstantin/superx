@@ -4901,7 +4901,7 @@ async fn the_export_holds_every_row_once_in_order_and_nothing_else() {
     put_action(&kernel, 22, &agent, &agent, "src-other", 2, "a22").await;
 
     let everything = ExportOptions::parse(Some("everything"), Some("full"), Some("txt"), None, None).expect("options");
-    let pages = Pages { messages: 3, actions: 2 };
+    let pages = Pages { messages: 3, lines: 2, actions: 2 };
     let text = exported(session_export(kernel.clone(), session.clone(), everything, export_at(5), pages)).await;
     assert_eq!(
         exported_rows(&text),
@@ -4927,6 +4927,101 @@ async fn the_export_holds_every_row_once_in_order_and_nothing_else() {
     assert!(text.contains("\nm5\n") && !text.contains("\nm4\n"), "only the matching row: {text}");
     assert!(text.contains("- **only rows matching:** “M5”"), "the file says it is filtered: {text}");
     assert!(text.ends_with("**end of export** · 1 row · 1 message (1 user) · 0 actions\n"), "{text}");
+}
+
+/// A transcript line at a set time with a set id, as the capture writes
+/// it: whole under `line` since #471, its kind alone before.
+async fn put_line(kernel: &Kernel, n: u32, agent: &superx_kernel::types::RecordId, src: &str, secs: u32,
+                  kind: &str, line: Option<serde_json::Value>) {
+    let mut payload = serde_json::json!({ "kind": kind, "session": src, "file": "/p/s.jsonl" });
+    if let Some(line) = line {
+        payload["line"] = line;
+    }
+    let payload = superx_kernel::message::json_to_object(&payload);
+    kernel
+        .db()
+        .query("CREATE $id SET lifecycle_event = 'transcript_event', payload = $payload, subject = $agent, agent = $agent, valid_from = $at")
+        .bind(("id", export_id("telemetry_stream", n)))
+        .bind(("payload", superx_kernel::types::Value::Object(payload)))
+        .bind(("agent", agent.clone()))
+        .bind(("at", export_at(secs)))
+        .await
+        .expect("create")
+        .check()
+        .expect("line row");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_export_writes_every_transcript_line_in_place_and_whole() {
+    use superx_mod_ui::export::{session_export, ExportOptions, Pages};
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-x").await;
+    put_message(&kernel, 1, &session, &agent, 1, "m1").await;
+    put_line(&kernel, 31, &agent, "src-x", 2, "attachment", Some(serde_json::json!({
+        "type": "attachment", "uuid": "u-31", "renderedRole": "user",
+        "attachment": { "type": "instructions", "files": [{ "path": "/r/CLAUDE.md" }] },
+        "rendered": [{ "content": "Contents of /r/CLAUDE.md: never cut" }]
+    })))
+    .await;
+    for n in [32, 33] {
+        put_line(&kernel, n, &agent, "src-x", 2, "mode", Some(serde_json::json!({ "type": "mode", "mode": "normal", "sessionId": "s" }))).await;
+    }
+    // Kept by its kind alone, before #471, and an action: the appendix.
+    put_line(&kernel, 34, &agent, "src-x", 2, "attachment", None).await;
+    put_action(&kernel, 35, &agent, &agent, "src-x", 2, "a1").await;
+    put_message(&kernel, 2, &session, &agent, 3, "m2").await;
+    put_line(&kernel, 36, &agent, "src-x", 4, "system", Some(serde_json::json!({
+        "type": "system", "subtype": "turn_duration", "durationMs": 270_000, "messageCount": 12, "isMeta": false
+    })))
+    .await;
+
+    // One row a page: every edge between the two walks is crossed.
+    let pages = Pages { messages: 1, lines: 1, actions: 1 };
+    let everything = ExportOptions::parse(Some("everything"), Some("full"), Some("txt"), None, None).expect("options");
+    let text = exported(session_export(kernel.clone(), session.clone(), everything, export_at(5), pages)).await;
+    let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s:?} is not in the file: {text}"));
+    assert!(at("    m1") < at("[attachment · instructions · sent as user]"), "{text}");
+    assert!(at("    Contents of /r/CLAUDE.md: never cut") < at("[mode]"), "the text the model was given: {text}");
+    assert!(at("\"path\": \"/r/CLAUDE.md\"") < at("[mode]"), "and the attachment as recorded: {text}");
+    assert!(at("[mode]") < at("[unchanged: mode]"), "a line said again is named: {text}");
+    assert!(at("[unchanged: mode]") < at("    m2"), "{text}");
+    assert!(at("    m2") < at("[system · turn_duration]"), "{text}");
+    assert!(at("[system · turn_duration]") < at("    [the turn took 4 min 30 s · 12 messages]"), "{text}");
+    assert!(!text.contains("u-31") && !text.contains("isMeta"), "a line's bookkeeping is not written: {text}");
+    let appendix = at("APPENDIX: the OS's action events");
+    assert!(appendix > at("[system · turn_duration]"), "{text}");
+    assert_eq!(
+        text[appendix..].lines().filter(|l| l.starts_with("action ")).count(),
+        2,
+        "the action and the line kept by kind only, nothing written in place: {text}"
+    );
+    assert!(text.contains("transcript lines kept by kind only (1, #471): attachment ×1"), "{text}");
+    assert!(
+        text.ends_with("end of export · 8 rows · 2 messages (2 user) · 4 transcript lines · 2 actions\n"),
+        "{text}"
+    );
+
+    // The conversation alone holds every line in place too.
+    let conversation = ExportOptions::parse(Some("conversation"), Some("full"), Some("txt"), None, None).expect("options");
+    let text = exported(session_export(kernel.clone(), session, conversation, export_at(5), pages)).await;
+    assert!(text.contains("    Contents of /r/CLAUDE.md: never cut") && !text.contains("APPENDIX"), "{text}");
+    assert!(text.ends_with("end of export · 6 rows · 2 messages (2 user) · 4 transcript lines\n"), "{text}");
+}
+
+/// The feed's search reads every payload field that holds a string, and
+/// passes over one that holds anything else: a whole transcript line is an
+/// object, which `string::lowercase` refuses, and failed the search (#477).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_passes_over_a_whole_transcript_line() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-x").await;
+    put_line(&kernel, 41, &agent, "src-x", 1, "attachment", Some(serde_json::json!({ "type": "attachment" }))).await;
+    put_action(&kernel, 42, &agent, &agent, "src-x", 2, "needle").await;
+    let rows = superx_mod_ui::activity::session_activity(&kernel, session, 50, None, Some("needle"))
+        .await
+        .expect("a search over a whole line answers");
+    assert_eq!(rows.len(), 1, "{rows:?}");
 }
 
 /// A session named by its id is found with one read; a name still goes
