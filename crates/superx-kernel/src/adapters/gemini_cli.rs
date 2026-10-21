@@ -9,7 +9,8 @@
 //!   `chats/session-*.jsonl` (top level; subagent transcripts in
 //!   subdirectories are post-FVP).
 //! - Line 1 of each file is a session header (`sessionId`, `kind`).
-//! - `{"$set": …}` lines are header mutations — folded, not messages.
+//! - `{"$set": …}` lines are header mutations, not messages: the header
+//!   and every `$set` are kept whole as `transcript_event`s (#471).
 //! - `type:"user"` — `content` is an ARRAY of parts (`{text}` /
 //!   `inlineData`); `type:"gemini"` — `content` is a plain string,
 //!   plus `thoughts`, `tokens`, `model`, optional `toolCalls`.
@@ -248,16 +249,20 @@ impl GeminiCliAdapter {
         let file_key = file.to_string_lossy().to_string();
 
         // Header line: establishes the session for this file.
-        if let Some(session_id) = json.get("sessionId").and_then(|v| v.as_str()) {
-            if json.get("type").is_none() && json.get("$set").is_none() {
-                file_sessions.insert(file_key.clone(), session_id.to_string());
-                return Ok(0);
-            }
+        let header_session = json
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .filter(|_| json.get("type").is_none() && json.get("$set").is_none());
+        if let Some(session_id) = header_session {
+            file_sessions.insert(file_key.clone(), session_id.to_string());
         }
-        // Header mutations are state churn, not conversation.
-        if json.get("$set").is_some() {
-            return Ok(0);
-        }
+        let header_kind = if header_session.is_some() {
+            Some("header")
+        } else if json.get("$set").is_some() {
+            Some("$set")
+        } else {
+            None
+        };
 
         let session_key = file_sessions
             .get(&file_key)
@@ -272,6 +277,25 @@ impl GeminiCliAdapter {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "unknown-session".to_string())
             });
+
+        // A header, and a header mutation (`$set`), are not conversation:
+        // they are kept whole as telemetry (#471). They were folded away.
+        if let Some(kind) = header_kind {
+            let mut payload = Object::new();
+            payload.insert("kind".to_string(), Value::String(kind.to_string()));
+            payload.insert("session".to_string(), Value::String(session_key));
+            payload.insert("file".to_string(), Value::String(file_key));
+            payload.insert("line".to_string(), Value::Object(json_to_object(json)));
+            kernel
+                .log_telemetry_for_agent(
+                    "transcript_event",
+                    Value::Object(payload),
+                    Some(source.entity_id.clone()),
+                    Some(source.agent_id.clone()),
+                )
+                .await?;
+            return Ok(1);
+        }
 
         let line_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match line_type {
@@ -362,6 +386,7 @@ impl GeminiCliAdapter {
                 if let Some(c) = json.get("content").and_then(|v| v.as_str()) {
                     payload.insert("content".to_string(), Value::String(c.to_string()));
                 }
+                payload.insert("line".to_string(), Value::Object(json_to_object(json)));
                 kernel
                     .log_telemetry_for_agent(
                         "transcript_event",
@@ -380,6 +405,7 @@ impl GeminiCliAdapter {
                 payload.insert("session".to_string(), Value::String(session_key));
                 let snippet: String = json.to_string().chars().take(500).collect();
                 payload.insert("snippet".to_string(), Value::String(snippet));
+                payload.insert("line".to_string(), Value::Object(json_to_object(json)));
                 kernel
                     .log_telemetry_for_agent(
                         "transcript_raw",
