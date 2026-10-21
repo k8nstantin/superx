@@ -1060,6 +1060,19 @@ pub struct SseEvent {
     /// messages (they carry `session_id`) and on global events.
     pub session_src: Option<String>,
     pub valid_from: String,
+    /// The request a message row belongs to (#481). A reply is written as
+    /// several rows; its request's facts are shown once, under the newest
+    /// of them, as the export writes them once.
+    pub request: Option<String>,
+    /// That request's model, effort and token counts as this row recorded
+    /// them: the export's request line.
+    pub request_line: Option<String>,
+    /// A transcript line's heading (#481).
+    pub heading: Option<String>,
+    /// A digest of what the line says, its bookkeeping aside. A line that
+    /// says what the last line under its heading said is shown as
+    /// unchanged, as the export names it.
+    pub said: Option<String>,
 }
 
 /// One model's stint inside one session (#406, #414): a run of

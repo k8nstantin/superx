@@ -5045,8 +5045,11 @@ async fn the_session_view_shows_each_row_as_the_export_writes_it() {
         "{}",
         line.rendered
     );
+    assert_eq!(line.heading.as_deref(), Some("attachment · edited_text_file"), "its heading, to name it again by (#481)");
+    assert!(line.said.is_some(), "and a digest of what it says");
     let message = rows.iter().find(|r| r.kind == "message").expect("the message's row");
     assert!(message.rendered.ends_with("user: a reply"), "one line stays one line: {}", message.rendered);
+    assert_eq!((message.request.as_deref(), message.heading.as_deref()), (None, None), "a prompt records no request");
 }
 
 /// A session named by its id is found with one read; a name still goes

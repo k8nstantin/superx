@@ -1448,6 +1448,20 @@ impl Writer {
     fn close_request(&mut self) {
         let Some(r) = self.request.take() else { return };
         self.flush_unchanged();
+        let line = self.request_text(&r);
+        match self.format {
+            Format::Markdown => {
+                let _ = writeln!(self.out, "*{line}*\n");
+            }
+            Format::Text => {
+                let _ = writeln!(self.out, "    [{line}]\n");
+            }
+        }
+    }
+
+    /// A request's id, model, effort and token counters, in words: the
+    /// line the file closes a request with, and the session view too (#481).
+    fn request_text(&self, r: &Request) -> String {
         let mut line = format!("request {}", self.code(&r.id));
         if let Some(model) = &r.model {
             let _ = write!(line, " · {}", self.code(model));
@@ -1464,14 +1478,7 @@ impl Writer {
                 let _ = write!(line, " · tokens: {tokens}");
             }
         }
-        match self.format {
-            Format::Markdown => {
-                let _ = writeln!(self.out, "*{line}*\n");
-            }
-            Format::Text => {
-                let _ = writeln!(self.out, "    [{line}]\n");
-            }
-        }
+        line
     }
 
     /// A transcript line that is not a message, where it happened (#477):
@@ -1942,9 +1949,11 @@ fn feed_writer(at: DateTime<Utc>) -> Writer {
     Writer::new(&options, at)
 }
 
-/// A message as the file writes it: every piece whole, then the model,
-/// effort and token counts of its request as this row recorded them.
-pub(crate) fn message_body(m: &MessageRecord) -> String {
+/// A message as the file writes it: every piece whole; and the id of its
+/// request with the request's line as this row recorded them, which the
+/// view shows once per request, under its newest row, as the file does
+/// (#481).
+pub(crate) fn message_body(m: &MessageRecord) -> (String, Option<(String, String)>) {
     let mut w = feed_writer(m.valid_from);
     let raw = m.raw.clone().map(|o| Value::Object(o).into_json_value());
     w.line = raw.as_ref().map(line_facts).unwrap_or_default();
@@ -1955,15 +1964,19 @@ pub(crate) fn message_body(m: &MessageRecord) -> String {
     for p in &pieces {
         w.txt_piece(p);
     }
-    w.request = raw.as_ref().and_then(request_of);
-    w.close_request();
-    w.out.trim_end().to_string()
+    let request = raw.as_ref().and_then(request_of).map(|r| {
+        let line = w.request_text(&r);
+        (r.id, line)
+    });
+    (w.out.trim_end().to_string(), request)
 }
 
-/// A transcript line kept whole (#471) as the file writes it: its heading
-/// and its pieces. `None` for any other action event, and for a line kept
-/// by its kind alone.
-pub(crate) fn line_body(a: &TelemetryRecord) -> Option<(String, String)> {
+/// A transcript line kept whole (#471) as the file writes it: its heading,
+/// its pieces, and a digest of what it says, its bookkeeping aside, so the
+/// view can name a line that says it again as unchanged, as the file does
+/// (#481). `None` for any other action event, and for a line kept by its
+/// kind alone.
+pub(crate) fn line_body(a: &TelemetryRecord) -> Option<(String, String, String)> {
     if a.lifecycle_event != "transcript_event" {
         return None;
     }
@@ -1975,7 +1988,10 @@ pub(crate) fn line_body(a: &TelemetryRecord) -> Option<(String, String)> {
     for p in &pieces {
         w.txt_piece(p);
     }
-    Some((heading, w.out.trim_end().to_string()))
+    let said = beyond(line, LINE_BOOKKEEPING).unwrap_or(Json::Null).to_string();
+    let mut digest = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&said, &mut digest);
+    Some((heading, w.out.trim_end().to_string(), format!("{:016x}", std::hash::Hasher::finish(&digest))))
 }
 
 fn plural(n: usize) -> &'static str {
@@ -2345,15 +2361,15 @@ mod tests {
             })),
             "",
         );
-        let body = message_body(&reply);
-        for s in [
-            "    thinking · 5.7 s:\n        Check the cursor first.",
-            "    tool call Bash (toolu_9):",
-            long.as_str(),
-            "    [request req_9 · claude-opus-5-5 · effort max · tokens: 3 in · 120 out]",
-        ] {
+        let (body, request) = message_body(&reply);
+        for s in ["    thinking · 5.7 s:\n        Check the cursor first.", "    tool call Bash (toolu_9):", long.as_str()] {
             assert!(body.contains(s), "{s:?} is not in the row: {body}");
         }
+        assert!(!body.contains("[request"), "the request's line is the page's to place, once: {body}");
+        assert_eq!(
+            request,
+            Some(("req_9".to_string(), "request req_9 · claude-opus-5-5 · effort max · tokens: 3 in · 120 out".to_string()))
+        );
         let result = message(
             "tool",
             Some(json!({
@@ -2364,7 +2380,8 @@ mod tests {
             })),
             "line one\nline two",
         );
-        let body = message_body(&result);
+        let (body, request) = message_body(&result);
+        assert_eq!(request, None, "a tool result records no request");
         assert!(body.contains("tool result (for toolu_9), permission: accept · source config:"), "{body}");
         assert!(body.contains("        line one\n        line two"), "every line of the output: {body}");
     }
@@ -2378,10 +2395,24 @@ mod tests {
                     "attachment": { "type": "edited_text_file", "filename": "/r/a.rs" },
                     "rendered": [{ "content": reminder.clone() }] }),
         );
-        let (heading, body) = line_body(&row).expect("a whole line");
+        let (heading, body, said) = line_body(&row).expect("a whole line");
         assert_eq!(heading, "attachment · edited_text_file · sent as system");
         assert!(body.contains(&reminder) && body.contains("\"filename\": \"/r/a.rs\""), "{body}");
         assert!(!body.contains("u-9"), "no bookkeeping: {body}");
+        let again = line_row(
+            "attachment",
+            json!({ "type": "attachment", "renderedRole": "system", "uuid": "u-10",
+                    "attachment": { "type": "edited_text_file", "filename": "/r/a.rs" },
+                    "rendered": [{ "content": reminder.clone() }] }),
+        );
+        let changed = line_row(
+            "attachment",
+            json!({ "type": "attachment", "renderedRole": "system", "uuid": "u-11",
+                    "attachment": { "type": "edited_text_file", "filename": "/r/b.rs" },
+                    "rendered": [{ "content": reminder.clone() }] }),
+        );
+        assert_eq!(line_body(&again).map(|l| l.2), Some(said.clone()), "the same line, its bookkeeping aside");
+        assert_ne!(line_body(&changed).map(|l| l.2), Some(said), "a line that says something else");
         let kind_only = TelemetryRecord {
             payload: <Json as superx_kernel::types::SurrealValue>::into_value(json!({ "kind": "attachment", "session": "s" })),
             ..line_row("attachment", json!({}))

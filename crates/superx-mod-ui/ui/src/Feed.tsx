@@ -277,8 +277,25 @@ const labelColor = (label: string) => LABEL_COLORS[label] ?? '#52514e'
 /// writes for it (#479). Drawn only while it is near the screen (#461), so
 /// it is kept cheap and memoized. Padding, not a margin, between rows: the
 /// list measures each row's box, and a margin falls outside it.
-const FeedRow = memo(function FeedRow({ r, directory }: { r: SseEvent; directory: Directory }) {
+const FeedRow = memo(function FeedRow({
+  r,
+  directory,
+  closes,
+  unchanged,
+}: {
+  r: SseEvent
+  directory: Directory
+  /// The newest row of its request: the request's line goes under it,
+  /// once, as the export writes it (#481).
+  closes: boolean
+  /// A transcript line that says what the last line under its heading
+  /// said: named, not written again, as the export names it (#481).
+  unchanged: boolean
+}) {
   const identity = identityOf(r, directory)
+  const stamped = localStamp(r)
+  const text = unchanged ? `${stamped.split('\n', 1)[0]} · unchanged` : stamped
+  const request = closes && r.request_line ? `\n    [${r.request_line}]` : ''
   return (
     // A div, not the default <p>: a row holds badges, which are
     // divs, and a div inside a <p> is invalid HTML (#415 QA). Its text is
@@ -300,7 +317,8 @@ const FeedRow = memo(function FeedRow({ r, directory }: { r: SseEvent; directory
           {identity?.label ?? 'system'}
         </Badge>
       </Tooltip>
-      {localStamp(r)}
+      {text}
+      {request}
     </Text>
   )
 })
@@ -367,6 +385,23 @@ export function Feed({
   const visible = useMemo(() => rows.filter((r) => active === 'all' || rowLabel(r) === active), [rows, active])
 
   const directory = useMemo(() => buildDirectory(sessions, agents), [sessions, agents])
+
+  // As the export writes them (#481): a request's line once, under its
+  // newest row, and a transcript line that says what the last line under
+  // its heading said named as unchanged. Over the rows held, oldest first.
+  const { closes, unchanged } = useMemo(() => {
+    const newest = new Map<string, string>()
+    const last = new Map<string, string>()
+    const unchanged = new Set<string>()
+    for (const r of visible) {
+      if (r.request) newest.set(r.request, r.id)
+      if (r.heading && r.said) {
+        if (last.get(r.heading) === r.said) unchanged.add(r.id)
+        last.set(r.heading, r.said)
+      }
+    }
+    return { closes: new Set(newest.values()), unchanged }
+  }, [visible])
 
   // Only the rows near the screen are drawn (#461): a long session's feed
   // holds tens of thousands, and drawing them all held the page for
@@ -552,7 +587,9 @@ export function Feed({
             increaseViewportBy={{ top: 800, bottom: 400 }}
             context={{ show: !loading && !!onLoadOlder, loadingOlder, exhausted }}
             components={{ Header: HistoryEdge }}
-            itemContent={(_, r) => <FeedRow r={r} directory={directory} />}
+            itemContent={(_, r) => (
+              <FeedRow r={r} directory={directory} closes={closes.has(r.id)} unchanged={unchanged.has(r.id)} />
+            )}
           />
         )}
       </ScrollArea>

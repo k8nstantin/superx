@@ -47,15 +47,21 @@ pub fn session_key_of(payload: &Value) -> Option<String> {
 /// bridge broadcasts, so backlog and live rows are interchangeable.
 #[must_use]
 pub fn message_event(m: &MessageRecord) -> SseEvent {
+    let (rendered, request) = message_row(m);
+    let (request, request_line) = request.unzip();
     SseEvent {
         id: superx_ops::record_uuid(&m.id),
         kind: "message".to_string(),
-        rendered: message_row(m),
+        rendered,
         role: Some(m.role.clone()),
         agent_id: Some(superx_ops::record_uuid(&m.agent)),
         session_id: Some(superx_ops::record_uuid(&m.session)),
         session_src: None,
         valid_from: m.valid_from.to_rfc3339(),
+        request,
+        request_line,
+        heading: None,
+        said: None,
     }
 }
 
@@ -63,47 +69,54 @@ pub fn message_event(m: &MessageRecord) -> SseEvent {
 /// bridge broadcasts.
 #[must_use]
 pub fn action_event(a: &TelemetryRecord) -> SseEvent {
+    let (rendered, line) = action_row(a);
+    let (heading, said) = line.unzip();
     SseEvent {
         id: superx_ops::record_uuid(&a.id),
         kind: "action".to_string(),
-        rendered: action_row(a),
+        rendered,
         role: None,
         agent_id: a.agent.as_ref().map(superx_ops::record_uuid),
         session_id: None,
         session_src: session_key_of(&a.payload),
         valid_from: a.valid_from.to_rfc3339(),
+        request: None,
+        request_line: None,
+        heading,
+        said,
     }
 }
 
 /// A message's feed row (#479): its stamp and role, then what the export
-/// writes for it, whole — on the same line when that is one line. The
-/// CLI's one-line summary (`superx_ops::render_message`) cut a tool call's
-/// hint at 60 characters and wrote thinking and tool output as a word.
-fn message_row(m: &MessageRecord) -> String {
+/// writes for it, whole — on the same line when that is one line — and its
+/// request with the request's line, which the page shows once per request
+/// (#481). The CLI's one-line summary (`superx_ops::render_message`) cut a
+/// tool call's hint at 60 characters and wrote thinking and tool output as
+/// a word.
+fn message_row(m: &MessageRecord) -> (String, Option<(String, String)>) {
     let ts = m.emitted_at.unwrap_or(m.valid_from).format("%Y-%m-%d %H:%M:%S");
     let head = format!("[{ts}] {:>9}:", m.role);
-    let body = crate::export::message_body(m);
-    match body.lines().count() {
+    let (body, request) = crate::export::message_body(m);
+    let row = match body.lines().count() {
         0 => head,
         1 => format!("{head} {}", body.trim_start()),
         _ => format!("{head}\n{body}"),
-    }
+    };
+    (row, request)
 }
 
 /// An action's feed row: a transcript line kept whole (#471) as the export
 /// writes it (#479), whose payload `superx_ops::render_event` cut at 80
-/// characters; any other event as the CLI renders it.
-fn action_row(a: &TelemetryRecord) -> String {
+/// characters, with its heading and a digest of what it says (#481); any
+/// other event as the CLI renders it.
+fn action_row(a: &TelemetryRecord) -> (String, Option<(String, String)>) {
     match crate::export::line_body(a) {
-        Some((heading, body)) => {
+        Some((heading, body, said)) => {
             let head = format!("[{}] {heading}", a.valid_from.format("%H:%M:%S"));
-            if body.is_empty() {
-                head
-            } else {
-                format!("{head}\n{body}")
-            }
+            let row = if body.is_empty() { head } else { format!("{head}\n{body}") };
+            (row, Some((heading, said)))
         }
-        None => superx_ops::render_event(a).trim_end().to_string(),
+        None => (superx_ops::render_event(a).trim_end().to_string(), None),
     }
 }
 
