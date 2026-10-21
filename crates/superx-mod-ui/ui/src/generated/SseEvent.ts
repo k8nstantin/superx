@@ -17,4 +17,25 @@ role: string | null, agent_id: string | null, session_id: string | null,
  * action to its session (`SessionView.src` matches). `None` on
  * messages (they carry `session_id`) and on global events.
  */
-session_src: string | null, valid_from: string, };
+session_src: string | null, valid_from: string, 
+/**
+ * The request a message row belongs to (#481). A reply is written as
+ * several rows; its request's facts are shown once, under the newest
+ * of them, as the export writes them once.
+ */
+request: string | null, 
+/**
+ * That request's model, effort and token counts as this row recorded
+ * them: the export's request line.
+ */
+request_line: string | null, 
+/**
+ * A transcript line's heading (#481).
+ */
+heading: string | null, 
+/**
+ * A digest of what the line says, its bookkeeping aside. A line that
+ * says what the last line under its heading said is shown as
+ * unchanged, as the export names it.
+ */
+said: string | null, };
