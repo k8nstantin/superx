@@ -14,10 +14,11 @@
 //!   arrays for assistant text / tool_use / tool_result), `sessionId`,
 //!   ISO-8601 `timestamp`, and `origin.kind == "human"` on genuine
 //!   human prompts.
-//! - Sidecar lines (`ai-title`, `mode`, `file-history-*`, …) are
-//!   state, not conversation — captured as telemetry.
-//! - Unknown shapes are captured raw (`transcript_raw`), never
-//!   dropped, never a crash.
+//! - Every other line (`attachment`, `system`, `api-request*`,
+//!   `ai-title`, `mode`, `file-history-*`, …) is not conversation and is
+//!   captured as telemetry, the whole line under `line` (#471).
+//! - Unparseable lines are captured raw (`transcript_raw`), the whole
+//!   text under `text`, never dropped, never a crash.
 //!
 //! History is backfilled on first contact (operator directive:
 //! conversations readable historical AND live), then the cursor
@@ -245,6 +246,8 @@ impl ClaudeCodeAdapter {
             payload.insert("session".to_string(), Value::String(file_session));
             let snippet: String = trimmed.chars().take(RAW_SNIPPET_MAX).collect();
             payload.insert("snippet".to_string(), Value::String(snippet));
+            // The whole line, whatever its length: nothing is dropped (#471).
+            payload.insert("text".to_string(), Value::String(trimmed.to_string()));
             kernel
                 .log_telemetry_for_agent(
                     "transcript_raw",
@@ -326,6 +329,10 @@ impl ClaudeCodeAdapter {
                     "file".to_string(),
                     Value::String(file.to_string_lossy().to_string()),
                 );
+                // The whole line (#471): the system prompt and the context
+                // sent with each request, attachments, turn durations, away
+                // summaries. These were kept as their kind alone.
+                payload.insert("line".to_string(), Value::Object(json_to_object(&json)));
                 kernel
                     .log_telemetry_for_agent(
                         "transcript_event",

@@ -138,3 +138,32 @@ async fn backfill_cap_skips_oversized_history() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+
+/// The header, every `$set` and every info line are kept whole (#471):
+/// the header and `$set` lines were folded away unseen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn header_set_and_info_lines_are_kept_whole() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    let sources = gemini_sources(&kernel).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let recent = kernel.recent_telemetry(50).await?;
+    let kept: Vec<String> = recent
+        .iter()
+        .filter(|e| e.lifecycle_event == "transcript_event")
+        .filter_map(|e| match &e.payload {
+            Value::Object(o) => match (o.get("kind"), o.get("line")) {
+                (Some(Value::String(kind)), Some(Value::Object(_))) => Some(kind.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    for kind in ["header", "$set", "info"] {
+        assert!(kept.iter().any(|k| k == kind), "{kind} is kept whole: {kept:?}");
+    }
+    Ok(())
+}

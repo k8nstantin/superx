@@ -264,3 +264,34 @@ async fn every_listed_root_is_captured_under_its_own_source() -> Result<(), Box<
     assert_eq!(quiet.total(), 0, "each source keeps its own read position");
     Ok(())
 }
+
+/// Nothing is dropped (#471): a line that is not conversation keeps its
+/// whole content under `line`, and an unparseable line its whole text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_line_is_kept_whole() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    let sources = cc_sources(&kernel).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let recent = kernel.recent_telemetry(50).await?;
+    let field = |event: &str, key: &str| {
+        recent.iter().find(|e| e.lifecycle_event == event).and_then(|e| match &e.payload {
+            Value::Object(o) => o.get(key).cloned(),
+            _ => None,
+        })
+    };
+    let line = match field("transcript_event", "line") {
+        Some(Value::Object(line)) => line,
+        other => return Err(format!("the ai-title line is kept whole, not {other:?}").into()),
+    };
+    assert_eq!(line.get("aiTitle"), Some(&Value::String("Test session".into())));
+    assert_eq!(
+        field("transcript_raw", "text"),
+        Some(Value::String("this is {{{ not json".into())),
+        "the unparseable line, whole"
+    );
+    Ok(())
+}
