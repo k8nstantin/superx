@@ -3779,6 +3779,7 @@ dependencies = [
  "superx-kernel",
  "superx-mod-entities",
  "superx-mod-hello",
+ "superx-mod-repos",
  "superx-mod-specs",
  "superx-mod-ui",
  "superx-ops",
@@ -3835,6 +3836,19 @@ name = "superx-mod-hello"
 version = "1.1.0"
 dependencies = [
  "async-trait",
+ "linkme",
+ "superx-kernel",
+ "surrealdb",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "superx-mod-repos"
+version = "1.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
  "linkme",
  "superx-kernel",
  "surrealdb",

@@ -1,0 +1,18 @@
+[package]
+name = "superx-mod-repos"
+description = "Repos: the git repositories the agents work in, read read-only and kept in the module's own database"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+linkme.workspace = true
+superx-kernel = { path = "../superx-kernel" }
+tracing.workspace = true
+
+[dev-dependencies]
+surrealdb.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
