@@ -1924,6 +1924,60 @@ impl Writer {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// One row, for the session view (#479): the file's renderer, so the view
+// shows what the file holds
+// ─────────────────────────────────────────────────────────────────────
+
+/// How the session view writes a row: plain text, every tool call and
+/// output whole, no times (the feed stamps each row itself).
+fn feed_writer(at: DateTime<Utc>) -> Writer {
+    let options = ExportOptions {
+        include: Include::Everything,
+        tools: ToolDetail::Full,
+        format: Format::Text,
+        clock: None,
+        matching: None,
+    };
+    Writer::new(&options, at)
+}
+
+/// A message as the file writes it: every piece whole, then the model,
+/// effort and token counts of its request as this row recorded them.
+pub(crate) fn message_body(m: &MessageRecord) -> String {
+    let mut w = feed_writer(m.valid_from);
+    let raw = m.raw.clone().map(|o| Value::Object(o).into_json_value());
+    w.line = raw.as_ref().map(line_facts).unwrap_or_default();
+    let pieces = pieces_of(raw.as_ref(), &m.content, &mut w.calls);
+    if pieces.is_empty() {
+        w.out.push_str("    (no content captured)\n");
+    }
+    for p in &pieces {
+        w.txt_piece(p);
+    }
+    w.request = raw.as_ref().and_then(request_of);
+    w.close_request();
+    w.out.trim_end().to_string()
+}
+
+/// A transcript line kept whole (#471) as the file writes it: its heading
+/// and its pieces. `None` for any other action event, and for a line kept
+/// by its kind alone.
+pub(crate) fn line_body(a: &TelemetryRecord) -> Option<(String, String)> {
+    if a.lifecycle_event != "transcript_event" {
+        return None;
+    }
+    let payload = a.payload.clone().into_json_value();
+    let line = payload.get("line")?;
+    let kind = payload.get("kind").and_then(Json::as_str).unwrap_or("line");
+    let mut w = feed_writer(a.valid_from);
+    let (heading, pieces) = line_pieces(kind, line, &mut w.calls);
+    for p in &pieces {
+        w.txt_piece(p);
+    }
+    Some((heading, w.out.trim_end().to_string()))
+}
+
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
@@ -2275,6 +2329,66 @@ mod tests {
         assert!(out.contains("*unchanged:* `mode`\n"), "{out}");
         assert!(out.contains("\"aiTitle\": \"Fix the export and the view\""), "{out}");
         assert_eq!(w.lines, 6, "every line is counted, named or written");
+    }
+
+    #[test]
+    fn a_feed_row_holds_what_the_file_holds() {
+        let long = "x".repeat(300);
+        let reply = message(
+            "assistant",
+            Some(json!({
+                "type": "assistant", "requestId": "req_9", "effort": "max", "thinkingDurationMs": 5_700,
+                "message": { "id": "msg_9", "model": "claude-opus-5-5", "content": [
+                    { "type": "thinking", "thinking": "Check the cursor first.", "signature": "s" },
+                    { "type": "tool_use", "id": "toolu_9", "name": "Bash", "input": { "command": long } }
+                ], "usage": { "input_tokens": 3, "output_tokens": 120 } }
+            })),
+            "",
+        );
+        let body = message_body(&reply);
+        for s in [
+            "    thinking · 5.7 s:\n        Check the cursor first.",
+            "    tool call Bash (toolu_9):",
+            long.as_str(),
+            "    [request req_9 · claude-opus-5-5 · effort max · tokens: 3 in · 120 out]",
+        ] {
+            assert!(body.contains(s), "{s:?} is not in the row: {body}");
+        }
+        let result = message(
+            "tool",
+            Some(json!({
+                "type": "user", "permissionDecision": { "decision": "accept", "source": "config" },
+                "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_9", "content": "line one\nline two" }
+                ] }
+            })),
+            "line one\nline two",
+        );
+        let body = message_body(&result);
+        assert!(body.contains("tool result (for toolu_9), permission: accept · source config:"), "{body}");
+        assert!(body.contains("        line one\n        line two"), "every line of the output: {body}");
+    }
+
+    #[test]
+    fn a_feed_row_of_a_transcript_line_is_the_whole_line() {
+        let reminder = "r".repeat(400);
+        let row = line_row(
+            "attachment",
+            json!({ "type": "attachment", "renderedRole": "system", "uuid": "u-9",
+                    "attachment": { "type": "edited_text_file", "filename": "/r/a.rs" },
+                    "rendered": [{ "content": reminder.clone() }] }),
+        );
+        let (heading, body) = line_body(&row).expect("a whole line");
+        assert_eq!(heading, "attachment · edited_text_file · sent as system");
+        assert!(body.contains(&reminder) && body.contains("\"filename\": \"/r/a.rs\""), "{body}");
+        assert!(!body.contains("u-9"), "no bookkeeping: {body}");
+        let kind_only = TelemetryRecord {
+            payload: <Json as superx_kernel::types::SurrealValue>::into_value(json!({ "kind": "attachment", "session": "s" })),
+            ..line_row("attachment", json!({}))
+        };
+        assert!(line_body(&kind_only).is_none(), "a line kept by its kind alone has no text");
+        let other = TelemetryRecord { lifecycle_event: "tool_call".into(), ..line_row("attachment", json!({})) };
+        assert!(line_body(&other).is_none(), "another event is the CLI's to render");
     }
 
     #[test]

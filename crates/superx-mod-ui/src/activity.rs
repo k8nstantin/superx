@@ -50,7 +50,7 @@ pub fn message_event(m: &MessageRecord) -> SseEvent {
     SseEvent {
         id: superx_ops::record_uuid(&m.id),
         kind: "message".to_string(),
-        rendered: superx_ops::render_message(m).trim_end().to_string(),
+        rendered: message_row(m),
         role: Some(m.role.clone()),
         agent_id: Some(superx_ops::record_uuid(&m.agent)),
         session_id: Some(superx_ops::record_uuid(&m.session)),
@@ -66,12 +66,44 @@ pub fn action_event(a: &TelemetryRecord) -> SseEvent {
     SseEvent {
         id: superx_ops::record_uuid(&a.id),
         kind: "action".to_string(),
-        rendered: superx_ops::render_event(a).trim_end().to_string(),
+        rendered: action_row(a),
         role: None,
         agent_id: a.agent.as_ref().map(superx_ops::record_uuid),
         session_id: None,
         session_src: session_key_of(&a.payload),
         valid_from: a.valid_from.to_rfc3339(),
+    }
+}
+
+/// A message's feed row (#479): its stamp and role, then what the export
+/// writes for it, whole — on the same line when that is one line. The
+/// CLI's one-line summary (`superx_ops::render_message`) cut a tool call's
+/// hint at 60 characters and wrote thinking and tool output as a word.
+fn message_row(m: &MessageRecord) -> String {
+    let ts = m.emitted_at.unwrap_or(m.valid_from).format("%Y-%m-%d %H:%M:%S");
+    let head = format!("[{ts}] {:>9}:", m.role);
+    let body = crate::export::message_body(m);
+    match body.lines().count() {
+        0 => head,
+        1 => format!("{head} {}", body.trim_start()),
+        _ => format!("{head}\n{body}"),
+    }
+}
+
+/// An action's feed row: a transcript line kept whole (#471) as the export
+/// writes it (#479), whose payload `superx_ops::render_event` cut at 80
+/// characters; any other event as the CLI renders it.
+fn action_row(a: &TelemetryRecord) -> String {
+    match crate::export::line_body(a) {
+        Some((heading, body)) => {
+            let head = format!("[{}] {heading}", a.valid_from.format("%H:%M:%S"));
+            if body.is_empty() {
+                head
+            } else {
+                format!("{head}\n{body}")
+            }
+        }
+        None => superx_ops::render_event(a).trim_end().to_string(),
     }
 }
 

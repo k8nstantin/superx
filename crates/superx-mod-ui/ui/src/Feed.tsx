@@ -273,16 +273,25 @@ const LABEL_COLORS: Record<string, string> = {
 }
 const labelColor = (label: string) => LABEL_COLORS[label] ?? '#52514e'
 
-/// One row of the feed: its label, its session, its line. Drawn only while
-/// it is near the screen (#461), so it is kept cheap and memoized. Padding,
-/// not a margin, between rows: the list measures each row's box, and a
-/// margin falls outside it.
+/// One row of the feed: its label, its session, and everything the export
+/// writes for it (#479). Drawn only while it is near the screen (#461), so
+/// it is kept cheap and memoized. Padding, not a margin, between rows: the
+/// list measures each row's box, and a margin falls outside it.
 const FeedRow = memo(function FeedRow({ r, directory }: { r: SseEvent; directory: Directory }) {
   const identity = identityOf(r, directory)
   return (
     // A div, not the default <p>: a row holds badges, which are
-    // divs, and a div inside a <p> is invalid HTML (#415 QA).
-    <Text component="div" size="sm" ff="monospace" pb={2} c={r.kind === 'action' ? 'dimmed' : undefined}>
+    // divs, and a div inside a <p> is invalid HTML (#415 QA). Its text is
+    // written as the export writes it: every line break kept, and a long
+    // line wrapped rather than cut or scrolled.
+    <Text
+      component="div"
+      size="sm"
+      ff="monospace"
+      pb={2}
+      c={r.kind === 'action' ? 'dimmed' : undefined}
+      style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}
+    >
       <Badge size="xs" mr={4} variant="filled" autoContrast color={labelColor(rowLabel(r))}>
         {rowLabel(r)}
       </Badge>
