@@ -12,10 +12,16 @@
 //! output that came as a block array (#460). This one reads the captured
 //! event (`raw`) whole.
 //!
-//! One request walks the session's messages oldest-first by the (capture
-//! time, id) cursor over the existing indexes, then its action events into
-//! an appendix, and streams the file as it goes, so the page writes it
-//! straight into the file the reader picked. Each request to the model
+//! Every other line of the transcript, which the capture keeps whole since
+//! #471 (the system prompt and tools, each message sent with a request,
+//! each request's parameters, attachments, system lines), is written where
+//! it happened, between the messages (#477).
+//!
+//! One request walks the session's messages and its transcript lines
+//! oldest-first together, by the (capture time, id) cursor over the
+//! existing indexes, then its other action events into an appendix, and
+//! streams the file as it goes, so the page writes it straight into the
+//! file the reader picked. Each request to the model
 //! closes with its model, effort and tokens; each thinking block says how
 //! long it took, and each tool result how its call was allowed (#472). The file's
 //! last line counts what it holds; the page keeps the file only when that
@@ -40,6 +46,9 @@ use crate::activity::LiveRow;
 pub const MESSAGE_PAGE: u32 = 500; // skill-allow: §9-const — read-path bound, not a policy tunable
 /// Action events read at a time.
 pub const ACTION_PAGE: u32 = 2000; // skill-allow: §9-const — read-path bound, not a policy tunable
+/// Transcript lines read at a time. Each carries its whole line, as a
+/// message carries its event.
+pub const LINE_PAGE: u32 = 500; // skill-allow: §9-const — read-path bound, not a policy tunable
 /// The lines of a tool's input or output that "first lines" keeps: the
 /// count the export panel names.
 pub const TRIMMED_TOOL_LINES: usize = 20; // skill-allow: §9-const — render-layer bound, the choice the page names
@@ -50,6 +59,26 @@ const CHUNK_BYTES: usize = 64 * 1024; // skill-allow: §9-const — transport bo
 /// a thinking block's signature and a Gemini part's thought signature are
 /// opaque tokens for the provider, not anything an agent can read.
 const OPAQUE: &[&str] = &["signature", "thoughtSignature"];
+
+/// The fields a transcript line carries to link and stamp it, not to say
+/// anything: written nowhere, as a message's are not, and named at the top
+/// of the file. Its `type` is the line's heading, its `timestamp` the
+/// heading's time, and its `cwd` and `gitBranch` the place note written
+/// when the place changes.
+const LINE_BOOKKEEPING: &[&str] = &[
+    "type", "uuid", "parentUuid", "logicalParentUuid", "sessionId", "session_id", "timestamp", "version",
+    "userType", "isSidechain", "isMeta", "entrypoint", "slug", "cwd", "gitBranch", "leafUuid",
+];
+
+/// The lines Claude Code writes as it sends a request: one of them ends the
+/// request before it. No other line does: a refusal or a notice can land
+/// between two rows of one request.
+const REQUEST_SENT: &[&str] = &["api-request-shape", "api-request-blob", "api-request"];
+
+/// The action events that are transcript lines kept whole (#471): written
+/// in place, not in the appendix. A line kept by its kind alone, before
+/// #471, has no `line` and stays in the appendix.
+const WHOLE_LINE: &str = "(lifecycle_event = 'transcript_event' AND payload.line != NONE)";
 
 /// The marker that opens the file's last line. The page checks for it
 /// before it keeps the file.
@@ -153,12 +182,13 @@ impl ExportOptions {
 #[derive(Debug, Clone, Copy)]
 pub struct Pages {
     pub messages: u32,
+    pub lines: u32,
     pub actions: u32,
 }
 
 impl Default for Pages {
     fn default() -> Self {
-        Self { messages: MESSAGE_PAGE, actions: ACTION_PAGE }
+        Self { messages: MESSAGE_PAGE, lines: LINE_PAGE, actions: ACTION_PAGE }
     }
 }
 
@@ -182,12 +212,10 @@ pub fn session_export(
             agent.as_deref().unwrap_or("unknown"),
             superx_ops::record_uuid(&session)
         );
-        // The action arm is matched as the session view matches it; read
-        // only when the file holds actions.
-        let scope = match options.include {
-            Include::Everything => Some(crate::activity::session_scope(&kernel, session.clone()).await?),
-            Include::Conversation => None,
-        };
+        // The action arm is matched as the session view matches it. Every
+        // file reads it: the transcript lines are events of the session's
+        // agent, for its source key.
+        let scope = crate::activity::session_scope(&kernel, session.clone()).await?;
         let keyword = options.matching.clone();
         let mut file = Writer::new(&options, until);
         file.header(&Facts {
@@ -196,8 +224,10 @@ pub fn session_export(
             model: model.as_deref(),
             effort: effort.as_deref(),
         });
-        // The conversation, oldest first.
+        // The conversation, oldest first: the messages and the transcript's
+        // other lines together, each where it happened (#477).
         let mut messages: Walk<MessageRecord> = Walk::new(pages.messages);
+        let mut lines: Walk<TelemetryRecord> = Walk::new(pages.lines);
         loop {
             if messages.wants_page() {
                 let rows = message_page(
@@ -206,23 +236,44 @@ pub fn session_export(
                 .await?;
                 messages.take(rows);
             }
-            let Some(row) = messages.pop() else { break };
-            file.message(&row);
+            if lines.wants_page() {
+                let rows = action_page(
+                    &kernel, &session, scope.as_ref(), Actions::Lines, keyword.as_deref(), lines.after.clone(),
+                    until, lines.page,
+                )
+                .await?;
+                lines.take(rows);
+            }
+            let line_next = match (messages.peek(), lines.peek()) {
+                (None, None) => break,
+                (Some(m), Some(l)) => order_of(l) < order_of(m),
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+            };
+            if line_next {
+                let Some(row) = lines.pop() else { break };
+                file.transcript_line(&row);
+            } else {
+                let Some(row) = messages.pop() else { break };
+                file.message(&row);
+            }
             if file.pending() >= CHUNK_BYTES {
                 yield file.drain();
             }
         }
         file.close_request();
-        // The OS's action events after it, in one appendix, oldest first
-        // (#472): interleaved, they were most of the rows a reader had to
-        // read past.
-        if let Some(scope) = scope.as_ref() {
+        file.flush_unchanged();
+        // The OS's other action events after it, in one appendix, oldest
+        // first (#472): interleaved, they were most of the rows a reader
+        // had to read past.
+        if options.include == Include::Everything {
             file.appendix();
             let mut actions: Walk<TelemetryRecord> = Walk::new(pages.actions);
             loop {
                 if actions.wants_page() {
                     let rows = action_page(
-                        &kernel, &session, scope.as_ref(), keyword.as_deref(), actions.after.clone(), until, actions.page,
+                        &kernel, &session, scope.as_ref(), Actions::Others, keyword.as_deref(),
+                        actions.after.clone(), until, actions.page,
                     )
                     .await?;
                     actions.take(rows);
@@ -282,6 +333,27 @@ impl<T: LiveRow> Walk<T> {
     fn pop(&mut self) -> Option<T> {
         self.rows.pop_front()
     }
+
+    fn peek(&self) -> Option<&T> {
+        self.rows.front()
+    }
+}
+
+/// A row's place in the session: capture time, then id, as the feed
+/// orders the two tables together (`activity::merge_newest`). One adapter
+/// captures a transcript's lines in the order they were written.
+fn order_of<T: LiveRow>(row: &T) -> (DateTime<Utc>, String) {
+    let (id, at) = row.key();
+    (at, superx_ops::record_uuid(id))
+}
+
+/// Which of the session's action events a walk reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Actions {
+    /// The transcript lines kept whole (#471), written in place.
+    Lines,
+    /// Every other one, for the appendix.
+    Others,
 }
 
 /// One forward page over a session's rows. `>=` first, so the engine walks
@@ -345,26 +417,29 @@ async fn message_page(
 /// The next page of the session's action events, matched as the session
 /// view matches them (see `activity`): emitted by the session, or by its
 /// agent for its source key. Without a resolved scope only the first arm
-/// can match; it never widens to everything.
+/// can match; it never widens to everything. `which` picks the transcript
+/// lines kept whole, or every other event.
+#[allow(clippy::too_many_arguments)] // skill-allow: allow — one page read: its scope, its cursor and its filter
 async fn action_page(
     kernel: &Kernel,
     session: &RecordId,
     scope: Option<&(RecordId, String)>,
+    which: Actions,
     keyword: Option<&str>,
     after: Option<(DateTime<Utc>, RecordId)>,
     until: DateTime<Utc>,
     page: u32,
 ) -> Result<Vec<TelemetryRecord>> {
     let act_match = crate::activity::act_match();
-    let sql = walk_query(
-        "telemetry_stream",
-        match scope {
-            Some(_) => "(subject = $sess OR (agent = $agent AND payload.session = $src))",
-            None => "subject = $sess",
-        },
-        after.is_some(),
-        keyword.map(|_| act_match.as_str()),
-    );
+    let arms = match scope {
+        Some(_) => "(subject = $sess OR (agent = $agent AND payload.session = $src))",
+        None => "subject = $sess",
+    };
+    let scope_clause = match which {
+        Actions::Lines => format!("{arms} AND {WHOLE_LINE}"),
+        Actions::Others => format!("{arms} AND !{WHOLE_LINE}"),
+    };
+    let sql = walk_query("telemetry_stream", &scope_clause, after.is_some(), keyword.map(|_| act_match.as_str()));
     crate::answered("export actions", || {
         let (sql, session, after, scope) = (sql.clone(), session.clone(), after.clone(), scope.cloned());
         let keyword = keyword.map(str::to_lowercase);
@@ -414,6 +489,9 @@ enum Piece {
     },
     /// A one-line fact: an image, a model fallback, a tool reference.
     Note(String),
+    /// Text a transcript line holds, written as it is, fenced: a system
+    /// prompt's own headings and a reminder's tags stay its own (#477).
+    Verbatim(String),
     /// A shape the export does not know, whole.
     Unknown { label: String, json: Json },
 }
@@ -899,6 +977,197 @@ fn tokens_line(usage: &Json) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// A transcript line that is not a message (#477), taken apart
+// ─────────────────────────────────────────────────────────────────────
+
+/// What `v` holds beyond `known`: its other fields, or `v` itself when it
+/// is not an object, so nothing a line holds is lost to its shape.
+fn beyond(v: &Json, known: &[&str]) -> Option<Json> {
+    if v.is_object() {
+        more_of(v, known)
+    } else {
+        Some(v.clone())
+    }
+}
+
+/// One transcript line that is not a message: its heading, and every piece
+/// of it in order. What it holds that is not named here is written as its
+/// JSON, never dropped; its text is written as it is.
+fn line_pieces(kind: &str, line: &Json, calls: &mut HashMap<String, String>) -> (String, Vec<Piece>) {
+    let mut out = Vec::new();
+    let mut known: Vec<&str> = LINE_BOOKKEEPING.to_vec();
+    let text = |key: &str| line.get(key).and_then(Json::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    let heading = match kind {
+        // The system prompt and the tools offered, written when they change.
+        "api-request-shape" => {
+            if let Some(hash) = text("shapeHash") {
+                known.push("shapeHash");
+                out.push(Piece::Note(format!("shape {hash}")));
+            }
+            if let Some(shape) = line.get("shape") {
+                known.push("shape");
+                shape_pieces(shape, &mut out);
+            }
+            "system prompt and tools".to_string()
+        }
+        // One message of a request as it was sent, kept once by its hash.
+        "api-request-blob" => {
+            let mut heading = "context sent".to_string();
+            if let Some(hash) = text("hash") {
+                known.push("hash");
+                out.push(Piece::Note(format!("blob {hash}")));
+            }
+            if let Some(message) = line.get("message") {
+                known.push("message");
+                let mut said = vec!["content"];
+                if let Some(role) = message.get("role").and_then(Json::as_str) {
+                    said.push("role");
+                    let _ = write!(heading, " · {role}");
+                }
+                if let Some(content) = message.get("content") {
+                    claude_pieces(content, calls, &mut out);
+                }
+                if let Some(json) = beyond(message, &said) {
+                    out.push(Piece::Unknown { label: "message".to_string(), json });
+                }
+            }
+            heading
+        }
+        // A request: its parameters, the messages it sent, how it cached.
+        "api-request" => {
+            let mut heading = "request sent".to_string();
+            if let Some(source) = text("querySource") {
+                known.push("querySource");
+                let _ = write!(heading, " · {source}");
+            }
+            if let Some(model) = line.pointer("/params/model").and_then(Json::as_str) {
+                let _ = write!(heading, " · {model}");
+            }
+            heading
+        }
+        // What was attached to a request: as the model was given it, then
+        // as Claude Code recorded it.
+        "attachment" => {
+            let mut heading = "attachment".to_string();
+            if let Some(attachment) = line.get("attachment") {
+                known.push("attachment");
+                let mut said = Vec::new();
+                if let Some(t) = attachment.get("type").and_then(Json::as_str) {
+                    said.push("type");
+                    let _ = write!(heading, " · {t}");
+                }
+                if let Some(rendered) = line.get("rendered") {
+                    known.push("rendered");
+                    match rendered.as_array() {
+                        Some(parts) => {
+                            for part in parts {
+                                if let Some(content) = part.get("content") {
+                                    claude_pieces(content, calls, &mut out);
+                                }
+                                if let Some(json) = beyond(part, &["content"]) {
+                                    out.push(Piece::Unknown { label: "rendered".to_string(), json });
+                                }
+                            }
+                        }
+                        None => out.push(Piece::Unknown { label: "rendered".to_string(), json: rendered.clone() }),
+                    }
+                }
+                if let Some(json) = beyond(attachment, &said) {
+                    out.push(Piece::Unknown { label: "as recorded".to_string(), json });
+                }
+            }
+            if let Some(role) = text("renderedRole") {
+                known.push("renderedRole");
+                let _ = write!(heading, " · sent as {role}");
+            }
+            heading
+        }
+        // Claude Code's own lines: a turn's duration, an away summary, a
+        // compaction, a refusal.
+        "system" => {
+            let mut heading = "system".to_string();
+            if let Some(subtype) = text("subtype") {
+                known.push("subtype");
+                let _ = write!(heading, " · {subtype}");
+            }
+            if let Some(ms) = line.get("durationMs").and_then(Json::as_u64) {
+                known.push("durationMs");
+                let mut note = format!("the turn took {}", took(ms));
+                if let Some(n) = line.get("messageCount").and_then(Json::as_u64) {
+                    known.push("messageCount");
+                    let _ = write!(note, " · {} message{}", grouped(n), if n == 1 { "" } else { "s" });
+                }
+                out.push(Piece::Note(note));
+            }
+            if let Some(content) = line.get("content") {
+                known.push("content");
+                claude_pieces(content, calls, &mut out);
+            }
+            heading
+        }
+        // Any other line: its content as text, when it has one.
+        _ => {
+            if let Some(content) = line.get("content") {
+                known.push("content");
+                claude_pieces(content, calls, &mut out);
+            }
+            kind.to_string()
+        }
+    };
+    if let Some(json) = beyond(line, &known) {
+        out.push(Piece::Unknown { label: "fields".to_string(), json });
+    }
+    for p in &mut out {
+        if let Piece::Text(t) = p {
+            *p = Piece::Verbatim(std::mem::take(t));
+        }
+    }
+    (heading, out)
+}
+
+/// The system prompt's blocks as text, then each tool offered: its name,
+/// its description as text, and the rest of its definition as JSON.
+fn shape_pieces(shape: &Json, out: &mut Vec<Piece>) {
+    let mut known = Vec::new();
+    if let Some(blocks) = shape.get("system").and_then(Json::as_array) {
+        known.push("system");
+        for block in blocks {
+            match block.get("text").and_then(Json::as_str) {
+                Some(text) => {
+                    out.push(Piece::Text(text.to_string()));
+                    details("system prompt block", block, &["type", "text"], out);
+                }
+                None => out.push(Piece::Unknown { label: "system prompt block".to_string(), json: block.clone() }),
+            }
+        }
+    }
+    if let Some(tools) = shape.get("tools").and_then(Json::as_array) {
+        known.push("tools");
+        for tool in tools {
+            let mut said = Vec::new();
+            let name = match tool.get("name").and_then(Json::as_str) {
+                Some(name) => {
+                    said.push("name");
+                    name
+                }
+                None => "a tool with no name",
+            };
+            out.push(Piece::Note(format!("tool {name}")));
+            if let Some(description) = tool.get("description").and_then(Json::as_str) {
+                said.push("description");
+                out.push(Piece::Text(description.to_string()));
+            }
+            if let Some(json) = beyond(tool, &said) {
+                out.push(Piece::Unknown { label: format!("{name}: definition"), json });
+            }
+        }
+    }
+    if let Some(json) = beyond(shape, &known) {
+        out.push(Piece::Unknown { label: "shape".to_string(), json });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // The file
 // ─────────────────────────────────────────────────────────────────────
 
@@ -941,6 +1210,13 @@ struct Writer {
     line: LineFacts,
     /// Transcript lines the capture kept by kind only, counted (#471).
     kinds: BTreeMap<String, u64>,
+    /// Transcript lines written in place (#477).
+    lines: u64,
+    /// What the last line under each heading said, its bookkeeping aside:
+    /// a line that says it again word for word is named, not written again.
+    said: HashMap<String, Json>,
+    /// The headings of the lines that said it again, not yet named.
+    unchanged: Vec<String>,
 }
 
 impl Writer {
@@ -964,6 +1240,9 @@ impl Writer {
             request: None,
             line: LineFacts::default(),
             kinds: BTreeMap::new(),
+            lines: 0,
+            said: HashMap::new(),
+            unchanged: Vec::new(),
         }
     }
 
@@ -977,7 +1256,7 @@ impl Writer {
     }
 
     fn rows(&self) -> u64 {
-        self.roles.values().sum::<u64>() + self.actions
+        self.roles.values().sum::<u64>() + self.lines + self.actions
     }
 
     /// A moment on the reader's clock, with its offset when that differs
@@ -1002,9 +1281,13 @@ impl Writer {
         };
         let model = [facts.model, facts.effort].into_iter().flatten().collect::<Vec<_>>().join(" · ");
         let holds = match self.include {
-            Include::Conversation => "the conversation: every message, oldest first",
+            Include::Conversation => {
+                "the conversation: every message and every other line of the transcript, each where it happened, \
+                 oldest first"
+            }
             Include::Everything => {
-                "everything: every message, oldest first, then every action the OS recorded, in an appendix"
+                "everything: every message and every other line of the transcript, each where it happened, oldest \
+                 first, then every other action the OS recorded, in an appendix"
             }
         };
         let tools = match self.tools {
@@ -1014,7 +1297,8 @@ impl Writer {
         };
         let times = match self.clock {
             Some(tz) => format!(
-                "on your clock ({}). A message at the moment its agent wrote it, an action at the moment SuperX captured it",
+                "on your clock ({}). A message or a transcript line at the moment its agent wrote it (a line with no \
+                 time of its own when SuperX captured it), an action at the moment SuperX captured it",
                 tz.name()
             ),
             None => "not written".to_string(),
@@ -1038,18 +1322,29 @@ impl Writer {
                 .to_string(),
         ));
         lines.push((
+            "transcript lines",
+            "the system prompt and tools when they change, each message as it was sent with a request, each \
+             request's parameters, every attachment (CLAUDE.md and memory, reminders, the skills and tools \
+             offered, file notices) and every system line (turn durations, away summaries, compactions, \
+             refusals), each whole, where it happened; their text is written as it is, fenced. A line that \
+             says word for word what the last line under its heading said is named as unchanged, not \
+             written again"
+                .to_string(),
+        ));
+        lines.push((
             "not written",
             "the transcript's bookkeeping (ids, timestamps inside a message, the agent's own structured \
-             copy of each tool result), thinking signatures, and image bytes: each image is named with \
-             its type and size"
+             copy of each tool result, and on every other line its ids, session id, version, user type, \
+             entry point, slug, and sidechain and meta flags), thinking signatures, and image bytes: each \
+             image is named with its type and size"
                 .to_string(),
         ));
         lines.push((
             "not captured",
-            "the content of the transcript lines that are not messages: the system prompt, the context \
-             injected into each request (CLAUDE.md, memory, reminders), the skills and tools offered, \
-             attachments, turn durations and away summaries. This version of the OS records only that \
-             each happened (#471); with everything, the appendix counts them by kind"
+            "for lines captured before 2026-10-21 13:20 UTC, the content of every transcript line that is \
+             not a message: the OS kept only that each happened (#471); with everything, the appendix counts \
+             them by kind. A Gemini tool's display output, and Gemini inline data past its first 256 \
+             characters. A transcript line that is not JSON: it carries no session (#186)"
                 .to_string(),
         ));
         match self.format {
@@ -1072,6 +1367,7 @@ impl Writer {
     }
 
     fn message(&mut self, m: &MessageRecord) {
+        self.flush_unchanged();
         *self.roles.entry(m.role.clone()).or_default() += 1;
         let raw = m.raw.clone().map(|o| Value::Object(o).into_json_value());
         let context = raw.as_ref().map(context_of).unwrap_or_default();
@@ -1151,6 +1447,7 @@ impl Writer {
     /// effort and token counters, once.
     fn close_request(&mut self) {
         let Some(r) = self.request.take() else { return };
+        self.flush_unchanged();
         let mut line = format!("request {}", self.code(&r.id));
         if let Some(model) = &r.model {
             let _ = write!(line, " · {}", self.code(model));
@@ -1177,9 +1474,91 @@ impl Writer {
         }
     }
 
+    /// A transcript line that is not a message, where it happened (#477):
+    /// the capture keeps it whole since #471. A line that sends a request
+    /// ends the one before it. A line that says word for word what the last
+    /// line under its heading said is named, not written again.
+    fn transcript_line(&mut self, a: &TelemetryRecord) {
+        self.lines += 1;
+        let payload = a.payload.clone().into_json_value();
+        let kind = payload.get("kind").and_then(Json::as_str).unwrap_or("line").to_string();
+        let line = payload.get("line").cloned().unwrap_or(Json::Null);
+        if REQUEST_SENT.contains(&kind.as_str()) {
+            self.close_request();
+        }
+        // A message sent again carries none of a transcript row's facts.
+        self.line = LineFacts::default();
+        let (heading, pieces) = line_pieces(&kind, &line, &mut self.calls);
+        let said = beyond(&line, LINE_BOOKKEEPING).unwrap_or(Json::Null);
+        if self.said.get(&heading) == Some(&said) {
+            self.unchanged.push(heading);
+            return;
+        }
+        self.said.insert(heading.clone(), said);
+        self.flush_unchanged();
+
+        let context = context_of(&line);
+        let place = (context.cwd, context.branch);
+        let moved = place.0.is_some() && place != self.place;
+        if moved {
+            self.place = place;
+        }
+        let at = line
+            .get("timestamp")
+            .and_then(Json::as_str)
+            .and_then(|t| t.parse::<DateTime<Utc>>().ok())
+            .unwrap_or(a.valid_from);
+        let mut title = heading;
+        if let Some(t) = self.when(at) {
+            let _ = write!(title, " · {t}");
+        }
+        match self.format {
+            Format::Markdown => {
+                let _ = writeln!(self.out, "### {title}\n");
+                if moved {
+                    let note = self.place_note();
+                    let _ = writeln!(self.out, "*{note}*\n");
+                }
+                for p in &pieces {
+                    self.md_piece(p);
+                }
+            }
+            Format::Text => {
+                let _ = writeln!(self.out, "[{title}]");
+                if moved {
+                    let note = self.place_note();
+                    let _ = writeln!(self.out, "    {note}");
+                }
+                for p in &pieces {
+                    self.txt_piece(p);
+                }
+                self.out.push('\n');
+            }
+        }
+    }
+
+    /// The lines that said again what the last line under their heading
+    /// said, named in one line where they happened.
+    fn flush_unchanged(&mut self) {
+        if self.unchanged.is_empty() {
+            return;
+        }
+        let names = std::mem::take(&mut self.unchanged);
+        let list = names.iter().map(|n| self.code(n)).collect::<Vec<_>>().join(" · ");
+        match self.format {
+            Format::Markdown => {
+                let _ = writeln!(self.out, "*unchanged:* {list}\n");
+            }
+            Format::Text => {
+                let _ = writeln!(self.out, "[unchanged: {list}]\n");
+            }
+        }
+    }
+
     /// Where the OS's action events begin: after the conversation, so it
     /// reads without them (#472).
     fn appendix(&mut self) {
+        self.flush_unchanged();
         match self.format {
             Format::Markdown => self.out.push_str(
                 "---\n\n## Appendix: the OS's action events\n\n\
@@ -1261,6 +1640,7 @@ impl Writer {
     }
 
     fn footer(&mut self) {
+        self.flush_unchanged();
         let messages: u64 = self.roles.values().sum();
         let by_role = self
             .roles
@@ -1272,6 +1652,9 @@ impl Writer {
         let mut line = format!("{} · {}", counted(self.rows(), "row"), counted(messages, "message"));
         if !by_role.is_empty() {
             let _ = write!(line, " ({by_role})");
+        }
+        if self.lines > 0 {
+            let _ = write!(line, " · {}", counted(self.lines, "transcript line"));
         }
         if self.include == Include::Everything {
             let _ = write!(line, " · {}", counted(self.actions, "action"));
@@ -1393,6 +1776,10 @@ impl Writer {
             Piece::Note(n) => {
                 let _ = writeln!(self.out, "*{n}*\n");
             }
+            Piece::Verbatim(t) => {
+                let fence = fence_for(t);
+                let _ = writeln!(self.out, "{fence}text\n{}\n{fence}\n", t.trim_end_matches('\n'));
+            }
             Piece::Unknown { label, json } => {
                 let _ = writeln!(self.out, "**{label}**\n");
                 let body = pretty(json);
@@ -1444,7 +1831,7 @@ impl Writer {
 
     fn txt_piece(&mut self, p: &Piece) {
         match p {
-            Piece::Text(t) => indent(&mut self.out, t, 4),
+            Piece::Text(t) | Piece::Verbatim(t) => indent(&mut self.out, t, 4),
             Piece::Thinking { title, text } => {
                 self.out.push_str("    thinking");
                 if let Some(title) = title {
@@ -1782,6 +2169,112 @@ mod tests {
             "{}",
             w.out
         );
+    }
+
+    /// A transcript line kept whole (#471), as the capture writes it.
+    fn line_row(kind: &str, line: Json) -> TelemetryRecord {
+        TelemetryRecord {
+            id: RecordId::new("telemetry_stream", superx_kernel::types::Uuid::new_v7()),
+            lifecycle_event: "transcript_event".into(),
+            payload: <Json as superx_kernel::types::SurrealValue>::into_value(
+                json!({ "kind": kind, "session": "s", "file": "/p/s.jsonl", "line": line }),
+            ),
+            subject: None,
+            agent: None,
+            valid_from: "2026-10-21T13:24:48Z".parse().expect("ts"),
+        }
+    }
+
+    #[test]
+    fn a_request_ends_where_the_next_is_sent_and_a_refusal_inside_it_does_not() {
+        let mut w = Writer::new(&options(Format::Markdown, ToolDetail::Full), Utc::now());
+        w.message(&reply_row("req_1", json!({ "type": "text", "text": "Reading it." }), 10));
+        w.transcript_line(&line_row(
+            "system",
+            json!({ "type": "system", "subtype": "model_refusal_no_fallback", "content": "Refused." }),
+        ));
+        w.message(&reply_row("req_1", json!({ "type": "tool_use", "id": "toolu_1", "name": "Read", "input": {} }), 40));
+        w.transcript_line(&line_row(
+            "api-request-blob",
+            json!({ "type": "api-request-blob", "hash": "h1", "message": {
+                "role": "system", "content": [{ "type": "text", "text": "<total_tokens>9 tokens left</total_tokens>" }]
+            } }),
+        ));
+        w.close_request();
+        let out = &w.out;
+        assert_eq!(out.matches("*request `req_1`").count(), 1, "{out}");
+        let at = |s: &str| {
+            let found = out.find(s);
+            assert!(found.is_some(), "{s:?} is not written: {out}");
+            found.unwrap_or_default()
+        };
+        assert!(at("### system · model_refusal_no_fallback") < at("**tool call** `Read`"), "{out}");
+        assert!(at("**tool call** `Read`") < at("*request `req_1`"), "{out}");
+        assert!(at("*request `req_1`") < at("### context sent · system"), "{out}");
+        assert!(out.contains("*blob h1*"), "{out}");
+        assert!(out.contains("```text\n<total_tokens>9 tokens left</total_tokens>\n```"), "as it was sent: {out}");
+    }
+
+    #[test]
+    fn the_system_prompt_the_tools_and_each_request_are_written_whole() {
+        let mut w = Writer::new(&options(Format::Markdown, ToolDetail::Full), Utc::now());
+        w.transcript_line(&line_row(
+            "api-request-shape",
+            json!({ "type": "api-request-shape", "shapeHash": "abc", "version": "2.1.304", "shape": {
+                "system": [{ "type": "text", "text": "You are Claude Code.\n# Rules", "cache_control": { "type": "ephemeral" } }],
+                "tools": [{ "name": "Bash", "description": "Runs a command.", "input_schema": { "type": "object" } }]
+            } }),
+        ));
+        w.transcript_line(&line_row(
+            "api-request-blob",
+            json!({ "type": "api-request-blob", "hash": "h2", "message": { "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "", "signature": "opaque-bytes" },
+                { "type": "tool_use", "id": "toolu_2", "name": "Bash", "input": { "command": "ls" } }
+            ] } }),
+        ));
+        w.transcript_line(&line_row(
+            "api-request",
+            json!({ "type": "api-request", "querySource": "repl_main_thread", "id": "r-1", "tail": ["h2"],
+                    "params": { "model": "claude-opus-5-5", "max_tokens": 128000, "output_config": { "effort": "max" } } }),
+        ));
+        let out = &w.out;
+        for s in [
+            "### system prompt and tools",
+            "*shape abc*",
+            "```text\nYou are Claude Code.\n# Rules\n```",
+            "\"cache_control\"",
+            "*tool Bash*",
+            "```text\nRuns a command.\n```",
+            "**Bash: definition**",
+            "### context sent · assistant",
+            "*blob h2*",
+            "**tool call** `Bash`",
+            "\"command\": \"ls\"",
+            "### request sent · repl_main_thread · claude-opus-5-5",
+            "\"max_tokens\": 128000",
+            "\"tail\"",
+            "\"r-1\"",
+        ] {
+            assert!(out.contains(s), "{s:?} is not written: {out}");
+        }
+        assert!(!out.contains("opaque-bytes") && !out.contains("2.1.304"), "a signature and bookkeeping are not: {out}");
+    }
+
+    #[test]
+    fn a_line_said_again_is_named_and_a_changed_one_is_written() {
+        let mut w = Writer::new(&options(Format::Markdown, ToolDetail::Full), Utc::now());
+        for title in ["Fix the export", "Fix the export", "Fix the export and the view"] {
+            w.transcript_line(&line_row("ai-title", json!({ "type": "ai-title", "aiTitle": title, "sessionId": "s" })));
+            w.transcript_line(&line_row("mode", json!({ "type": "mode", "mode": "normal", "sessionId": "s" })));
+        }
+        w.flush_unchanged();
+        let out = &w.out;
+        assert_eq!(out.matches("### ai-title").count(), 2, "{out}");
+        assert_eq!(out.matches("### mode").count(), 1, "{out}");
+        assert!(out.contains("*unchanged:* `ai-title` · `mode`\n"), "{out}");
+        assert!(out.contains("*unchanged:* `mode`\n"), "{out}");
+        assert!(out.contains("\"aiTitle\": \"Fix the export and the view\""), "{out}");
+        assert_eq!(w.lines, 6, "every line is counted, named or written");
     }
 
     #[test]

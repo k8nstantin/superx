@@ -390,12 +390,15 @@ const SEARCHED_PAYLOAD_FIELDS: &[&str] = &[
 ];
 
 /// The action-side keyword clause: the event name, plus every payload
-/// field above. A field the payload lacks coalesces to the empty
-/// string rather than dropping the row.
+/// field above that holds a string. A field the payload lacks, or holds
+/// as anything else, matches nothing: `line` is a whole transcript line,
+/// an object, since #471, and `string::lowercase` refuses an object, which
+/// failed the whole search (#477). `AND` stops at the check, so the
+/// function never sees one.
 pub(crate) fn act_match() -> String {
     let fields: Vec<String> = SEARCHED_PAYLOAD_FIELDS
         .iter()
-        .map(|f| format!("string::contains(string::lowercase(payload.{f} ?? ''), $q)"))
+        .map(|f| format!("(type::is_string(payload.{f}) AND string::contains(string::lowercase(payload.{f}), $q))"))
         .collect();
     format!(
         "(string::contains(string::lowercase(lifecycle_event), $q) OR {})",
