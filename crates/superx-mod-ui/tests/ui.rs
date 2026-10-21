@@ -5024,6 +5024,31 @@ async fn a_search_passes_over_a_whole_transcript_line() {
     assert_eq!(rows.len(), 1, "{rows:?}");
 }
 
+/// The session view shows each row as the export writes it (#479): a
+/// transcript line whole, where the CLI's renderer cut its payload at 80
+/// characters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_view_shows_each_row_as_the_export_writes_it() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-x").await;
+    let reminder = format!("<system-reminder>{}</system-reminder>", "never cut ".repeat(20));
+    put_line(&kernel, 51, &agent, "src-x", 1, "attachment", Some(serde_json::json!({
+        "type": "attachment", "attachment": { "type": "edited_text_file" }, "rendered": [{ "content": reminder }]
+    })))
+    .await;
+    put_message(&kernel, 52, &session, &agent, 2, "a reply").await;
+    let rows = superx_mod_ui::activity::session_activity(&kernel, session, 50, None, None).await.expect("activity");
+    let line = rows.iter().find(|r| r.kind == "action").expect("the line's row");
+    assert!(line.rendered.contains(&reminder), "whole: {}", line.rendered);
+    assert!(
+        line.rendered.lines().next().is_some_and(|l| l.ends_with("] attachment · edited_text_file")),
+        "{}",
+        line.rendered
+    );
+    let message = rows.iter().find(|r| r.kind == "message").expect("the message's row");
+    assert!(message.rendered.ends_with("user: a reply"), "one line stays one line: {}", message.rendered);
+}
+
 /// A session named by its id is found with one read; a name still goes
 /// through the shared resolver, and anything that is not a session says
 /// so as it always has (#461).
