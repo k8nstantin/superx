@@ -12,9 +12,12 @@
 //! output that came as a block array (#460). This one reads the captured
 //! event (`raw`) whole.
 //!
-//! One request walks the session oldest-first by the (capture time, id)
-//! cursor over the existing indexes and streams the file as it goes, so
-//! the page writes it straight into the file the reader picked. The file's
+//! One request walks the session's messages oldest-first by the (capture
+//! time, id) cursor over the existing indexes, then its action events into
+//! an appendix, and streams the file as it goes, so the page writes it
+//! straight into the file the reader picked. Each request to the model
+//! closes with its model, effort and tokens; each thinking block says how
+//! long it took, and each tool result how its call was allowed (#472). The file's
 //! last line counts what it holds; the page keeps the file only when that
 //! line arrived, so a failed export never leaves a short file that looks
 //! whole.
@@ -193,8 +196,8 @@ pub fn session_export(
             model: model.as_deref(),
             effort: effort.as_deref(),
         });
+        // The conversation, oldest first.
         let mut messages: Walk<MessageRecord> = Walk::new(pages.messages);
-        let mut actions: Option<Walk<TelemetryRecord>> = scope.as_ref().map(|_| Walk::new(pages.actions));
         loop {
             if messages.wants_page() {
                 let rows = message_page(
@@ -203,31 +206,34 @@ pub fn session_export(
                 .await?;
                 messages.take(rows);
             }
-            if let (Some(walk), Some(scope)) = (actions.as_mut(), scope.as_ref()) {
-                if walk.wants_page() {
-                    let rows = action_page(
-                        &kernel, &session, scope.as_ref(), keyword.as_deref(), walk.after.clone(), until, walk.page,
-                    )
-                    .await?;
-                    walk.take(rows);
-                }
-            }
-            let action_first = match (messages.head(), actions.as_ref().and_then(Walk::head)) {
-                (None, None) => break,
-                (Some(m), Some(a)) => a < m,
-                (None, Some(_)) => true,
-                (Some(_), None) => false,
-            };
-            if action_first {
-                if let Some(row) = actions.as_mut().and_then(Walk::pop) {
-                    file.action(&row);
-                }
-            } else if let Some(row) = messages.pop() {
-                file.message(&row);
-            }
+            let Some(row) = messages.pop() else { break };
+            file.message(&row);
             if file.pending() >= CHUNK_BYTES {
                 yield file.drain();
             }
+        }
+        file.close_request();
+        // The OS's action events after it, in one appendix, oldest first
+        // (#472): interleaved, they were most of the rows a reader had to
+        // read past.
+        if let Some(scope) = scope.as_ref() {
+            file.appendix();
+            let mut actions: Walk<TelemetryRecord> = Walk::new(pages.actions);
+            loop {
+                if actions.wants_page() {
+                    let rows = action_page(
+                        &kernel, &session, scope.as_ref(), keyword.as_deref(), actions.after.clone(), until, actions.page,
+                    )
+                    .await?;
+                    actions.take(rows);
+                }
+                let Some(row) = actions.pop() else { break };
+                file.action(&row);
+                if file.pending() >= CHUNK_BYTES {
+                    yield file.drain();
+                }
+            }
+            file.kinds_note();
         }
         file.footer();
         tracing::info!(
@@ -271,15 +277,6 @@ impl<T: LiveRow> Walk<T> {
             self.after = Some((at, id.clone()));
         }
         self.rows.extend(rows);
-    }
-
-    /// The next row's place in the merged order: capture time, then id, as
-    /// the feed orders two tables (`merge_newest`).
-    fn head(&self) -> Option<(DateTime<Utc>, String)> {
-        self.rows.front().map(|r| {
-            let (id, at) = r.key();
-            (at, superx_ops::record_uuid(id))
-        })
     }
 
     fn pop(&mut self) -> Option<T> {
@@ -759,6 +756,148 @@ fn context_of(raw: &Json) -> Context {
     }
 }
 
+/// What a transcript line records beside its blocks (#472): how long its
+/// thinking took, and how its tool call was allowed.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct LineFacts {
+    thought_ms: Option<u64>,
+    permission: Option<String>,
+}
+
+fn line_facts(raw: &Json) -> LineFacts {
+    LineFacts { thought_ms: raw.get("thinkingDurationMs").and_then(Json::as_u64), permission: permission_of(raw) }
+}
+
+/// How a tool call was allowed or refused, as the transcript records it
+/// beside the call's result: the decision and everything said about it,
+/// the classifier's request, and the kind of denial.
+fn permission_of(raw: &Json) -> Option<String> {
+    let decision = raw.get("permissionDecision");
+    let request = raw.pointer("/serverClassifierContext/request").and_then(Json::as_str);
+    let denial = raw.get("toolDenialKind").and_then(Json::as_str);
+    if decision.is_none() && request.is_none() && denial.is_none() {
+        return None;
+    }
+    let mut said = Vec::new();
+    match decision.and_then(Json::as_object) {
+        Some(d) => {
+            if let Some(v) = d.get("decision").and_then(Json::as_str) {
+                said.push(v.to_string());
+            }
+            for (k, v) in d.iter().filter(|(k, _)| k.as_str() != "decision") {
+                let v = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+                said.push(format!("{} {v}", spaced(k)));
+            }
+        }
+        None => said.extend(decision.map(Json::to_string)),
+    }
+    if let Some(r) = request {
+        said.push(format!("classifier request {r}"));
+    }
+    if let Some(k) = denial {
+        said.push(format!("denied as {k}"));
+    }
+    Some(said.join(" · "))
+}
+
+/// `reasonType` → `reason type`.
+fn spaced(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 4);
+    for c in key.chars() {
+        if c.is_ascii_uppercase() {
+            out.push(' ');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A duration as a reader says it: `850 ms`, `5.7 s`, `4 min 30 s`.
+fn took(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms} ms")
+    } else if ms < 60_000 {
+        format!("{}.{} s", ms / 1_000, ms % 1_000 / 100)
+    } else {
+        format!("{} min {} s", ms / 60_000, ms % 60_000 / 1_000)
+    }
+}
+
+/// One request to the model (#472). Claude Code writes a reply as several
+/// rows, one per block, each repeating the request's counters as they stood
+/// when it was written; Gemini re-emits a reply, fuller each time. So a
+/// request's facts are written once, when its last row has gone by.
+#[derive(Debug, Clone, PartialEq)]
+struct Request {
+    id: String,
+    model: Option<String>,
+    requested: Option<String>,
+    effort: Option<String>,
+    usage: Option<Json>,
+}
+
+fn request_of(raw: &Json) -> Option<Request> {
+    let text = |v: Option<&Json>| v.and_then(Json::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    if raw.get("message").is_some() {
+        let id = text(raw.get("requestId")).or_else(|| text(raw.pointer("/message/id")))?;
+        return Some(Request {
+            id,
+            model: text(raw.pointer("/message/model")),
+            requested: text(raw.get("requestedModel")),
+            effort: text(raw.get("effort")),
+            usage: raw.pointer("/message/usage").cloned(),
+        });
+    }
+    // A Gemini reply is one record, its counters under `tokens`.
+    let usage = raw.get("tokens")?.clone();
+    Some(Request { id: text(raw.get("id"))?, model: text(raw.get("model")), requested: None, effort: None, usage: Some(usage) })
+}
+
+/// A request's token counters in words, and any counter not named here as
+/// it was recorded.
+fn tokens_line(usage: &Json) -> String {
+    let mut said = Vec::new();
+    let mut known: Vec<&str> = Vec::new();
+    let named: [(&str, &str); 10] = [
+        // Claude
+        ("input_tokens", "in"),
+        ("cache_creation_input_tokens", "cache write"),
+        ("cache_read_input_tokens", "cache read"),
+        ("output_tokens", "out"),
+        // Gemini
+        ("input", "in"),
+        ("cached", "cached"),
+        ("output", "out"),
+        ("thoughts", "thoughts"),
+        ("tool", "tool"),
+        ("total", "total"),
+    ];
+    for (key, label) in named {
+        if let Some(n) = usage.get(key).and_then(Json::as_u64) {
+            said.push(format!("{} {label}", grouped(n)));
+            known.push(key);
+        }
+    }
+    if let Some(details) = usage.get("output_tokens_details") {
+        if let Some(n) = details.get("thinking_tokens").and_then(Json::as_u64) {
+            said.push(format!("{} of them thinking", grouped(n)));
+            if more_of(details, &["thinking_tokens"]).is_none() {
+                known.push("output_tokens_details");
+            }
+        }
+    }
+    let mut line = said.join(" · ");
+    if let Some(rest) = more_of(usage, &known) {
+        if !line.is_empty() {
+            line.push_str(" · ");
+        }
+        line.push_str(&rest.to_string());
+    }
+    line
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // The file
 // ─────────────────────────────────────────────────────────────────────
@@ -796,6 +935,12 @@ struct Writer {
     /// The last thing written was an action line (Markdown lists need a
     /// blank line before what follows).
     in_actions: bool,
+    /// The request the last rows belong to, written when it ends.
+    request: Option<Request>,
+    /// What the line being written records beside its blocks.
+    line: LineFacts,
+    /// Transcript lines the capture kept by kind only, counted (#471).
+    kinds: BTreeMap<String, u64>,
 }
 
 impl Writer {
@@ -816,6 +961,9 @@ impl Writer {
             roles: BTreeMap::new(),
             actions: 0,
             in_actions: false,
+            request: None,
+            line: LineFacts::default(),
+            kinds: BTreeMap::new(),
         }
     }
 
@@ -855,7 +1003,9 @@ impl Writer {
         let model = [facts.model, facts.effort].into_iter().flatten().collect::<Vec<_>>().join(" · ");
         let holds = match self.include {
             Include::Conversation => "the conversation: every message, oldest first",
-            Include::Everything => "everything: every message and every action the OS recorded, oldest first",
+            Include::Everything => {
+                "everything: every message, oldest first, then every action the OS recorded, in an appendix"
+            }
         };
         let tools = match self.tools {
             ToolDetail::Full => "tool calls and output in full".to_string(),
@@ -882,10 +1032,24 @@ impl Writer {
             lines.push(("only rows matching", format!("“{q}”")));
         }
         lines.push((
+            "each request",
+            "closes with its id, model, effort and token counts; each thinking block says how long it \
+             took, and each tool result how its call was allowed"
+                .to_string(),
+        ));
+        lines.push((
             "not written",
-            "the transcript's bookkeeping (ids, timestamps inside a message, token usage, \
-             the agent's own structured copy of each tool result), thinking signatures, \
-             and image bytes: each image is named with its type and size"
+            "the transcript's bookkeeping (ids, timestamps inside a message, the agent's own structured \
+             copy of each tool result), thinking signatures, and image bytes: each image is named with \
+             its type and size"
+                .to_string(),
+        ));
+        lines.push((
+            "not captured",
+            "the content of the transcript lines that are not messages: the system prompt, the context \
+             injected into each request (CLAUDE.md, memory, reminders), the skills and tools offered, \
+             attachments, turn durations and away summaries. This version of the OS records only that \
+             each happened (#471); with everything, the appendix counts them by kind"
                 .to_string(),
         ));
         match self.format {
@@ -912,6 +1076,12 @@ impl Writer {
         let raw = m.raw.clone().map(|o| Value::Object(o).into_json_value());
         let context = raw.as_ref().map(context_of).unwrap_or_default();
         let pieces = pieces_of(raw.as_ref(), &m.content, &mut self.calls);
+        // A row of another request, or of none, ends the one before it.
+        let request = raw.as_ref().and_then(request_of);
+        if request.as_ref().map(|r| &r.id) != self.request.as_ref().map(|r| &r.id) {
+            self.close_request();
+        }
+        self.line = raw.as_ref().map(line_facts).unwrap_or_default();
 
         // The heading: who, when, and the model where it changes.
         let mut heading = m.role.clone();
@@ -966,6 +1136,83 @@ impl Writer {
                 self.out.push('\n');
             }
         }
+        // Its newest row holds the request's counters as they ended.
+        self.request = request;
+    }
+
+    /// The request the rows just written belong to, closed: its id, model,
+    /// effort and token counters, once.
+    fn close_request(&mut self) {
+        let Some(r) = self.request.take() else { return };
+        let mut line = format!("request {}", self.code(&r.id));
+        if let Some(model) = &r.model {
+            let _ = write!(line, " · {}", self.code(model));
+        }
+        if let Some(asked) = r.requested.as_ref().filter(|asked| Some(*asked) != r.model.as_ref()) {
+            let _ = write!(line, " (asked for {})", self.code(asked));
+        }
+        if let Some(effort) = &r.effort {
+            let _ = write!(line, " · effort {effort}");
+        }
+        if let Some(usage) = &r.usage {
+            let tokens = tokens_line(usage);
+            if !tokens.is_empty() {
+                let _ = write!(line, " · tokens: {tokens}");
+            }
+        }
+        match self.format {
+            Format::Markdown => {
+                let _ = writeln!(self.out, "*{line}*\n");
+            }
+            Format::Text => {
+                let _ = writeln!(self.out, "    [{line}]\n");
+            }
+        }
+    }
+
+    /// Where the OS's action events begin: after the conversation, so it
+    /// reads without them (#472).
+    fn appendix(&mut self) {
+        match self.format {
+            Format::Markdown => self.out.push_str(
+                "---\n\n## Appendix: the OS's action events\n\n\
+                 Every action the OS recorded for this session, oldest first, each with its whole payload.\n\n",
+            ),
+            Format::Text => {
+                self.out.push_str("APPENDIX: the OS's action events, oldest first, each with its whole payload\n\n");
+            }
+        }
+    }
+
+    /// The transcript lines this OS recorded by kind alone (#471): that they
+    /// happened and when, not what they held.
+    fn kinds_note(&mut self) {
+        if self.kinds.is_empty() {
+            return;
+        }
+        let total: u64 = self.kinds.values().sum();
+        let list = self
+            .kinds
+            .iter()
+            .map(|(kind, n)| format!("{} ×{}", self.code(kind), grouped(*n)))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        match self.format {
+            Format::Markdown => {
+                if self.in_actions {
+                    self.out.push('\n');
+                    self.in_actions = false;
+                }
+                let _ = writeln!(
+                    self.out,
+                    "**Transcript lines kept by kind only:** {} lines the OS saw but did not keep the content of (#471): {list}\n",
+                    grouped(total)
+                );
+            }
+            Format::Text => {
+                let _ = writeln!(self.out, "\ntranscript lines kept by kind only ({}, #471): {list}\n", grouped(total));
+            }
+        }
     }
 
     fn place_note(&self) -> String {
@@ -978,7 +1225,14 @@ impl Writer {
 
     fn action(&mut self, a: &TelemetryRecord) {
         self.actions += 1;
-        let payload = serde_json::to_string(&a.payload.clone().into_json_value()).unwrap_or_default();
+        let payload = a.payload.clone().into_json_value();
+        // The capture's event for a transcript line it kept by kind only.
+        if a.lifecycle_event == "transcript_event" {
+            if let Some(kind) = payload.get("kind").and_then(Json::as_str) {
+                *self.kinds.entry(kind.to_string()).or_default() += 1;
+            }
+        }
+        let payload = serde_json::to_string(&payload).unwrap_or_default();
         let when = self.when(a.valid_from);
         match self.format {
             Format::Markdown => {
@@ -1098,6 +1352,9 @@ impl Writer {
                 if let Some(title) = title {
                     let _ = write!(self.out, " · {title}");
                 }
+                if let Some(ms) = self.line.thought_ms {
+                    let _ = write!(self.out, " · {}", took(ms));
+                }
                 self.out.push_str("\n\n");
                 if text.is_empty() {
                     self.out.push_str("> *(no thinking text in the transcript)*\n\n");
@@ -1119,7 +1376,10 @@ impl Writer {
                 self.md_tool_body(&body, "json", "input");
             }
             Piece::Result { name, id, error, status, more, parts } => {
-                let label = self.result_label(name.as_deref(), id.as_deref(), *error, status.as_deref(), more.as_ref());
+                let mut label = self.result_label(name.as_deref(), id.as_deref(), *error, status.as_deref(), more.as_ref());
+                if let Some(permission) = &self.line.permission {
+                    let _ = write!(label, " · permission: {permission}");
+                }
                 let _ = writeln!(self.out, "**tool result** {label}\n");
                 self.md_parts(parts);
             }
@@ -1183,6 +1443,9 @@ impl Writer {
                 if let Some(title) = title {
                     let _ = write!(self.out, " · {title}");
                 }
+                if let Some(ms) = self.line.thought_ms {
+                    let _ = write!(self.out, " · {}", took(ms));
+                }
                 self.out.push_str(":\n");
                 if text.is_empty() {
                     self.out.push_str("        (no thinking text in the transcript)\n");
@@ -1217,6 +1480,9 @@ impl Writer {
                 }
                 if let Some(more) = more {
                     let _ = write!(label, " {more}");
+                }
+                if let Some(permission) = &self.line.permission {
+                    let _ = write!(label, ", permission: {permission}");
                 }
                 let _ = writeln!(self.out, "    {label}:");
                 if self.tools == ToolDetail::LeftOut {
@@ -1353,8 +1619,136 @@ mod tests {
         for m in rows {
             w.message(m);
         }
+        w.close_request();
         w.footer();
         w.out
+    }
+
+    /// One row of a Claude Code reply, as the transcript writes it: a block,
+    /// and the request's counters as they stood.
+    fn reply_row(request: &str, block: Json, output_tokens: u64) -> MessageRecord {
+        message(
+            "assistant",
+            Some(json!({
+                "type": "assistant", "requestId": request, "effort": "max", "requestedModel": "claude-opus-5-5",
+                "message": {
+                    "id": format!("msg_{request}"), "model": "claude-sonnet-5-5", "content": [block],
+                    "usage": {
+                        "input_tokens": 2, "cache_creation_input_tokens": 8_843, "cache_read_input_tokens": 42_806,
+                        "output_tokens": output_tokens, "output_tokens_details": { "thinking_tokens": 7 },
+                        "service_tier": "standard"
+                    }
+                }
+            })),
+            "",
+        )
+    }
+
+    #[test]
+    fn a_request_is_written_once_with_the_counters_its_last_row_holds() {
+        let rows = [
+            reply_row("req_1", json!({ "type": "thinking", "thinking": "plan", "signature": "s" }), 10),
+            reply_row("req_1", json!({ "type": "text", "text": "Running the tests." }), 50),
+            reply_row("req_1", json!({ "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {} }), 120),
+            message(
+                "tool",
+                Some(json!({ "type": "user", "message": { "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_1", "content": "ok" }
+                ] } })),
+                "",
+            ),
+            reply_row("req_2", json!({ "type": "text", "text": "Done." }), 3),
+        ];
+        let out = written(&options(Format::Markdown, ToolDetail::Full), &rows);
+        assert_eq!(out.matches("*request ").count(), 2, "one line per request: {out}");
+        let first = out.find("*request `req_1`").expect("the first request is closed");
+        assert!(out[..first].contains("Running the tests.") && out[first..].contains("**tool result**"), "after its rows: {out}");
+        assert!(
+            out.contains(
+                "*request `req_1` · `claude-sonnet-5-5` (asked for `claude-opus-5-5`) · effort max · tokens: \
+                 2 in · 8,843 cache write · 42,806 cache read · 120 out · 7 of them thinking · {\"service_tier\":\"standard\"}*"
+            ),
+            "the last row's counters, every one of them: {out}"
+        );
+        assert!(out.contains("*request `req_2`") && out.contains("3 out"), "the last request closes at the end: {out}");
+    }
+
+    #[test]
+    fn a_thinking_block_says_how_long_it_took_even_without_its_text() {
+        let mut row = reply_row("req_1", json!({ "type": "thinking", "thinking": "", "signature": "s" }), 1);
+        let raw = json!({ "type": "assistant", "thinkingDurationMs": 270_000, "requestId": "req_1",
+            "message": { "id": "m", "content": [{ "type": "thinking", "thinking": "", "signature": "s" }] } });
+        row.raw = Some(superx_kernel::message::json_to_object(&raw));
+        let md = written(&options(Format::Markdown, ToolDetail::Full), std::slice::from_ref(&row));
+        assert!(md.contains("**thinking** · 4 min 30 s\n\n> *(no thinking text in the transcript)*"), "{md}");
+        let txt = written(&options(Format::Text, ToolDetail::Full), &[row]);
+        assert!(txt.contains("    thinking · 4 min 30 s:\n        (no thinking text in the transcript)"), "{txt}");
+        assert_eq!((took(850), took(5_700), took(270_000)), ("850 ms".into(), "5.7 s".into(), "4 min 30 s".into()));
+    }
+
+    #[test]
+    fn a_tool_result_says_how_its_call_was_allowed() {
+        let result = |extra: Json| {
+            let mut raw = json!({ "type": "user", "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "out", "is_error": true }
+            ] } });
+            for (k, v) in extra.as_object().expect("object") {
+                raw[k] = v.clone();
+            }
+            message("tool", Some(raw), "")
+        };
+        let allowed = result(json!({
+            "permissionDecision": { "decision": "accept", "source": "config", "reasonType": "classifier" },
+            "serverClassifierContext": { "request": "3b48cd21", "context": { "git_state": {} } }
+        }));
+        let denied = result(json!({ "permissionDecision": { "decision": "deny" }, "toolDenialKind": "classifier" }));
+        let md = written(&options(Format::Markdown, ToolDetail::Full), &[allowed, denied.clone()]);
+        // The decision first, then what was said about it, in key order.
+        assert!(
+            md.contains("· error · permission: accept · reason type classifier · source config · classifier request 3b48cd21\n"),
+            "{md}"
+        );
+        assert!(md.contains("permission: deny · denied as classifier"), "{md}");
+        let txt = written(&options(Format::Text, ToolDetail::Full), &[denied]);
+        assert!(txt.contains(", error, permission: deny · denied as classifier:"), "{txt}");
+    }
+
+    #[test]
+    fn a_gemini_reply_closes_with_its_counters() {
+        let reply = message(
+            "assistant",
+            Some(json!({ "id": "g1", "type": "gemini", "model": "gemini-3-pro", "content": "Hello",
+                "tokens": { "input": 1_200, "output": 40, "cached": 1_000, "thoughts": 25, "tool": 0, "total": 1_265 } })),
+            "Hello",
+        );
+        let out = written(&options(Format::Markdown, ToolDetail::Full), &[reply]);
+        assert!(
+            out.contains("*request `g1` · `gemini-3-pro` · tokens: 1,200 in · 1,000 cached · 40 out · 25 thoughts · 0 tool · 1,265 total*"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_lines_kept_by_kind_only_are_counted_after_the_actions() {
+        let mut w = Writer::new(&options(Format::Markdown, ToolDetail::Full), Utc::now());
+        w.appendix();
+        for kind in ["attachment", "api-request", "attachment"] {
+            w.action(&TelemetryRecord {
+                id: RecordId::new("telemetry_stream", superx_kernel::types::Uuid::new_v7()),
+                lifecycle_event: "transcript_event".into(),
+                payload: <Json as superx_kernel::types::SurrealValue>::into_value(json!({ "kind": kind, "session": "s" })),
+                subject: None,
+                agent: None,
+                valid_from: Utc::now(),
+            });
+        }
+        w.kinds_note();
+        assert!(w.out.starts_with("---\n\n## Appendix: the OS's action events\n\n"), "{}", w.out);
+        assert!(
+            w.out.contains("**Transcript lines kept by kind only:** 3 lines the OS saw but did not keep the content of (#471): `api-request` ×1 · `attachment` ×2"),
+            "{}",
+            w.out
+        );
     }
 
     #[test]

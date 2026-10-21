@@ -4905,9 +4905,10 @@ async fn the_export_holds_every_row_once_in_order_and_nothing_else() {
     let text = exported(session_export(kernel.clone(), session.clone(), everything, export_at(5), pages)).await;
     assert_eq!(
         exported_rows(&text),
-        ["m1", "a1", "m2", "m3", "m4", "m5", "m6", "a2", "a3", "m7", "a4"],
-        "every row once, by capture time then id, across both tables: {text}"
+        ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "a1", "a2", "a3", "a4"],
+        "every row once, by capture time then id: the conversation, then the actions in an appendix (#472): {text}"
     );
+    assert!(text.contains("APPENDIX: the OS's action events"), "{text}");
     assert!(!text.contains("m21") && !text.contains("a22"), "another session's rows: {text}");
     assert!(!text.contains("m8"), "a row captured after the export began: {text}");
     assert!(
