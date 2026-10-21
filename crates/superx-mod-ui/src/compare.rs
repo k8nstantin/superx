@@ -89,8 +89,10 @@ pub(crate) fn split(total: i64, weights: &[i64]) -> Vec<i64> {
 /// One repository the runs worked in, and every run's claim on it.
 struct RepoClaims {
     name: String,
-    /// A checkout to read it from.
+    /// A checkout to read it from: a full clone when there is one (#483).
     dir: String,
+    /// That checkout is a shallow clone.
+    shallow: bool,
     claims: Vec<Claim>,
     /// The start of the first run that worked here: nothing older can be
     /// credited, so nothing older is walked. The oldest run anywhere — a
@@ -119,20 +121,23 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
     let checkouts = crate::checkout::Checkouts::resolve(cwds.iter()).await;
     let parse = |s: &str| DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc));
 
-    // Claims per repository — by its common git dir, so a worktree is its
-    // repository (#414).
+    // Claims per repository — by what it is a checkout of, so a worktree
+    // is its repository (#414), and so is a build folder cloned from its
+    // remote (#483).
     let mut repos: HashMap<String, RepoClaims> = HashMap::new();
     for r in runs {
         let (Some(from), Some(to)) = (parse(&r.first), parse(&r.last)) else { continue };
         let mut seen: HashSet<&str> = HashSet::new();
         for w in &r.work {
             let Some(co) = checkouts.of(&w.cwd) else { continue };
-            if !seen.insert(co.common.as_str()) {
+            let co = checkouts.reader(co);
+            if !seen.insert(co.key.as_str()) {
                 continue;
             }
-            let rc = repos.entry(co.common.clone()).or_insert_with(|| RepoClaims {
+            let rc = repos.entry(co.key.clone()).or_insert_with(|| RepoClaims {
                 name: co.repo.clone(),
                 dir: co.toplevel.clone(),
+                shallow: co.shallow,
                 claims: Vec::new(),
                 earliest: from,
             });
@@ -153,7 +158,9 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
         let rc = &repos[key];
         let dir = std::path::Path::new(&rc.dir);
         let mainline = crate::landed::mainline_of(dir, &rc.name, mainlines).await;
-        let Some(work) = crate::landed::repo_work(dir, &mainline, Some(rc.earliest)).await else {
+        let trusted = crate::landed::mainline_trusted(dir, &mainline, rc.shallow).await;
+        let read = if trusted { crate::landed::repo_work(dir, &mainline, Some(rc.earliest)).await } else { None };
+        let Some(work) = read else {
             // git cannot read that main line at all — a ref named for this
             // repository that does not resolve. Said, not dropped (#415
             // review).
@@ -342,7 +349,7 @@ pub async fn compare(runs: &[ModelRun], mainlines: &HashMap<String, String>) -> 
     for r in runs {
         let e = sp.entry(r.model.as_str()).or_default();
         for w in &r.work {
-            if checkouts.of(&w.cwd).is_some_and(|co| judged.contains(&co.common)) {
+            if checkouts.of(&w.cwd).is_some_and(|co| judged.contains(&checkouts.reader(co).key)) {
                 e.out_tokens += w.out_tokens;
                 e.messages += w.replies;
                 e.minutes += w.minutes;

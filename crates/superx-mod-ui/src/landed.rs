@@ -96,6 +96,43 @@ pub(crate) async fn main_ref(dir: &Path) -> String {
     "HEAD".to_string()
 }
 
+/// The commits a shallow clone's history stops at: git keeps them in
+/// `shallow`, beside the repository, each a commit whose parents were never
+/// fetched, so `git log` reads it as adding every file it holds. A build
+/// folder cloned at depth 1 read as the whole repository landed in one
+/// commit. Empty for a full clone. Read as a file: nothing runs.
+pub(crate) async fn shallow_boundary(dir: &Path) -> HashSet<String> {
+    let Some(path) = git(dir, &["rev-parse", "--path-format=absolute", "--git-path", "shallow"]).await else {
+        return HashSet::new();
+    };
+    std::fs::read_to_string(path.trim())
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// The repository a remote URL names, as its last path segment:
+/// `git@bitbucket.org:team/gryphon-data-lake.git` → `gryphon-data-lake`.
+pub(crate) fn name_of_url(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let name = url.rsplit(['/', ':']).next()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Whether `mainline` can stand for what landed in a checkout. A shallow
+/// clone's own branches are the work it was made for — a build folder
+/// commits on them — so its main line must be what the remote holds, a
+/// remote-tracking ref: never `HEAD` or a local branch, which the
+/// fallback in [`main_ref`] would give it.
+pub(crate) async fn mainline_trusted(dir: &Path, mainline: &str, shallow: bool) -> bool {
+    if !shallow {
+        return true;
+    }
+    git(dir, &["rev-parse", "--symbolic-full-name", mainline])
+        .await
+        .is_some_and(|full| full.trim().starts_with("refs/remotes/"))
+}
+
 /// The repository's name: the directory holding `.git` — for a
 /// worktree, the main checkout's, so worktrees of one repo read as one.
 pub(crate) fn repo_name(common_git_dir: &str, toplevel: &str) -> String {
@@ -127,8 +164,10 @@ pub async fn landed(
     mainlines: &HashMap<String, String>,
 ) -> Landed {
     let mut landed = Landed::default();
-    // One repository per common git dir: worktrees fold into their repo.
-    let mut repos: BTreeMap<String, (String, String)> = BTreeMap::new();
+    // One repository per repository, read from a full clone of it when
+    // there is one: worktrees fold into their repo, and so does a build
+    // folder cloned from its remote (#483).
+    let mut repos: BTreeMap<String, (String, String, bool)> = BTreeMap::new();
     let mut cwds: Vec<&String> = cwds.iter().collect();
     cwds.sort();
     for cwd in cwds {
@@ -136,18 +175,27 @@ pub async fn landed(
             landed.unreadable += 1;
             continue;
         };
+        let co = checkouts.reader(co);
         repos
-            .entry(co.common.clone())
-            .or_insert_with(|| (co.toplevel.clone(), co.repo.clone()));
+            .entry(co.key.clone())
+            .or_insert_with(|| (co.toplevel.clone(), co.repo.clone(), co.shallow));
         if repos.len() >= LANDED_REPOS {
             break;
         }
     }
     let since_s = since.map(|s| s.to_rfc3339());
     let mut series: BTreeMap<String, (i64, i64)> = BTreeMap::new();
-    for (top, name) in repos.into_values() {
+    for (top, name, shallow) in repos.into_values() {
         let dir = Path::new(&top);
         let branch = mainline_of(dir, &name, mainlines).await;
+        if !mainline_trusted(dir, &branch, shallow).await {
+            landed.unreadable += 1;
+            continue;
+        }
+        // A shallow clone's first commit landed nothing: it is where its
+        // history was cut.
+        let boundary = if shallow { shallow_boundary(dir).await } else { HashSet::new() };
+        let mut cut = false;
         // First-parent on the main line counts what LANDED, once — not a
         // branch's commits and their squash both. `-m` diffs a merge
         // commit against its first parent so merged work is counted too.
@@ -171,6 +219,10 @@ pub async fn landed(
         let mut bucket: Option<String> = None;
         for line in out.lines() {
             if let Some(rest) = line.strip_prefix('\u{1}') {
+                cut = rest.split('\t').next().is_some_and(|hash| boundary.contains(hash));
+                if cut {
+                    continue;
+                }
                 repo.commits += 1;
                 bucket = rest
                     .split('\t')
@@ -180,6 +232,9 @@ pub async fn landed(
                     // On the viewer's clock, as the transcript's series it
                     // is drawn against (#415 review).
                     .map(|d| d.with_timezone(&clock).format("%Y-%m-%dT%H").to_string());
+                continue;
+            }
+            if cut {
                 continue;
             }
             let mut parts = line.split('\t');
@@ -325,12 +380,17 @@ fn parse_work_log(out: &str) -> Vec<WorkCommit> {
 
 /// `(path, blob)` → the main-line commit that wrote that version of the
 /// file, oldest writer kept. A `--raw` log names every file's new blob.
-fn parse_versions(out: &str) -> HashMap<(String, String), String> {
+fn parse_versions(out: &str, boundary: &HashSet<String>) -> HashMap<(String, String), String> {
     let mut versions: HashMap<(String, String), String> = HashMap::new();
     let mut commit = String::new();
     for line in out.lines() {
         if let Some(hash) = line.strip_prefix('\u{1}') {
             commit = hash.trim().to_string();
+            continue;
+        }
+        // A shallow clone's first commit wrote no version: every file it
+        // holds was there before its history was cut (#483).
+        if boundary.contains(&commit) {
             continue;
         }
         let Some((path, blob)) = raw_entry(line) else { continue };
@@ -477,12 +537,15 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
         &bounded(vec!["log", mainline, "--no-merges", "--no-renames", "--numstat", WORK_FORMAT], since_s.as_deref()),
     )
     .await?;
+    // A shallow clone's first commit is where its history was cut, not
+    // work that landed: read as a commit, it added every file (#483).
+    let boundary = shallow_boundary(dir).await;
     let mut work = RepoWork {
         identity: git(dir, &["config", "user.email"])
             .await
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
-        landed: parse_work_log(&landed_log),
+        landed: parse_work_log(&landed_log).into_iter().filter(|c| !boundary.contains(&c.hash)).collect(),
         ..RepoWork::default()
     };
     // A main line that took nothing in the period is not where the work
@@ -512,7 +575,7 @@ pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>)
         ),
     )
     .await
-    .map(|o| parse_versions(&o))
+    .map(|o| parse_versions(&o, &boundary))
     .unwrap_or_default();
 
     // Every branch the main line does not contain. `refs/stash` and the
@@ -689,6 +752,20 @@ fn skip_for_survival(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_url_names_its_repository() {
+        for (url, name) in [
+            ("git@bitbucket.org:gryphonnetworks/gryphon-data-lake.git", "gryphon-data-lake"),
+            ("https://github.com/k8nstantin/superx.git", "superx"),
+            ("https://github.com/k8nstantin/superx/", "superx"),
+            ("file:///tmp/a/gryphon-data-lake", "gryphon-data-lake"),
+            ("ssh://git@host:7999/team/repo.git", "repo"),
+        ] {
+            assert_eq!(name_of_url(url).as_deref(), Some(name), "{url}");
+        }
+        assert_eq!(name_of_url("  "), None);
+    }
 
     #[test]
     fn a_deletion_leaves_no_blob_to_match() {

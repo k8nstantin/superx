@@ -833,7 +833,9 @@ pub async fn join(
     // Per repository: its name, a checkout to read it from, its candidates.
     struct Repo {
         name: String,
+        /// A full clone to read it from when there is one (#483).
         dir: String,
+        shallow: bool,
         toplevels: Vec<String>,
         earliest: DateTime<Utc>,
         tasks: Vec<usize>,
@@ -843,9 +845,13 @@ pub async fn join(
     for (i, t) in tasks.iter().enumerate() {
         for cwd in &t.cwds {
             let Some(co) = checkouts.of(cwd) else { continue };
-            let r = repos.entry(co.common.clone()).or_insert_with(|| Repo {
-                name: co.repo.clone(),
-                dir: co.toplevel.clone(),
+            // The repository it is a checkout of: a build folder cloned
+            // from its remote is that repository (#483).
+            let reader = checkouts.reader(co);
+            let r = repos.entry(reader.key.clone()).or_insert_with(|| Repo {
+                name: reader.repo.clone(),
+                dir: reader.toplevel.clone(),
+                shallow: reader.shallow,
                 toplevels: Vec::new(),
                 earliest: t.opened,
                 tasks: Vec::new(),
@@ -892,7 +898,9 @@ pub async fn join(
         let r = &repos[key];
         let dir = std::path::Path::new(&r.dir);
         let mainline = crate::landed::mainline_of(dir, &r.name, mainlines).await;
-        let Some(work) = crate::landed::repo_work(dir, &mainline, Some(r.earliest)).await else {
+        let trusted = crate::landed::mainline_trusted(dir, &mainline, r.shallow).await;
+        let read = if trusted { crate::landed::repo_work(dir, &mainline, Some(r.earliest)).await } else { None };
+        let Some(work) = read else {
             coverage.unreadable_repos.push(r.name.clone());
             continue;
         };
