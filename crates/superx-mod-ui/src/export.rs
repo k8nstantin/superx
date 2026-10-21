@@ -1076,9 +1076,14 @@ impl Writer {
         let raw = m.raw.clone().map(|o| Value::Object(o).into_json_value());
         let context = raw.as_ref().map(context_of).unwrap_or_default();
         let pieces = pieces_of(raw.as_ref(), &m.content, &mut self.calls);
-        // A row of another request, or of none, ends the one before it.
+        // A row of another request, or the person's next prompt, ends the
+        // request before it. Its own tool results do not: Claude Code runs a
+        // tool as soon as its call has streamed, so a result can land between
+        // two blocks of one request, and closing there wrote one request
+        // several times (#474).
         let request = raw.as_ref().and_then(request_of);
-        if request.as_ref().map(|r| &r.id) != self.request.as_ref().map(|r| &r.id) {
+        let another = request.as_ref().is_some_and(|r| self.request.as_ref().is_some_and(|open| open.id != r.id));
+        if another || m.role == "user" {
             self.close_request();
         }
         self.line = raw.as_ref().map(line_facts).unwrap_or_default();
@@ -1137,7 +1142,9 @@ impl Writer {
             }
         }
         // Its newest row holds the request's counters as they ended.
-        self.request = request;
+        if request.is_some() {
+            self.request = request;
+        }
     }
 
     /// The request the rows just written belong to, closed: its id, model,
@@ -1662,7 +1669,7 @@ mod tests {
         let out = written(&options(Format::Markdown, ToolDetail::Full), &rows);
         assert_eq!(out.matches("*request ").count(), 2, "one line per request: {out}");
         let first = out.find("*request `req_1`").expect("the first request is closed");
-        assert!(out[..first].contains("Running the tests.") && out[first..].contains("**tool result**"), "after its rows: {out}");
+        assert!(out[..first].contains("**tool result**") && out[first..].contains("Done."), "after its rows, before the next: {out}");
         assert!(
             out.contains(
                 "*request `req_1` · `claude-sonnet-5-5` (asked for `claude-opus-5-5`) · effort max · tokens: \
@@ -1671,6 +1678,32 @@ mod tests {
             "the last row's counters, every one of them: {out}"
         );
         assert!(out.contains("*request `req_2`") && out.contains("3 out"), "the last request closes at the end: {out}");
+    }
+
+    #[test]
+    fn a_request_split_by_its_own_tool_result_is_written_once() {
+        // Claude Code runs a tool as soon as its call has streamed: the result
+        // lands between two blocks of one request (12 of 108 requests in the
+        // session the analyst reviewed, #474).
+        let result = message(
+            "tool",
+            Some(json!({ "type": "user", "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "ok" }
+            ] } })),
+            "",
+        );
+        let prompt = message("user", Some(json!({ "type": "user", "message": { "content": "next" } })), "next");
+        let rows = [
+            reply_row("req_1", json!({ "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {} }), 40),
+            result,
+            reply_row("req_1", json!({ "type": "tool_use", "id": "toolu_2", "name": "Read", "input": {} }), 90),
+            prompt,
+        ];
+        let out = written(&options(Format::Markdown, ToolDetail::Full), &rows);
+        assert_eq!(out.matches("*request `req_1`").count(), 1, "one request, one line: {out}");
+        assert!(out.contains("· 90 out ·"), "the counters of its last row: {out}");
+        let line = out.find("*request `req_1`").expect("closed");
+        assert!(out[line..].contains("next"), "closed before the person's next prompt: {out}");
     }
 
     #[test]
