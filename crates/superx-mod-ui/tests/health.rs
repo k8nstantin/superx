@@ -47,6 +47,32 @@ fn a_dead_capture_under_busy_work_is_a_stall_once_the_wait_passes_the_limit() {
 }
 
 #[test]
+fn a_remembered_wait_ends_once_anything_is_recorded_after_it() {
+    // 2026-10-20 18:32:03: a poll saw a change a second before capture took
+    // it, and nothing polled again until 2026-10-21 10:00:30, with capture
+    // ten seconds behind the operator's session. Kept, 18:32:03 read as
+    // fifteen hours stalled (#464).
+    let yesterday = Utc.with_ymd_and_hms(2026, 10, 20, 18, 32, 3).single().expect("t");
+    let at = |m: u32, s: u32| Utc.with_ymd_and_hms(2026, 10, 21, 10, m, s).single().expect("t");
+    let (v, since) = judge(&facts(Some(at(0, 10)), Some(at(0, 20))), Some(yesterday), at(0, 30), 300);
+    assert!(!v.stalled, "ten seconds behind is not fifteen hours stalled: {v:?}");
+    assert_eq!(since, Some(at(0, 20)), "it waits since the change waiting now");
+}
+
+#[test]
+fn busy_work_with_capture_a_few_seconds_behind_is_never_a_stall() {
+    // Ten minutes of polls, each landing while capture is six seconds
+    // behind a session that keeps writing.
+    let mut since = None;
+    for k in 0..60 {
+        let now = t(12, 0, 0) + Duration::seconds(10 * k);
+        let (v, s) = judge(&facts(Some(now - Duration::seconds(8)), Some(now - Duration::seconds(2))), since, now, 300);
+        assert!(!v.stalled, "poll {k}: {v:?}");
+        since = s;
+    }
+}
+
+#[test]
 fn nothing_ever_recorded_or_nothing_to_compare() {
     let (v, _) = judge(&facts(None, Some(t(10, 0, 0))), None, t(10, 6, 0), 300);
     assert!(v.stalled, "transcripts, and nothing ever recorded");

@@ -24,6 +24,13 @@
 //! (2026-10-18: a 6-minute quiet spell, then a line taken in 81 s late
 //! behind a hung connection, read as a 5-minute stall under the first
 //! rule, which compared the two times directly.)
+//!
+//! Polls can be hours apart, or all land while capture is seconds behind
+//! busy work, so a remembered time is dropped once anything is recorded
+//! after it. A capture that stopped records nothing, and its wait keeps
+//! growing. (2026-10-21: a poll at 18:32:03 and the next at 06:00 the
+//! following morning, with capture ten seconds behind, read as fifteen
+//! hours stalled — #464.)
 
 use std::path::Path;
 
@@ -76,8 +83,12 @@ pub fn judge(facts: &Facts, waiting_since: Option<DateTime<Utc>>, now: DateTime<
         (Some((changed, _)), None) => Some(*changed),
         (None, _) => None,
     };
+    // A remembered change still waits only while nothing has been recorded
+    // since it. A record after it means capture moved past that moment,
+    // whether or not a poll was there to see it catch up (#464).
+    let remembered = waiting_since.filter(|s| facts.last_written.is_none_or(|written| written < *s));
     // It has waited since the earliest such change seen and not yet taken.
-    let since = waiting.map(|changed| waiting_since.map_or(changed, |s| s.min(changed)));
+    let since = waiting.map(|changed| remembered.map_or(changed, |s| s.min(changed)));
     let view = CaptureView {
         last_written: facts.last_written.map(|t| t.to_rfc3339()),
         transcripts_changed: facts.newest.as_ref().map(|(t, _)| t.to_rfc3339()),
