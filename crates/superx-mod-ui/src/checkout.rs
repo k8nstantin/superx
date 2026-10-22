@@ -35,10 +35,14 @@ pub struct Checkout {
     pub repo: String,
     /// The checkout's common git dir: its own repository on disk.
     pub common: String,
-    /// The repository it is a checkout of: its `origin` URL when it has
-    /// one, else its common git dir. A build folder cloned from a
-    /// repository's remote is that repository, not a new one (#483).
+    /// The repository it is a checkout of: its common git dir, so every
+    /// worktree of one repository reads as one and a separate clone as its
+    /// own (#496). A shallow clone takes the key of a full clone of its
+    /// remote when the directories hold one: a build folder cloned from a
+    /// repository's remote is that repository (#483).
     pub key: String,
+    /// Its `origin` remote's URL, when it has one.
+    pub origin: Option<String>,
     /// A shallow clone: its history stops at the commit it was cloned at,
     /// whose parents were never fetched (#483).
     pub shallow: bool,
@@ -104,18 +108,28 @@ impl Checkouts {
             };
             out.by_dir.insert(dir.clone(), entry);
         }
-        // A shallow clone takes the name of a full clone of its repository
-        // when there is one: the name the operator's main-line setting and
-        // every page know it by (#483).
-        let full: HashMap<String, String> = out
+        // A shallow clone is the full clone of its remote that the
+        // directories hold, if any (#483): the one named for the
+        // repository, else the first by path. Separate full clones of one
+        // remote stay separate — each has its own branches and its own main
+        // line, and judging them as one read history none of them holds
+        // (#496).
+        let full: Vec<(String, String, String, String)> = out
             .list
             .iter()
             .filter(|c| !c.shallow)
-            .map(|c| (c.key.clone(), c.repo.clone()))
+            .filter_map(|c| Some((c.origin.clone()?, c.toplevel.clone(), c.key.clone(), c.repo.clone())))
             .collect();
         for c in out.list.iter_mut().filter(|c| c.shallow) {
-            if let Some(name) = full.get(&c.key) {
-                c.repo = name.clone();
+            let Some(origin) = c.origin.clone() else { continue };
+            let named = name_of_url(&origin);
+            let found = full
+                .iter()
+                .filter(|f| f.0 == origin)
+                .min_by_key(|f| (Some(&f.3) != named.as_ref(), f.1.clone()));
+            if let Some((_, _, key, repo)) = found {
+                c.key = key.clone();
+                c.repo = repo.clone();
             }
         }
         out
@@ -223,7 +237,13 @@ async fn read_checkout(toplevel: String, common: String) -> Checkout {
     };
     Checkout {
         repo,
-        key: origin.unwrap_or_else(|| common.clone()),
+        // A shallow clone of a remote is grouped with the full clone of it
+        // in `resolve`; alone, with the other shallow clones of the remote.
+        key: match origin.as_deref().filter(|_| shallow) {
+            Some(url) => url.to_string(),
+            None => common.clone(),
+        },
+        origin,
         shallow,
         toplevel,
         common,
@@ -323,6 +343,7 @@ mod tests {
             repo: "r".into(),
             common: "/r/.git".into(),
             key: "/r/.git".into(),
+            origin: None,
             shallow: false,
             initial: first_from,
             moves,
@@ -357,6 +378,7 @@ mod tests {
             repo: "r".into(),
             common: "/r/.git".into(),
             key: "/r/.git".into(),
+            origin: None,
             shallow: false,
             initial: first_from,
             moves,
@@ -381,6 +403,7 @@ mod tests {
             repo: "r".into(),
             common: "/r/.git".into(),
             key: "/r/.git".into(),
+            origin: None,
             shallow: false,
             initial: first_from,
             moves,

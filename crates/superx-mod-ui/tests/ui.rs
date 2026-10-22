@@ -5114,6 +5114,27 @@ async fn a_shallow_build_folder_is_its_repository_and_its_cut_landed_nothing() {
     let landed = superx_mod_ui::landed::landed(&both, &checkouts, None, utc, &mainlines).await;
     assert_eq!(landed.repos.len(), 1, "{landed:?}");
     assert_eq!((landed.commits, landed.added), (3, 2001), "every commit once: {landed:?}");
+
+    // Another full clone of the same remote stays a repository of its own
+    // (#496): it has its own branches and main line. The build folder
+    // still goes with the clone named for the repository, though another
+    // comes first by path.
+    let other = remote.base.join("a").join("gryphon-data-lake-freq");
+    clone(&other, false);
+    let other_cwd = other.to_string_lossy().into_owned();
+    let three: HashSet<String> = HashSet::from([full_cwd.clone(), other_cwd.clone(), build_cwd.clone()]);
+    let checkouts = superx_mod_ui::checkout::Checkouts::resolve(&three).await;
+    let (f, o, b) = (
+        checkouts.of(&full_cwd).expect("full"),
+        checkouts.of(&other_cwd).expect("other"),
+        checkouts.of(&build_cwd).expect("build"),
+    );
+    assert_ne!(f.key, o.key, "two full clones, two repositories");
+    assert_eq!(b.key, f.key, "the build folder is the clone named for its repository");
+    assert_eq!((b.repo.as_str(), o.repo.as_str()), ("gryphon-data-lake", "gryphon-data-lake-freq"));
+    assert_eq!(checkouts.reader(b).toplevel, f.toplevel);
+    let landed = superx_mod_ui::landed::landed(&three, &checkouts, None, utc, &mainlines).await;
+    assert_eq!(landed.repos.len(), 2, "each full clone read on its own: {landed:?}");
     let _ = std::fs::remove_dir_all(&remote.base);
 }
 
