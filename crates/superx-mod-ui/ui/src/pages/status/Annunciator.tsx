@@ -1,4 +1,6 @@
 import { SimpleGrid } from '@mantine/core'
+import { useQuery } from '@tanstack/react-query'
+import { fetchCapture } from '../../api'
 import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import type { StatusResponse } from '../../generated/StatusResponse'
@@ -57,6 +59,18 @@ export function Annunciator({
   const lagTone = captureTone(lag, anythingLive, down)
   const quiet = !down && !anythingLive && lag != null && lag >= BANDS.lagWarn
 
+  // Every transcript line captured, whole (#489): checked by the server,
+  // transcript by transcript, from when it began watching each. The same
+  // query as the capture banner, so one request serves both.
+  const capture = useQuery({ queryKey: ['capture'], queryFn: fetchCapture, refetchInterval: 30000, retry: 1 })
+  const files = capture.data?.files
+  const lost = (files ?? []).filter((f) => n(f.rows) < n(f.lines))
+  const partial = (files ?? []).filter((f) => n(f.kind_only) > 0)
+  const unread = (files ?? []).filter((f) => f.unread_secs != null && n(f.unread_secs) >= n(capture.data?.stall_secs))
+  const linesRead = (files ?? []).reduce((a, f) => a + n(f.lines), 0)
+  const names = (fs: typeof lost) => fs.map((f) => f.session.split('/').pop()?.slice(0, 8)).join(', ')
+  const completeTone: Tone = !capture.data ? 'ok' : files == null ? 'warn' : lost.length || partial.length || unread.length ? 'bad' : 'ok'
+
   const loading = !s
   const v = (x: number | bigint | null | undefined) => (loading ? '…' : fmtCompact(x))
 
@@ -88,6 +102,38 @@ export function Annunciator({
                 : `${fmtCompact(i.events_last_hour)} events this hour`
         }
         tip="age of the newest captured event. It only counts as lag when something is actually running: with no live session there is nothing to capture, so the lamp reads quiet rather than raising an alarm over an idle machine. It goes red when the capture module itself is not active, which is the real failure."
+        onClick={() => jump('systems')}
+      />
+      <Lamp
+        label="Capture complete"
+        value={
+          !capture.data
+            ? '…'
+            : files == null
+              ? 'unchecked'
+              : lost.length
+                ? `${fmtCompact(lost.reduce((a, f) => a + n(f.lines) - n(f.rows), 0))} lost`
+                : partial.length
+                  ? 'partial'
+                  : unread.length
+                    ? 'behind'
+                    : 'whole'
+        }
+        tone={completeTone}
+        sub={
+          !capture.data
+            ? ''
+            : files == null
+              ? 'the check got no answer'
+              : lost.length
+                ? `lines read without a row · ${names(lost)}`
+                : partial.length
+                  ? `lines kept by kind only · ${names(partial)}`
+                  : unread.length
+                    ? `a line unread for ${fmtAge(Math.max(...unread.map((f) => n(f.unread_secs))))} · ${names(unread)}`
+                    : `${files.length} transcript${files.length === 1 ? '' : 's'} · ${fmtCompact(linesRead)} lines, every one a row`
+        }
+        tip="every line capture read from each Claude Code transcript changed in the last hour has a row, kept whole, and no complete line has waited unread past the stall limit. Counted from when this server began watching each transcript: a restart starts the count again."
         onClick={() => jump('systems')}
       />
       <Lamp

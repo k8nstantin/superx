@@ -43,6 +43,10 @@ struct AppState {
     /// Since when a transcript change has been waiting to be taken in, as
     /// this server's polls have seen it (#452).
     capture_waiting: std::sync::Arc<std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    /// What the completeness check has counted of each watched transcript,
+    /// across its polls (#489). One check at a time: a second would count
+    /// from the same place.
+    capture_watch: std::sync::Arc<tokio::sync::Mutex<crate::completeness::Watch>>,
 }
 
 impl AppState {
@@ -202,6 +206,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         events: events.clone(),
         answers: Answers::default(),
         capture_waiting: std::sync::Arc::default(),
+        capture_watch: std::sync::Arc::default(),
     };
     // Read once, here: resolving it per request would itself await the
     // substrate that might not answer.
@@ -366,13 +371,22 @@ async fn api_capture(State(state): State<AppState>) -> axum::response::Response 
     let stall = crate::resolved_stall_secs(kernel).await;
     match crate::health::read(kernel).await {
         Ok(facts) => {
-            let view = match state.capture_waiting.lock() {
+            let mut view = match state.capture_waiting.lock() {
                 Ok(mut since) => {
                     let (view, kept) = crate::health::judge(&facts, *since, chrono::Utc::now(), stall);
                     *since = kept;
                     view
                 }
                 Err(_) => crate::health::judge(&facts, None, chrono::Utc::now(), stall).0,
+            };
+            let window = crate::resolved_watch_secs(kernel).await;
+            let mut watch = state.capture_watch.lock().await;
+            view.files = match crate::completeness::check(kernel, &mut watch, chrono::Utc::now(), window).await {
+                Ok(files) => Some(files),
+                Err(e) => {
+                    tracing::warn!(target: "ui", error = %e, "capture completeness got no answer");
+                    None
+                }
             };
             let body = serde_json::to_string(&view).unwrap_or_else(|_| "{}".to_string());
             state.remember("capture", &body);

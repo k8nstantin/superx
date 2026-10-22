@@ -22,6 +22,7 @@ use superx_kernel::{
 pub mod activity;
 pub mod checkout;
 pub mod compare;
+pub mod completeness;
 pub mod export;
 pub mod health;
 pub mod api;
@@ -155,6 +156,12 @@ pub async fn resolved_default_range(kernel: &Kernel) -> String {
 /// page says capture is stalled (#452).
 pub async fn resolved_stall_secs(kernel: &Kernel) -> u64 {
     resolved_secs(kernel, health::STALL_SECS_PARAM, health::DEFAULT_STALL_SECS).await
+}
+
+/// How recently a transcript must have changed for the completeness check
+/// to watch it (#489).
+pub async fn resolved_watch_secs(kernel: &Kernel) -> u64 {
+    resolved_secs(kernel, completeness::WATCH_SECS_PARAM, completeness::DEFAULT_WATCH_SECS).await
 }
 
 pub async fn resolved_cache_secs(kernel: &Kernel) -> u64 {
