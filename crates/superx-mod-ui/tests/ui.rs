@@ -5147,6 +5147,48 @@ async fn the_export_writes_each_second_in_the_order_its_rows_were_captured() {
     }
 }
 
+/// The session view pages back without losing a row inside a second the
+/// index misorders (#487): SurrealDB 3.1's index on a datetime puts `.178`
+/// after `.178501`, so a page cut by its limit held `.178` and `.9` and not
+/// `.178501`, and the next page, older than `.178`, never returned it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_view_pages_back_through_a_second_without_losing_a_row() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-x").await;
+    let at = |t: &str| -> chrono::DateTime<chrono::Utc> { t.parse().expect("ts") };
+    let times = ["2026-10-01T00:00:02.178Z", "2026-10-01T00:00:02.178501Z", "2026-10-01T00:00:02.9Z"];
+    for (n, t) in (81..).zip(times) {
+        let line = serde_json::json!({ "type": "mode", "mode": format!("m{n}") });
+        put_line_at(&kernel, n, &agent, "src-x", at(t), "mode", Some(line)).await;
+    }
+
+    // Two rows a page, each older than the oldest held, as the page asks.
+    let mut held: Vec<superx_mod_ui::api::SseEvent> = Vec::new();
+    for _ in 0..10 {
+        let before = held.first().map(|e| {
+            let id: superx_kernel::types::Uuid = e.id.parse().expect("uuid");
+            (at(&e.valid_from), Some(id))
+        });
+        let page = superx_mod_ui::activity::session_activity(&kernel, session.clone(), 2, before, None)
+            .await
+            .expect("a page");
+        if page.is_empty() {
+            break;
+        }
+        for e in page {
+            if !held.iter().any(|h| h.id == e.id) {
+                held.push(e);
+            }
+        }
+        held.sort_by(|a, b| (at(&a.valid_from), &a.id).cmp(&(at(&b.valid_from), &b.id)));
+    }
+    let order: Vec<&str> = held
+        .iter()
+        .map(|e| ["m81", "m82", "m83"].into_iter().find(|m| e.rendered.contains(m)).unwrap_or("?"))
+        .collect();
+    assert_eq!(order, ["m81", "m82", "m83"], "every row once, in capture order");
+}
+
 /// A session named by its id is found with one read; a name still goes
 /// through the shared resolver, and anything that is not a session says
 /// so as it always has (#461).

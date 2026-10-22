@@ -413,7 +413,8 @@ fn merge_newest(
 /// and a page edge between them skipped the other one for good, because
 /// strict `<` never returned it (#273). The UUIDv7 id breaks the tie, as
 /// the entities chains already do. Without an id (an older client) the
-/// cursor is the time alone.
+/// cursor is the time alone. The engine is asked for the cursor's second
+/// whole and the rows older than the cursor are picked here (#487).
 pub type Before = Option<(chrono::DateTime<chrono::Utc>, Option<superx_kernel::types::Uuid>)>;
 
 /// A keyword the feed is filtered to, lowercased. `None` = no filter.
@@ -459,15 +460,12 @@ fn page_query(table: &str, scope: Option<&str>, before: Before, q: Query, keywor
     if let Some(s) = scope {
         wheres.push(s);
     }
-    // `<=` first, so the engine walks the time index backwards and the
-    // tie is only a filter on it; an `OR` of two ranges instead planned
-    // as a union and a sort (EXPLAIN, #273).
-    match before {
-        Some((_, Some(_))) => {
-            wheres.push("valid_from <= $before AND (valid_from < $before OR id < $before_id)")
-        }
-        Some((_, None)) => wheres.push("valid_from < $before"),
-        None => {}
+    // One range on the time index, walked backwards, through the end of
+    // the cursor's second: the index keeps whole seconds in order but not
+    // the rows within one, so the rows older than the cursor are picked
+    // after the read (#487).
+    if before.is_some() {
+        wheres.push("valid_from < $before");
     }
     if q.is_some() {
         wheres.push(keyword);
@@ -488,11 +486,8 @@ macro_rules! page {
         crate::answered("activity page", || async {
             let mut stmt = $kernel.db().query(&$sql).bind(("limit", $limit));
             $( stmt = stmt.bind($extra); )*
-            if let Some((cut, id)) = $before {
-                stmt = stmt.bind(("before", cut));
-                if let Some(id) = id {
-                    stmt = stmt.bind(("before_id", superx_kernel::types::RecordId::new($table, id)));
-                }
+            if let Some((cut, _)) = $before {
+                stmt = stmt.bind(("before", second_after(cut)));
             }
             if let Some(k) = $q {
                 stmt = stmt.bind(("q", k.to_lowercase()));
@@ -501,6 +496,57 @@ macro_rules! page {
         })
         .await?
     }};
+}
+
+/// The bound a backward page reads to: just past the cursor's second, so
+/// the page holds that second whole (#487).
+fn second_after(cut: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(cut.timestamp() + 1, 1_000).unwrap_or(cut)
+}
+
+/// One table's rows for a backward page, ending on a whole second (#487).
+/// SurrealDB 3.1's index on a datetime orders the rows within a second
+/// wrongly (`.178` after `.178501`), so a page cut by its limit inside a
+/// second could hold one row and miss another captured after it, which
+/// the next page, asked for rows older than the oldest held, never
+/// returned. A full page drops its oldest second, which the next page
+/// reads whole; a second holding more rows than a page is read with a
+/// larger limit.
+async fn whole_seconds<T, F, Fut>(limit: u32, mut read: F) -> Result<Vec<T>>
+where
+    T: LiveRow,
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<T>>>,
+{
+    let mut ask = limit.max(1);
+    loop {
+        let rows = read(ask).await?;
+        if rows.len() < ask as usize {
+            return Ok(rows);
+        }
+        let oldest = rows.iter().map(|r| r.key().1.timestamp()).min();
+        let whole: Vec<T> = rows.into_iter().filter(|r| Some(r.key().1.timestamp()) != oldest).collect();
+        if !whole.is_empty() {
+            return Ok(whole);
+        }
+        ask = ask.saturating_mul(2);
+    }
+}
+
+/// The rows of a backward page older than its cursor, by capture time and
+/// then id (#273), compared here rather than by the index (#487).
+fn older_than<T: LiveRow>(rows: Vec<T>, before: Before) -> Vec<T> {
+    let Some((cut, id)) = before else { return rows };
+    let id = id.map(|u| u.to_string());
+    rows.into_iter()
+        .filter(|r| {
+            let (rid, at) = r.key();
+            match &id {
+                Some(id) => at < cut || (at == cut && superx_ops::record_uuid(rid) < *id),
+                None => at < cut,
+            }
+        })
+        .collect()
 }
 
 /// The NEWEST `limit` messages across ALL sessions, optionally walking
@@ -513,20 +559,26 @@ async fn recent_messages(
     q: Query<'_>,
 ) -> Result<Vec<MessageRecord>> {
     if before.is_none() && q.is_none() {
-        let rows: Vec<MessageRecord> = crate::answered("recent messages", || async {
-            Ok(kernel
-            .db()
-            .query(format!("SELECT {} FROM message ORDER BY valid_from DESC LIMIT $limit", projection("message")))
-            .bind(("limit", limit))
-            .await?
-            .take(0)?)
+        return whole_seconds(limit, |ask| async move {
+            crate::answered("recent messages", || async {
+                Ok(kernel
+                    .db()
+                    .query(format!("SELECT {} FROM message ORDER BY valid_from DESC LIMIT $limit", projection("message")))
+                    .bind(("limit", ask))
+                    .await?
+                    .take(0)?)
+            })
+            .await
         })
-        .await?;
-        return Ok(rows);
+        .await;
     }
     let sql = page_query("message", None, before, q, MSG_MATCH);
-    let rows: Vec<MessageRecord> = page!(kernel, "message", sql, limit, before, q);
-    Ok(rows)
+    let rows: Vec<MessageRecord> = whole_seconds(limit, |ask| {
+        let sql = sql.clone();
+        async move { Ok(page!(kernel, "message", sql, ask, before, q)) }
+    })
+    .await?;
+    Ok(older_than(rows, before))
 }
 
 /// The NEWEST `limit` telemetry events, optionally older than a cursor
@@ -541,11 +593,18 @@ async fn recent_actions(
     q: Query<'_>,
 ) -> Result<Vec<TelemetryRecord>> {
     if before.is_none() && q.is_none() {
-        return crate::answered("recent actions", || kernel.recent_telemetry(limit)).await;
+        return whole_seconds(limit, |ask| async move {
+            crate::answered("recent actions", || kernel.recent_telemetry(ask)).await
+        })
+        .await;
     }
     let sql = page_query("telemetry_stream", None, before, q, &act_match());
-    let rows: Vec<TelemetryRecord> = page!(kernel, "telemetry_stream", sql, limit, before, q);
-    Ok(rows)
+    let rows: Vec<TelemetryRecord> = whole_seconds(limit, |ask| {
+        let sql = sql.clone();
+        async move { Ok(page!(kernel, "telemetry_stream", sql, ask, before, q)) }
+    })
+    .await?;
+    Ok(older_than(rows, before))
 }
 
 /// The GLOBAL feed: everything the OS captured, everyone and every
@@ -585,8 +644,12 @@ pub async fn session_activity(
     let scope = session_scope(kernel, session.clone()).await?;
 
     let msg_sql = page_query("message", Some("session = $sess"), before, q, MSG_MATCH);
-    let messages: Vec<MessageRecord> =
-        page!(kernel, "message", msg_sql, limit, before, q, ("sess", session.clone()));
+    let messages: Vec<MessageRecord> = whole_seconds(limit, |ask| {
+        let (sql, session) = (msg_sql.clone(), session.clone());
+        async move { Ok(page!(kernel, "message", sql, ask, before, q, ("sess", session.clone()))) }
+    })
+    .await?;
+    let messages = older_than(messages, before);
 
     // Two ways an action belongs to a session (see the module doc);
     // without a resolved scope only the subject arm can match — it must
@@ -601,20 +664,27 @@ pub async fn session_activity(
         q,
         &act_match(),
     );
-    let actions: Vec<TelemetryRecord> = match scope {
-        Some((agent, src_key)) => page!(
-            kernel,
-            "telemetry_stream",
-            act_sql,
-            limit,
-            before,
-            q,
-            ("sess", session.clone()),
-            ("agent", agent.clone()),
-            ("src", src_key.clone())
-        ),
-        None => page!(kernel, "telemetry_stream", act_sql, limit, before, q, ("sess", session.clone())),
-    };
+    let actions: Vec<TelemetryRecord> = whole_seconds(limit, |ask| {
+        let (sql, session, scope) = (act_sql.clone(), session.clone(), scope.clone());
+        async move {
+            Ok(match scope {
+                Some((agent, src_key)) => page!(
+                    kernel,
+                    "telemetry_stream",
+                    sql,
+                    ask,
+                    before,
+                    q,
+                    ("sess", session.clone()),
+                    ("agent", agent.clone()),
+                    ("src", src_key.clone())
+                ),
+                None => page!(kernel, "telemetry_stream", sql, ask, before, q, ("sess", session.clone())),
+            })
+        }
+    })
+    .await?;
+    let actions = older_than(actions, before);
     Ok(merge_newest(&messages, &actions, limit))
 }
 
