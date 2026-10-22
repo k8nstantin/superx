@@ -509,10 +509,15 @@ fn second_after(cut: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::
 /// wrongly (`.178` after `.178501`), so a page cut by its limit inside a
 /// second could hold one row and miss another captured after it, which
 /// the next page, asked for rows older than the oldest held, never
-/// returned. A full page drops its oldest second, which the next page
-/// reads whole; a second holding more rows than a page is read with a
-/// larger limit.
-async fn whole_seconds<T, F, Fut>(limit: u32, mut read: F) -> Result<Vec<T>>
+/// returned. So a page holds whole seconds only: a full read's oldest
+/// second may be partial and is left for the next page, and the read grows
+/// until the whole seconds older than the cursor fill the page, or history
+/// ends. The rows older than the cursor are picked first: a page whose read
+/// held only rows at or past the cursor and a partial older second came
+/// back empty, and the page took it for the beginning of history; and a
+/// page cut short of its limit by a dropped second left the feed's first
+/// page with seven rows of ten (#496).
+async fn whole_seconds<T, F, Fut>(limit: u32, before: Before, mut read: F) -> Result<Vec<T>>
 where
     T: LiveRow,
     F: FnMut(u32) -> Fut,
@@ -521,12 +526,16 @@ where
     let mut ask = limit.max(1);
     loop {
         let rows = read(ask).await?;
-        if rows.len() < ask as usize {
+        let full = rows.len() >= ask as usize;
+        // The oldest second the engine reached: a full read may hold only
+        // part of it.
+        let oldest = rows.iter().map(|r| r.key().1.timestamp()).min();
+        let rows = older_than(rows, before);
+        if !full {
             return Ok(rows);
         }
-        let oldest = rows.iter().map(|r| r.key().1.timestamp()).min();
         let whole: Vec<T> = rows.into_iter().filter(|r| Some(r.key().1.timestamp()) != oldest).collect();
-        if !whole.is_empty() {
+        if whole.len() >= limit as usize {
             return Ok(whole);
         }
         ask = ask.saturating_mul(2);
@@ -559,7 +568,7 @@ async fn recent_messages(
     q: Query<'_>,
 ) -> Result<Vec<MessageRecord>> {
     if before.is_none() && q.is_none() {
-        return whole_seconds(limit, |ask| async move {
+        return whole_seconds(limit, None, |ask| async move {
             crate::answered("recent messages", || async {
                 Ok(kernel
                     .db()
@@ -573,12 +582,12 @@ async fn recent_messages(
         .await;
     }
     let sql = page_query("message", None, before, q, MSG_MATCH);
-    let rows: Vec<MessageRecord> = whole_seconds(limit, |ask| {
+    let rows: Vec<MessageRecord> = whole_seconds(limit, before, |ask| {
         let sql = sql.clone();
         async move { Ok(page!(kernel, "message", sql, ask, before, q)) }
     })
     .await?;
-    Ok(older_than(rows, before))
+    Ok(rows)
 }
 
 /// The NEWEST `limit` telemetry events, optionally older than a cursor
@@ -593,18 +602,18 @@ async fn recent_actions(
     q: Query<'_>,
 ) -> Result<Vec<TelemetryRecord>> {
     if before.is_none() && q.is_none() {
-        return whole_seconds(limit, |ask| async move {
+        return whole_seconds(limit, None, |ask| async move {
             crate::answered("recent actions", || kernel.recent_telemetry(ask)).await
         })
         .await;
     }
     let sql = page_query("telemetry_stream", None, before, q, &act_match());
-    let rows: Vec<TelemetryRecord> = whole_seconds(limit, |ask| {
+    let rows: Vec<TelemetryRecord> = whole_seconds(limit, before, |ask| {
         let sql = sql.clone();
         async move { Ok(page!(kernel, "telemetry_stream", sql, ask, before, q)) }
     })
     .await?;
-    Ok(older_than(rows, before))
+    Ok(rows)
 }
 
 /// The GLOBAL feed: everything the OS captured, everyone and every
@@ -644,12 +653,11 @@ pub async fn session_activity(
     let scope = session_scope(kernel, session.clone()).await?;
 
     let msg_sql = page_query("message", Some("session = $sess"), before, q, MSG_MATCH);
-    let messages: Vec<MessageRecord> = whole_seconds(limit, |ask| {
+    let messages: Vec<MessageRecord> = whole_seconds(limit, before, |ask| {
         let (sql, session) = (msg_sql.clone(), session.clone());
         async move { Ok(page!(kernel, "message", sql, ask, before, q, ("sess", session.clone()))) }
     })
     .await?;
-    let messages = older_than(messages, before);
 
     // Two ways an action belongs to a session (see the module doc);
     // without a resolved scope only the subject arm can match — it must
@@ -664,7 +672,7 @@ pub async fn session_activity(
         q,
         &act_match(),
     );
-    let actions: Vec<TelemetryRecord> = whole_seconds(limit, |ask| {
+    let actions: Vec<TelemetryRecord> = whole_seconds(limit, before, |ask| {
         let (sql, session, scope) = (act_sql.clone(), session.clone(), scope.clone());
         async move {
             Ok(match scope {
@@ -684,7 +692,6 @@ pub async fn session_activity(
         }
     })
     .await?;
-    let actions = older_than(actions, before);
     Ok(merge_newest(&messages, &actions, limit))
 }
 

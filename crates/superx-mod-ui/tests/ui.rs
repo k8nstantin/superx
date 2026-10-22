@@ -5114,6 +5114,27 @@ async fn a_shallow_build_folder_is_its_repository_and_its_cut_landed_nothing() {
     let landed = superx_mod_ui::landed::landed(&both, &checkouts, None, utc, &mainlines).await;
     assert_eq!(landed.repos.len(), 1, "{landed:?}");
     assert_eq!((landed.commits, landed.added), (3, 2001), "every commit once: {landed:?}");
+
+    // Another full clone of the same remote stays a repository of its own
+    // (#496): it has its own branches and main line. The build folder
+    // still goes with the clone named for the repository, though another
+    // comes first by path.
+    let other = remote.base.join("a").join("gryphon-data-lake-freq");
+    clone(&other, false);
+    let other_cwd = other.to_string_lossy().into_owned();
+    let three: HashSet<String> = HashSet::from([full_cwd.clone(), other_cwd.clone(), build_cwd.clone()]);
+    let checkouts = superx_mod_ui::checkout::Checkouts::resolve(&three).await;
+    let (f, o, b) = (
+        checkouts.of(&full_cwd).expect("full"),
+        checkouts.of(&other_cwd).expect("other"),
+        checkouts.of(&build_cwd).expect("build"),
+    );
+    assert_ne!(f.key, o.key, "two full clones, two repositories");
+    assert_eq!(b.key, f.key, "the build folder is the clone named for its repository");
+    assert_eq!((b.repo.as_str(), o.repo.as_str()), ("gryphon-data-lake", "gryphon-data-lake-freq"));
+    assert_eq!(checkouts.reader(b).toplevel, f.toplevel);
+    let landed = superx_mod_ui::landed::landed(&three, &checkouts, None, utc, &mainlines).await;
+    assert_eq!(landed.repos.len(), 2, "each full clone read on its own: {landed:?}");
     let _ = std::fs::remove_dir_all(&remote.base);
 }
 
@@ -5293,6 +5314,41 @@ async fn the_completeness_check_finds_a_lost_line_a_kind_only_line_and_an_unread
     append("{\"type\":\"mode\"}\n");
     assert_eq!(counted(&kernel, &mut watch).await, (4, 3, 1, true), "a line waiting unread");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Paging back across a second boundary reaches every row (#496). Twelve
+/// rows in each of two seconds, ten a page: a page whose engine read held
+/// only rows at or past the cursor and part of the older second came back
+/// empty, and the page took it for the beginning of history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_view_pages_back_across_a_second_to_the_first_row() {
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-x").await;
+    for n in 1..=24 {
+        let secs = if n <= 12 { 1 } else { 2 };
+        put_message(&kernel, n, &session, &agent, secs, &format!("m{n}")).await;
+    }
+    let at = |t: &str| -> chrono::DateTime<chrono::Utc> { t.parse().expect("ts") };
+    let mut held: Vec<superx_mod_ui::api::SseEvent> = Vec::new();
+    for _ in 0..20 {
+        let before = held.first().map(|e| {
+            let id: superx_kernel::types::Uuid = e.id.parse().expect("uuid");
+            (at(&e.valid_from), Some(id))
+        });
+        let page = superx_mod_ui::activity::session_activity(&kernel, session.clone(), 10, before, None)
+            .await
+            .expect("a page");
+        if page.is_empty() {
+            break;
+        }
+        for e in page {
+            if !held.iter().any(|h| h.id == e.id) {
+                held.push(e);
+            }
+        }
+        held.sort_by(|a, b| (at(&a.valid_from), &a.id).cmp(&(at(&b.valid_from), &b.id)));
+    }
+    assert_eq!(held.len(), 24, "every row, down to the first");
 }
 
 /// A session named by its id is found with one read; a name still goes
