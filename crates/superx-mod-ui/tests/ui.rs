@@ -5189,6 +5189,112 @@ async fn the_session_view_pages_back_through_a_second_without_losing_a_row() {
     assert_eq!(order, ["m81", "m82", "m83"], "every row once, in capture order");
 }
 
+/// The completeness check (#489): from where capture stood when watching
+/// began, every line capture reads from a transcript has a row, kept whole,
+/// and no complete line waits unread. A line read without a row, a line
+/// kept by its kind alone and a line not read yet are each found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_completeness_check_finds_a_lost_line_a_kind_only_line_and_an_unread_one() {
+    use std::io::Write as _;
+    use superx_kernel::adapters::claude_code::CURSOR_TYPE;
+    use superx_kernel::types::{Object, Value};
+    use superx_mod_ui::completeness::{check, Watch};
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "k").await;
+    let dir = std::env::temp_dir().join(format!("superx-complete-{}", superx_kernel::types::Uuid::new_v7()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let file = dir.join("k.jsonl");
+    let path = file.to_string_lossy().into_owned();
+    let text = |s: &str| Value::String(s.to_string());
+
+    // The session's transcript, and the source capture reads it from.
+    let mut desc = Object::new();
+    desc.insert("name".to_string(), text("claude_code/k"));
+    desc.insert("session".to_string(), text("k"));
+    desc.insert("locator".to_string(), text(&path));
+    kernel.supersede_state(session.clone(), "attr_session_descriptor", Value::Object(desc)).await.expect("session");
+    let source = kernel.create_entity("node_source").await.expect("source");
+    let mut sdesc = Object::new();
+    sdesc.insert("name".to_string(), text("-k"));
+    sdesc.insert("locator".to_string(), text(&dir.to_string_lossy()));
+    sdesc.insert("adapter".to_string(), text("adapter_claude_code"));
+    kernel.supersede_state(source.clone(), "attr_source_descriptor", Value::Object(sdesc)).await.expect("source");
+    kernel.ensure_cursor_type(CURSOR_TYPE, "telemetry", "test").await.expect("cursor type");
+
+    let append = |s: &str| {
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&file).expect("open");
+        f.write_all(s.as_bytes()).expect("append");
+    };
+    // Capture moved its cursor to the transcript's end.
+    let read_all = || async {
+        let len = std::fs::metadata(&file).expect("meta").len();
+        let mut files = Object::new();
+        files.insert(path.clone(), Value::Number((len as i64).into()));
+        let mut meta = Object::new();
+        meta.insert("files".to_string(), Value::Object(files));
+        kernel.write_cursor(source.clone(), CURSOR_TYPE, None, Some(meta)).await.expect("cursor");
+    };
+    let line_row = |kind: &str, whole: bool| {
+        let mut payload = Object::new();
+        payload.insert("kind".to_string(), text(kind));
+        payload.insert("session".to_string(), text("k"));
+        payload.insert("file".to_string(), text(&path));
+        if whole {
+            payload.insert("line".to_string(), Value::Object(Object::new()));
+        }
+        payload
+    };
+    async fn counted(kernel: &Kernel, watch: &mut Watch) -> (i64, i64, i64, bool) {
+        let files = check(kernel, watch, chrono::Utc::now(), 3_600).await.expect("a check");
+        assert_eq!(files.len(), 1, "{files:?}");
+        let f = &files[0];
+        (f.lines, f.rows, f.kind_only, f.unread_secs.is_some())
+    }
+    let mut watch = Watch::default();
+
+    // Lines captured before watching began are not counted.
+    append("{\"type\":\"mode\"}\n{\"type\":\"mode\"}\n");
+    read_all().await;
+    assert_eq!(counted(&kernel, &mut watch).await, (0, 0, 0, false));
+
+    // A message and an attachment, each a row; a blank line, which capture skips.
+    append("{\"type\":\"user\"}\n\n{\"type\":\"attachment\"}\n");
+    kernel
+        .log_message(superx_kernel::message::NewMessage {
+            session: session.clone(),
+            agent: agent.clone(),
+            role: "user".into(),
+            content: "hi".into(),
+            raw: None,
+            seq: None,
+            emitted_at: None,
+        })
+        .await
+        .expect("message");
+    let payload = Value::Object(line_row("attachment", true));
+    kernel.log_telemetry_for_agent("transcript_event", payload, Some(source.clone()), Some(agent.clone())).await.expect("row");
+    read_all().await;
+    assert_eq!(counted(&kernel, &mut watch).await, (2, 2, 0, false), "every line a row");
+
+    // A line capture read and wrote no row for: lost.
+    append("{\"type\":\"ai-title\"}\n");
+    read_all().await;
+    assert_eq!(counted(&kernel, &mut watch).await, (3, 2, 0, false), "a line without a row");
+
+    // A line kept by its kind alone.
+    append("{\"type\":\"mode\"}\n");
+    let payload = Value::Object(line_row("mode", false));
+    kernel.log_telemetry_for_agent("transcript_event", payload, Some(source.clone()), Some(agent.clone())).await.expect("row");
+    read_all().await;
+    assert_eq!(counted(&kernel, &mut watch).await, (4, 3, 1, false), "a line kept by kind only");
+
+    // A complete line capture has not read.
+    append("{\"type\":\"mode\"}\n");
+    assert_eq!(counted(&kernel, &mut watch).await, (4, 3, 1, true), "a line waiting unread");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A session named by its id is found with one read; a name still goes
 /// through the shared resolver, and anything that is not a session says
 /// so as it always has (#461).

@@ -96,6 +96,7 @@ pub fn judge(facts: &Facts, waiting_since: Option<DateTime<Utc>>, now: DateTime<
         waiting_since: since.map(|t| t.to_rfc3339()),
         stall_secs: i64::try_from(stall_secs).unwrap_or(i64::MAX),
         stalled: since.is_some_and(|s| now - s > limit),
+        files: None,
     };
     (view, since)
 }

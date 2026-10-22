@@ -38,6 +38,31 @@ pub struct CaptureView {
     pub stall_secs: i64,
     /// A change has waited longer than that.
     pub stalled: bool,
+    /// Every transcript line captured, whole (#489), for each Claude Code
+    /// transcript changed lately; `None` when the check got no answer.
+    pub files: Option<Vec<CaptureFile>>,
+}
+
+/// One transcript, checked line by line against what capture wrote (#489).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub struct CaptureFile {
+    /// The session, as `<agent>/<session key>`.
+    pub session: String,
+    /// RFC3339: from when its lines are counted — this server began
+    /// watching it.
+    pub since: String,
+    /// The bytes the transcript holds, and the bytes capture has read.
+    pub bytes: i64,
+    pub read: i64,
+    /// How long a complete line has waited unread, in seconds, when one has.
+    pub unread_secs: Option<i64>,
+    /// The lines capture read since then, and the rows it wrote for them:
+    /// fewer rows than lines is a line lost.
+    pub lines: i64,
+    pub rows: i64,
+    /// Lines kept by their kind alone since then: none, since #471.
+    pub kind_only: i64,
 }
 
 #[derive(Debug, Serialize, TS)]
