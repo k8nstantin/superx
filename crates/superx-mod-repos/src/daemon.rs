@@ -33,12 +33,15 @@ pub fn live_pid(instance: &Instance) -> Option<u32> {
 /// removing its pid file (a power loss) leaves a pid the system may have
 /// given to another program since: `stop` never signals that one, and
 /// `start` does not take it for a running module. One that has exited and
-/// is not yet reaped (`<defunct>`) is not running either, though `kill -0`
-/// still answers for it.
+/// is not yet reaped (state `Z`) is not running either, though `kill -0`
+/// still answers for it; its state says so wherever `ps` runs, whatever
+/// name each system's `ps` prints for it.
 fn is_ours(pid: u32) -> bool {
     Command::new("ps")
         .arg("-p")
         .arg(pid.to_string())
+        .arg("-o")
+        .arg("stat=")
         .arg("-o")
         .arg("comm=")
         .stderr(Stdio::null())
@@ -46,7 +49,11 @@ fn is_ours(pid: u32) -> bool {
         .ok()
         .filter(|out| out.status.success())
         .and_then(|out| String::from_utf8(out.stdout).ok())
-        .is_some_and(|comm| Path::new(comm.trim()).file_name().is_some_and(|name| name == EXE_NAME))
+        .is_some_and(|line| {
+            let line = line.trim();
+            let (state, comm) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+            !state.starts_with('Z') && Path::new(comm.trim()).file_name().is_some_and(|name| name == EXE_NAME)
+        })
 }
 
 /// Start the module in the background, unless it is already running.

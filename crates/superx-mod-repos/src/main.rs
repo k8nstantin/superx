@@ -10,7 +10,9 @@
 //! - `superx-repos run`: the process itself, in the foreground; `start`
 //!   runs it in the background.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -154,50 +156,71 @@ async fn report(instance: &Instance) -> Result<String, String> {
 
 /// The process itself, in the order the kernel's boot starts a module:
 /// registered and starting; listening on its URL and active; serving until
-/// asked to stop; then stopped.
+/// asked to stop; then stopped. A stop that comes while it starts, such as
+/// while the substrate is slow to answer, ends it there.
 async fn run(instance: &Instance) -> Result<(), String> {
     if let Some(pid) = daemon::live_pid(instance) {
         return Err(format!("already running (pid {pid}): `superx-repos stop` first"));
     }
     let _log = superx_kernel::logging::init_with_filter(&instance.log_dir(), &instance.log_filter)
         .map_err(|e| e.to_string())?;
-    // Listening for the stop signals before anything says it runs, so a
-    // stop that arrives during startup still ends it in order.
+    // Listening for the stop signals before anything says it runs. Once a
+    // listener exists, a signal no longer ends the process by itself, so
+    // every step of the start is raced against it.
     let interrupt = signal(SignalKind::interrupt()).map_err(|e| format!("SIGINT cannot be watched: {e}"))?;
     let terminate = signal(SignalKind::terminate()).map_err(|e| format!("SIGTERM cannot be watched: {e}"))?;
-    let kernel = connect(instance).await?;
+    let mut stop = Box::pin(stop_signal(interrupt, terminate));
+    let Some(kernel) = unless_stopped(&mut stop, connect(instance)).await else {
+        tracing::info!(target: "repos", "stopped before it reached the substrate");
+        return Ok(());
+    };
+    let kernel = kernel?;
     let started = Instant::now();
-    let entity = registry::starting(&kernel).await.map_err(|e| e.to_string())?;
-    let up = async {
+    let up = unless_stopped(&mut stop, async {
+        let entity = registry::starting(&kernel).await.map_err(|e| e.to_string())?;
         let (listener, url) = listen(&kernel).await?;
         let startup_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         registry::active(&kernel, entity, &url, startup_ms).await.map_err(|e| e.to_string())?;
         let pid = daemon::PidFile::write(instance)?;
         Ok::<_, String>((listener, url, pid))
-    }
+    })
     .await;
     let (listener, url, _pid) = match up {
-        Ok(up) => up,
-        Err(why) => {
+        Some(Ok(up)) => up,
+        Some(Err(why)) => {
             tracing::error!(target: "repos", %why, "not started");
-            if let Err(e) = registry::failed(&kernel, &why).await {
-                tracing::warn!(target: "repos", error = %e, "the registry was not told it failed");
-            }
+            told(registry::failed(&kernel, &why).await, "failed");
             return Err(why);
+        }
+        None => {
+            tracing::info!(target: "repos", "stopped while starting");
+            told(registry::stopped(&kernel).await, "stopped");
+            return Ok(());
         }
     };
     tracing::info!(target: "repos", %url, "running");
-    let served =
-        axum::serve(listener, server::app(kernel.clone())).with_graceful_shutdown(stop(interrupt, terminate)).await;
-    let told = match &served {
-        Ok(()) => registry::stopped(&kernel).await,
-        Err(e) => registry::failed(&kernel, &format!("serving {url}: {e}")).await,
-    };
-    if let Err(e) = told {
-        tracing::warn!(target: "repos", error = %e, "the registry was not told it stopped");
+    let served = axum::serve(listener, server::app(kernel.clone())).with_graceful_shutdown(stop).await;
+    match &served {
+        Ok(()) => told(registry::stopped(&kernel).await, "stopped"),
+        Err(e) => told(registry::failed(&kernel, &format!("serving {url}: {e}")).await, "failed"),
     }
     tracing::info!(target: "repos", "stopped");
     served.map_err(|e| e.to_string())
+}
+
+/// A registry write that did not go through is logged; the process goes on.
+fn told(result: superx_kernel::Result<()>, what: &str) {
+    if let Err(e) = result {
+        tracing::warn!(target: "repos", error = %e, "the registry was not told it {what}");
+    }
+}
+
+/// `step`, unless a stop signal comes first: then `None`.
+async fn unless_stopped<T, S: Future<Output = ()>>(stop: &mut Pin<Box<S>>, step: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        out = step => Some(out),
+        () = stop.as_mut() => None,
+    }
 }
 
 /// Its port from its parameters, and the listener on it.
@@ -209,7 +232,7 @@ async fn listen(kernel: &Kernel) -> Result<(TcpListener, String), String> {
 }
 
 /// Resolves on SIGINT (`superx-repos stop`, ctrl-c) or SIGTERM.
-async fn stop(mut interrupt: Signal, mut terminate: Signal) {
+async fn stop_signal(mut interrupt: Signal, mut terminate: Signal) {
     tokio::select! {
         _ = interrupt.recv() => {}
         _ = terminate.recv() => {}

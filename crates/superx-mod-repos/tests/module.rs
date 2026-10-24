@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use surrealdb::opt::auth::Database;
 use superx_kernel::types::Value;
@@ -221,9 +222,33 @@ fn start_without_a_substrate_says_why_and_leaves_nothing_running() {
     std::fs::remove_dir_all(&home).expect("clean up");
 }
 
+/// A substrate that takes the connection and never answers: `run` waits at
+/// its very first step, as it does when the substrate hangs (#452).
+fn silent_substrate() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let endpoint = format!("ws://{}", listener.local_addr().expect("address"));
+    (listener, endpoint)
+}
+
+/// The connection `run` opens to the substrate: by then it is listening
+/// for the stop signals. Held, so the substrate goes on not answering.
+fn connection_from(listener: &std::net::TcpListener) -> std::net::TcpStream {
+    listener.set_nonblocking(true).expect("non-blocking");
+    let connected = (0..200).find_map(|_| match listener.accept() {
+        Ok((conn, _)) => Some(conn),
+        Err(e) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "accept: {e}");
+            std::thread::sleep(Duration::from_millis(50));
+            None
+        }
+    });
+    connected.expect("superx-repos reached the substrate within 10 s")
+}
+
 #[test]
-fn stop_signals_superx_repos_and_never_another_process() {
-    let home = scratch_home("ws://127.0.0.1:1");
+fn stop_ends_superx_repos_even_while_it_starts_and_never_signals_another_process() {
+    let (substrate, endpoint) = silent_substrate();
+    let home = scratch_home(&endpoint);
     let instance = Instance::read(&home).expect("instance");
     std::fs::create_dir_all(instance.module_dir()).expect("module dir");
 
@@ -236,20 +261,25 @@ fn stop_signals_superx_repos_and_never_another_process() {
     other.kill().expect("kill sleep");
     other.wait().expect("reap sleep");
 
-    // A superx-repos that is running: here, waiting for the root password.
+    // superx-repos, still starting: the substrate took its connection and
+    // never answered. Not reaped until `stop` returns, so it is a zombie
+    // in between, which must not read as running.
     let mut ours = Command::new(EXE)
         .arg("--home")
         .arg(&home)
-        .arg("--initialize")
-        .stdin(Stdio::piped())
+        .arg("run")
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("superx-repos");
+    let _held = connection_from(&substrate);
     std::fs::write(instance.pid_path(), ours.id().to_string()).expect("pid file");
     assert_eq!(daemon::live_pid(&instance), Some(ours.id()));
+    let asked = Instant::now();
     let said = daemon::stop(&instance).expect("stops");
     assert_eq!(said, format!("superx-repos stopped (pid {})\n", ours.id()));
-    assert!(ours.wait().expect("reaped").code().is_none(), "ended by the signal");
+    assert!(asked.elapsed() < Duration::from_secs(5), "stopped while starting, not after a wait: {:?}", asked.elapsed());
+    assert!(ours.wait().expect("reaped").success(), "a stop while starting is an orderly end");
     std::fs::remove_dir_all(&home).expect("clean up");
 }
