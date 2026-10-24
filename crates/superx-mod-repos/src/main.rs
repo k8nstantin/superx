@@ -14,14 +14,16 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use superx_kernel::Kernel;
 use superx_mod_repos::instance::{Instance, PASSWORD_ENV};
-use superx_mod_repos::{daemon, params, registry, server, status, MODULE_NAME, SCHEMA_DDL};
+use superx_mod_repos::{daemon, params, registry, server, status, sweep, MODULE_NAME, SCHEMA_DDL};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::sync::watch;
 
 #[derive(Parser)]
 #[command(
@@ -199,7 +201,24 @@ async fn run(instance: &Instance) -> Result<(), String> {
         }
     };
     tracing::info!(target: "repos", %url, "running");
-    let served = axum::serve(listener, server::app(kernel.clone())).with_graceful_shutdown(stop).await;
+    // The crawler runs beside the page until the stop that ends the page.
+    // However the page ends, the crawler is told and waited for, so a pass
+    // it was in is recorded as stopped.
+    let (asked, watched) = watch::channel(false);
+    let asked = Arc::new(asked);
+    let crawler = tokio::spawn(sweep::run(kernel.clone(), sweep::Stop::new(watched)));
+    let on_stop = {
+        let asked = Arc::clone(&asked);
+        async move {
+            stop.await;
+            asked.send_replace(true);
+        }
+    };
+    let served = axum::serve(listener, server::app(kernel.clone())).with_graceful_shutdown(on_stop).await;
+    asked.send_replace(true);
+    if let Err(e) = crawler.await {
+        tracing::warn!(target: "repos", error = %e, "the crawler did not end cleanly");
+    }
     match &served {
         Ok(()) => told(registry::stopped(&kernel).await, "stopped"),
         Err(e) => told(registry::failed(&kernel, &format!("serving {url}: {e}")).await, "failed"),
