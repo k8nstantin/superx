@@ -27,11 +27,15 @@
 //! no external diff, no optional locks).
 
 pub mod daemon;
+pub mod git;
 pub mod instance;
+pub mod list;
 pub mod params;
 pub mod registry;
 pub mod server;
 pub mod status;
+pub mod store;
+pub mod sweep;
 
 use superx_kernel::{KernelModuleDescriptor, NodeKind};
 

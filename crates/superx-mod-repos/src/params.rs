@@ -85,6 +85,16 @@ pub struct Params {
 }
 
 impl Params {
+    /// Whether a repository is one the operator excluded: by its name, or
+    /// by a prefix of one of its paths.
+    #[must_use]
+    pub fn excludes(&self, name: &str, paths: &[&str]) -> bool {
+        self.exclude
+            .iter()
+            .filter(|e| !e.is_empty())
+            .any(|e| e == name || paths.iter().any(|p| p.starts_with(e.as_str())))
+    }
+
     /// Whether `path` is one the crawler never blames.
     #[must_use]
     pub fn skips_survival(&self, path: &str) -> bool {
@@ -377,6 +387,23 @@ mod tests {
         let port = r.problems.iter().find(|p| p.name == PORT_PARAM).expect("reported");
         assert_eq!(port.found, "70000");
         assert!(r.settings.iter().all(|s| !s.set), "a refused value is not in force");
+    }
+
+    #[test]
+    fn a_repository_is_excluded_by_its_name_or_a_prefix_of_its_path() {
+        let mut values = BTreeMap::new();
+        values.insert(EXCLUDE_PARAM, strings(&["skeema", "/tmp/builds/"]));
+        let p = from_values(&values).params;
+        assert!(p.excludes("skeema", &["/w/skeema"]), "by name");
+        assert!(p.excludes("x", &["/w/x", "/tmp/builds/x/.git"]), "by a prefix of one of its paths");
+        assert!(!p.excludes("superx", &["/w/SuperX"]));
+
+        // An empty entry would be a prefix of every path: the list is the
+        // wrong shape, said so, and nothing is excluded.
+        values.insert(EXCLUDE_PARAM, strings(&["skeema", ""]));
+        let r = from_values(&values);
+        assert!(r.problems.iter().any(|p| p.name == EXCLUDE_PARAM), "{:?}", r.problems);
+        assert!(!r.params.excludes("superx", &["/w/SuperX"]) && !r.params.excludes("skeema", &["/w/skeema"]));
     }
 
     #[test]

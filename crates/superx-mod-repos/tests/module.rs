@@ -198,6 +198,27 @@ async fn holdings_counts_what_the_database_has() {
     let (at, outcome) = h.last_crawl.expect("a crawl ran");
     assert_eq!(outcome, "complete", "the newest crawl, not the first");
     assert_eq!(at.to_rfc3339(), "2026-10-21T10:00:04+00:00");
+    assert_eq!(h.last_pass, None, "no pass yet");
+
+    let pass = superx_mod_repos::store::Sweep {
+        directories_read: 6,
+        repositories_known: 3,
+        repositories_stale: 1,
+        checkouts_known: 4,
+        rows_written: 17,
+        git_calls: 18,
+        outcome: "complete",
+        ..Default::default()
+    };
+    let finished = chrono::DateTime::parse_from_rfc3339("2026-10-24T15:00:00Z").expect("time").to_utc();
+    superx_mod_repos::store::create_sweep(&db, &pass, finished).await.expect("pass recorded");
+    let last = holdings(&db).await.expect("reads").last_pass.expect("a pass ran");
+    assert_eq!((last.finished_at, last.outcome.as_str()), (finished, "complete"));
+    assert_eq!(
+        (last.directories_read, last.repositories_known, last.repositories_stale, last.checkouts_known),
+        (6, 3, 1, 4)
+    );
+    assert_eq!((last.rows_written, last.git_calls, last.git_timeouts), (17, 18, 0));
 }
 
 #[test]

@@ -20,8 +20,9 @@ rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 superx-kernel = { path = "../superx-kernel" }
-tokio = { workspace = true, features = ["signal", "net"] }
+tokio = { workspace = true, features = ["signal", "net", "process", "time", "sync"] }
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 surrealdb.workspace = true

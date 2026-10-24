@@ -4,6 +4,7 @@
 use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
+use superx_kernel::types::Value;
 use superx_kernel::{Db, Kernel, Result};
 
 use crate::params::{self, Resolved};
@@ -17,6 +18,22 @@ pub struct Holdings {
     pub commits: i64,
     /// When the newest crawl finished, and how it ended.
     pub last_crawl: Option<(DateTime<Utc>, String)>,
+    /// The newest pass over the list.
+    pub last_pass: Option<LastPass>,
+}
+
+/// The newest pass over the list, as `status` prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastPass {
+    pub finished_at: DateTime<Utc>,
+    pub outcome: String,
+    pub directories_read: i64,
+    pub repositories_known: i64,
+    pub repositories_stale: i64,
+    pub checkouts_known: i64,
+    pub rows_written: i64,
+    pub git_calls: i64,
+    pub git_timeouts: i64,
 }
 
 /// The counts, and the newest crawl. A count is NONE for an empty table:
@@ -26,7 +43,9 @@ const HOLDINGS: &str = "\
     RETURN (SELECT count() AS n FROM checkout GROUP ALL)[0].n;\
     RETURN (SELECT count() AS n FROM commit GROUP ALL)[0].n;\
     RETURN (SELECT VALUE finished_at FROM crawl ORDER BY valid_from DESC LIMIT 1)[0];\
-    RETURN (SELECT VALUE outcome FROM crawl ORDER BY valid_from DESC LIMIT 1)[0];";
+    RETURN (SELECT VALUE outcome FROM crawl ORDER BY valid_from DESC LIMIT 1)[0];\
+    SELECT finished_at, outcome, directories_read, repositories_known, repositories_stale, checkouts_known, \
+        rows_written, git_calls, git_timeouts, valid_from FROM sweep ORDER BY valid_from DESC LIMIT 1;";
 
 /// Read what the module's own database holds.
 ///
@@ -40,11 +59,38 @@ pub async fn holdings(db: &Db) -> Result<Holdings> {
     let commits: Option<i64> = res.take(2)?;
     let finished: Option<DateTime<Utc>> = res.take(3)?;
     let outcome: Option<String> = res.take(4)?;
+    let passes: Vec<Value> = res.take(5)?;
     Ok(Holdings {
         repositories: repositories.unwrap_or_default(),
         checkouts: checkouts.unwrap_or_default(),
         commits: commits.unwrap_or_default(),
         last_crawl: finished.zip(outcome),
+        last_pass: passes.first().and_then(last_pass),
+    })
+}
+
+fn last_pass(row: &Value) -> Option<LastPass> {
+    let Value::Object(o) = row else { return None };
+    let n = |key: &str| match o.get(key) {
+        Some(Value::Number(n)) => n.to_int(),
+        _ => None,
+    };
+    Some(LastPass {
+        finished_at: match o.get("finished_at") {
+            Some(Value::Datetime(d)) => DateTime::<Utc>::from(*d),
+            _ => return None,
+        },
+        outcome: match o.get("outcome") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return None,
+        },
+        directories_read: n("directories_read")?,
+        repositories_known: n("repositories_known")?,
+        repositories_stale: n("repositories_stale")?,
+        checkouts_known: n("checkouts_known")?,
+        rows_written: n("rows_written")?,
+        git_calls: n("git_calls")?,
+        git_timeouts: n("git_timeouts")?,
     })
 }
 
@@ -66,9 +112,17 @@ pub async fn render(kernel: &Kernel) -> Result<String> {
     let resolved = params::resolve(kernel).await?;
     let database = match kernel.module_db(MODULE_NAME).await {
         Ok(db) => Database::Ready(holdings(&db).await?),
-        Err(e) => Database::Unavailable(e.to_string()),
+        Err(e) => Database::Unavailable(own_hint(&e.to_string())),
     };
     Ok(text(&database, &resolved))
+}
+
+/// The kernel names `superx modules provision <name>` for a module database
+/// it cannot sign in to: a command that knows only the modules linked into
+/// `superx`. This module provisions its own.
+fn own_hint(kernel_words: &str) -> String {
+    let words = kernel_words.split(" — run `superx modules provision").next().unwrap_or(kernel_words);
+    format!("{words}. Provision it with `superx-repos --initialize`")
 }
 
 /// The status text for what was found.
@@ -86,6 +140,27 @@ pub fn text(database: &Database, resolved: &Resolved) -> String {
                 "database    superx/{MODULE_NAME}: {} repositories · {} checkouts · {} commits · {crawl}",
                 h.repositories, h.checkouts, h.commits
             );
+            match &h.last_pass {
+                Some(p) => {
+                    let _ = writeln!(
+                        out,
+                        "last pass   {} ({}): {} directories read · {} repositories, {} stale · {} checkouts · \
+                         {} rows written · {} git calls, {} cut off",
+                        p.finished_at.to_rfc3339(),
+                        p.outcome,
+                        p.directories_read,
+                        p.repositories_known,
+                        p.repositories_stale,
+                        p.checkouts_known,
+                        p.rows_written,
+                        p.git_calls,
+                        p.git_timeouts
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "last pass   none yet");
+                }
+            }
         }
         Database::Unavailable(why) => {
             let _ = writeln!(out, "database    superx/{MODULE_NAME}: not available. {why}");
@@ -122,6 +197,46 @@ mod tests {
             assert!(t.contains(name), "{name} is listed:\n{t}");
         }
         assert!(!t.contains("problems"), "{t}");
+    }
+
+    #[test]
+    fn the_last_pass_says_when_how_it_ended_and_what_it_found() {
+        let h = Holdings {
+            last_pass: Some(LastPass {
+                finished_at: DateTime::parse_from_rfc3339("2026-10-24T15:00:00Z").expect("time").to_utc(),
+                outcome: "partial".to_string(),
+                directories_read: 52,
+                repositories_known: 9,
+                repositories_stale: 1,
+                checkouts_known: 14,
+                rows_written: 37,
+                git_calls: 61,
+                git_timeouts: 2,
+            }),
+            ..Holdings::default()
+        };
+        let t = text(&Database::Ready(h), &from_values(&BTreeMap::new()));
+        assert!(
+            t.contains(
+                "last pass   2026-10-24T15:00:00+00:00 (partial): 52 directories read · 9 repositories, 1 stale · \
+                 14 checkouts · 37 rows written · 61 git calls, 2 cut off"
+            ),
+            "{t}"
+        );
+        let none = text(&Database::Ready(Holdings::default()), &from_values(&BTreeMap::new()));
+        assert!(none.contains("last pass   none yet"), "{none}");
+    }
+
+    #[test]
+    fn an_unprovisioned_database_names_this_modules_own_command() {
+        let kernel = "configuration error: module 'repos' db signin refused (There was a problem with authentication) \
+                      — run `superx modules provision repos` first";
+        assert_eq!(
+            own_hint(kernel),
+            "configuration error: module 'repos' db signin refused (There was a problem with authentication). \
+             Provision it with `superx-repos --initialize`"
+        );
+        assert_eq!(own_hint("cannot connect"), "cannot connect. Provision it with `superx-repos --initialize`");
     }
 
     #[test]
