@@ -5351,6 +5351,23 @@ async fn the_session_view_pages_back_across_a_second_to_the_first_row() {
     assert_eq!(held.len(), 24, "every row, down to the first");
 }
 
+/// Landed work reads every repository the agents worked in (#498): it
+/// stopped at eight, and the rest were left out without a word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn landed_work_reads_every_repository_the_agents_worked_in() {
+    use std::collections::{HashMap, HashSet};
+    let repos: Vec<TestRepo> = (0..9).map(|n| TestRepo::new(&format!("repo-{n}"), "main")).collect();
+    let cwds: HashSet<String> = repos.iter().map(|r| r.cwd().to_string()).collect();
+    let checkouts = superx_mod_ui::checkout::Checkouts::resolve(&cwds).await;
+    let utc = chrono::FixedOffset::east_opt(0).expect("utc");
+    let landed = superx_mod_ui::landed::landed(&cwds, &checkouts, None, utc, &HashMap::new()).await;
+    assert_eq!(landed.repos.len(), 9, "every repository: {:?}", landed.repos.iter().map(|r| &r.name).collect::<Vec<_>>());
+    assert_eq!(landed.commits, 9, "each one's commit");
+    for r in &repos {
+        let _ = std::fs::remove_dir_all(&r.base);
+    }
+}
+
 /// A session named by its id is found with one read; a name still goes
 /// through the shared resolver, and anything that is not a session says
 /// so as it always has (#461).
