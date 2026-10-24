@@ -764,14 +764,31 @@ mod tests {
     use super::*;
 
     /// The bound decides, not the command (#498): a real git read cut off
-    /// at a millisecond is unreadable, and the same read given its time
-    /// answers.
+    /// at its bound is unreadable, and a read given its time answers. The
+    /// read that is cut off can never answer in time, however fast the
+    /// machine: git opens a pipe nothing writes to until the bound has
+    /// passed (#502: a `rev-parse` cut off at 1 ms answered in time on CI).
     #[tokio::test]
     async fn a_read_is_cut_off_by_its_bound_alone() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = std::env::temp_dir().join(format!("superx-ui-bound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let pipe = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&pipe).status().expect("mkfifo runs");
+        assert!(made.success(), "the pipe is made");
+        let path = pipe.to_string_lossy().into_owned();
+        assert!(git_within(here, &["hash-object", &path], 50).await.is_none(), "cut off at its bound");
+        // The abandoned git still waits on the pipe: open it and close it,
+        // so git reads nothing, answers and exits.
+        let released = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || std::fs::OpenOptions::new().write(true).open(&pipe).map(drop)),
+        )
+        .await;
+        assert!(matches!(released, Ok(Ok(Ok(())))), "the abandoned read had the pipe open: {released:?}");
         let args = ["rev-parse", "--show-toplevel"];
-        assert!(git_within(here, &args, 1).await.is_none(), "cut off at 1 ms");
         assert!(git_within(here, &args, HISTORY_TIMEOUT_MS).await.is_some(), "given its time");
+        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
     #[test]
