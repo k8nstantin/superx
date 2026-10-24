@@ -159,26 +159,37 @@ async fn its_url_answers_with_the_status() {
     assert_eq!(r.status(), 404);
 }
 
+/// What a crawl counts beyond the first approval (#501), all zero.
+const NO_COUNTS: &str = "checkouts_read: 0, refs_read: 0, files_read: 0, reflog_read: 0, unreachable_read: 0, \
+    blame_lines_read: 0, bytes_read: 0, commits_new: 0, commit_files_new: 0, lines_added_new: 0, lines_removed_new: 0, \
+    refs_new: 0, refs_moved: 0, refs_gone: 0, refs_rewritten: 0, head_moves_new: 0, placements_changed: 0, \
+    landed_new: 0, survival_changed: 0, survival_delta: 0, git_timeouts: 0, git_ms: 0, rows_written: 0";
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn holdings_counts_what_the_database_has() {
     let db = own_db().await;
     assert_eq!(holdings(&db).await.expect("reads"), Holdings::default(), "a fresh database holds nothing");
 
     for sql in [
-        "CREATE repository:r1 CONTENT { common_dir: '/w/a/.git', name: 'a', found_at: time::now(), valid_from: time::now() }",
-        "CREATE checkout CONTENT { repository: repository:r1, toplevel: '/w/a', found_at: time::now(), valid_from: time::now() }",
-        "CREATE checkout CONTENT { repository: repository:r1, toplevel: '/w/a-wt', found_at: time::now(), valid_from: time::now() }",
+        "CREATE repository:r1 CONTENT { common_dir: '/w/a/.git', name: 'a', found_at: time::now(), valid_from: time::now() }".to_string(),
+        "CREATE checkout CONTENT { repository: repository:r1, toplevel: '/w/a', found_at: time::now(), valid_from: time::now() }".to_string(),
+        "CREATE checkout CONTENT { repository: repository:r1, toplevel: '/w/a-wt', found_at: time::now(), valid_from: time::now() }".to_string(),
         "CREATE commit CONTENT { repository: repository:r1, hash: '0123456789abcdef0123456789abcdef01234567', \
-         authored_at: time::now(), committed_at: time::now(), author: 'me@x', subject: 's', parents: 1, added: 1, \
-         removed: 0, valid_from: time::now() }",
-        "CREATE crawl CONTENT { repository: repository:r1, started_at: d'2026-10-21T09:00:00Z', \
-         finished_at: d'2026-10-21T09:00:05Z', mainline: 'origin/main', mainline_from: 'origin_head', identity: NONE, \
-         tip: NONE, since: NONE, outcome: 'partial', commits_read: 1, files_blamed: 0, files_left: 0, git_calls: 2, \
-         git_failed: 1, note: 'blame timed out', valid_from: d'2026-10-21T09:00:05Z' }",
-        "CREATE crawl CONTENT { repository: repository:r1, started_at: d'2026-10-21T10:00:00Z', \
-         finished_at: d'2026-10-21T10:00:04Z', mainline: 'origin/main', mainline_from: 'origin_head', identity: NONE, \
-         tip: NONE, since: NONE, outcome: 'complete', commits_read: 1, files_blamed: 1, files_left: 0, git_calls: 3, \
-         git_failed: 0, note: NONE, valid_from: d'2026-10-21T10:00:04Z' }",
+         authored_at: time::now(), committed_at: time::now(), author: 'me@x', committer: 'me@x', subject: 's', \
+         body: NONE, parents: 1, added: 1, removed: 0, valid_from: time::now() }"
+            .to_string(),
+        format!(
+            "CREATE crawl CONTENT {{ repository: repository:r1, started_at: d'2026-10-21T09:00:00Z', \
+             finished_at: d'2026-10-21T09:00:05Z', mainline: 'origin/main', mainline_from: 'origin_head', identity: NONE, \
+             tip: NONE, since: NONE, outcome: 'partial', commits_read: 1, files_blamed: 0, files_left: 0, git_calls: 2, \
+             git_failed: 1, note: 'blame timed out', {NO_COUNTS}, valid_from: d'2026-10-21T09:00:05Z' }}"
+        ),
+        format!(
+            "CREATE crawl CONTENT {{ repository: repository:r1, started_at: d'2026-10-21T10:00:00Z', \
+             finished_at: d'2026-10-21T10:00:04Z', mainline: 'origin/main', mainline_from: 'origin_head', identity: NONE, \
+             tip: NONE, since: NONE, outcome: 'complete', commits_read: 1, files_blamed: 1, files_left: 0, git_calls: 3, \
+             git_failed: 0, note: NONE, {NO_COUNTS}, valid_from: d'2026-10-21T10:00:04Z' }}"
+        ),
     ] {
         db.query(sql).await.expect("query").check().expect("row taken");
     }
