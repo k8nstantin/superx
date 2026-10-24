@@ -20,8 +20,6 @@ use tokio::process::Command;
 
 use crate::api::{ChurnPoint, Landed, LandedRepo};
 
-/// Repositories read per request, at most.
-const LANDED_REPOS: usize = 8; // skill-allow: §9-const — read-path bound, not a policy tunable
 /// Files blamed per repository when measuring survival (#405): only the
 /// files the period's landed commits touched, so the bound is on the
 /// work, not on the alphabet (#414).
@@ -32,6 +30,13 @@ const BLAMES_AT_ONCE: usize = 8; // skill-allow: §9-const — read-path bound, 
 
 /// A git call slower than this is abandoned and counted unreadable.
 const GIT_TIMEOUT_MS: u64 = 4_000; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// The model comparison's read of a repository's main line (#498). The
+/// comparison answers outside any request budget, and a read cut off drops
+/// the repository from every chart as unresolved: gryphon-data-lake's takes
+/// 2.4–3.4 s with nothing else running, and ran past `GIT_TIMEOUT_MS`
+/// whenever the daemon was busy.
+const HISTORY_TIMEOUT_MS: u64 = 120_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
 /// Configuration under which a read would run a program the repository
 /// names, overridden on every call (#447): `log.showSignature` hands each
@@ -58,6 +63,11 @@ fn no_diff_drivers(subcommand: &str) -> &'static [&'static str] {
 /// runs, and no optional lock is taken, so no index refresh is written
 /// back (git(1), `GIT_OPTIONAL_LOCKS`).
 pub(crate) async fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    git_within(dir, args, GIT_TIMEOUT_MS).await
+}
+
+/// [`git`], abandoned after `timeout_ms` instead.
+async fn git_within(dir: &Path, args: &[&str], timeout_ms: u64) -> Option<String> {
     let (subcommand, rest) = args.split_first()?;
     let run = Command::new("git")
         .arg("-C")
@@ -68,7 +78,7 @@ pub(crate) async fn git(dir: &Path, args: &[&str]) -> Option<String> {
         .args(rest)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .output();
-    let out = tokio::time::timeout(Duration::from_millis(GIT_TIMEOUT_MS), run)
+    let out = tokio::time::timeout(Duration::from_millis(timeout_ms), run)
         .await
         .ok()?
         .ok()?;
@@ -179,9 +189,6 @@ pub async fn landed(
         repos
             .entry(co.key.clone())
             .or_insert_with(|| (co.toplevel.clone(), co.repo.clone(), co.shallow));
-        if repos.len() >= LANDED_REPOS {
-            break;
-        }
     }
     let since_s = since.map(|s| s.to_rfc3339());
     let mut series: BTreeMap<String, (i64, i64)> = BTreeMap::new();
@@ -532,9 +539,12 @@ fn recover(log: &str, versions: &HashMap<(String, String), String>, seen: &mut H
 /// answer at all.
 pub async fn repo_work(dir: &Path, mainline: &str, since: Option<DateTime<Utc>>) -> Option<RepoWork> {
     let since_s = since.map(|s| s.to_rfc3339());
-    let landed_log = git(
+    // The one read whose failure drops the repository: given the time it
+    // takes (#498).
+    let landed_log = git_within(
         dir,
         &bounded(vec!["log", mainline, "--no-merges", "--no-renames", "--numstat", WORK_FORMAT], since_s.as_deref()),
+        HISTORY_TIMEOUT_MS,
     )
     .await?;
     // A shallow clone's first commit is where its history was cut, not
@@ -752,6 +762,17 @@ fn skip_for_survival(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bound decides, not the command (#498): a real git read cut off
+    /// at a millisecond is unreadable, and the same read given its time
+    /// answers.
+    #[tokio::test]
+    async fn a_read_is_cut_off_by_its_bound_alone() {
+        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let args = ["rev-parse", "--show-toplevel"];
+        assert!(git_within(here, &args, 1).await.is_none(), "cut off at 1 ms");
+        assert!(git_within(here, &args, HISTORY_TIMEOUT_MS).await.is_some(), "given its time");
+    }
 
     #[test]
     fn a_remote_url_names_its_repository() {
