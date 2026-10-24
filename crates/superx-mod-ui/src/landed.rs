@@ -780,8 +780,9 @@ mod tests {
         assert!(git_within(here, &["hash-object", &path], 50).await.is_none(), "cut off at its bound");
         // The abandoned git still waits on the pipe: open it and close it,
         // so git reads nothing, answers and exits.
+        const RELEASE: Duration = Duration::from_secs(10); // skill-allow: §9-duration — test fixture, not a policy
         let released = tokio::time::timeout(
-            Duration::from_secs(10),
+            RELEASE,
             tokio::task::spawn_blocking(move || std::fs::OpenOptions::new().write(true).open(&pipe).map(drop)),
         )
         .await;
