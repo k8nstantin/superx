@@ -17,7 +17,8 @@ export type ExportOptions = {
   timestamps: boolean
   /// Only rows matching the session view's search (when one is active).
   matching: boolean
-  format: 'txt' | 'md'
+  /// A file to read, or every line exactly as captured (#524).
+  format: 'txt' | 'md' | 'jsonl'
 }
 
 export const DEFAULT_EXPORT: ExportOptions = {
@@ -84,7 +85,15 @@ export function exportFileName(session: SessionView, o: ExportOptions, now: Date
   return `${session.agent}-${session.short_id}-${day}.${o.format}`
 }
 
-export const mimeOf = (format: ExportOptions['format']) => (format === 'md' ? 'text/markdown' : 'text/plain')
+/// What the save dialog calls each format.
+const FORMAT_NAMES: Record<ExportOptions['format'], string> = {
+  txt: 'Plain text',
+  md: 'Markdown',
+  jsonl: 'JSON lines',
+}
+
+export const mimeOf = (format: ExportOptions['format']) =>
+  format === 'md' ? 'text/markdown' : format === 'jsonl' ? 'application/x-ndjson' : 'text/plain'
 
 // Where the file goes is the reader's to choose (#444): the browser's own
 // save dialog (File System Access), where it has one. Typed here, not
@@ -115,7 +124,7 @@ export async function chooseWhere(name: string, format: ExportOptions['format'])
     return await pick({
       suggestedName: name,
       id: 'superx-export',
-      types: [{ description: format === 'md' ? 'Markdown' : 'Plain text', accept: { [mimeOf(format)]: [`.${format}`] } }],
+      types: [{ description: FORMAT_NAMES[format], accept: { [mimeOf(format)]: [`.${format}`] } }],
     })
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') return null

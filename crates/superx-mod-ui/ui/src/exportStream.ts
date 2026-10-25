@@ -15,6 +15,16 @@ const END_MARK = 'end of export · '
 /// (…) · 19,317 actions`), or null when the text does not end with it.
 export function summaryOf(tail: string): string | null {
   const last = tail.trimEnd().split('\n').pop() ?? ''
+  // A `jsonl` file ends with `{"end of export": "<the count line>"}` (#524).
+  if (last.startsWith('{')) {
+    try {
+      const end: unknown = JSON.parse(last)
+      const holds = end && typeof end === 'object' ? (end as Record<string, unknown>)['end of export'] : undefined
+      return typeof holds === 'string' ? holds : null
+    } catch {
+      return null
+    }
+  }
   const line = last.replace(/^\*\*end of export\*\* · /, END_MARK)
   return line.startsWith(END_MARK) ? line.slice(END_MARK.length) : null
 }

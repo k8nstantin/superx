@@ -165,6 +165,7 @@ export function SessionExport({
               data={[
                 { value: 'txt', label: 'Plain text (.txt)' },
                 { value: 'md', label: 'Markdown (.md)' },
+                { value: 'jsonl', label: 'Every line as captured (.jsonl)' },
               ]}
             />
           </div>
