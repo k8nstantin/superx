@@ -1,5 +1,6 @@
-//! Claude Desktop adapter tests: signal-vs-noise filtering, multiline
-//! folding, rotation tolerance. Telemetry only — the app stores no
+//! Claude Desktop adapter tests: every record kept whole (#522), multiline
+//! folding, the native host's bracketed records, a log rewritten in place,
+//! a rotated log read to its end. Telemetry only — the app stores no
 //! conversations locally.
 
 mod common;
@@ -56,7 +57,7 @@ async fn desktop_sources(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn signal_lines_become_events_noise_skipped() -> Result<(), Box<dyn Error>> {
+async fn every_record_becomes_an_event() -> Result<(), Box<dyn Error>> {
     let kernel = common::fresh_seeded_kernel().await?;
     let tmp = tempfile::tempdir()?;
     arrange(&kernel, tmp.path()).await?;
@@ -66,18 +67,14 @@ async fn signal_lines_become_events_noise_skipped() -> Result<(), Box<dyn Error>
 
     let report = capture_tick(&kernel, &sources, None).await?;
     assert!(report.errors.is_empty(), "{:?}", report.errors);
-    assert_eq!(
-        report.total(),
-        3,
-        "Starting app + MCP + folded error; health checks and feature refreshes skipped"
-    );
+    assert_eq!(report.total(), 6, "every record, the health checks and feature refreshes too; the error folded");
 
     let recent = kernel.recent_telemetry(20).await?;
     let events: Vec<&superx_kernel::TelemetryRecord> = recent
         .iter()
         .filter(|e| e.lifecycle_event == "desktop_event")
         .collect();
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 6);
     // The multiline error record was folded into one event.
     let folded = events
         .iter()
@@ -91,16 +88,16 @@ async fn signal_lines_become_events_noise_skipped() -> Result<(), Box<dyn Error>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rotation_resets_offset_and_resumes() -> Result<(), Box<dyn Error>> {
+async fn a_log_rewritten_in_place_is_read_from_its_start() -> Result<(), Box<dyn Error>> {
     let kernel = common::fresh_seeded_kernel().await?;
     let tmp = tempfile::tempdir()?;
     arrange(&kernel, tmp.path()).await?;
 
     let sources = desktop_sources(&kernel).await?;
-    assert_eq!(capture_tick(&kernel, &sources, None).await?.total(), 3);
+    assert_eq!(capture_tick(&kernel, &sources, None).await?.total(), 6);
     assert_eq!(capture_tick(&kernel, &sources, None).await?.total(), 0, "cursor holds");
 
-    // Simulate rotation: a fresh, shorter active file.
+    // The same file, rewritten shorter in place.
     fs::write(
         tmp.path().join("main.log"),
         "2026-08-07 11:00:00 [info] Starting app v1.0.2340\n",
@@ -117,5 +114,70 @@ async fn rotation_resets_offset_and_resumes() -> Result<(), Box<dyn Error>> {
         .open(tmp.path().join("main.log"))?;
     writeln!(f, "2026-08-07 11:00:01 [info] beforeQuit handler fired, going down")?;
     assert_eq!(capture_tick(&kernel, &sources, None).await?.total(), 1);
+    Ok(())
+}
+
+/// A rotated log is read to its end before the new one starts (#522):
+/// electron-log renames `main.log` to `main1.log`, and the lines written
+/// since the last read are in the renamed file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotated_log_is_read_to_its_end_before_the_new_one() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    let sources = desktop_sources(&kernel).await?;
+    assert_eq!(capture_tick(&kernel, &sources, None).await?.total(), 6);
+
+    let log = tmp.path().join("main.log");
+    let mut f = fs::OpenOptions::new().append(true).open(&log)?;
+    writeln!(f, "2026-08-07 10:00:06 [info] written before the rotation")?;
+    writeln!(f, "2026-08-07 10:00:07 [info] the last line of the old log")?;
+    drop(f);
+    fs::rename(&log, tmp.path().join("main1.log"))?;
+    fs::write(&log, "2026-08-07 10:00:08 [info] the first line of the new log\n")?;
+
+    assert_eq!(capture_tick(&kernel, &sources, None).await?.total(), 3, "the old log's 2 last lines, then the new log's 1");
+    let recent = kernel.recent_telemetry(50).await?;
+    let lines: Vec<String> = recent
+        .iter()
+        .filter(|e| e.lifecycle_event == "desktop_event")
+        .map(|e| format!("{:?}", e.payload))
+        .collect();
+    for wanted in ["written before the rotation", "the last line of the old log", "the first line of the new log"] {
+        assert!(lines.iter().any(|l| l.contains(wanted)), "{wanted}: {lines:?}");
+    }
+    assert_eq!(capture_tick(&kernel, &sources, None).await?.total(), 0, "nothing read twice");
+    Ok(())
+}
+
+/// The Chrome native host writes bracketed dates; each of its lines is a
+/// record of its own, kept whole (#522).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_native_hosts_bracketed_lines_are_each_a_record() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    fs::write(
+        tmp.path().join("chrome-native-host.log"),
+        concat!(
+            "[2026-08-24 12:19:35 INFO chrome-native-host] Chrome native host starting (version 0.1.0)\n",
+            "[2026-08-24 12:19:35 INFO chrome-native-host] Socket created successfully\n",
+            "[2026-10-20 09:44:18 INFO chrome-native-host] Entering main message loop\n",
+        ),
+    )?;
+    let sources = desktop_sources(&kernel).await?;
+    assert_eq!(sources.len(), 2, "main.log and chrome-native-host.log");
+    let report = capture_tick(&kernel, &sources, None).await?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.total(), 9, "main.log's 6 records and the native host's 3");
+    let recent = kernel.recent_telemetry(50).await?;
+    let host: Vec<String> = recent
+        .iter()
+        .filter(|e| e.lifecycle_event == "desktop_event" && format!("{:?}", e.payload).contains("chrome-native-host]"))
+        .map(|e| format!("{:?}", e.payload))
+        .collect();
+    assert_eq!(host.len(), 3, "one event per line: {host:?}");
+    assert!(host.iter().all(|l| l.matches("chrome-native-host]").count() == 1), "never folded together: {host:?}");
     Ok(())
 }

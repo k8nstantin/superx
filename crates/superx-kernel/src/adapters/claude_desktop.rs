@@ -11,13 +11,16 @@
 //!
 //! - Line format: `YYYY-MM-DD HH:MM:SS [level] message`, local time;
 //!   records may span multiple lines (continuations don't start with
-//!   a date).
-//! - ~99% of lines are polling noise (health checks, feature
-//!   refreshes); only signal-bearing lines become events.
-//! - Rotation: `<name>.log` → `<name>1.log`, one generation kept —
-//!   shrinkage resets the offset. The duplicated
-//!   `unknown-window*.log` renderers are skipped (byte-identical to
-//!   `claude.ai-web*.log`).
+//!   a date). The Chrome native host writes `[YYYY-MM-DD HH:MM:SS LEVEL
+//!   chrome-native-host] message`.
+//! - Every record is captured whole as a `desktop_event`: most are
+//!   polling noise (health checks, feature refreshes), and kept all the
+//!   same (#522).
+//! - Rotation: `<name>.log` → `<name>1.log`, one generation kept. A
+//!   log's inode rides in its cursor: when it changes, the rotated file is
+//!   read to its end before the new log starts from 0; a log that only
+//!   shrank restarts from 0. The duplicated `unknown-window*.log`
+//!   renderers are skipped (byte-identical to `claude.ai-web*.log`).
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -43,24 +46,6 @@ pub const LOGS_ROOT_PARAM: &str = "attr_claude_desktop_logs_root";
 
 /// Cursor type uid for log read positions.
 pub const CURSOR_TYPE: &str = "claude_desktop_logs";
-
-/// Signal markers: a line containing any of these becomes a
-/// `desktop_event`; everything else is polling noise and is skipped.
-/// Format knowledge owned by this adapter (measured ~99% noise).
-const SIGNAL_MARKERS: &[&str] = &[
-    "[MCP]",
-    "[Chrome Extension MCP]",
-    "[Claude in Chrome]",
-    "[CCD]",
-    "MCP Server connection",
-    "Starting app",
-    "beforeQuit",
-    "willQuit",
-    "onQuitCleanup",
-    "account active and logged in",
-    "No persisted sessions",
-    "[error]",
-];
 
 pub struct ClaudeDesktopAdapter;
 
@@ -135,56 +120,54 @@ impl AgentAdapter for ClaudeDesktopAdapter {
             .await?;
 
         let file = PathBuf::from(&source.locator);
-        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let Ok(meta) = file.metadata() else {
+            return Ok(0); // gone for now: its read position is kept
+        };
+        let len = meta.len();
+        let inode = inode_of(&meta);
 
         let prior = kernel
             .latest_cursor(source.entity_id.clone(), CURSOR_TYPE)
             .await?;
-        let mut offset = prior
-            .as_ref()
-            .and_then(|c| c.metadata.as_ref())
-            .and_then(|m| match m.get("offset") {
-                Some(Value::Number(n)) => n.to_int().map(|i| i.max(0) as u64),
-                _ => None,
-            })
-            .unwrap_or(0);
-        if offset > len {
-            offset = 0; // rotated — one generation kept, recapture
-        }
-        if len == offset {
-            return Ok(0);
-        }
+        let number = |key: &str| match prior.as_ref().and_then(|c| c.metadata.as_ref()).and_then(|m| m.get(key)) {
+            Some(Value::Number(n)) => n.to_int(),
+            _ => None,
+        };
+        let mut offset = number("offset").map_or(0, |i| u64::try_from(i).unwrap_or(0));
+        let read_inode = number("inode").and_then(|i| u64::try_from(i).ok());
 
-        let (lines, consumed) = read_complete_lines(&file, offset)?;
-        let records = fold_multiline(&lines);
         let mut events = 0u64;
-        for record in records {
-            if !SIGNAL_MARKERS.iter().any(|m| record.contains(m)) {
-                continue; // measured ~99% polling noise
+        if let (Some(before), Some(now)) = (read_inode, inode) {
+            if before != now {
+                // Rotated: the file read so far is now `<name>1.log`. Its
+                // last lines are read before the new log (#522).
+                let rotated = rotated_file(&file)
+                    .filter(|r| r.metadata().ok().as_ref().and_then(inode_of) == Some(before));
+                if let Some(rotated) = rotated {
+                    events += self.capture_records(kernel, source, &read_rest(&rotated, offset)?).await?;
+                }
+                offset = 0;
             }
-            let mut payload = Object::new();
-            payload.insert("line".to_string(), Value::String(record.clone()));
-            payload.insert(
-                "file".to_string(),
-                Value::String(source.name.clone()),
-            );
-            kernel
-                .log_telemetry_for_agent(
-                    "desktop_event",
-                    Value::Object(payload),
-                    Some(source.entity_id.clone()),
-                    Some(source.agent_id.clone()),
-                )
-                .await?;
-            events += 1;
+        }
+        if offset > len {
+            offset = 0; // shrank in place: recapture from the start
+        }
+        let mut consumed = 0;
+        if len > offset {
+            let (lines, read) = read_complete_lines(&file, offset)?;
+            events += self.capture_records(kernel, source, &lines).await?;
+            consumed = read;
         }
 
-        if consumed > 0 {
+        if consumed > 0 || read_inode != inode {
             let mut metadata = Object::new();
             metadata.insert(
                 "offset".to_string(),
-                Value::Number(((offset + consumed) as i64).into()),
+                Value::Number(i64::try_from(offset + consumed).unwrap_or(i64::MAX).into()),
             );
+            if let Some(inode) = inode {
+                metadata.insert("inode".to_string(), Value::Number(i64::try_from(inode).unwrap_or(i64::MAX).into()));
+            }
             kernel
                 .write_cursor(
                     source.entity_id.clone(),
@@ -199,6 +182,26 @@ impl AgentAdapter for ClaudeDesktopAdapter {
 }
 
 impl ClaudeDesktopAdapter {
+    /// Every record of `lines`, whole, as a `desktop_event` (#522).
+    async fn capture_records(&self, kernel: &Kernel, source: &SourceRef, lines: &[String]) -> Result<u64> {
+        let mut events = 0u64;
+        for record in fold_multiline(lines) {
+            let mut payload = Object::new();
+            payload.insert("line".to_string(), Value::String(record));
+            payload.insert("file".to_string(), Value::String(source.name.clone()));
+            kernel
+                .log_telemetry_for_agent(
+                    "desktop_event",
+                    Value::Object(payload),
+                    Some(source.entity_id.clone()),
+                    Some(source.agent_id.clone()),
+                )
+                .await?;
+            events += 1;
+        }
+        Ok(events)
+    }
+
     async fn logs_root(&self, kernel: &Kernel) -> Result<Option<PathBuf>> {
         if let Some(entity) = kernel
             .find_module_by_name(NodeKind::Adapter, ADAPTER_NAME)
@@ -219,12 +222,12 @@ impl ClaudeDesktopAdapter {
 }
 
 /// Fold continuation lines into their parent record: a new record
-/// starts with a `YYYY-MM-DD ` date prefix; anything else belongs to
+/// starts with a date (see [`starts_record`]); anything else belongs to
 /// the previous line (Node error dumps span multiple lines).
 fn fold_multiline(lines: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in lines {
-        if starts_with_date(line) || out.is_empty() {
+        if starts_record(line) || out.is_empty() {
             out.push(line.clone());
         } else if let Some(last) = out.last_mut() {
             last.push('\n');
@@ -234,8 +237,10 @@ fn fold_multiline(lines: &[String]) -> Vec<String> {
     out
 }
 
-fn starts_with_date(line: &str) -> bool {
-    let b = line.as_bytes();
+/// Does `line` start a record: electron-log's `YYYY-MM-DD ` date, or the
+/// native host's bracketed `[YYYY-MM-DD `?
+fn starts_record(line: &str) -> bool {
+    let b = line.strip_prefix('[').unwrap_or(line).as_bytes();
     b.len() > 10
         && b[0].is_ascii_digit()
         && b[1].is_ascii_digit()
@@ -244,6 +249,37 @@ fn starts_with_date(line: &str) -> bool {
         && b[4] == b'-'
         && b[7] == b'-'
         && b[10] == b' '
+}
+
+/// The rotated generation of a log: `<name>.log` → `<name>1.log`.
+fn rotated_file(file: &Path) -> Option<PathBuf> {
+    let stem = file.file_stem()?.to_string_lossy().to_string();
+    Some(file.with_file_name(format!("{stem}1.log")))
+}
+
+/// A file's inode: the same file under a new name keeps it.
+#[cfg(unix)]
+fn inode_of(meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(meta.ino())
+}
+
+#[cfg(not(unix))]
+fn inode_of(_meta: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// Every line of `file` from `offset` to its end, a last line without its
+/// newline included: a rotated log is never written again.
+fn read_rest(file: &Path, offset: u64) -> Result<Vec<String>> {
+    let mut f = std::fs::File::open(file)
+        .map_err(|e| KernelError::Module(format!("open {}: {e}", file.display())))?;
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|e| KernelError::Module(format!("seek {}: {e}", file.display())))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)
+        .map_err(|e| KernelError::Module(format!("read {}: {e}", file.display())))?;
+    Ok(String::from_utf8_lossy(&buf).lines().map(str::to_string).collect())
 }
 
 fn read_complete_lines(file: &Path, offset: u64) -> Result<(Vec<String>, u64)> {
