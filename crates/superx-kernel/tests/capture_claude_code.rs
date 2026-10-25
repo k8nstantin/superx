@@ -14,7 +14,7 @@ use superx_kernel::adapters::claude_code::{
 };
 use superx_kernel::capture::{capture_tick, discover_paired};
 use superx_kernel::registry::{KernelModule as _, NodeKind};
-use superx_kernel::types::Value;
+use superx_kernel::types::{Decimal, Number, Value};
 use superx_kernel::Kernel;
 
 /// Only this adapter's sources — the other adapters linked into this
@@ -294,6 +294,81 @@ async fn every_line_is_kept_whole() -> Result<(), Box<dyn Error>> {
         "the unparseable line, whole"
     );
     Ok(())
+}
+
+/// A line is kept exactly as written (#516): a key holding `null` is still
+/// there when read back from the engine, a float keeps its last bit, and an
+/// integer beyond `i64` stays exact as a decimal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nulls_and_numbers_are_kept_exactly() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    fs::write(
+        tmp.path().join("projects").join("-tmp-proj").join("sess-n.jsonl"),
+        concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"exact"}],"stop_sequence":null,"usage":{"fallback_credit":null,"iterations":[null]}},"big":18446744073709551615,"sessionId":"sess-n","timestamp":"2026-08-07T11:00:00.000Z"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok","tool_use_id":"t1"}]},"toolUseResult":{"durationSeconds":9.577058125019073,"returnCodeInterpretation":null},"sessionId":"sess-n","timestamp":"2026-08-07T11:00:01.000Z"}"#,
+            "\n",
+            r#"{"type":"mode","mode":null,"ratio":0.1,"sessionId":"sess-n"}"#,
+            "\n"
+        ),
+    )?;
+    let sources = cc_sources(&kernel).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let session = kernel
+        .find_entity_by_name("node_session", "attr_session_descriptor", "claude_code/sess-n")
+        .await?
+        .expect("session captured");
+    let raws: Vec<Value> =
+        kernel.session_messages(session, 10).await?.into_iter().filter_map(|m| m.raw.map(Value::Object)).collect();
+    let [reply, result] = raws.as_slice() else {
+        return Err(format!("two conversation lines, not {}", raws.len()).into());
+    };
+    assert!(matches!(at(reply, &["message", "stop_sequence"]), Some(Value::Null)), "{reply:?}");
+    assert!(matches!(at(reply, &["message", "usage", "fallback_credit"]), Some(Value::Null)), "{reply:?}");
+    assert!(
+        matches!(at(reply, &["message", "usage", "iterations"]), Some(Value::Array(a)) if matches!(a.as_slice(), [Value::Null])),
+        "{reply:?}"
+    );
+    assert!(
+        matches!(at(reply, &["big"]), Some(Value::Number(Number::Decimal(d))) if *d == Decimal::from(u64::MAX)),
+        "an integer beyond i64 stays exact: {:?}",
+        at(reply, &["big"])
+    );
+    let duration: f64 = "9.577058125019073".parse()?;
+    assert!(
+        matches!(at(result, &["toolUseResult", "durationSeconds"]), Some(Value::Number(Number::Float(f))) if f.to_bits() == duration.to_bits()),
+        "a float keeps its last bit: {:?}",
+        at(result, &["toolUseResult", "durationSeconds"])
+    );
+    assert!(matches!(at(result, &["toolUseResult", "returnCodeInterpretation"]), Some(Value::Null)), "{result:?}");
+
+    let recent = kernel.recent_telemetry(50).await?;
+    let mode = recent
+        .iter()
+        .find_map(|e| match at(&e.payload, &["line", "type"]) {
+            Some(Value::String(t)) if t == "mode" => at(&e.payload, &["line"]).cloned(),
+            _ => None,
+        })
+        .ok_or("the mode line is captured")?;
+    assert!(matches!(at(&mode, &["mode"]), Some(Value::Null)), "{mode:?}");
+    assert!(
+        matches!(at(&mode, &["ratio"]), Some(Value::Number(Number::Float(f))) if f.to_bits() == 0.1_f64.to_bits()),
+        "{mode:?}"
+    );
+    Ok(())
+}
+
+/// The value at `path` inside `v`, through objects.
+fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(v, |here, key| match here {
+        Value::Object(o) => o.get(*key),
+        _ => None,
+    })
 }
 
 /// A subagent's own transcript, and a workflow's agents and journal, are

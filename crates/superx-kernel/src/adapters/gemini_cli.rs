@@ -33,7 +33,7 @@ use surrealdb::types::{Object, RecordId, Value};
 
 use crate::capture::{AgentAdapter, DiscoveredSource, SourceRef, ADAPTERS};
 use crate::error::{KernelError, Result};
-use crate::message::{json_to_object, NewMessage};
+use crate::message::{line_to_object, NewMessage};
 use crate::registry::{KernelModule, KernelModuleDescriptor, NodeKind, KERNEL_MODULES};
 use crate::substrate::Kernel;
 
@@ -285,7 +285,7 @@ impl GeminiCliAdapter {
             payload.insert("kind".to_string(), Value::String(kind.to_string()));
             payload.insert("session".to_string(), Value::String(session_key));
             payload.insert("file".to_string(), Value::String(file_key));
-            payload.insert("line".to_string(), Value::Object(json_to_object(json)));
+            payload.insert("line".to_string(), Value::Object(line_to_object(json)));
             kernel
                 .log_telemetry_for_agent(
                     "transcript_event",
@@ -330,7 +330,7 @@ impl GeminiCliAdapter {
                         agent: source.agent_id.clone(),
                         role: role.to_string(),
                         content: content.clone(),
-                        raw: Some(json_to_object(&sanitized)),
+                        raw: Some(line_to_object(&sanitized)),
                         seq: None,
                         emitted_at,
                     })
@@ -386,7 +386,7 @@ impl GeminiCliAdapter {
                 if let Some(c) = json.get("content").and_then(|v| v.as_str()) {
                     payload.insert("content".to_string(), Value::String(c.to_string()));
                 }
-                payload.insert("line".to_string(), Value::Object(json_to_object(json)));
+                payload.insert("line".to_string(), Value::Object(line_to_object(json)));
                 kernel
                     .log_telemetry_for_agent(
                         "transcript_event",
@@ -405,7 +405,7 @@ impl GeminiCliAdapter {
                 payload.insert("session".to_string(), Value::String(session_key));
                 let snippet: String = json.to_string().chars().take(500).collect();
                 payload.insert("snippet".to_string(), Value::String(snippet));
-                payload.insert("line".to_string(), Value::Object(json_to_object(json)));
+                payload.insert("line".to_string(), Value::Object(line_to_object(json)));
                 kernel
                     .log_telemetry_for_agent(
                         "transcript_raw",

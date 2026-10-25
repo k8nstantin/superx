@@ -167,3 +167,45 @@ async fn header_set_and_info_lines_are_kept_whole() -> Result<(), Box<dyn Error>
     }
     Ok(())
 }
+
+/// A record and a header keep their nulls (#516): read back from the
+/// engine, a key holding `null` is still there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_keeps_its_nulls() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    let chats = tmp.path().join("tmp").join("proj-slug").join("chats");
+    let body = [
+        r#"{"sessionId":"g-sess-n","projectHash":"abc","startTime":"2026-08-07T10:00:00.000Z","lastUpdated":"2026-08-07T10:00:00.000Z","kind":"main","summary":null}"#,
+        r#"{"id":"u-n","type":"user","timestamp":"2026-08-07T10:00:01.000Z","content":[{"text":"hi"}],"displayContent":null}"#,
+    ]
+    .join("\n");
+    fs::write(chats.join("session-2026-08-07T10-00-gsessn.jsonl"), body + "\n")?;
+    let sources = gemini_sources(&kernel).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let session = kernel
+        .find_entity_by_name("node_session", "attr_session_descriptor", "gemini_cli/g-sess-n")
+        .await?
+        .expect("session entity from header line");
+    let messages = kernel.session_messages(session, 10).await?;
+    let raw = messages.first().and_then(|m| m.raw.as_ref()).ok_or("the user record is captured")?;
+    assert!(matches!(raw.get("displayContent"), Some(Value::Null)), "{raw:?}");
+
+    let recent = kernel.recent_telemetry(50).await?;
+    let header = recent
+        .iter()
+        .find_map(|e| match &e.payload {
+            Value::Object(o) if matches!(o.get("session"), Some(Value::String(s)) if s == "g-sess-n")
+                && matches!(o.get("kind"), Some(Value::String(k)) if k == "header") =>
+            {
+                o.get("line").cloned()
+            }
+            _ => None,
+        })
+        .ok_or("the header is kept whole")?;
+    assert!(matches!(&header, Value::Object(o) if matches!(o.get("summary"), Some(Value::Null))), "{header:?}");
+    Ok(())
+}
