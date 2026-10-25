@@ -22,6 +22,7 @@ serde_json.workspace = true
 superx-kernel = { path = "../superx-kernel" }
 tokio = { workspace = true, features = ["signal", "net"] }
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 surrealdb.workspace = true

@@ -8,20 +8,23 @@
 //!   used for that one session and never stored.
 //! - `superx-performance start | stop | status`
 //! - `superx-performance run`: the process itself, in the foreground;
-//!   `start` runs it in the background.
+//!   `start` runs it in the background. It serves its URL and reads every
+//!   captured line into its database, pass after pass.
 
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use superx_kernel::Kernel;
 use superx_mod_performance::instance::{Instance, PASSWORD_ENV};
-use superx_mod_performance::{daemon, params, registry, server, status, MODULE_NAME, SCHEMA_DDL};
+use superx_mod_performance::{daemon, params, reader, registry, server, status, MODULE_NAME, SCHEMA_DDL};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::sync::watch;
 
 #[derive(Parser)]
 #[command(
@@ -156,9 +159,9 @@ async fn report(instance: &Instance) -> Result<String, String> {
 }
 
 /// The process itself, in the order the kernel's boot starts a module:
-/// registered and starting; listening on its URL and active; serving until
-/// asked to stop; then stopped. A stop that comes while it starts, such as
-/// while the substrate is slow to answer, ends it there.
+/// registered and starting; listening on its URL and active; serving and
+/// reading until asked to stop; then stopped. A stop that comes while it
+/// starts, such as while the substrate is slow to answer, ends it there.
 async fn run(instance: &Instance) -> Result<(), String> {
     if let Some(pid) = daemon::live_pid(instance) {
         return Err(format!("already running (pid {pid}): `superx-performance stop` first"));
@@ -201,7 +204,24 @@ async fn run(instance: &Instance) -> Result<(), String> {
         }
     };
     tracing::info!(target: "performance", %url, "running");
-    let served = axum::serve(listener, server::app(kernel.clone(), port)).with_graceful_shutdown(stop).await;
+    // The reader runs beside the page until the stop that ends the page.
+    // However the page ends, the reader is told and waited for, so a pass
+    // it was in is recorded as stopped.
+    let (asked, watched) = watch::channel(false);
+    let asked = Arc::new(asked);
+    let reading = tokio::spawn(reader::run(kernel.clone(), reader::Stop::new(watched)));
+    let on_stop = {
+        let asked = Arc::clone(&asked);
+        async move {
+            stop.await;
+            asked.send_replace(true);
+        }
+    };
+    let served = axum::serve(listener, server::app(kernel.clone(), port)).with_graceful_shutdown(on_stop).await;
+    asked.send_replace(true);
+    if let Err(e) = reading.await {
+        tracing::warn!(target: "performance", error = %e, "the reader did not end cleanly");
+    }
     match &served {
         Ok(()) => told(registry::stopped(&kernel).await, "stopped"),
         Err(e) => told(registry::failed(&kernel, &format!("serving {url}: {e}")).await, "failed"),

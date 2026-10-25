@@ -1,0 +1,484 @@
+//! The reader (#508), end to end: a kernel holding a session's lines as
+//! capture keeps them, and the module's own database, both on the
+//! in-memory engine. What a pass writes is read back from the database.
+//! Every pass after the first reads the minute before the last one stopped,
+//! so these tests read lines again on purpose.
+
+use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
+use superx_kernel::message::json_to_object;
+use superx_kernel::types::{Object, RecordId, Value};
+use superx_kernel::{Kernel, REQUIRED_METAMODEL_TYPES};
+use superx_mod_performance::reader::{pass_on, Reader, Stop};
+use superx_mod_performance::{MODULE_NAME, SCHEMA_DDL};
+use tokio::sync::watch;
+
+const KERNEL_PASSWORD: &str = "test-kernel-password-for-mem-engine";
+
+async fn booted_kernel() -> Kernel {
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db("kernel").await.expect("nsdb");
+    let ddl = superx_kernel::SCHEMA_DDL.replace("$SUPERX_KERNEL_PASSWORD", KERNEL_PASSWORD);
+    db.query(ddl).await.expect("ddl").check().expect("ddl ok");
+    db.signin(surrealdb::opt::auth::Database {
+        namespace: "superx".to_string(),
+        database: "kernel".to_string(),
+        username: "superx_kernel".to_string(),
+        password: KERNEL_PASSWORD.to_string(),
+    })
+    .await
+    .expect("service sign-in");
+    let kernel = Kernel::from_db(db);
+    for t in REQUIRED_METAMODEL_TYPES {
+        kernel.ensure_type_definition(t.uid, t.category, t.memory_tier).await.expect("metamodel");
+    }
+    kernel
+}
+
+async fn own_db() -> superx_kernel::Db {
+    let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+    db.use_ns("superx").use_db(MODULE_NAME).await.expect("nsdb");
+    db.query(SCHEMA_DDL.replace("$SUPERX_MODULE_PASSWORD", "test-password"))
+        .await
+        .expect("provision")
+        .check()
+        .expect("provision is clean");
+    db
+}
+
+/// An agent and one of its sessions, as capture registers them.
+async fn agent_and_session(kernel: &Kernel, agent_name: &str, key: &str) -> (RecordId, RecordId) {
+    let agent = kernel.create_entity("node_agent").await.expect("agent");
+    let mut d = Object::new();
+    d.insert("name".to_string(), Value::String(agent_name.to_string()));
+    kernel.supersede_state(agent.clone(), "attr_agent_descriptor", Value::Object(d)).await.expect("agent descriptor");
+    let session = kernel.create_entity("node_session").await.expect("session");
+    let mut d = Object::new();
+    d.insert("name".to_string(), Value::String(format!("{agent_name}/{key}")));
+    d.insert("session".to_string(), Value::String(key.to_string()));
+    kernel.supersede_state(session.clone(), "attr_session_descriptor", Value::Object(d)).await.expect("session descriptor");
+    (agent, session)
+}
+
+fn start() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 25, 9, 0, 0).single().expect("time")
+}
+
+/// An id the kernel would give a line it captured at `at`.
+fn id_at(table: &str, at: DateTime<Utc>) -> RecordId {
+    let stamp = uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        u64::try_from(at.timestamp()).expect("after 1970"),
+        at.timestamp_subsec_nanos(),
+    );
+    RecordId::new(table, superx_kernel::types::Uuid::from(uuid::Uuid::new_v7(stamp)))
+}
+
+/// The session's lines, captured a tenth of a second apart from `from`.
+struct Capture<'a> {
+    kernel: &'a Kernel,
+    agent: RecordId,
+    session: RecordId,
+    key: String,
+    at: DateTime<Utc>,
+}
+
+impl Capture<'_> {
+    fn tick(&mut self) -> DateTime<Utc> {
+        self.at += TimeDelta::milliseconds(100);
+        self.at
+    }
+
+    /// A conversation line, as `message` keeps it.
+    async fn message(&mut self, json: serde_json::Value) {
+        let at = self.tick();
+        let mut json = json;
+        json["timestamp"] = serde_json::Value::String(at.to_rfc3339());
+        json["sessionId"] = serde_json::Value::String(self.key.clone());
+        self.kernel
+            .db()
+            .query(
+                "CREATE $id CONTENT { session: $sess, agent: $agent, role: 'x', content: '', raw: $raw, \
+                 emitted_at: $at, valid_from: $at }",
+            )
+            .bind(("id", id_at("message", at)))
+            .bind(("sess", self.session.clone()))
+            .bind(("agent", self.agent.clone()))
+            .bind(("raw", Value::Object(json_to_object(&json))))
+            .bind(("at", at))
+            .await
+            .expect("line")
+            .check()
+            .expect("line taken");
+    }
+
+    /// Any other line, as a `transcript_event` keeps it whole.
+    async fn event(&mut self, json: serde_json::Value) {
+        let at = self.tick();
+        let mut json = json;
+        json["timestamp"] = serde_json::Value::String(at.to_rfc3339());
+        let kind = json["type"].as_str().unwrap_or_default().to_string();
+        let payload = serde_json::json!({ "kind": kind, "session": self.key, "file": "/t.jsonl", "line": json });
+        self.kernel
+            .db()
+            .query("CREATE $id CONTENT { lifecycle_event: 'transcript_event', payload: $payload, agent: $agent, valid_from: $at }")
+            .bind(("id", id_at("telemetry_stream", at)))
+            .bind(("payload", Value::Object(json_to_object(&payload))))
+            .bind(("agent", self.agent.clone()))
+            .bind(("at", at))
+            .await
+            .expect("event")
+            .check()
+            .expect("event taken");
+    }
+
+    /// Something else the firehose holds, which is not a line.
+    async fn noise(&mut self) {
+        let at = self.tick();
+        self.kernel
+            .db()
+            .query("CREATE $id CONTENT { lifecycle_event: 'message_captured', payload: { role: 'user' }, valid_from: $at }")
+            .bind(("id", id_at("telemetry_stream", at)))
+            .bind(("at", at))
+            .await
+            .expect("noise")
+            .check()
+            .expect("noise taken");
+    }
+}
+
+fn usage(output: i64, thinking: i64) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": 5, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 2000, "output_tokens": output,
+        "service_tier": "standard", "output_tokens_details": { "thinking_tokens": thinking },
+        "server_tool_use": { "web_search_requests": 0, "web_fetch_requests": 0 }
+    })
+}
+
+fn block(id: &str, index: i64, content: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    let mut line = serde_json::json!({
+        "type": "assistant", "cwd": "/repo", "gitBranch": "main", "entrypoint": "cli", "version": "2.1.304",
+        "isSidechain": false, "requestId": "req", "effort": "max", "apiBlockIndex": index,
+        "message": { "id": id, "model": "claude-opus-5-5", "stop_reason": "tool_use", "content": [content], "usage": usage(900, 600) }
+    });
+    if let (Some(l), serde_json::Value::Object(e)) = (line.as_object_mut(), extra) {
+        l.extend(e);
+    }
+    line
+}
+
+fn result(call: &str, content: &str, reported: serde_json::Value, error: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "user", "cwd": "/repo", "gitBranch": "main",
+        "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": call, "content": content, "is_error": error }] },
+        "toolUseResult": reported
+    })
+}
+
+/// A Claude Code session: a prompt, a reply that thinks, answers and
+/// commits, an edit, a test run, an interrupted call, and the lines Claude
+/// Code keeps beside the conversation.
+async fn claude_session(c: &mut Capture<'_>) {
+    c.message(serde_json::json!({ "type": "user", "cwd": "/repo", "gitBranch": "main", "origin": { "kind": "human" }, "message": { "role": "user", "content": "commit the fix" } })).await;
+    c.noise().await;
+    c.message(block("msg_1", 0, serde_json::json!({ "type": "thinking", "thinking": "", "signature": "s" }), serde_json::json!({ "thinkingDurationMs": 3100 }))).await;
+    c.message(block("msg_1", 1, serde_json::json!({ "type": "text", "text": "Committing." }), serde_json::json!({}))).await;
+    c.message(block("msg_1", 2, serde_json::json!({ "type": "tool_use", "id": "call_commit", "name": "Bash", "input": { "command": "git commit -m 'fix: x'", "description": "Commit" } }), serde_json::json!({}))).await;
+    c.message(result("call_commit", "[main abc1234] fix: x", serde_json::json!({ "stdout": "[main abc1234] fix: x\n 1 file changed", "stderr": "", "interrupted": false }), false)).await;
+    c.event(serde_json::json!({ "type": "attachment", "cwd": "/repo", "attachment": { "type": "queued_command", "prompt": "and run the tests", "origin": { "kind": "human" } } })).await;
+    c.message(block("msg_2", 0, serde_json::json!({ "type": "tool_use", "id": "call_edit", "name": "Edit", "input": { "file_path": "/repo/a.rs", "old_string": "a", "new_string": "b" } }), serde_json::json!({}))).await;
+    c.message(result("call_edit", "updated", serde_json::json!({ "filePath": "/repo/a.rs", "oldString": "a", "newString": "b", "userModified": false, "structuredPatch": [{ "lines": ["-a", "+b", "+c"] }] }), false)).await;
+    c.message(block("msg_3", 0, serde_json::json!({ "type": "tool_use", "id": "call_test", "name": "Bash", "input": { "command": "cd /repo && cargo test" } }), serde_json::json!({}))).await;
+    c.message(result("call_test", "ok", serde_json::json!({ "stdout": "    Finished `test` profile\ntest result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.1s", "stderr": "" }), false)).await;
+    c.message(block("msg_4", 0, serde_json::json!({ "type": "tool_use", "id": "call_long", "name": "Bash", "input": { "command": "sleep 100" } }), serde_json::json!({}))).await;
+    c.message(serde_json::json!({ "type": "user", "cwd": "/repo", "message": { "role": "user", "content": [{ "type": "text", "text": "[Request interrupted by user for tool use]" }] } })).await;
+    c.event(serde_json::json!({ "type": "system", "subtype": "turn_duration", "cwd": "/repo", "durationMs": 9000, "messageCount": 12 })).await;
+    c.event(serde_json::json!({ "type": "system", "subtype": "compact_boundary", "cwd": "/repo", "compactMetadata": { "trigger": "auto", "preTokens": 900_000, "postTokens": 20_000, "cumulativeDroppedTokens": 880_000, "durationMs": 60_000 } })).await;
+    c.event(serde_json::json!({ "type": "system", "subtype": "away_summary", "cwd": "/repo/sub", "gitBranch": "main", "content": "While you were away: committed." })).await;
+}
+
+async fn count(db: &superx_kernel::Db, table: &str) -> i64 {
+    let n: Option<i64> =
+        db.query(format!("RETURN (SELECT count() AS n FROM {table} GROUP ALL)[0].n")).await.expect("count").take(0).expect("n");
+    n.unwrap_or(0)
+}
+
+async fn rows(db: &superx_kernel::Db, sql: &str) -> Vec<Value> {
+    db.query(sql).await.expect("query").take(0).expect("rows")
+}
+
+fn text(v: &Value, key: &str) -> Option<String> {
+    match v {
+        Value::Object(o) => match o.get(key) {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn int(v: &Value, key: &str) -> Option<i64> {
+    match v {
+        Value::Object(o) => match o.get(key) {
+            Some(Value::Number(n)) => n.to_int(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Rows in a known order: the engine's order of rows written within a
+/// second is not one to rely on (#486).
+fn sorted<T: Ord>(items: impl Iterator<Item = T>) -> Vec<T> {
+    let mut v: Vec<T> = items.collect();
+    v.sort();
+    v
+}
+
+fn never_stop() -> (watch::Sender<bool>, Stop) {
+    let (asked, watched) = watch::channel(false);
+    (asked, Stop::new(watched))
+}
+
+const TABLES: [&str; 15] = [
+    "session", "session_place", "prompt", "reply", "reply_state", "thinking", "tool_call", "tool_result", "edit",
+    "git_event", "test_run", "build_run", "turn", "compaction", "away",
+];
+
+async fn every_count(db: &superx_kernel::Db) -> Vec<(&'static str, i64)> {
+    let mut out = Vec::new();
+    for t in TABLES {
+        out.push((t, count(db, t).await));
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_pass_reads_every_line_into_its_facts_and_a_second_pass_writes_nothing() {
+    let kernel = booted_kernel().await;
+    let db = own_db().await;
+    let (agent, session) = agent_and_session(&kernel, "claude_code", "s1").await;
+    let mut c = Capture { kernel: &kernel, agent, session, key: "s1".to_string(), at: start() };
+    claude_session(&mut c).await;
+
+    let (_asked, mut stop) = never_stop();
+    let mut reader = Reader::default();
+    let first = pass_on(&kernel, &db, &mut reader, &mut stop).await.expect("pass");
+    assert_eq!((first.outcome, first.lines_read, first.lines_unread), ("complete", 15, 0), "{first:?}");
+    let counts = every_count(&db).await;
+    assert_eq!(
+        counts,
+        vec![
+            ("session", 1),
+            ("session_place", 2),
+            ("prompt", 3),
+            ("reply", 4),
+            ("reply_state", 5),
+            ("thinking", 1),
+            ("tool_call", 4),
+            ("tool_result", 4),
+            ("edit", 1),
+            ("git_event", 1),
+            ("test_run", 1),
+            ("build_run", 1),
+            ("turn", 1),
+            ("compaction", 1),
+            ("away", 1),
+        ]
+    );
+    assert_eq!(first.rows_written, counts.iter().map(|(_, n)| n).sum::<i64>());
+
+    let s = rows(&db, "SELECT agent, agent_id, entrypoint, client_version FROM session").await;
+    assert_eq!(
+        (text(&s[0], "agent"), text(&s[0], "agent_id"), text(&s[0], "entrypoint"), text(&s[0], "client_version")),
+        (Some("claude_code".into()), Some("s1".into()), None, None),
+        "its first line names no entrypoint or version"
+    );
+    let kinds = rows(&db, "SELECT kind, text, at FROM prompt ORDER BY at").await;
+    assert_eq!(
+        kinds.iter().map(|p| text(p, "kind").unwrap_or_default()).collect::<Vec<_>>(),
+        ["typed", "queued", "interrupt"]
+    );
+    let reply = rows(&db, "SELECT model, effort, stop_reason FROM reply WHERE agent_id = 'msg_1'").await;
+    assert_eq!((text(&reply[0], "model"), text(&reply[0], "effort")), (Some("claude-opus-5-5".into()), Some("max".into())));
+    let states = rows(&db, "SELECT text_chars, output_tokens, thinking_tokens FROM reply_state WHERE reply.agent_id = 'msg_1'").await;
+    assert_eq!(
+        sorted(states.iter().map(|s| (int(s, "text_chars"), int(s, "output_tokens"), int(s, "thinking_tokens")))),
+        [(Some(0), Some(900), Some(600)), (Some(11), Some(900), Some(600))],
+        "a state when the reply is first read, another when its text arrives"
+    );
+    let thinking = rows(&db, "SELECT position, ms FROM thinking").await;
+    assert_eq!((int(&thinking[0], "position"), int(&thinking[0], "ms")), (Some(0), Some(3100)));
+    let outcomes = rows(&db, "SELECT tool_call.call_id AS call, outcome FROM tool_result ORDER BY call").await;
+    assert_eq!(
+        outcomes.iter().map(|o| (text(o, "call").unwrap_or_default(), text(o, "outcome").unwrap_or_default())).collect::<Vec<_>>(),
+        [
+            ("call_commit".to_string(), "ok".to_string()),
+            ("call_edit".to_string(), "ok".to_string()),
+            ("call_long".to_string(), "interrupted".to_string()),
+            ("call_test".to_string(), "ok".to_string()),
+        ]
+    );
+    let git = rows(&db, "SELECT action, hash, branch, subject, dir FROM git_event").await;
+    assert_eq!(
+        (text(&git[0], "action"), text(&git[0], "hash"), text(&git[0], "branch"), text(&git[0], "subject"), text(&git[0], "dir")),
+        (Some("commit".into()), Some("abc1234".into()), Some("main".into()), Some("fix: x".into()), Some("/repo".into()))
+    );
+    let test = rows(&db, "SELECT runner, passed, failed, ignored FROM test_run").await;
+    assert_eq!((int(&test[0], "passed"), int(&test[0], "failed"), int(&test[0], "ignored")), (Some(7), Some(0), Some(1)));
+    let edit = rows(&db, "SELECT path, added, removed, counted_from FROM edit").await;
+    assert_eq!((int(&edit[0], "added"), int(&edit[0], "removed"), text(&edit[0], "counted_from")), (Some(2), Some(1), Some("patch".into())));
+    let places = rows(&db, "SELECT cwd, at FROM session_place ORDER BY at").await;
+    assert_eq!(places.iter().map(|p| text(p, "cwd").unwrap_or_default()).collect::<Vec<_>>(), ["/repo", "/repo/sub"]);
+
+    let second = pass_on(&kernel, &db, &mut reader, &mut stop).await.expect("second pass");
+    assert_eq!((second.outcome, second.rows_written), ("complete", 0), "{second:?}");
+    assert!(second.lines_read > 0, "it read the minute before the last pass stopped");
+    assert_eq!(every_count(&db).await, counts, "nothing written twice");
+
+    let mut restarted = Reader::default();
+    let third = pass_on(&kernel, &db, &mut restarted, &mut stop).await.expect("pass after a restart");
+    assert_eq!(third.rows_written, 0, "{third:?}");
+    assert_eq!(every_count(&db).await, counts, "nothing written twice after a restart");
+    assert_eq!(count(&db, "pass").await, 3, "one row per pass");
+}
+
+#[tokio::test]
+async fn a_reply_read_again_from_the_middle_after_a_restart_counts_its_text_once() {
+    let kernel = booted_kernel().await;
+    let db = own_db().await;
+    let (agent, session) = agent_and_session(&kernel, "claude_code", "s2").await;
+    let mut c = Capture { kernel: &kernel, agent, session, key: "s2".to_string(), at: start() };
+    c.message(block("msg_9", 0, serde_json::json!({ "type": "text", "text": "Part one." }), serde_json::json!({}))).await;
+    c.message(block("msg_9", 1, serde_json::json!({ "type": "text", "text": "Part two!" }), serde_json::json!({}))).await;
+    let (_asked, mut stop) = never_stop();
+    pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("first pass");
+
+    // The reply goes on after the pass; the module restarts before the next.
+    c.message(block("msg_9", 2, serde_json::json!({ "type": "text", "text": "And three." }), serde_json::json!({}))).await;
+    c.message(block("msg_9", 3, serde_json::json!({ "type": "thinking", "thinking": "hmm", "signature": "s" }), serde_json::json!({}))).await;
+    let after = pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("pass after a restart");
+    assert_eq!(after.outcome, "complete");
+    let states = rows(&db, "SELECT text_chars FROM reply_state").await;
+    assert_eq!(
+        sorted(states.iter().map(|s| int(s, "text_chars"))),
+        [Some(9), Some(18), Some(28)],
+        "each line's text counted once, whichever pass read it"
+    );
+    assert_eq!(count(&db, "reply").await, 1);
+    let thinking = rows(&db, "SELECT position, chars FROM thinking").await;
+    assert_eq!((int(&thinking[0], "position"), int(&thinking[0], "chars")), (Some(3), Some(3)));
+}
+
+#[tokio::test]
+async fn a_pass_that_was_never_recorded_is_read_again_without_writing_twice() {
+    let kernel = booted_kernel().await;
+    let db = own_db().await;
+    let (agent, session) = agent_and_session(&kernel, "claude_code", "s3").await;
+    let mut c = Capture { kernel: &kernel, agent, session, key: "s3".to_string(), at: start() };
+    claude_session(&mut c).await;
+    let (_asked, mut stop) = never_stop();
+    pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("pass");
+    let counts = every_count(&db).await;
+    // As if the process died after writing its rows, before its pass row.
+    db.query("DELETE pass").await.expect("forget the pass").check().expect("forgotten");
+    let again = pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("the pass again");
+    assert_eq!((again.lines_read, again.rows_written), (15, 0), "{again:?}");
+    assert_eq!(every_count(&db).await, counts);
+}
+
+#[tokio::test]
+async fn a_pass_asked_to_stop_is_recorded_as_stopped() {
+    let kernel = booted_kernel().await;
+    let db = own_db().await;
+    let (agent, session) = agent_and_session(&kernel, "claude_code", "s4").await;
+    let mut c = Capture { kernel: &kernel, agent, session, key: "s4".to_string(), at: start() };
+    claude_session(&mut c).await;
+    let (asked, mut stop) = never_stop();
+    asked.send_replace(true);
+    let stopped = pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("pass");
+    assert_eq!((stopped.outcome, stopped.lines_read), ("stopped", 0));
+    let recorded = rows(&db, "SELECT outcome, note, to_line FROM pass").await;
+    assert_eq!(text(&recorded[0], "outcome").as_deref(), Some("stopped"));
+}
+
+#[tokio::test]
+async fn a_gemini_reply_grows_line_by_line_and_older_lines_read_again_change_nothing() {
+    let kernel = booted_kernel().await;
+    let db = own_db().await;
+    let (agent, session) = agent_and_session(&kernel, "gemini_cli", "g1").await;
+    let mut c = Capture { kernel: &kernel, agent, session, key: "g1".to_string(), at: start() };
+    c.message(serde_json::json!({ "id": "u1", "type": "user", "content": [{ "text": "list the files" }] })).await;
+    let emission = |content: &str, output: i64, thoughts: usize, status: &str| {
+        serde_json::json!({
+            "id": "g-1", "type": "gemini", "model": "gemini-3.1-pro-preview", "content": content,
+            "tokens": { "input": 900, "output": output, "cached": 400, "thoughts": 50, "tool": 10, "total": 1000 },
+            "thoughts": (0..thoughts).map(|i| serde_json::json!({ "subject": format!("step {i}"), "description": "x", "timestamp": "2026-10-25T09:00:00Z" })).collect::<Vec<_>>(),
+            "toolCalls": [{ "id": "ls_1", "name": "run_shell_command", "status": status, "timestamp": "2026-10-25T09:00:00Z",
+                "args": { "command": "ls", "dir_path": "/repo" },
+                "result": [{ "functionResponse": { "id": "ls_1", "name": "run_shell_command", "response": { "output": "Output: a\nExit Code: 0" } } }] }]
+        })
+    };
+    c.message(serde_json::json!({ "id": "g-1", "type": "gemini", "content": "" })).await;
+    c.message(emission("", 10, 1, "executing")).await;
+    c.message(emission("Here", 20, 2, "success")).await;
+    c.message(emission("Here are the files.", 40, 2, "success")).await;
+    let (_asked, mut stop) = never_stop();
+    let mut reader = Reader::default();
+    pass_on(&kernel, &db, &mut reader, &mut stop).await.expect("pass");
+    assert_eq!(count(&db, "reply").await, 1);
+    let reply = rows(&db, "SELECT kernel_message, model FROM reply").await;
+    assert_eq!(text(&reply[0], "model").as_deref(), Some("gemini-3.1-pro-preview"));
+    let states = rows(&db, "SELECT text_chars, output_tokens, input_tokens FROM reply_state").await;
+    assert_eq!(
+        sorted(states.iter().map(|s| (int(s, "text_chars"), int(s, "output_tokens"), int(s, "input_tokens")))),
+        [(Some(0), Some(60), Some(500)), (Some(4), Some(70), Some(500)), (Some(19), Some(90), Some(500))]
+    );
+    assert_eq!((count(&db, "thinking").await, count(&db, "tool_call").await, count(&db, "tool_result").await), (2, 1, 1));
+    assert_eq!(count(&db, "prompt").await, 1);
+    let counts = every_count(&db).await;
+    pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("after a restart");
+    assert_eq!(every_count(&db).await, counts, "older emissions read again add no state");
+}
+
+#[tokio::test]
+async fn a_line_of_an_unknown_shape_is_counted_and_the_rest_is_read() {
+    let kernel = booted_kernel().await;
+    let db = own_db().await;
+    let (agent, session) = agent_and_session(&kernel, "claude_code", "s5").await;
+    let mut c = Capture { kernel: &kernel, agent, session, key: "s5".to_string(), at: start() };
+    c.message(serde_json::json!({ "type": "hologram" })).await;
+    c.message(block("msg_5", 0, serde_json::json!({ "type": "text", "text": "ok" }), serde_json::json!({}))).await;
+    let (_asked, mut stop) = never_stop();
+    let p = pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("pass");
+    assert_eq!((p.lines_read, p.lines_unread, p.outcome), (2, 1, "complete"));
+    assert_eq!(count(&db, "reply").await, 1);
+    let recorded = rows(&db, "SELECT lines_read, lines_unread, replies_new FROM pass").await;
+    assert_eq!((int(&recorded[0], "lines_unread"), int(&recorded[0], "replies_new")), (Some(1), Some(1)));
+}
+
+#[tokio::test]
+async fn spans_without_an_index_keep_their_places_when_read_again() {
+    let kernel = booted_kernel().await;
+    let db = own_db().await;
+    let (agent, session) = agent_and_session(&kernel, "claude_code", "s6").await;
+    let mut c = Capture { kernel: &kernel, agent, session, key: "s6".to_string(), at: start() };
+    // Before Claude Code wrote `apiBlockIndex`: a span's place is the number
+    // of the reply's blocks before it.
+    let unindexed = |content: serde_json::Value| {
+        let mut line = block("msg_old", 0, content, serde_json::json!({}));
+        line.as_object_mut().expect("object").remove("apiBlockIndex");
+        line
+    };
+    c.message(unindexed(serde_json::json!({ "type": "thinking", "thinking": "a", "signature": "s" }))).await;
+    c.message(unindexed(serde_json::json!({ "type": "text", "text": "b" }))).await;
+    c.message(unindexed(serde_json::json!({ "type": "thinking", "thinking": "cc", "signature": "s" }))).await;
+    let (_asked, mut stop) = never_stop();
+    let mut reader = Reader::default();
+    pass_on(&kernel, &db, &mut reader, &mut stop).await.expect("pass");
+    let places = |rows: Vec<Value>| sorted(rows.iter().map(|t| (int(t, "position"), int(t, "chars"))));
+    let first = places(rows(&db, "SELECT position, chars FROM thinking").await);
+    assert_eq!(first, [(Some(0), Some(1)), (Some(2), Some(2))]);
+    pass_on(&kernel, &db, &mut reader, &mut stop).await.expect("the same reader again");
+    pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("after a restart");
+    assert_eq!(places(rows(&db, "SELECT position, chars FROM thinking").await), first, "read again, the same places");
+}
