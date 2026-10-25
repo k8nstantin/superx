@@ -109,6 +109,11 @@ pub enum ToolDetail {
 pub enum Format {
     Markdown,
     Text,
+    /// Every row as it is stored, one JSON object a line (#524): a
+    /// message's whole `raw`, a transcript line's whole `line`. It returns
+    /// before any rendering; the renderers take it as text only where a
+    /// `match` must name it.
+    Jsonl,
 }
 
 impl Format {
@@ -118,6 +123,7 @@ impl Format {
         match self {
             Self::Markdown => "text/markdown; charset=utf-8",
             Self::Text => "text/plain; charset=utf-8",
+            Self::Jsonl => "application/x-ndjson; charset=utf-8",
         }
     }
 }
@@ -164,7 +170,8 @@ impl ExportOptions {
         let format = match format {
             Some("md") => Format::Markdown,
             Some("txt") => Format::Text,
-            other => return Err(format!("format must be md or txt, not {}", given(other))),
+            Some("jsonl") => Format::Jsonl,
+            other => return Err(format!("format must be md, txt or jsonl, not {}", given(other))),
         };
         let clock = match tz {
             None => None,
@@ -232,6 +239,7 @@ pub fn session_export(
             while messages.wants_page() {
                 let rows = message_page(
                     &kernel, &session, keyword.as_deref(), messages.after(), until, messages.page,
+                    options.format == Format::Jsonl,
                 )
                 .await?;
                 messages.take(rows);
@@ -419,8 +427,9 @@ enum Actions {
 /// the export began out of it. The fields
 /// are the feed's (`activity::projection`): a message's `toolUseResult`,
 /// the agent's own structured copy of output the message already carries,
-/// stays in the engine.
-fn walk_query(table: &str, scope: &str, cursor: bool, keyword: Option<&str>) -> String {
+/// stays in the engine. A `whole` read takes every field: the `jsonl`
+/// export writes each row as it is stored (#524).
+fn walk_query(table: &str, scope: &str, cursor: bool, keyword: Option<&str>, whole: bool) -> String {
     let mut wheres = vec![scope.to_string(), "valid_from <= $until".to_string()];
     // From the second the last page stopped in, read whole: the walk
     // skips what it has read (#485).
@@ -432,12 +441,13 @@ fn walk_query(table: &str, scope: &str, cursor: bool, keyword: Option<&str>) -> 
     }
     format!(
         "SELECT {} FROM {table} WHERE {} ORDER BY valid_from ASC, id ASC LIMIT $page",
-        crate::activity::projection(table),
+        if whole { "*" } else { crate::activity::projection(table) },
         wheres.join(" AND ")
     )
 }
 
 /// The next page of the session's messages.
+#[allow(clippy::too_many_arguments)] // skill-allow: allow — one page read: its scope, its cursor, its filter and its fields
 async fn message_page(
     kernel: &Kernel,
     session: &RecordId,
@@ -445,12 +455,14 @@ async fn message_page(
     after: Option<DateTime<Utc>>,
     until: DateTime<Utc>,
     page: u32,
+    whole: bool,
 ) -> Result<Vec<MessageRecord>> {
     let sql = walk_query(
         "message",
         "session = $sess",
         after.is_some(),
         keyword.map(|_| crate::activity::MSG_MATCH),
+        whole,
     );
     crate::answered("export messages", || {
         let (sql, session) = (sql.clone(), session.clone());
@@ -499,7 +511,7 @@ async fn action_page(
         Actions::Lines => format!("{arms} AND {WHOLE_LINE}"),
         Actions::Others => format!("{arms} AND !{WHOLE_LINE}"),
     };
-    let sql = walk_query("telemetry_stream", &scope_clause, after.is_some(), keyword.map(|_| act_match.as_str()));
+    let sql = walk_query("telemetry_stream", &scope_clause, after.is_some(), keyword.map(|_| act_match.as_str()), false);
     crate::answered("export actions", || {
         let (sql, session, scope) = (sql.clone(), session.clone(), scope.cloned());
         let keyword = keyword.map(str::to_lowercase);
@@ -614,6 +626,23 @@ fn grouped(n: u64) -> String {
 /// whole — Anthropic-style `message.content` blocks (Claude Code) and
 /// Gemini's `content` parts, `thoughts` and `toolCalls`; anything else is
 /// its extracted text and its captured event as JSON.
+/// Who wrote a message: its role, and for a subagent's line (#514) the
+/// subagent too, so a session's own lines and its subagents' read apart
+/// (#524).
+pub(crate) fn speaker(m: &MessageRecord) -> String {
+    let subagent = m.raw.as_ref().and_then(|raw| match raw.get("isSidechain") {
+        Some(Value::Bool(true)) => Some(match raw.get("agentId") {
+            Some(Value::String(id)) => format!("subagent {id}"),
+            _ => "subagent".to_string(),
+        }),
+        _ => None,
+    });
+    match subagent {
+        Some(subagent) => format!("{} · {subagent}", m.role),
+        None => m.role.clone(),
+    }
+}
+
 fn pieces_of(raw: Option<&Json>, content: &str, calls: &mut HashMap<String, String>) -> Vec<Piece> {
     let mut out = Vec::new();
     match raw {
@@ -1332,6 +1361,9 @@ impl Writer {
     }
 
     fn header(&mut self, facts: &Facts<'_>) {
+        if self.format == Format::Jsonl {
+            return; // every line a row; the last one says the file is whole
+        }
         let exported = match self.clock {
             Some(tz) => {
                 let local = self.until.with_timezone(&tz);
@@ -1415,7 +1447,7 @@ impl Writer {
                 }
                 self.out.push_str("\n---\n\n");
             }
-            Format::Text => {
+            Format::Text | Format::Jsonl => {
                 let width = lines.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
                 self.out.push_str("SuperX session export\n");
                 for (k, v) in &lines {
@@ -1427,6 +1459,15 @@ impl Writer {
     }
 
     fn message(&mut self, m: &MessageRecord) {
+        if self.format == Format::Jsonl {
+            *self.roles.entry(m.role.clone()).or_default() += 1;
+            let row = m.raw.clone().map_or_else(
+                || serde_json::json!({ "role": m.role, "content": m.content }),
+                |o| Value::Object(o).into_json_value(),
+            );
+            self.json_line(&row);
+            return;
+        }
         self.flush_unchanged();
         *self.roles.entry(m.role.clone()).or_default() += 1;
         let raw = m.raw.clone().map(|o| Value::Object(o).into_json_value());
@@ -1445,7 +1486,7 @@ impl Writer {
         self.line = raw.as_ref().map(line_facts).unwrap_or_default();
 
         // The heading: who, when, and the model where it changes.
-        let mut heading = m.role.clone();
+        let mut heading = speaker(m);
         if let Some(t) = self.when(m.emitted_at.unwrap_or(m.valid_from)) {
             let _ = write!(heading, " · {t}");
         }
@@ -1482,7 +1523,7 @@ impl Writer {
                     self.md_piece(p);
                 }
             }
-            Format::Text => {
+            Format::Text | Format::Jsonl => {
                 let _ = writeln!(self.out, "[{heading}]");
                 if moved {
                     let note = self.place_note();
@@ -1513,7 +1554,7 @@ impl Writer {
             Format::Markdown => {
                 let _ = writeln!(self.out, "*{line}*\n");
             }
-            Format::Text => {
+            Format::Text | Format::Jsonl => {
                 let _ = writeln!(self.out, "    [{line}]\n");
             }
         }
@@ -1547,6 +1588,14 @@ impl Writer {
     /// line under its heading said is named, not written again.
     fn transcript_line(&mut self, a: &TelemetryRecord) {
         self.lines += 1;
+        if self.format == Format::Jsonl {
+            // The line as captured; of a line kept by kind alone (#471),
+            // what was kept.
+            let payload = a.payload.clone().into_json_value();
+            let row = payload.get("line").filter(|l| !l.is_null()).cloned().unwrap_or(payload);
+            self.json_line(&row);
+            return;
+        }
         let payload = a.payload.clone().into_json_value();
         let kind = payload.get("kind").and_then(Json::as_str).unwrap_or("line").to_string();
         let line = payload.get("line").cloned().unwrap_or(Json::Null);
@@ -1590,7 +1639,7 @@ impl Writer {
                     self.md_piece(p);
                 }
             }
-            Format::Text => {
+            Format::Text | Format::Jsonl => {
                 let _ = writeln!(self.out, "[{title}]");
                 if moved {
                     let note = self.place_note();
@@ -1616,7 +1665,7 @@ impl Writer {
             Format::Markdown => {
                 let _ = writeln!(self.out, "*unchanged:* {list}\n");
             }
-            Format::Text => {
+            Format::Text | Format::Jsonl => {
                 let _ = writeln!(self.out, "[unchanged: {list}]\n");
             }
         }
@@ -1625,13 +1674,16 @@ impl Writer {
     /// Where the OS's action events begin: after the conversation, so it
     /// reads without them (#472).
     fn appendix(&mut self) {
+        if self.format == Format::Jsonl {
+            return;
+        }
         self.flush_unchanged();
         match self.format {
             Format::Markdown => self.out.push_str(
                 "---\n\n## Appendix: the OS's action events\n\n\
                  Every action the OS recorded for this session, oldest first, each with its whole payload.\n\n",
             ),
-            Format::Text => {
+            Format::Text | Format::Jsonl => {
                 self.out.push_str("APPENDIX: the OS's action events, oldest first, each with its whole payload\n\n");
             }
         }
@@ -1640,7 +1692,7 @@ impl Writer {
     /// The transcript lines this OS recorded by kind alone (#471): that they
     /// happened and when, not what they held.
     fn kinds_note(&mut self) {
-        if self.kinds.is_empty() {
+        if self.kinds.is_empty() || self.format == Format::Jsonl {
             return;
         }
         let total: u64 = self.kinds.values().sum();
@@ -1662,7 +1714,7 @@ impl Writer {
                     grouped(total)
                 );
             }
-            Format::Text => {
+            Format::Text | Format::Jsonl => {
                 let _ = writeln!(self.out, "\ntranscript lines kept by kind only ({}, #471): {list}\n", grouped(total));
             }
         }
@@ -1678,6 +1730,15 @@ impl Writer {
 
     fn action(&mut self, a: &TelemetryRecord) {
         self.actions += 1;
+        if self.format == Format::Jsonl {
+            let row = serde_json::json!({
+                "event": a.lifecycle_event,
+                "at": a.valid_from.to_rfc3339(),
+                "payload": a.payload.clone().into_json_value(),
+            });
+            self.json_line(&row);
+            return;
+        }
         let payload = a.payload.clone().into_json_value();
         // The capture's event for a transcript line it kept by kind only.
         if a.lifecycle_event == "transcript_event" {
@@ -1696,7 +1757,7 @@ impl Writer {
                 let _ = writeln!(self.out, "{line} · {} · {}", self.code(&a.lifecycle_event), self.code(&payload));
                 self.in_actions = true;
             }
-            Format::Text => {
+            Format::Text | Format::Jsonl => {
                 let mut line = String::new();
                 if let Some(t) = when {
                     let _ = write!(line, "[{t}] ");
@@ -1736,7 +1797,18 @@ impl Writer {
             Format::Text => {
                 let _ = writeln!(self.out, "{END_MARK} · {line}");
             }
+            Format::Jsonl => {
+                let mut end = serde_json::Map::new();
+                end.insert(END_MARK.to_string(), Json::String(line));
+                self.json_line(&Json::Object(end));
+            }
         }
+    }
+
+    /// One row of a `jsonl` file: its JSON, on one line.
+    fn json_line(&mut self, row: &Json) {
+        self.out.push_str(&row.to_string());
+        self.out.push('\n');
     }
 
     /// Inline code that holds `s` whatever backticks it carries; plain text
@@ -2725,9 +2797,77 @@ mod tests {
             Some("include must be conversation or everything, not “all”"),
             "the refusal reads as words, not as a Rust value"
         );
-        assert!(ExportOptions::parse(Some("everything"), Some("full"), Some("pdf"), None, None).is_err());
+        assert_eq!(
+            ExportOptions::parse(Some("everything"), Some("full"), Some("jsonl"), None, None).map(|o| o.format),
+            Ok(Format::Jsonl)
+        );
+        assert_eq!(
+            ExportOptions::parse(Some("everything"), Some("full"), Some("pdf"), None, None).err().as_deref(),
+            Some("format must be md, txt or jsonl, not “pdf”")
+        );
         assert!(ExportOptions::parse(Some("everything"), Some("full"), Some("md"), Some("Mars/Base"), None).is_err());
         assert!(ExportOptions::parse(None, Some("full"), Some("md"), None, None).is_err(), "nothing is assumed");
+    }
+
+    /// A message as capture now stores it (#516): every key, `null` too.
+    fn stored(role: &str, raw: Json) -> MessageRecord {
+        MessageRecord { raw: Some(superx_kernel::message::line_to_object(&raw)), ..message(role, None, "") }
+    }
+
+    #[test]
+    fn a_jsonl_file_holds_every_row_as_it_is_stored() {
+        let reply = json!({
+            "type": "assistant", "sessionId": "s", "uuid": "u-1",
+            "message": { "role": "assistant", "content": [{ "type": "text", "text": "hi" }], "stop_sequence": null },
+        });
+        let result = json!({
+            "type": "user", "sessionId": "s", "uuid": "u-2",
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "out" }] },
+            "toolUseResult": { "stdout": "out", "stderr": "", "interrupted": false, "returnCodeInterpretation": null },
+        });
+        let line = json!({ "type": "mode", "mode": null, "sessionId": "s" });
+        let mut w = Writer::new(&options(Format::Jsonl, ToolDetail::Full), "2026-10-25T17:00:00Z".parse().expect("ts"));
+        w.header(&Facts { identity: "claude_code/s", source: Some("s"), model: None, effort: None });
+        w.message(&stored("assistant", reply.clone()));
+        w.message(&stored("tool", result.clone()));
+        w.transcript_line(&line_row("mode", line.clone()));
+        w.action(&TelemetryRecord { lifecycle_event: "message_captured".into(), ..line_row("mode", Json::Null) });
+        w.footer();
+        let rows: Vec<Json> = w.out.lines().map(|l| serde_json::from_str(l).expect("every line is JSON")).collect();
+        assert_eq!(rows.len(), 5, "{}", w.out);
+        assert_eq!(rows[0], reply, "the message's whole line, its null kept");
+        assert_eq!(rows[1], result, "the whole line, toolUseResult and its null too");
+        assert_eq!(rows[2], line, "the transcript line as captured");
+        assert_eq!(rows[3]["event"], json!("message_captured"));
+        assert_eq!(rows[3]["at"], json!("2026-10-21T13:24:48+00:00"));
+        assert_eq!(
+            rows[4],
+            json!({ "end of export": "4 rows · 2 messages (1 assistant, 1 tool) · 1 transcript line · 1 action" }),
+            "the last line says the file is whole"
+        );
+    }
+
+    #[test]
+    fn a_jsonl_export_reads_every_field_and_the_others_the_feeds() {
+        let whole = walk_query("message", "session = $sess", false, None, true);
+        assert!(whole.starts_with("SELECT * FROM message"), "{whole}");
+        let feed = walk_query("message", "session = $sess", false, None, false);
+        assert!(feed.contains("OMIT raw.toolUseResult"), "{feed}");
+    }
+
+    #[test]
+    fn a_subagents_line_is_headed_as_the_subagents() {
+        let sub = stored(
+            "assistant",
+            json!({ "type": "assistant", "isSidechain": true, "agentId": "a1", "message": { "role": "assistant", "content": "done" } }),
+        );
+        let own = stored("assistant", json!({ "type": "assistant", "isSidechain": false, "message": { "role": "assistant", "content": "mine" } }));
+        assert_eq!(speaker(&sub), "assistant · subagent a1");
+        assert_eq!(speaker(&own), "assistant");
+        for format in [Format::Text, Format::Markdown] {
+            let out = written(&options(format, ToolDetail::Full), &[sub.clone(), own.clone()]);
+            assert!(out.contains("assistant · subagent a1"), "{format:?}: {out}");
+        }
     }
 
     #[test]

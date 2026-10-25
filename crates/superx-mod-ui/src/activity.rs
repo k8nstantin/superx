@@ -95,7 +95,7 @@ pub fn action_event(a: &TelemetryRecord) -> SseEvent {
 /// a word.
 fn message_row(m: &MessageRecord) -> (String, Option<(String, String)>) {
     let ts = m.emitted_at.unwrap_or(m.valid_from).format("%Y-%m-%d %H:%M:%S");
-    let head = format!("[{ts}] {:>9}:", m.role);
+    let head = format!("[{ts}] {:>9}:", crate::export::speaker(m));
     let (body, request) = crate::export::message_body(m);
     let row = match body.lines().count() {
         0 => head,
