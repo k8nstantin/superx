@@ -206,7 +206,9 @@ DEFINE INDEX idx_telemetry_agent ON TABLE telemetry_stream
 -- One row per conversation event captured from an agent's session.
 -- `content` is the extracted readable text (empty when the event has
 -- none); `raw` preserves the full original source event — capture is
--- very detailed by design. `role` is deliberately un-ASSERTed:
+-- very detailed by design — and `raw_text` the event exactly as the
+-- agent wrote it, its line's text, of which `raw` is the parsed copy
+-- (v2.3, #528). `role` is deliberately un-ASSERTed:
 -- adapters store source-native labels and tolerance beats constraint
 -- at the capture boundary. Sessions are node_session entities;
 -- their metadata lives in state_ledger like everything else.
@@ -224,6 +226,7 @@ DEFINE FIELD agent       ON TABLE message TYPE record<entity>
 DEFINE FIELD role        ON TABLE message TYPE string;
 DEFINE FIELD content     ON TABLE message TYPE string;
 DEFINE FIELD raw         ON TABLE message TYPE option<object> FLEXIBLE;
+DEFINE FIELD raw_text    ON TABLE message TYPE option<string>;
 DEFINE FIELD seq         ON TABLE message TYPE option<int>;
 DEFINE FIELD emitted_at  ON TABLE message TYPE option<datetime>;
 DEFINE FIELD valid_from  ON TABLE message TYPE datetime;

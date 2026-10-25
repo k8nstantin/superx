@@ -20,4 +20,4 @@ pub const SCHEMA_DDL: &str = include_str!("../../../schema/kernel.surql");
 /// parameter on the kernel entity; `start` compares and self-upgrades
 /// (tolerant re-apply) on mismatch — a new binary on an older
 /// substrate must never brick the boot (issue #158).
-pub const SCHEMA_VERSION: &str = "2.2";
+pub const SCHEMA_VERSION: &str = "2.3";

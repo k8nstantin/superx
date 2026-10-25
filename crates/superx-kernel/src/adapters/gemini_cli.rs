@@ -156,11 +156,11 @@ impl AgentAdapter for GeminiCliAdapter {
                 }
             }
 
-            for (json, superseded) in parse_read(&lines) {
+            for (json, text, superseded) in parse_read(&lines) {
                 events += if superseded {
-                    self.capture_superseded(kernel, source, &file_sessions, file, &json).await?
+                    self.capture_superseded(kernel, source, &file_sessions, file, &json, text).await?
                 } else {
-                    self.capture_record(kernel, source, &mut sessions, &mut file_sessions, file, &json)
+                    self.capture_record(kernel, source, &mut sessions, &mut file_sessions, file, &json, text)
                         .await?
                 };
             }
@@ -205,6 +205,7 @@ impl GeminiCliAdapter {
         file_sessions: &mut BTreeMap<String, String>,
         file: &Path,
         json: &serde_json::Value,
+        text: &str,
     ) -> Result<u64> {
         let file_key = file.to_string_lossy().to_string();
 
@@ -234,6 +235,7 @@ impl GeminiCliAdapter {
             payload.insert("session".to_string(), Value::String(session_key));
             payload.insert("file".to_string(), Value::String(file_key));
             payload.insert("line".to_string(), Value::Object(line_to_object(json)));
+            payload.insert("raw_text".to_string(), Value::String(text.to_string()));
             kernel
                 .log_telemetry_for_agent(
                     "transcript_event",
@@ -271,7 +273,7 @@ impl GeminiCliAdapter {
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|dt| dt.with_timezone(&Utc));
                 kernel
-                    .log_message(NewMessage {
+                    .log_message_line(NewMessage {
                         session: session_id.clone(),
                         agent: source.agent_id.clone(),
                         role: role.to_string(),
@@ -279,7 +281,7 @@ impl GeminiCliAdapter {
                         raw: Some(line_to_object(json)),
                         seq: None,
                         emitted_at,
-                    })
+                    }, Some(text.to_string()))
                     .await?;
 
                 let mut payload = Object::new();
@@ -333,6 +335,7 @@ impl GeminiCliAdapter {
                     payload.insert("content".to_string(), Value::String(c.to_string()));
                 }
                 payload.insert("line".to_string(), Value::Object(line_to_object(json)));
+                payload.insert("raw_text".to_string(), Value::String(text.to_string()));
                 kernel
                     .log_telemetry_for_agent(
                         "transcript_event",
@@ -352,6 +355,7 @@ impl GeminiCliAdapter {
                 let snippet: String = json.to_string().chars().take(500).collect();
                 payload.insert("snippet".to_string(), Value::String(snippet));
                 payload.insert("line".to_string(), Value::Object(line_to_object(json)));
+                payload.insert("raw_text".to_string(), Value::String(text.to_string()));
                 kernel
                     .log_telemetry_for_agent(
                         "transcript_raw",
@@ -375,12 +379,14 @@ impl GeminiCliAdapter {
         file_sessions: &BTreeMap<String, String>,
         file: &Path,
         json: &serde_json::Value,
+        text: &str,
     ) -> Result<u64> {
         let mut payload = Object::new();
         payload.insert("kind".to_string(), Value::String("superseded".to_string()));
         payload.insert("session".to_string(), Value::String(session_of(file_sessions, file, json)));
         payload.insert("file".to_string(), Value::String(file.to_string_lossy().to_string()));
         payload.insert("line".to_string(), Value::Object(line_to_object(json)));
+        payload.insert("raw_text".to_string(), Value::String(text.to_string()));
         kernel
             .log_telemetry_for_agent(
                 "transcript_event",
@@ -393,17 +399,18 @@ impl GeminiCliAdapter {
     }
 }
 
-/// A read's lines, in order, each with whether a later line of the same
-/// read writes the same record (same `id`): Gemini re-emits a record as it
-/// streams, each time fuller. Headers and `$set` lines carry no `id`.
+/// A read's lines, in order, each parsed, with its exact text (#528), and
+/// with whether a later line of the same read writes the same record (same
+/// `id`): Gemini re-emits a record as it streams, each time fuller. Headers
+/// and `$set` lines carry no `id`.
 /// Unparseable lines survive as raw strings wrapped in a marker so the
 /// caller still captures them.
-fn parse_read(lines: &[String]) -> Vec<(serde_json::Value, bool)> {
-    let parsed: Vec<serde_json::Value> = lines
+fn parse_read(lines: &[String]) -> Vec<(serde_json::Value, &str, bool)> {
+    let read: Vec<&str> = lines.iter().map(String::as_str).filter(|line| !line.trim().is_empty()).collect();
+    let parsed: Vec<serde_json::Value> = read
         .iter()
-        .map(|line| line.trim())
-        .filter(|trimmed| !trimmed.is_empty())
-        .map(|trimmed| {
+        .map(|line| {
+            let trimmed = line.trim();
             serde_json::from_str::<serde_json::Value>(trimmed)
                 .unwrap_or_else(|_| serde_json::json!({ "type": "unparseable", "line": trimmed }))
         })
@@ -416,7 +423,7 @@ fn parse_read(lines: &[String]) -> Vec<(serde_json::Value, bool)> {
     }
     let superseded: Vec<bool> =
         parsed.iter().enumerate().map(|(i, json)| record_id(json).is_some_and(|id| last.get(id) != Some(&i))).collect();
-    parsed.into_iter().zip(superseded).collect()
+    parsed.into_iter().zip(read).zip(superseded).map(|((json, text), superseded)| (json, text, superseded)).collect()
 }
 
 /// A conversation record's `id`; headers and `$set` lines have none.
