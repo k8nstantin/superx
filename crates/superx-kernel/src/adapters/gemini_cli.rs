@@ -15,15 +15,17 @@
 //!   `inlineData`); `type:"gemini"` — `content` is a plain string,
 //!   plus `thoughts`, `tokens`, `model`, optional `toolCalls`.
 //! - Records are RE-EMITTED as they stream (same `id`, progressively
-//!   fuller): dedupe within a batch by id (last wins); across batches
-//!   a same-id record is re-emitted only if it grew.
-//! - Files reach hundreds of MB with base64 `inlineData` and huge
-//!   `resultDisplay` render junk: backfill is byte-capped and raw
-//!   payloads are sanitized (resultDisplay stripped, inlineData
-//!   truncated).
+//!   fuller). Every line is captured whole (#518): within one read, a
+//!   record's last write is its `message` row and each earlier write a
+//!   `transcript_event` of kind `superseded`; a later read's write is a
+//!   row of its own.
+//! - Only the header names the session: every line of a file is captured
+//!   into it, whichever read takes the line.
+//! - Nothing is cut: a new file is read whole from its start, and a
+//!   record keeps its `resultDisplay` and its `inlineData` as written.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -46,19 +48,8 @@ pub const AGENT_NAME: &str = "gemini_cli";
 /// Parameter overriding the Gemini root (`~/.gemini` by default).
 pub const ROOT_PARAM: &str = "attr_gemini_cli_root";
 
-/// Parameter capping how many trailing bytes of a large chat file are
-/// backfilled on first contact.
-pub const BACKFILL_MAX_PARAM: &str = "attr_gemini_cli_backfill_max_bytes";
-
 /// Cursor type uid for chat-file read positions.
 pub const CURSOR_TYPE: &str = "gemini_cli_chats";
-
-/// Default backfill cap; Gemini chat files reach 677 MB on this
-/// machine and ingesting them whole would swamp the substrate.
-const DEFAULT_BACKFILL_MAX_BYTES: u64 = 8_388_608; // skill-allow: §9-const — 8 MiB backfill cap, param-overridable
-
-/// Truncation bound for base64 `inlineData` blobs inside raw payloads.
-const INLINE_DATA_MAX: usize = 256; // skill-allow: §9-const — raw-payload sanitization bound
 
 pub struct GeminiCliAdapter;
 
@@ -138,7 +129,6 @@ impl AgentAdapter for GeminiCliAdapter {
             .and_then(|c| c.metadata.as_ref())
             .map(read_offsets)
             .unwrap_or_default();
-        let backfill_max = self.backfill_max(kernel).await?;
 
         let mut events: u64 = 0;
         let mut changed = false;
@@ -150,43 +140,29 @@ impl AgentAdapter for GeminiCliAdapter {
         for file in &files {
             let key = file.to_string_lossy().to_string();
             let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-            let known = offsets.contains_key(&key);
             let mut offset = offsets.get(&key).copied().unwrap_or(0);
             if offset > len {
                 offset = 0; // rotated / replaced
-            }
-            if !known && len > backfill_max {
-                // First contact with an oversized file: cap the
-                // backfill to the trailing window, aligned to the
-                // next full line.
-                offset = align_to_next_line(file, len - backfill_max)?;
-                let mut payload = Object::new();
-                payload.insert("file".to_string(), Value::String(key.clone()));
-                payload.insert(
-                    "skipped_bytes".to_string(),
-                    Value::Number((offset as i64).into()),
-                );
-                kernel
-                    .log_telemetry_for_agent(
-                        "backfill_capped",
-                        Value::Object(payload),
-                        Some(source.entity_id.clone()),
-                        Some(source.agent_id.clone()),
-                    )
-                    .await?;
             }
             if len == offset {
                 continue;
             }
             let (lines, consumed) = read_complete_lines(file, offset)?;
+            if offset > 0 && !file_sessions.contains_key(&key) {
+                // This read starts past the header, the only line that
+                // names the session.
+                if let Some(session) = header_session(file)? {
+                    file_sessions.insert(key.clone(), session);
+                }
+            }
 
-            // Batch-level dedupe of re-emitted records: same id →
-            // last occurrence wins.
-            let parsed = dedupe_batch(&lines);
-            for json in parsed {
-                events += self
-                    .capture_record(kernel, source, &mut sessions, &mut file_sessions, file, &json)
-                    .await?;
+            for (json, superseded) in parse_read(&lines) {
+                events += if superseded {
+                    self.capture_superseded(kernel, source, &file_sessions, file, &json).await?
+                } else {
+                    self.capture_record(kernel, source, &mut sessions, &mut file_sessions, file, &json)
+                        .await?
+                };
             }
             if consumed > 0 {
                 offsets.insert(key, offset + consumed);
@@ -216,22 +192,6 @@ impl GeminiCliAdapter {
             .map_err(|_| KernelError::Config("HOME is not set; cannot locate ~/.gemini".into()))?;
         let root = Path::new(&home).join(".gemini");
         Ok(root.is_dir().then_some(root))
-    }
-
-    async fn backfill_max(&self, kernel: &Kernel) -> Result<u64> {
-        if let Some(entity) = kernel
-            .find_module_by_name(NodeKind::Adapter, ADAPTER_NAME)
-            .await?
-        {
-            if let Some(Value::Number(n)) =
-                kernel.get_parameter(entity, BACKFILL_MAX_PARAM).await?
-            {
-                if let Some(i) = n.to_int() {
-                    return Ok(i.max(0) as u64);
-                }
-            }
-        }
-        Ok(DEFAULT_BACKFILL_MAX_BYTES)
     }
 
     /// Capture one deduped record. Returns events emitted (0 for
@@ -264,19 +224,7 @@ impl GeminiCliAdapter {
             None
         };
 
-        let session_key = file_sessions
-            .get(&file_key)
-            .cloned()
-            .or_else(|| {
-                json.get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| {
-                file.file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown-session".to_string())
-            });
+        let session_key = session_of(file_sessions, file, json);
 
         // A header, and a header mutation (`$set`), are not conversation:
         // they are kept whole as telemetry (#471). They were folded away.
@@ -322,15 +270,13 @@ impl GeminiCliAdapter {
                     .and_then(|v| v.as_str())
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|dt| dt.with_timezone(&Utc));
-                let sanitized = sanitize(json);
-
                 kernel
                     .log_message(NewMessage {
                         session: session_id.clone(),
                         agent: source.agent_id.clone(),
                         role: role.to_string(),
                         content: content.clone(),
-                        raw: Some(line_to_object(&sanitized)),
+                        raw: Some(line_to_object(json)),
                         seq: None,
                         emitted_at,
                     })
@@ -418,40 +364,99 @@ impl GeminiCliAdapter {
             }
         }
     }
+
+    /// Capture a record's earlier write, which a later line of the same
+    /// read writes again: whole, as a `transcript_event` of kind
+    /// `superseded`, so no line is dropped (#518).
+    async fn capture_superseded(
+        &self,
+        kernel: &Kernel,
+        source: &SourceRef,
+        file_sessions: &BTreeMap<String, String>,
+        file: &Path,
+        json: &serde_json::Value,
+    ) -> Result<u64> {
+        let mut payload = Object::new();
+        payload.insert("kind".to_string(), Value::String("superseded".to_string()));
+        payload.insert("session".to_string(), Value::String(session_of(file_sessions, file, json)));
+        payload.insert("file".to_string(), Value::String(file.to_string_lossy().to_string()));
+        payload.insert("line".to_string(), Value::Object(line_to_object(json)));
+        kernel
+            .log_telemetry_for_agent(
+                "transcript_event",
+                Value::Object(payload),
+                Some(source.entity_id.clone()),
+                Some(source.agent_id.clone()),
+            )
+            .await?;
+        Ok(1)
+    }
 }
 
-/// Parse lines and dedupe re-emitted records: same `id` → the LAST
-/// occurrence in the batch wins (records grow as they stream).
-/// Unparseable lines survive as raw strings wrapped in a marker so
-/// the caller still captures them.
-fn dedupe_batch(lines: &[String]) -> Vec<serde_json::Value> {
-    let mut order: Vec<(Option<String>, serde_json::Value)> = Vec::new();
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+/// A read's lines, in order, each with whether a later line of the same
+/// read writes the same record (same `id`): Gemini re-emits a record as it
+/// streams, each time fuller. Headers and `$set` lines carry no `id`.
+/// Unparseable lines survive as raw strings wrapped in a marker so the
+/// caller still captures them.
+fn parse_read(lines: &[String]) -> Vec<(serde_json::Value, bool)> {
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|trimmed| !trimmed.is_empty())
+        .map(|trimmed| {
+            serde_json::from_str::<serde_json::Value>(trimmed)
+                .unwrap_or_else(|_| serde_json::json!({ "type": "unparseable", "line": trimmed }))
+        })
+        .collect();
+    let mut last: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, json) in parsed.iter().enumerate() {
+        if let Some(id) = record_id(json) {
+            last.insert(id, i);
         }
-        let json = serde_json::from_str::<serde_json::Value>(trimmed).unwrap_or_else(|_| {
-            serde_json::json!({ "type": "unparseable", "line": trimmed })
-        });
-        let id = json
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            // Only conversation records dedupe; headers/$set have no id.
-            .filter(|_| json.get("type").is_some());
-        if let Some(ref id_val) = id {
-            if let Some(pos) = order
-                .iter()
-                .position(|(existing, _)| existing.as_deref() == Some(id_val))
-            {
-                order.remove(pos);
-            }
-        }
-        order.push((id, json));
     }
-    order.into_iter().map(|(_, j)| j).collect()
+    let superseded: Vec<bool> =
+        parsed.iter().enumerate().map(|(i, json)| record_id(json).is_some_and(|id| last.get(id) != Some(&i))).collect();
+    parsed.into_iter().zip(superseded).collect()
 }
+
+/// A conversation record's `id`; headers and `$set` lines have none.
+fn record_id(json: &serde_json::Value) -> Option<&str> {
+    json.get("id").and_then(|v| v.as_str()).filter(|_| json.get("type").is_some())
+}
+
+/// The session a line is captured into: the one its file's header names,
+/// else the line's own `sessionId`, else the file's name.
+fn session_of(file_sessions: &BTreeMap<String, String>, file: &Path, json: &serde_json::Value) -> String {
+    file_sessions
+        .get(&*file.to_string_lossy())
+        .cloned()
+        .or_else(|| json.get("sessionId").and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_else(|| {
+            file.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown-session".to_string())
+        })
+}
+
+/// The session a chat file's header names: its first line, when that line
+/// is a header (a `sessionId` with no `type` and no `$set`).
+fn header_session(file: &Path) -> Result<Option<String>> {
+    let f = std::fs::File::open(file)
+        .map_err(|e| KernelError::Module(format!("open {}: {e}", file.display())))?;
+    let mut first = String::new();
+    std::io::BufReader::new(f)
+        .read_line(&mut first)
+        .map_err(|e| KernelError::Module(format!("read {}: {e}", file.display())))?;
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(first.trim()) else {
+        return Ok(None);
+    };
+    Ok(json
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .filter(|_| json.get("type").is_none() && json.get("$set").is_none())
+        .map(str::to_string))
+}
+
 
 /// Extract readable text: user parts arrays join their `text` fields;
 /// gemini `content` is already a plain string.
@@ -471,37 +476,6 @@ fn extract_text(json: &serde_json::Value) -> String {
     }
 }
 
-/// Sanitize a record for raw storage: strip `resultDisplay` render
-/// junk wholesale; truncate base64 `inlineData.data` blobs.
-fn sanitize(json: &serde_json::Value) -> serde_json::Value {
-    let mut v = json.clone();
-    if let Some(calls) = v.get_mut("toolCalls").and_then(|c| c.as_array_mut()) {
-        for call in calls {
-            if let Some(obj) = call.as_object_mut() {
-                obj.remove("resultDisplay");
-            }
-        }
-    }
-    if let Some(parts) = v.get_mut("content").and_then(|c| c.as_array_mut()) {
-        for part in parts {
-            if let Some(data) = part
-                .pointer_mut("/inlineData/data")
-                .and_then(|d| d.as_str().map(str::to_string))
-            {
-                if data.len() > INLINE_DATA_MAX {
-                    let truncated: String = data.chars().take(INLINE_DATA_MAX).collect();
-                    if let Some(slot) = part.pointer_mut("/inlineData/data") {
-                        *slot = serde_json::Value::String(format!(
-                            "{truncated}…[truncated {} bytes]",
-                            data.len()
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    v
-}
 
 /// `chats/*.jsonl` at the top level, sorted. Subagent transcripts in
 /// subdirectories are post-FVP.
@@ -518,28 +492,6 @@ fn chat_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Find the first line boundary at or after `from`, so a capped
-/// backfill never starts mid-line.
-fn align_to_next_line(file: &Path, from: u64) -> Result<u64> {
-    let mut f = std::fs::File::open(file)
-        .map_err(|e| KernelError::Module(format!("open {}: {e}", file.display())))?;
-    f.seek(SeekFrom::Start(from))
-        .map_err(|e| KernelError::Module(format!("seek {}: {e}", file.display())))?;
-    let mut buf = [0u8; 65536];
-    let mut pos = from;
-    loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| KernelError::Module(format!("read {}: {e}", file.display())))?;
-        if n == 0 {
-            return Ok(pos); // no newline until EOF
-        }
-        if let Some(idx) = buf[..n].iter().position(|&b| b == b'\n') {
-            return Ok(pos + idx as u64 + 1);
-        }
-        pos += n as u64;
-    }
-}
 
 fn read_complete_lines(file: &Path, offset: u64) -> Result<(Vec<String>, u64)> {
     let mut f = std::fs::File::open(file)
