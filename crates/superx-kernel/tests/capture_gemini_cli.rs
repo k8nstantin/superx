@@ -1,5 +1,6 @@
-//! Gemini CLI adapter tests: header/`$set` folding, part-array user
-//! text, re-emission dedupe, tool-call actions, backfill cap.
+//! Gemini CLI adapter tests: header/`$set` lines kept whole, part-array
+//! user text, every write of a streamed record kept, tool-call actions, a
+//! file read whole from its start into its header's session (#518).
 
 mod common;
 
@@ -7,9 +8,7 @@ use std::error::Error;
 use std::fs;
 use std::io::Write as _;
 
-use superx_kernel::adapters::gemini_cli::{
-    GeminiCliAdapter, BACKFILL_MAX_PARAM, ROOT_PARAM,
-};
+use superx_kernel::adapters::gemini_cli::{GeminiCliAdapter, ROOT_PARAM};
 use superx_kernel::capture::{capture_tick, discover_paired};
 use superx_kernel::registry::KernelModule as _;
 use superx_kernel::types::Value;
@@ -56,7 +55,7 @@ async fn gemini_sources(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conversation_extracted_with_dedupe_and_tools() -> Result<(), Box<dyn Error>> {
+async fn every_write_is_kept_and_the_last_is_the_message() -> Result<(), Box<dyn Error>> {
     let kernel = common::fresh_seeded_kernel().await?;
     let tmp = tempfile::tempdir()?;
     arrange(&kernel, tmp.path()).await?;
@@ -74,68 +73,144 @@ async fn conversation_extracted_with_dedupe_and_tools() -> Result<(), Box<dyn Er
     assert_eq!(
         messages.len(),
         2,
-        "user + ONE deduped assistant (re-emission collapsed): {:?}",
+        "user + the assistant record's last write: {:?}",
         messages.iter().map(|m| (&m.role, &m.content)).collect::<Vec<_>>()
     );
     assert_eq!(messages[0].role, "user");
     assert_eq!(messages[0].content, "hello gemini\nsecond part", "parts joined");
     assert_eq!(messages[1].role, "assistant");
     assert_eq!(messages[1].content, "here you go", "last re-emission wins");
-    let raw = messages[1].raw.as_ref().expect("raw preserved");
-    assert!(
-        !format!("{raw:?}").contains("resultDisplay"),
-        "render junk stripped from raw"
+    let raw = Value::Object(messages[1].raw.clone().expect("raw preserved"));
+    assert_eq!(
+        at(&raw, &["toolCalls"]).and_then(|c| match c {
+            Value::Array(calls) => calls.first().and_then(|call| at(call, &["resultDisplay"])).cloned(),
+            _ => None,
+        }),
+        Some(Value::Array(vec![Value::Array(vec![Value::String("junk".into())].into())].into())),
+        "the call's resultDisplay is kept as written"
     );
 
     let recent = kernel.recent_telemetry(50).await?;
     let count = |name: &str| recent.iter().filter(|e| e.lifecycle_event == name).count();
-    assert_eq!(count("tool_call"), 1, "tool call becomes an action event");
-    assert!(count("transcript_event") >= 1, "info line captured");
+    assert_eq!(count("tool_call"), 1, "a call is one action event, from its record's last write");
+    let earlier = recent
+        .iter()
+        .find_map(|e| match at(&e.payload, &["kind"]) {
+            Some(Value::String(kind)) if kind == "superseded" => at(&e.payload, &["line"]).cloned(),
+            _ => None,
+        })
+        .ok_or("the record's earlier write is kept whole")?;
+    assert_eq!(at(&earlier, &["id"]), Some(&Value::String("g-1".into())));
+    assert_eq!(at(&earlier, &["content"]), Some(&Value::String(String::new())), "{earlier:?}");
+    assert!(matches!(at(&earlier, &["thoughts"]), Some(Value::Array(_))), "{earlier:?}");
+    assert!(count("transcript_event") >= 2, "info line and the earlier write captured");
     Ok(())
 }
 
+/// The value at `path` inside `v`, through objects.
+fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(v, |here, key| match here {
+        Value::Object(o) => o.get(*key),
+        _ => None,
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn backfill_cap_skips_oversized_history() -> Result<(), Box<dyn Error>> {
+async fn a_new_file_is_read_whole_from_its_start() -> Result<(), Box<dyn Error>> {
     let kernel = common::fresh_seeded_kernel().await?;
     let tmp = tempfile::tempdir()?;
     arrange(&kernel, tmp.path()).await?;
 
-    // Cap the backfill window very low, then bulk up the file so only
-    // the tail fits.
+    // The parameter that once capped a first read is set the old way, and
+    // does nothing: no part of a file is skipped (#518).
     let entity = kernel.register_module(&GeminiCliAdapter.descriptor()).await?;
-    kernel
-        .set_parameter(entity, BACKFILL_MAX_PARAM, Value::Number(120.into()))
-        .await?;
+    kernel.set_parameter(entity, "attr_gemini_cli_backfill_max_bytes", Value::Number(120.into())).await?;
     let chats = tmp.path().join("tmp").join("proj-slug").join("chats");
     let file = chats.join("session-2026-08-07T09-00-gsess1.jsonl");
     let mut f = fs::OpenOptions::new().append(true).open(&file)?;
-    // Tail line that must be captured (within the 120-byte window).
     writeln!(f, r#"{{"id":"u-9","type":"user","content":[{{"text":"tail msg"}}]}}"#)?;
 
     let sources = gemini_sources(&kernel).await?;
     let report = capture_tick(&kernel, &sources, None).await?;
-    assert!(report.errors.is_empty());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
 
-    // The oversized head was skipped: telemetry says so, and the
-    // early "hello gemini" user message was never ingested.
     let recent = kernel.recent_telemetry(50).await?;
-    assert!(
-        recent.iter().any(|e| e.lifecycle_event == "backfill_capped"),
-        "cap is announced, never silent"
-    );
-    let agent = kernel
-        .find_entity_by_name("node_agent", "attr_agent_descriptor", "gemini_cli")
+    assert!(recent.iter().all(|e| e.lifecycle_event != "backfill_capped"), "nothing is skipped");
+    let session = kernel
+        .find_entity_by_name("node_session", "attr_session_descriptor", "gemini_cli/g-sess-1")
         .await?
-        .expect("agent");
-    let msgs = kernel.agent_messages(agent, 20).await?;
+        .expect("session entity from header line");
+    let contents: Vec<String> = kernel.session_messages(session, 20).await?.into_iter().map(|m| m.content).collect();
+    assert!(contents.contains(&"hello gemini\nsecond part".to_string()), "the head is read: {contents:?}");
+    assert!(contents.contains(&"tail msg".to_string()), "the tail is read: {contents:?}");
+    Ok(())
+}
+
+/// A read that starts past the header still captures into the header's
+/// session (#518): only the header names it, and Gemini's records carry no
+/// `sessionId`. A later read once split a live chat across two sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_read_captures_into_the_headers_session() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    let sources = gemini_sources(&kernel).await?;
+    let first = capture_tick(&kernel, &sources, None).await?;
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+    let chats = tmp.path().join("tmp").join("proj-slug").join("chats");
+    let mut f = fs::OpenOptions::new().append(true).open(chats.join("session-2026-08-07T09-00-gsess1.jsonl"))?;
+    writeln!(f, r#"{{"id":"u-2","type":"user","timestamp":"2026-08-07T09:01:00.000Z","content":[{{"text":"a later message"}}]}}"#)?;
+    let later = capture_tick(&kernel, &sources, None).await?;
+    assert!(later.errors.is_empty(), "{:?}", later.errors);
+    assert!(later.total() >= 1, "the later line is read");
+
+    let session = kernel
+        .find_entity_by_name("node_session", "attr_session_descriptor", "gemini_cli/g-sess-1")
+        .await?
+        .expect("session entity from header line");
+    let contents: Vec<String> = kernel.session_messages(session, 20).await?.into_iter().map(|m| m.content).collect();
+    assert!(contents.contains(&"a later message".to_string()), "{contents:?}");
     assert!(
-        msgs.iter().all(|m| m.content != "hello gemini\nsecond part"),
-        "head beyond the cap not ingested"
+        kernel
+            .find_entity_by_name("node_session", "attr_session_descriptor", "gemini_cli/session-2026-08-07T09-00-gsess1")
+            .await?
+            .is_none(),
+        "no session is named after the file"
     );
-    assert!(
-        msgs.iter().any(|m| m.content == "tail msg"),
-        "tail within the cap ingested"
-    );
+    Ok(())
+}
+
+/// An attachment is kept as written (#518): its whole `inlineData`, never
+/// cut to a few hundred characters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attachment_is_kept_whole() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    let data = "A".repeat(1000);
+    let chats = tmp.path().join("tmp").join("proj-slug").join("chats");
+    let mut f = fs::OpenOptions::new().append(true).open(chats.join("session-2026-08-07T09-00-gsess1.jsonl"))?;
+    writeln!(
+        f,
+        r#"{{"id":"u-3","type":"user","content":[{{"text":"see this"}},{{"inlineData":{{"mimeType":"image/png","data":"{data}"}}}}]}}"#
+    )?;
+    let sources = gemini_sources(&kernel).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let session = kernel
+        .find_entity_by_name("node_session", "attr_session_descriptor", "gemini_cli/g-sess-1")
+        .await?
+        .expect("session entity from header line");
+    let messages = kernel.session_messages(session, 20).await?;
+    let raw = messages.iter().find(|m| m.content == "see this").and_then(|m| m.raw.clone()).ok_or("the record is captured")?;
+    let raw = Value::Object(raw);
+    let kept = at(&raw, &["content"]).and_then(|c| match c {
+        Value::Array(parts) => parts.get(1).and_then(|part| at(part, &["inlineData", "data"])).cloned(),
+        _ => None,
+    });
+    assert_eq!(kept, Some(Value::String(data)), "the whole attachment");
     Ok(())
 }
 
