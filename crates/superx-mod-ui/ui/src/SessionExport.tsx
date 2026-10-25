@@ -160,6 +160,7 @@ export function SessionExport({
             <SegmentedControl
               size="xs"
               fullWidth
+              orientation="vertical"
               value={o.format}
               onChange={(v) => set({ format: v as ExportOptions['format'] })}
               data={[
