@@ -39,7 +39,7 @@ use surrealdb::types::{Object, RecordId, Value};
 
 use crate::capture::{AgentAdapter, DiscoveredSource, SourceRef, ADAPTERS};
 use crate::error::{KernelError, Result};
-use crate::message::{json_to_object, NewMessage};
+use crate::message::{line_to_object, NewMessage};
 use crate::registry::{KernelModule, KernelModuleDescriptor, NodeKind, KERNEL_MODULES};
 use crate::substrate::Kernel;
 
@@ -303,7 +303,7 @@ impl ClaudeCodeAdapter {
                         agent: source.agent_id.clone(),
                         role: role.to_string(),
                         content: content.clone(),
-                        raw: Some(json_to_object(&json)),
+                        raw: Some(line_to_object(&json)),
                         seq: None,
                         emitted_at,
                     })
@@ -338,7 +338,7 @@ impl ClaudeCodeAdapter {
                 // The whole line (#471): the system prompt and the context
                 // sent with each request, attachments, turn durations, away
                 // summaries. These were kept as their kind alone.
-                payload.insert("line".to_string(), Value::Object(json_to_object(&json)));
+                payload.insert("line".to_string(), Value::Object(line_to_object(&json)));
                 kernel
                     .log_telemetry_for_agent(
                         "transcript_event",

@@ -8,7 +8,7 @@
 //! `(agent, valid_from)` index.
 
 use chrono::{DateTime, Utc};
-use surrealdb::types::{Object, RecordId, SurrealValue, Value};
+use surrealdb::types::{Decimal, Number, Object, RecordId, SurrealValue, Value};
 
 use crate::error::Result;
 use crate::substrate::Kernel;
@@ -230,11 +230,24 @@ struct MessageRow {
 }
 
 /// Convenience: wrap a `serde_json::Value` object as a substrate
-/// [`Object`] for `raw` payloads. Non-object JSON becomes an object
-/// with a single `"value"` key — nothing is ever dropped.
+/// [`Object`] by [`value_from_json`]. Non-object JSON becomes an object
+/// with a single `"value"` key. A key holding JSON `null` is not kept:
+/// a captured line is converted by [`line_to_object`].
 #[must_use]
 pub fn json_to_object(v: &serde_json::Value) -> Object {
-    match value_from_json(v) {
+    object_of(value_from_json(v))
+}
+
+/// A captured line as a substrate [`Object`], kept exactly as written:
+/// every key, `null` included, and every number exact (#516).
+/// Non-object JSON becomes an object with a single `"value"` key.
+#[must_use]
+pub fn line_to_object(v: &serde_json::Value) -> Object {
+    object_of(line_value_from_json(v))
+}
+
+fn object_of(value: Value) -> Object {
+    match value {
         Value::Object(o) => o,
         other => {
             let mut o = Object::new();
@@ -244,7 +257,41 @@ pub fn json_to_object(v: &serde_json::Value) -> Object {
     }
 }
 
-/// Recursively convert `serde_json::Value` → substrate [`Value`].
+/// A captured line's JSON as a substrate [`Value`], exactly: `null`
+/// stays NULL, where NONE would drop its key; an integer beyond `i64`
+/// stays exact as a decimal, never a rounded float. Floats are parsed
+/// exactly (serde_json's `float_roundtrip`).
+#[must_use]
+pub fn line_value_from_json(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Number(i.into())
+            } else if let Some(u) = n.as_u64() {
+                Value::Number(Number::Decimal(Decimal::from(u)))
+            } else {
+                Value::Number(n.as_f64().unwrap_or(0.0).into())
+            }
+        }
+        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::Array(items) => Value::Array(surrealdb::types::Array::from(
+            items.iter().map(line_value_from_json).collect::<Vec<_>>(),
+        )),
+        serde_json::Value::Object(map) => {
+            let mut o = Object::new();
+            for (k, val) in map {
+                o.insert(k.clone(), line_value_from_json(val));
+            }
+            Value::Object(o)
+        }
+    }
+}
+
+/// Recursively convert `serde_json::Value` → substrate [`Value`], for a
+/// value written into typed fields: JSON `null` becomes NONE, so a key
+/// holding it is not stored.
 #[must_use]
 pub fn value_from_json(v: &serde_json::Value) -> Value {
     match v {

@@ -11,7 +11,7 @@ async-trait.workspace = true
 chrono.workspace = true
 linkme.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 surrealdb.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
