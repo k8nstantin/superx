@@ -502,8 +502,9 @@ async fn api_sessions(
     Query(q): Query<SessionsQuery>,
 ) -> axum::response::Response {
     let kernel = &state.kernel;
-    // Four substrate round-trips per session (#380); until that is one
-    // query, at least two pollers share the cost (#390).
+    // Three substrate round-trips per session (#380), the action counts
+    // one read per agent (#530); until it is one query, at least two
+    // pollers share the cost (#390).
     let ttl = crate::resolved_cache_secs(kernel).await;
     let key = format!("sessions:{}", q.agent.clone().unwrap_or_default());
     if let Some(body) = state.cached(&key, ttl) {
@@ -537,6 +538,25 @@ async fn api_sessions(
             }
         }
     }
+    // Every session's action count, in one read per agent (#530).
+    let scopes: Vec<_> = sessions
+        .iter()
+        .map(|s| {
+            let name = match &s.payload {
+                superx_kernel::types::Value::Object(o) => match o.get("name") {
+                    Some(superx_kernel::types::Value::String(v)) => v.as_str(),
+                    _ => "",
+                },
+                _ => "",
+            };
+            let scope = name
+                .split_once('/')
+                .filter(|(_, src)| !src.is_empty())
+                .and_then(|(agent, src)| agent_ids.get(agent).map(|id| (id.clone(), src.to_string())));
+            (s.entity_id.clone(), scope)
+        })
+        .collect();
+    let actions = crate::activity::action_counts(kernel, &scopes).await.unwrap_or_default();
     for s in sessions {
         let name = match &s.payload {
             superx_kernel::types::Value::Object(o) => match o.get("name") {
@@ -554,17 +574,11 @@ async fn api_sessions(
         let src = name.split_once('/').map_or("", |(_, r)| r).to_string();
         // TOTAL activity — messages + the session's action events
         // (issue #187: the list counts everything the feed shows).
-        let scope = if src.is_empty() {
-            None
-        } else {
-            agent_ids.get(&agent).map(|id| (id.clone(), src.clone()))
-        };
+        let uuid = superx_ops::record_uuid(&s.entity_id);
         let count = crate::answered("session messages", || kernel.session_message_count(s.entity_id.clone()))
             .await
             .unwrap_or(0)
-            + crate::activity::session_action_count(kernel, s.entity_id.clone(), scope)
-                .await
-                .unwrap_or(0);
+            + actions.get(&uuid).copied().unwrap_or(0);
         let last_active = crate::activity::session_last_emitted(kernel, s.entity_id.clone())
             .await
             .ok()
@@ -580,7 +594,6 @@ async fn api_sessions(
         let (model, effort) = crate::activity::session_model_effort(kernel, s.entity_id.clone())
             .await
             .unwrap_or((None, None));
-        let uuid = superx_ops::record_uuid(&s.entity_id);
         out.push(SessionView {
             identity: format!("{agent}/{uuid}"),
             short_id: short.get(&uuid).cloned().unwrap_or_else(|| uuid.clone()),
