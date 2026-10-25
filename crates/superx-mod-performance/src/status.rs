@@ -141,7 +141,7 @@ pub async fn render(kernel: &Kernel) -> Result<String> {
 /// The kernel names `superx modules provision <name>` for a module database
 /// it cannot sign in to: a command that knows only the modules linked into
 /// `superx`. This module provisions its own.
-fn own_hint(kernel_words: &str) -> String {
+pub(crate) fn own_hint(kernel_words: &str) -> String {
     let words = kernel_words.split(" — run `superx modules provision").next().unwrap_or(kernel_words);
     format!("{words}. Provision it with `superx-performance --initialize`")
 }

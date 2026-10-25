@@ -27,6 +27,7 @@
 pub mod daemon;
 pub mod instance;
 pub mod params;
+pub mod reader;
 pub mod registry;
 pub mod server;
 pub mod status;

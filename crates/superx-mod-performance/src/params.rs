@@ -16,10 +16,16 @@ use crate::MODULE_NAME;
 pub const PORT_PARAM: &str = "attr_performance_port";
 const DEFAULT_PORT: u16 = 5153; // skill-allow: §9-const — bootstrap fallback, overridable by attr_performance_port
 
+/// How often the reader reads the lines captured since its last pass, in
+/// seconds; 0 pauses it.
+pub const READ_SECS_PARAM: &str = "attr_performance_read_secs";
+const DEFAULT_READ_SECS: u64 = 15; // skill-allow: §9-const — bootstrap fallback, overridable by attr_performance_read_secs
+
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
     pub port: u16,
+    pub read_secs: u64,
 }
 
 /// One parameter as it stands: the value in force, as `status` prints it,
@@ -48,7 +54,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 1] = [PORT_PARAM];
+pub const NAMES: [&str; 2] = [PORT_PARAM, READ_SECS_PARAM];
 
 /// Read every parameter from this module's registry entity. Before the
 /// module is registered, every parameter is its fallback.
@@ -81,7 +87,7 @@ pub async fn resolve(kernel: &Kernel) -> Result<Resolved> {
 #[must_use]
 pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
     let mut r = Reader { values, settings: Vec::new(), problems: Vec::new() };
-    let params = Params { port: r.port(PORT_PARAM, DEFAULT_PORT) };
+    let params = Params { port: r.port(PORT_PARAM, DEFAULT_PORT), read_secs: r.count(READ_SECS_PARAM, DEFAULT_READ_SECS) };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
 
@@ -117,6 +123,20 @@ impl Reader<'_> {
         let value = parsed.unwrap_or(fallback);
         self.settings.push(Setting { name, value: show(&value), set });
         value
+    }
+
+    /// A whole number, 0 or more.
+    fn count(&mut self, name: &'static str, fallback: u64) -> u64 {
+        self.read(
+            name,
+            "a whole number, 0 or more",
+            fallback,
+            |v| match v {
+                Value::Number(n) => n.to_int().and_then(|i| u64::try_from(i).ok()),
+                _ => None,
+            },
+            u64::to_string,
+        )
     }
 
     fn port(&mut self, name: &'static str, fallback: u16) -> u16 {
@@ -157,6 +177,7 @@ mod tests {
         assert_eq!(r.settings.len(), NAMES.len(), "every parameter is listed");
         assert!(r.settings.iter().all(|s| !s.set));
         assert_eq!(r.params.port, 5153);
+        assert_eq!(r.params.read_secs, 15);
         let names: Vec<&str> = r.settings.iter().map(|s| s.name).collect();
         assert_eq!(names, NAMES, "listed in order");
     }
@@ -165,9 +186,11 @@ mod tests {
     fn a_set_value_is_the_one_in_force() {
         let mut values = BTreeMap::new();
         values.insert(PORT_PARAM, number(6_000));
+        values.insert(READ_SECS_PARAM, number(0));
         let r = from_values(&values);
         assert!(r.problems.is_empty(), "{:?}", r.problems);
         assert_eq!(r.params.port, 6_000);
+        assert_eq!(r.params.read_secs, 0, "0 pauses the reader");
         let port = r.settings.iter().find(|s| s.name == PORT_PARAM).expect("listed");
         assert!(port.set && port.value == "6000");
     }
@@ -182,6 +205,14 @@ mod tests {
             let problem = r.problems.iter().find(|p| p.name == PORT_PARAM).expect("reported");
             assert_eq!(problem.found, found);
             assert!(r.settings.iter().all(|s| !s.set), "a refused value is not in force");
+        }
+        for (wrong, found) in [(number(-1), "-1"), (Value::String("15".to_string()), "\"15\"")] {
+            let mut values = BTreeMap::new();
+            values.insert(READ_SECS_PARAM, wrong);
+            let r = from_values(&values);
+            assert_eq!(r.params.read_secs, 15, "{found} is not a whole number of seconds");
+            let problem = r.problems.iter().find(|p| p.name == READ_SECS_PARAM).expect("reported");
+            assert_eq!(problem.found, found);
         }
     }
 }
