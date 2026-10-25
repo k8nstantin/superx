@@ -23,12 +23,18 @@
 //!   captured as telemetry, the whole line under `line` (#471).
 //! - Unparseable lines are captured raw (`transcript_raw`), the whole
 //!   text under `text`, never dropped, never a crash.
+//! - Beside the transcripts Claude Code writes other files: saved tool
+//!   outputs (`<sessionId>/tool-results/`), subagent descriptions
+//!   (`subagents/**/*.meta.json`), workflows (`<sessionId>/workflows/`) and
+//!   the project's `memory/`. Each is captured whole as a
+//!   `transcript_event` of kind `file`, whenever its size or modification
+//!   time changed (#520).
 //!
 //! History is backfilled on first contact (operator directive:
 //! conversations readable historical AND live), then the cursor
 //! resumes incrementally.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -57,6 +63,10 @@ pub const PROJECTS_ROOT_PARAM: &str = "attr_claude_code_projects_root";
 
 /// Cursor type uid for transcript read positions.
 pub const CURSOR_TYPE: &str = "claude_code_transcript";
+
+/// Cursor type uid for the files beside the transcripts: each file's size
+/// and modification time when it was last captured.
+pub const FILES_CURSOR_TYPE: &str = "claude_code_files";
 
 /// The folder under a session's own folder that holds its subagents'
 /// transcripts.
@@ -185,6 +195,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
         if changed {
             write_checkpoint(kernel, source, &offsets, events).await?;
         }
+        events += self.capture_files(kernel, source, &dir, &files).await?;
         Ok(events)
     }
 }
@@ -351,6 +362,110 @@ impl ClaudeCodeAdapter {
         }
         Ok(())
     }
+
+    /// Capture every file under the project folder that is not a
+    /// transcript, whole, whenever its size or modification time changed
+    /// since it was last captured (#520): a saved tool output, a subagent's
+    /// description, a workflow, a memory file. Each is a `transcript_event`
+    /// of kind `file`, so the session view and the export show it in place.
+    async fn capture_files(
+        &self,
+        kernel: &Kernel,
+        source: &SourceRef,
+        dir: &Path,
+        transcripts: &[PathBuf],
+    ) -> Result<u64> {
+        kernel
+            .ensure_cursor_type(
+                FILES_CURSOR_TYPE,
+                "telemetry",
+                "Claude Code files beside the transcripts (size and modification time of each, when captured)",
+            )
+            .await?;
+        let prior = kernel
+            .latest_cursor(source.entity_id.clone(), FILES_CURSOR_TYPE)
+            .await?;
+        let mut stamps = prior
+            .as_ref()
+            .and_then(|c| c.metadata.as_ref())
+            .map(read_stamps)
+            .unwrap_or_default();
+        let mut listed = BTreeSet::new();
+        let mut events: u64 = 0;
+        for file in side_files(dir, transcripts) {
+            let key = file.to_string_lossy().to_string();
+            listed.insert(key.clone());
+            let Ok(meta) = std::fs::metadata(&file) else {
+                continue; // gone since it was listed
+            };
+            let stamp = stamp_of(&meta);
+            if stamps.get(&key) == Some(&stamp) {
+                continue;
+            }
+            let bytes = match std::fs::read(&file) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(KernelError::Module(format!("read {}: {e}", file.display()))),
+            };
+            let mut line = Object::new();
+            line.insert("type".to_string(), Value::String("file".to_string()));
+            line.insert(
+                "path".to_string(),
+                Value::String(file.strip_prefix(dir).unwrap_or(&file).to_string_lossy().to_string()),
+            );
+            line.insert(
+                "bytes".to_string(),
+                Value::Number(i64::try_from(bytes.len()).unwrap_or(i64::MAX).into()),
+            );
+            if let Ok(modified) = meta.modified() {
+                line.insert("modified".to_string(), Value::Datetime(DateTime::<Utc>::from(modified).into()));
+            }
+            let content = match String::from_utf8(bytes) {
+                Ok(text) => Value::String(text),
+                Err(e) => Value::Bytes(e.into_bytes().into()),
+            };
+            line.insert("content".to_string(), content);
+            let mut payload = Object::new();
+            payload.insert("kind".to_string(), Value::String("file".to_string()));
+            if let Some(session) = session_of_side_file(dir, &file) {
+                payload.insert("session".to_string(), Value::String(session));
+            }
+            payload.insert("file".to_string(), Value::String(key.clone()));
+            payload.insert("line".to_string(), Value::Object(line));
+            kernel
+                .log_telemetry_for_agent(
+                    "transcript_event",
+                    Value::Object(payload),
+                    Some(source.entity_id.clone()),
+                    Some(source.agent_id.clone()),
+                )
+                .await?;
+            stamps.insert(key, stamp);
+            events += 1;
+        }
+        if events > 0 {
+            stamps.retain(|path, _| listed.contains(path));
+            let mut files = Object::new();
+            for (path, (bytes, modified)) in &stamps {
+                let stamp = vec![
+                    Value::Number(i64::try_from(*bytes).unwrap_or(i64::MAX).into()),
+                    Value::Number((*modified).into()),
+                ];
+                files.insert(path.clone(), Value::Array(surrealdb::types::Array::from(stamp)));
+            }
+            let mut metadata = Object::new();
+            metadata.insert("files".to_string(), Value::Object(files));
+            kernel
+                .write_cursor(
+                    source.entity_id.clone(),
+                    FILES_CURSOR_TYPE,
+                    Some(events.to_string()),
+                    Some(metadata),
+                )
+                .await?;
+        }
+        Ok(events)
+    }
 }
 
 /// Role classification per the mapped format: genuine human prompts
@@ -454,6 +569,68 @@ fn jsonl_under(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// Every regular file under the project folder that is not one of its
+/// transcripts, sorted. A folder or file linked from elsewhere is not
+/// followed.
+fn side_files(dir: &Path, transcripts: &[PathBuf]) -> Vec<PathBuf> {
+    let transcripts: BTreeSet<&PathBuf> = transcripts.iter().collect();
+    let mut out = Vec::new();
+    files_under(dir, &mut out);
+    out.retain(|file| !transcripts.contains(file));
+    out.sort();
+    out
+}
+
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => files_under(&path, out),
+            Ok(t) if t.is_file() => out.push(path),
+            _ => {}
+        }
+    }
+}
+
+/// The session a file beside the transcripts belongs to: the one whose
+/// folder holds it, when `<sessionId>.jsonl` sits beside that folder. A
+/// file anywhere else, such as `memory/`, is the project's.
+fn session_of_side_file(dir: &Path, file: &Path) -> Option<String> {
+    let mut parts = file.strip_prefix(dir).ok()?.components();
+    let folder = parts.next()?.as_os_str().to_string_lossy().to_string();
+    parts.next()?;
+    dir.join(format!("{folder}.jsonl")).is_file().then_some(folder)
+}
+
+/// A file's size and modification time, in nanoseconds since the epoch.
+fn stamp_of(meta: &std::fs::Metadata) -> (u64, i64) {
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+    (meta.len(), modified)
+}
+
+fn read_stamps(metadata: &Object) -> BTreeMap<String, (u64, i64)> {
+    let mut out = BTreeMap::new();
+    if let Some(Value::Object(files)) = metadata.get("files") {
+        for (path, stamp) in files.iter() {
+            if let Value::Array(a) = stamp {
+                if let [Value::Number(bytes), Value::Number(modified)] = a.as_slice() {
+                    if let (Some(bytes), Some(modified)) = (bytes.to_int(), modified.to_int()) {
+                        out.insert(path.clone(), (u64::try_from(bytes).unwrap_or(0), modified));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn is_jsonl(path: &Path) -> bool {

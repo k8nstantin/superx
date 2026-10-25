@@ -363,6 +363,83 @@ async fn nulls_and_numbers_are_kept_exactly() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The files beside the transcripts are captured whole (#520): a saved tool
+/// output and a subagent's description into their session, a memory file as
+/// the project's; again only when one changes; a subagent's transcript stays
+/// lines, never a file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_beside_the_transcripts_are_captured_whole() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    let project = tmp.path().join("projects").join("-tmp-proj");
+    let session_dir = project.join("sess-1");
+    fs::create_dir_all(session_dir.join("tool-results"))?;
+    fs::create_dir_all(session_dir.join("subagents"))?;
+    fs::create_dir_all(project.join("memory"))?;
+    fs::write(session_dir.join("tool-results").join("toolu_1.txt"), "a long output\nline two\n")?;
+    fs::write(session_dir.join("subagents").join("agent-a1.meta.json"), r#"{"agentType":"general-purpose","description":"look"}"#)?;
+    fs::write(
+        session_dir.join("subagents").join("agent-a1.jsonl"),
+        concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"subagent says hi"}]},"sessionId":"sess-1","isSidechain":true,"timestamp":"2026-08-07T10:00:03.000Z"}"#,
+            "\n"
+        ),
+    )?;
+    fs::write(project.join("memory").join("MEMORY.md"), "# Memory\n")?;
+
+    let sources = cc_sources(&kernel).await?;
+    let first = capture_tick(&kernel, &sources, None).await?;
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    assert_eq!(first.total(), 9, "the session's 5 lines, the subagent's 1 and 3 files");
+    let files = file_events(&kernel).await?;
+    assert_eq!(files.len(), 3, "{files:?}");
+    assert!(files.contains(&("sess-1/tool-results/toolu_1.txt".into(), Some("sess-1".into()), "a long output\nline two\n".into())), "{files:?}");
+    assert!(
+        files.contains(&(
+            "sess-1/subagents/agent-a1.meta.json".into(),
+            Some("sess-1".into()),
+            r#"{"agentType":"general-purpose","description":"look"}"#.into()
+        )),
+        "{files:?}"
+    );
+    assert!(files.contains(&("memory/MEMORY.md".into(), None, "# Memory\n".into())), "the project's own: {files:?}");
+
+    let quiet = capture_tick(&kernel, &sources, None).await?;
+    assert_eq!(quiet.total(), 0, "an unchanged file is not captured again");
+
+    fs::write(project.join("memory").join("MEMORY.md"), "# Memory\n- a new line\n")?;
+    let changed = capture_tick(&kernel, &sources, None).await?;
+    assert_eq!(changed.total(), 1, "only the changed file");
+    let files = file_events(&kernel).await?;
+    assert_eq!(files.len(), 4, "{files:?}");
+    assert!(files.contains(&("memory/MEMORY.md".into(), None, "# Memory\n- a new line\n".into())), "{files:?}");
+    Ok(())
+}
+
+/// Every `file` event captured: its path in the project, its session, and
+/// its content.
+async fn file_events(kernel: &Kernel) -> Result<Vec<(String, Option<String>, String)>, Box<dyn Error>> {
+    Ok(kernel
+        .recent_telemetry(200)
+        .await?
+        .into_iter()
+        .filter(|e| e.lifecycle_event == "transcript_event")
+        .filter(|e| matches!(at(&e.payload, &["kind"]), Some(Value::String(k)) if k == "file"))
+        .map(|e| {
+            let text = |path: &[&str]| match at(&e.payload, path) {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            };
+            (
+                text(&["line", "path"]).unwrap_or_default(),
+                text(&["session"]),
+                text(&["line", "content"]).unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
 /// The value at `path` inside `v`, through objects.
 fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter().try_fold(v, |here, key| match here {
