@@ -7,6 +7,10 @@
 //!
 //! - Projects root: `~/.claude/projects/<mangled-cwd>/`; each
 //!   `<sessionId>.jsonl` at the top level is one session transcript.
+//!   A subagent's own transcript is `<sessionId>/subagents/agent-*.jsonl`,
+//!   a workflow agent's `<sessionId>/subagents/workflows/<run>/agent-*.jsonl`
+//!   beside the run's `journal.jsonl`: their lines carry the parent
+//!   session's `sessionId` (and `isSidechain`), and are captured into it.
 //!   A session started under `CLAUDE_CONFIG_DIR=<dir>` writes to
 //!   `<dir>/projects/` instead, so the root can be several folders.
 //! - Conversation lines carry `type` (`user` / `assistant`), a
@@ -53,6 +57,11 @@ pub const PROJECTS_ROOT_PARAM: &str = "attr_claude_code_projects_root";
 
 /// Cursor type uid for transcript read positions.
 pub const CURSOR_TYPE: &str = "claude_code_transcript";
+
+/// The folder under a session's own folder that holds its subagents'
+/// transcripts.
+// skill-allow: §9-const — agent-format knowledge: where Claude Code writes a subagent's transcript
+const SUBAGENTS_DIR: &str = "subagents";
 
 /// How much of an unparseable line the `transcript_raw` payload
 /// carries.
@@ -229,14 +238,11 @@ impl ClaudeCodeAdapter {
         if trimmed.is_empty() {
             return Ok(());
         }
-        // The transcript FILE is `<sessionId>.jsonl` — the filename
-        // attributes lines that don't carry a sessionId themselves
-        // (sidecars, unparseable lines). Nothing is ever "unknown"
-        // (issues #186/#204).
-        let file_session = file
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown-session".to_string());
+        // The transcript FILE is `<sessionId>.jsonl`, or sits under
+        // `<sessionId>/subagents/`: its path attributes lines that don't
+        // carry a sessionId themselves (sidecars, a workflow's journal,
+        // unparseable lines). Nothing is ever "unknown" (issues #186/#204).
+        let file_session = session_of_file(file);
         let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             let mut payload = Object::new();
             payload.insert(
@@ -412,20 +418,59 @@ fn extract_text(json: &serde_json::Value) -> String {
     }
 }
 
-/// `*.jsonl` files at the top level of the project directory, sorted.
-/// A vanished directory yields an empty list — discovery owns
+/// The transcripts of a project directory, sorted: each `*.jsonl` at its
+/// top level, and each `*.jsonl` under a session's `subagents/` folder at
+/// any depth (a subagent's own transcript, a workflow agent's, a workflow's
+/// journal). A vanished directory yields an empty list — discovery owns
 /// forgetting sources.
 fn transcript_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return vec![];
     };
-    let mut files: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "jsonl"))
-        .collect();
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            jsonl_under(&path.join(SUBAGENTS_DIR), &mut files);
+        } else if is_jsonl(&path) {
+            files.push(path);
+        }
+    }
     files.sort();
     files
+}
+
+/// Every `*.jsonl` under `dir`, at any depth. A folder linked from
+/// elsewhere is not followed.
+fn jsonl_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            jsonl_under(&path, out);
+        } else if is_jsonl(&path) {
+            out.push(path);
+        }
+    }
+}
+
+fn is_jsonl(path: &Path) -> bool {
+    path.is_file() && path.extension().is_some_and(|e| e == "jsonl")
+}
+
+/// The session a transcript belongs to: the session folder that holds the
+/// `subagents/` folder it sits under, else the file's own name.
+fn session_of_file(file: &Path) -> String {
+    let parts: Vec<&std::ffi::OsStr> = file.iter().collect();
+    match parts.iter().rposition(|p| *p == SUBAGENTS_DIR) {
+        Some(i) if i > 0 => parts[i - 1].to_string_lossy().to_string(),
+        _ => file
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown-session".to_string()),
+    }
 }
 
 /// Read complete lines from `offset`, returning the lines and the

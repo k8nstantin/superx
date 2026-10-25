@@ -295,3 +295,63 @@ async fn every_line_is_kept_whole() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+
+/// A subagent's own transcript, and a workflow's agents and journal, are
+/// captured into the session that started them: a subagent's lines carry
+/// the parent's `sessionId`; a journal line carries none and is attributed
+/// by the session folder it sits under, never by its own file name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_transcripts_are_captured_into_their_session() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    let session_dir = tmp.path().join("projects").join("-tmp-proj").join("sess-1");
+    let subagents = session_dir.join("subagents");
+    let workflow = subagents.join("workflows").join("wf_1");
+    fs::create_dir_all(&workflow)?;
+    fs::write(
+        subagents.join("agent-a1.jsonl"),
+        concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"subagent says hi"}]},"sessionId":"sess-1","isSidechain":true,"agentId":"a1","timestamp":"2026-08-07T10:00:03.000Z"}"#,
+            "\n"
+        ),
+    )?;
+    fs::write(
+        workflow.join("agent-w1.jsonl"),
+        concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"workflow agent says hi"}]},"sessionId":"sess-1","isSidechain":true,"agentId":"w1","timestamp":"2026-08-07T10:00:04.000Z"}"#,
+            "\n"
+        ),
+    )?;
+    fs::write(workflow.join("journal.jsonl"), concat!(r#"{"type":"started","runId":"wf_1"}"#, "\n"))?;
+
+    let sources = cc_sources(&kernel).await?;
+    assert_eq!(sources.len(), 1, "the session folder is not a project of its own");
+    let report = capture_tick(&kernel, &sources, None).await?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.total(), 8, "the five lines of the session, two subagents' and a journal's");
+
+    let session = kernel
+        .find_entity_by_name("node_session", "attr_session_descriptor", "claude_code/sess-1")
+        .await?
+        .expect("session entity exists");
+    let contents: Vec<String> =
+        kernel.session_messages(session, 10).await?.into_iter().map(|m| m.content).collect();
+    assert!(contents.contains(&"subagent says hi".to_string()), "{contents:?}");
+    assert!(contents.contains(&"workflow agent says hi".to_string()), "{contents:?}");
+    assert!(
+        kernel.find_entity_by_name("node_session", "attr_session_descriptor", "claude_code/journal").await?.is_none(),
+        "a journal is never a session of its own"
+    );
+    let recent = kernel.recent_telemetry(100).await?;
+    let journal = recent
+        .iter()
+        .find(|e| {
+            e.lifecycle_event == "transcript_event"
+                && matches!(&e.payload, Value::Object(o) if o.get("kind") == Some(&Value::String("started".into())))
+        })
+        .ok_or("the journal line is captured")?;
+    let Value::Object(payload) = &journal.payload else { return Err("an object payload".into()) };
+    assert_eq!(payload.get("session"), Some(&Value::String("sess-1".into())), "attributed by its session folder");
+    Ok(())
+}
