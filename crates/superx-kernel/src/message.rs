@@ -54,6 +54,17 @@ impl Kernel {
     /// e.g. a `session` that is not a `node_session` entity or an
     /// `agent` that is not a `node_agent` entity (schema ASSERTs).
     pub async fn log_message(&self, msg: NewMessage) -> Result<RecordId> {
+        self.log_message_line(msg, None).await
+    }
+
+    /// Append one row to `message` as [`Kernel::log_message`] does, with
+    /// the event exactly as the agent wrote it (`raw_text`, its line's
+    /// text, #528) beside its parsed copy `raw`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Kernel::log_message`].
+    pub async fn log_message_line(&self, msg: NewMessage, raw_text: Option<String>) -> Result<RecordId> {
         let id = self.new_record_id("message");
         let row = MessageRow {
             session: msg.session,
@@ -61,6 +72,7 @@ impl Kernel {
             role: msg.role,
             content: msg.content,
             raw: msg.raw,
+            raw_text,
             seq: msg.seq,
             emitted_at: msg.emitted_at,
             valid_from: Utc::now(),
@@ -224,6 +236,7 @@ struct MessageRow {
     role: String,
     content: String,
     raw: Option<Object>,
+    raw_text: Option<String>,
     seq: Option<i64>,
     emitted_at: Option<DateTime<Utc>>,
     valid_from: DateTime<Utc>,

@@ -284,3 +284,42 @@ async fn a_record_keeps_its_nulls() -> Result<(), Box<dyn Error>> {
     assert!(matches!(&header, Value::Object(o) if matches!(o.get("summary"), Some(Value::Null))), "{header:?}");
     Ok(())
 }
+
+/// Every line keeps its exact text (#528): the header's, a streamed
+/// record's earlier write and its last, each as written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_line_keeps_its_exact_text() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    let header = r#"{"sessionId":"g-sess-x","kind":"main",  "startTime":"2026-08-07T11:00:00.000Z"}"#;
+    let partial = r#"{"id":"g-9","type":"gemini","content":"","tokens":{"output":1.0}}"#;
+    let full = r#"{"type":"gemini","id":"g-9","content":"done","model":"gemini-3.1-pro"}"#;
+    let chats = tmp.path().join("tmp").join("proj-slug").join("chats");
+    fs::write(chats.join("session-2026-08-07T11-00-gsessx.jsonl"), format!("{header}\n{partial}\n{full}\n"))?;
+    let sources = gemini_sources(&kernel).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let session = kernel
+        .find_entity_by_name("node_session", "attr_session_descriptor", "gemini_cli/g-sess-x")
+        .await?
+        .expect("session entity from header line");
+    let rows: Vec<Value> = kernel
+        .db()
+        .query("SELECT raw_text, valid_from FROM message WHERE session = $sess ORDER BY valid_from")
+        .bind(("sess", session))
+        .await?
+        .take(0)?;
+    let texts: Vec<Option<&Value>> = rows.iter().map(|r| at(r, &["raw_text"])).collect();
+    assert_eq!(texts, vec![Some(&Value::String(full.into()))], "the record's last write, exactly as written");
+
+    let recent = kernel.recent_telemetry(100).await?;
+    for wanted in [header, partial] {
+        assert!(
+            recent.iter().any(|e| matches!(at(&e.payload, &["raw_text"]), Some(Value::String(s)) if s == wanted)),
+            "{wanted}"
+        );
+    }
+    Ok(())
+}

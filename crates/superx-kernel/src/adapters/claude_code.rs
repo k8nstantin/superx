@@ -265,6 +265,7 @@ impl ClaudeCodeAdapter {
             payload.insert("snippet".to_string(), Value::String(snippet));
             // The whole line, whatever its length: nothing is dropped (#471).
             payload.insert("text".to_string(), Value::String(trimmed.to_string()));
+            payload.insert("raw_text".to_string(), Value::String(line.to_string()));
             kernel
                 .log_telemetry_for_agent(
                     "transcript_raw",
@@ -309,7 +310,7 @@ impl ClaudeCodeAdapter {
                     .map(|dt| dt.with_timezone(&Utc));
 
                 kernel
-                    .log_message(NewMessage {
+                    .log_message_line(NewMessage {
                         session: session_id.clone(),
                         agent: source.agent_id.clone(),
                         role: role.to_string(),
@@ -317,7 +318,7 @@ impl ClaudeCodeAdapter {
                         raw: Some(line_to_object(&json)),
                         seq: None,
                         emitted_at,
-                    })
+                    }, Some(line.to_string()))
                     .await?;
 
                 // Light action event so the live actions stream pulses
@@ -350,6 +351,7 @@ impl ClaudeCodeAdapter {
                 // sent with each request, attachments, turn durations, away
                 // summaries. These were kept as their kind alone.
                 payload.insert("line".to_string(), Value::Object(line_to_object(&json)));
+                payload.insert("raw_text".to_string(), Value::String(line.to_string()));
                 kernel
                     .log_telemetry_for_agent(
                         "transcript_event",

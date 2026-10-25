@@ -440,6 +440,50 @@ async fn file_events(kernel: &Kernel) -> Result<Vec<(String, Option<String>, Str
         .collect())
 }
 
+/// Every line keeps its exact text (#528) beside its parsed copy: a key's
+/// order, a number's spelling and the spacing a parser does not keep. A
+/// message holds it in `raw_text`; any other line in its payload's
+/// `raw_text`; an unparseable line too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_line_keeps_its_exact_text() -> Result<(), Box<dyn Error>> {
+    let kernel = common::fresh_seeded_kernel().await?;
+    let tmp = tempfile::tempdir()?;
+    arrange(&kernel, tmp.path()).await?;
+    let user = r#"{"type":"user","z":1,"message":{"role":"user","content":"hi"},"a":1.0,"sessionId":"sess-x","timestamp":"2026-08-07T12:00:00.000Z"}"#;
+    let mode = r#"{"type":"mode",  "mode":"normal","b":2,"a":1,"sessionId":"sess-x"}"#;
+    let broken = "not json {";
+    fs::write(
+        tmp.path().join("projects").join("-tmp-proj").join("sess-x.jsonl"),
+        format!("{user}\n{mode}\n{broken}\n"),
+    )?;
+    let sources = cc_sources(&kernel).await?;
+    let report = capture_tick(&kernel, &sources, None).await?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let session = kernel
+        .find_entity_by_name("node_session", "attr_session_descriptor", "claude_code/sess-x")
+        .await?
+        .expect("session captured");
+    let rows: Vec<Value> = kernel
+        .db()
+        .query("SELECT raw_text, valid_from FROM message WHERE session = $sess ORDER BY valid_from")
+        .bind(("sess", session))
+        .await?
+        .take(0)?;
+    let texts: Vec<Option<&Value>> = rows.iter().map(|r| at(r, &["raw_text"])).collect();
+    assert_eq!(texts, vec![Some(&Value::String(user.into()))], "the message, exactly as written");
+
+    let recent = kernel.recent_telemetry(100).await?;
+    let text_of = |event: &str, wanted: &str| {
+        recent.iter().any(|e| {
+            e.lifecycle_event == event && matches!(at(&e.payload, &["raw_text"]), Some(Value::String(s)) if s == wanted)
+        })
+    };
+    assert!(text_of("transcript_event", mode), "the mode line, exactly as written");
+    assert!(text_of("transcript_raw", broken), "the unparseable line, exactly as written");
+    Ok(())
+}
+
 /// The value at `path` inside `v`, through objects.
 fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter().try_fold(v, |here, key| match here {

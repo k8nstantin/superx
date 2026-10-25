@@ -1,4 +1,4 @@
-# SUPERX_SCHEMA.md — Substrate Schema, Source of Truth (v2.2)
+# SUPERX_SCHEMA.md — Substrate Schema, Source of Truth (v2.3)
 
 > **Status: locked on apply.** v2 designed operator + model on
 > 2026-08-06; **v2.1** (conversations first-class: `message` table +
@@ -10,6 +10,8 @@
 > per-change `Operator-approved:` PR marker (skill §7, CI-enforced).
 > **v2.2** (module registration ledger) designed 2026-08-19 per the
 > operator directive in issue #150.
+> **v2.3** (`message.raw_text`, each event exactly as written) approved
+> by the operator on 2026-10-25, issue #528.
 
 ## 1. Contracts (binding on every kernel verb)
 
@@ -151,6 +153,7 @@ agent_id; per-agent reads are one indexed query
 | `role` | `string` | source-native label (`user`, `assistant`, `tool`, …); deliberately un-ASSERTed — tolerance beats constraint at the capture boundary |
 | `content` | `string` | extracted readable text; empty when the event has none |
 | `raw` | `option<object> FLEXIBLE` | the full original source event — capture is very detailed by design |
+| `raw_text` | `option<string>` | the event exactly as the agent wrote it: its line's text, of which `raw` is the parsed copy *(v2.3, #528)* |
 | `seq` | `option<int>` | source ordering (e.g. JSONL line number) |
 | `emitted_at` | `option<datetime>` | the source's own timestamp, best effort |
 
@@ -212,6 +215,15 @@ v2.1 indexes back conversation rendering and per-agent queries.
 5. Decision: **capture everything by default** — no per-agent grant
    gate; "requesting perms where needed" is the OS-level file prompts.
    A future exclusion mechanism, if wanted, is a substrate parameter.
+
+## 5c. Delta in v2.3 (operator approval 2026-10-25, issue #528)
+
+1. New field `message.raw_text` (`option<string>`): the event exactly as
+   the agent wrote it, its line's text. `raw` stays its parsed copy,
+   which readers query; `raw_text` keeps what parsing cannot (a key's
+   order, a number's spelling, and anything a conversion would lose).
+   Purely additive: rows written before it carry none. An existing
+   instance applies it at its next start, by the version gate (#158).
 
 ## 5b. Delta in v2.2 (operator directive, issue #150)
 
