@@ -112,16 +112,112 @@ const CONTRACT: &[Table] = &[
         indexes: &["idx_away_line", "idx_away_session"],
     },
     Table {
-        name: "pass",
+        name: "repository",
+        fields: &["common_dir", "name", "found_at", "valid_from"],
+        indexes: &["idx_repository_dir"],
+    },
+    Table {
+        name: "checkout",
+        fields: &["repository", "toplevel", "found_at", "valid_from"],
+        indexes: &["idx_checkout_top", "idx_checkout_repo"],
+    },
+    Table {
+        name: "checkout_state",
+        fields: &["checkout", "branch", "first_branch", "present", "valid_from"],
+        indexes: &["idx_checkout_state"],
+    },
+    Table { name: "directory", fields: &["path", "source", "checkout", "exact", "valid_from"], indexes: &["idx_directory_path"] },
+    Table { name: "head_move", fields: &["checkout", "at", "branch", "valid_from"], indexes: &["idx_head_move"] },
+    Table {
+        name: "commit",
         fields: &[
-            "started_at", "finished_at", "from_line", "to_line", "lines_read", "lines_unread", "sessions_new",
-            "places_new", "prompts_new", "replies_new", "reply_states_new", "thinking_new", "tool_calls_new",
-            "tool_results_new", "edits_new", "git_events_new", "test_runs_new", "build_runs_new", "turns_new",
-            "compactions_new", "aways_new", "rows_written", "outcome", "note", "valid_from",
+            "repository", "hash", "authored_at", "committed_at", "author", "committer", "subject", "body", "parents",
+            "added", "removed", "valid_from",
         ],
+        indexes: &["idx_commit_hash", "idx_commit_author"],
+    },
+    Table {
+        name: "commit_file",
+        fields: &["commit", "path", "change", "added", "removed", "binary", "valid_from"],
+        indexes: &["idx_commit_file", "idx_file_path"],
+    },
+    Table { name: "placement", fields: &["commit", "crawl", "place", "first_parent", "valid_from"], indexes: &["idx_placement"] },
+    Table {
+        name: "landed_via",
+        fields: &["commit", "path", "via", "crawl", "valid_from"],
+        indexes: &["idx_landed_via", "idx_landed_via_via"],
+    },
+    Table { name: "survival", fields: &["commit", "crawl", "alive", "valid_from"], indexes: &["idx_survival"] },
+    Table {
+        name: "survival_file",
+        fields: &["commit", "crawl", "path", "alive", "valid_from"],
+        indexes: &["idx_survival_file"],
+    },
+    // The first approval's fields; `CRAWL_COUNTS` are added in `fields_of`.
+    Table {
+        name: "crawl",
+        fields: &[
+            "repository", "started_at", "finished_at", "mainline", "mainline_from", "identity", "tip", "since", "outcome",
+            "commits_read", "files_blamed", "files_left", "git_calls", "git_failed", "note", "valid_from",
+        ],
+        indexes: &["idx_crawl_repo"],
+    },
+    Table {
+        name: "ref_state",
+        fields: &["repository", "crawl", "name", "tip", "rewritten", "valid_from"],
+        indexes: &["idx_ref_state"],
+    },
+    Table {
+        name: "worktree_file",
+        fields: &["checkout", "crawl", "path", "from_path", "state", "staged", "added", "removed", "binary", "valid_from"],
+        indexes: &["idx_worktree_file"],
+    },
+    Table {
+        name: "crawl_step",
+        fields: &[
+            "crawl", "step", "started_at", "ms", "git_calls", "git_failed", "git_timeouts", "objects_read", "bytes_read",
+            "rows_written", "note", "valid_from",
+        ],
+        indexes: &["idx_crawl_step"],
+    },
+    // An array field's elements are a field of their own the engine
+    // defines (`args.*`, `crawls.*`).
+    Table {
+        name: "git_call",
+        fields: &[
+            "crawl", "step", "dir", "args", "args.*", "started_at", "ms", "exit", "timed_out", "bytes_out", "lines_out",
+            "stderr", "valid_from",
+        ],
+        indexes: &["idx_git_call", "idx_git_call_failed"],
+    },
+    Table {
+        name: "pass",
+        fields: &["started_at", "finished_at", "rows_written", "outcome", "note", "valid_from"],
         indexes: &["idx_pass"],
     },
+    Table {
+        name: "pass_source",
+        fields: &[
+            "pass", "source", "started_at", "finished_at", "items", "unread", "calls", "failed", "timed_out", "rows",
+            "counts", "from_id", "to_id", "crawls", "crawls.*", "outcome", "note", "valid_from",
+        ],
+        indexes: &["idx_pass_source", "idx_pass_source_source"],
+    },
 ];
+
+/// The counts of a crawl added by the second approval (#501).
+const CRAWL_COUNTS: &[&str] = &[
+    "checkouts_read", "refs_read", "files_read", "reflog_read", "unreachable_read", "blame_lines_read", "bytes_read",
+    "commits_new", "commit_files_new", "lines_added_new", "lines_removed_new", "refs_new", "refs_moved", "refs_gone",
+    "refs_rewritten", "head_moves_new", "placements_changed", "landed_new", "survival_changed", "survival_delta",
+    "git_timeouts", "git_ms", "rows_written",
+];
+
+/// A table's fields as the contract has them.
+fn fields_of(table: &Table) -> BTreeSet<String> {
+    let extra: &[&str] = if table.name == "crawl" { CRAWL_COUNTS } else { &[] };
+    table.fields.iter().chain(extra).map(|f| (*f).to_string()).collect()
+}
 
 fn keys_of(v: &Value, section: &str) -> BTreeSet<String> {
     let Value::Object(top) = v else { return BTreeSet::new() };
@@ -165,7 +261,7 @@ async fn provisioning_leaves_the_database_exactly_as_the_contract_says() {
     for table in CONTRACT {
         let info: Value =
             db.query(format!("INFO FOR TABLE {}", table.name)).await.expect("info").take(0).expect("decodes");
-        for (section, want) in [("fields", set_of(table.fields)), ("indexes", set_of(table.indexes))] {
+        for (section, want) in [("fields", fields_of(table)), ("indexes", set_of(table.indexes))] {
             let got = keys_of(&info, section);
             assert_eq!(
                 got,
@@ -427,32 +523,182 @@ fn away(set: &[(&str, &str)]) -> String {
     row("away", "", &base, set)
 }
 
-fn pass(set: &[(&str, &str)]) -> String {
-    let mut base = vec![
+fn pass(id: &str, set: &[(&str, &str)]) -> String {
+    let base = [
         ("started_at", "time::now()"),
         ("finished_at", "time::now()"),
-        ("from_line", "rand::uuid::v7()"),
-        ("to_line", "rand::uuid::v7()"),
-        ("lines_read", "500"),
+        ("rows_written", "1204"),
         ("outcome", "'complete'"),
         ("note", "NONE"),
         ("valid_from", "time::now()"),
     ];
-    for count in [
-        "lines_unread", "sessions_new", "places_new", "prompts_new", "replies_new", "reply_states_new", "thinking_new",
-        "tool_calls_new", "tool_results_new", "edits_new", "git_events_new", "test_runs_new", "build_runs_new",
-        "turns_new", "compactions_new", "aways_new", "rows_written",
-    ] {
-        base.push((count, "1"));
-    }
-    row("pass", "", &base, set)
+    row("pass", id, &base, set)
 }
 
-/// The engine holds the rules the reader relies on: one row per session,
-/// line, reply, thinking span, tool call, result, file of an edit, and test
-/// or build command; links that point at rows that exist; values from the
-/// closed lists; counts never below zero; a commit hash of 7 to 64
-/// characters.
+fn pass_source(set: &[(&str, &str)]) -> String {
+    let base = [
+        ("pass", "pass:p1"),
+        ("source", "'lines'"),
+        ("started_at", "time::now()"),
+        ("finished_at", "time::now()"),
+        ("items", "500"),
+        ("unread", "0"),
+        ("calls", "0"),
+        ("failed", "0"),
+        ("timed_out", "0"),
+        ("rows", "{ reply: 31, prompt: 4 }"),
+        ("counts", "{ sessions_read: 2 }"),
+        ("from_id", "rand::uuid::v7()"),
+        ("to_id", "rand::uuid::v7()"),
+        ("crawls", "[]"),
+        ("outcome", "'complete'"),
+        ("note", "NONE"),
+        ("valid_from", "time::now()"),
+    ];
+    row("pass_source", "", &base, set)
+}
+
+const HASH_A: &str = "0123456789abcdef0123456789abcdef01234567";
+const HASH_B: &str = "1123456789abcdef0123456789abcdef01234567";
+
+fn commit(id: &str, repository: &str, hash: &str, set: &[(&str, &str)]) -> String {
+    let (repository, hash) = (repository.to_string(), format!("'{hash}'"));
+    let base = [
+        ("repository", repository.as_str()),
+        ("hash", hash.as_str()),
+        ("authored_at", "time::now()"),
+        ("committed_at", "time::now()"),
+        ("author", "'me@x'"),
+        ("committer", "'noreply@github.com'"),
+        ("subject", "'s'"),
+        ("body", "'Why.\\n\\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>'"),
+        ("parents", "1"),
+        ("added", "3"),
+        ("removed", "0"),
+        ("valid_from", "time::now()"),
+    ];
+    row("commit", &format!(":{id}"), &base, set)
+}
+
+fn crawl(id: &str, set: &[(&str, &str)]) -> String {
+    let mut base = vec![
+        ("repository", "repository:r1"),
+        ("started_at", "time::now()"),
+        ("finished_at", "time::now()"),
+        ("mainline", "'origin/main'"),
+        ("mainline_from", "'origin_head'"),
+        ("identity", "'me@x'"),
+        ("tip", "NONE"),
+        ("since", "NONE"),
+        ("outcome", "'complete'"),
+        ("commits_read", "2"),
+        ("files_blamed", "1"),
+        ("files_left", "0"),
+        ("git_calls", "3"),
+        ("git_failed", "0"),
+        ("note", "NONE"),
+        ("valid_from", "time::now()"),
+    ];
+    base.extend(CRAWL_COUNTS.iter().map(|c| (*c, "0")));
+    row("crawl", &format!(":{id}"), &base, set)
+}
+
+fn commit_file(set: &[(&str, &str)]) -> String {
+    let base = [
+        ("commit", "commit:m1"),
+        ("path", "'a.rs'"),
+        ("change", "'added'"),
+        ("added", "3"),
+        ("removed", "0"),
+        ("binary", "false"),
+        ("valid_from", "time::now()"),
+    ];
+    row("commit_file", "", &base, set)
+}
+
+fn ref_state(set: &[(&str, &str)]) -> String {
+    let tip = format!("'{HASH_A}'");
+    let base = [
+        ("repository", "repository:r1"),
+        ("crawl", "crawl:c1"),
+        ("name", "'refs/heads/feat/x'"),
+        ("tip", tip.as_str()),
+        ("rewritten", "false"),
+        ("valid_from", "time::now()"),
+    ];
+    row("ref_state", "", &base, set)
+}
+
+fn worktree_file(set: &[(&str, &str)]) -> String {
+    let base = [
+        ("checkout", "checkout:k1"),
+        ("crawl", "crawl:c1"),
+        ("path", "'src/new.rs'"),
+        ("from_path", "NONE"),
+        ("state", "'untracked'"),
+        ("staged", "false"),
+        ("added", "120"),
+        ("removed", "0"),
+        ("binary", "false"),
+        ("valid_from", "time::now()"),
+    ];
+    row("worktree_file", "", &base, set)
+}
+
+fn crawl_step(set: &[(&str, &str)]) -> String {
+    let base = [
+        ("crawl", "crawl:c1"),
+        ("step", "'blame'"),
+        ("started_at", "time::now()"),
+        ("ms", "2100"),
+        ("git_calls", "40"),
+        ("git_failed", "0"),
+        ("git_timeouts", "0"),
+        ("objects_read", "88000"),
+        ("bytes_read", "7000000"),
+        ("rows_written", "6"),
+        ("note", "NONE"),
+        ("valid_from", "time::now()"),
+    ];
+    row("crawl_step", "", &base, set)
+}
+
+fn git_call(set: &[(&str, &str)]) -> String {
+    let base = [
+        ("crawl", "crawl:c1"),
+        ("step", "'log'"),
+        ("dir", "'/w/a'"),
+        ("args", "['log', 'origin/main', '--numstat']"),
+        ("started_at", "time::now()"),
+        ("ms", "120000"),
+        ("exit", "NONE"),
+        ("timed_out", "true"),
+        ("bytes_out", "0"),
+        ("lines_out", "0"),
+        ("stderr", "NONE"),
+        ("valid_from", "time::now()"),
+    ];
+    row("git_call", "", &base, set)
+}
+
+fn survival_file(set: &[(&str, &str)]) -> String {
+    let base = [
+        ("commit", "commit:m2"),
+        ("crawl", "crawl:c1"),
+        ("path", "'a.rs'"),
+        ("alive", "3"),
+        ("valid_from", "time::now()"),
+    ];
+    row("survival_file", "", &base, set)
+}
+
+/// The engine holds the rules the crawler relies on: one row per session,
+/// line, reply, thinking span, tool call, result, file of an edit, test or
+/// build command, repository, checkout, commit, file of a commit, HEAD move
+/// and landing; links that point at rows that exist; values from the closed
+/// lists, the crawler's sources among them; counts never below zero; a
+/// commit hash of 7 to 64 characters where an agent printed it and 40 or 64
+/// where git gave it whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_engine_refuses_what_the_schema_forbids() {
     let db = connect().await;
@@ -487,8 +733,45 @@ async fn the_engine_refuses_what_the_schema_forbids() {
             ("ms", "NONE"),
         ]),
         away(&[]),
-        pass(&[]),
-        pass(&[("from_line", "NONE"), ("to_line", "NONE"), ("lines_read", "0"), ("outcome", "'stopped'")]),
+        "CREATE repository:r1 CONTENT { common_dir: '/w/a/.git', name: 'a', found_at: time::now(), valid_from: time::now() }".to_string(),
+        "CREATE checkout:k1 CONTENT { repository: repository:r1, toplevel: '/w/a', found_at: time::now(), valid_from: time::now() }".to_string(),
+        "CREATE checkout_state CONTENT { checkout: checkout:k1, branch: 'main', first_branch: NONE, present: true, valid_from: time::now() }".to_string(),
+        "CREATE directory CONTENT { path: '/w/a/src', source: 'session', checkout: checkout:k1, exact: true, valid_from: time::now() }".to_string(),
+        "CREATE directory CONTENT { path: '/elsewhere', source: 'include', checkout: NONE, exact: false, valid_from: time::now() }".to_string(),
+        "CREATE head_move CONTENT { checkout: checkout:k1, at: d'2026-10-20T10:00:00Z', branch: 'feat', valid_from: time::now() }".to_string(),
+        crawl("c1", &[("refs_read", "25"), ("survival_delta", "-42")]),
+        commit("m1", "repository:r1", HASH_A, &[]),
+        commit("m2", "repository:r1", HASH_B, &[("body", "NONE")]),
+        commit_file(&[]),
+        commit_file(&[("path", "'gone.rs'"), ("change", "'deleted'"), ("added", "0"), ("removed", "40")]),
+        "CREATE placement CONTENT { commit: commit:m1, crawl: crawl:c1, place: 'branch', first_parent: false, valid_from: time::now() }".to_string(),
+        "CREATE landed_via CONTENT { commit: commit:m1, path: 'a.rs', via: commit:m2, crawl: crawl:c1, valid_from: time::now() }".to_string(),
+        "CREATE survival CONTENT { commit: commit:m2, crawl: crawl:c1, alive: 3, valid_from: time::now() }".to_string(),
+        survival_file(&[]),
+        ref_state(&[]),
+        ref_state(&[("name", "'refs/heads/thrown-away'"), ("tip", "NONE")]),
+        worktree_file(&[]),
+        worktree_file(&[("path", "'src/b.rs'"), ("from_path", "'src/a.rs'"), ("state", "'renamed'"), ("staged", "true")]),
+        crawl_step(&[]),
+        git_call(&[]),
+        git_call(&[("exit", "0"), ("timed_out", "false"), ("bytes_out", "48211"), ("lines_out", "1290")]),
+        commit("m3", "repository:r1", &"0123456789abcdef".repeat(4), &[]),
+        pass(":p1", &[]),
+        pass(":p2", &[("outcome", "'stopped'"), ("rows_written", "0")]),
+        pass_source(&[]),
+        pass_source(&[
+            ("source", "'repos'"),
+            ("calls", "149"),
+            ("failed", "1"),
+            ("rows", "{}"),
+            ("counts", "{ repositories_new: 9, checkouts_gone: 0 }"),
+            ("from_id", "NONE"),
+            ("to_id", "NONE"),
+            ("crawls", "[crawl:c1]"),
+            ("outcome", "'partial'"),
+            ("note", "'1 git call cut off'"),
+        ]),
+        pass_source(&[("pass", "pass:p2"), ("outcome", "'failed'"), ("note", "'the database did not answer'")]),
     ] {
         assert_eq!(refusal(&db, &sql).await, None, "a valid row must be taken: {sql}");
     }
@@ -535,8 +818,70 @@ async fn the_engine_refuses_what_the_schema_forbids() {
         (compaction(&[("kernel_message", "rand::uuid::v7()"), ("trigger", "'size'")]), "field `trigger`", "a trigger outside the list"),
         (compaction(&[]), "index `idx_compaction_line`", "a compaction read twice"),
         (away(&[]), "index `idx_away_line`", "a recap read twice"),
-        (pass(&[("outcome", "'done'")]), "field `outcome`", "a pass that ended some way outside the list"),
-        (pass(&[("lines_unread", "-1")]), "field `lines_unread`", "a negative count of lines not understood"),
+        (
+            "CREATE repository CONTENT { common_dir: '/w/a/.git', name: 'a', found_at: time::now(), valid_from: time::now() }".to_string(),
+            "index `idx_repository_dir`",
+            "a second row for one repository",
+        ),
+        (commit("d1", "repository:r1", HASH_A, &[]), "index `idx_commit_hash`", "a second row for one commit"),
+        (commit("d2", "repository:r1", &HASH_A[..39], &[]), "field `hash`", "a hash of 39 characters"),
+        (
+            commit("d3", "repository:nothing", "2123456789abcdef0123456789abcdef01234567", &[]),
+            "field `repository`",
+            "a commit of a repository that does not exist",
+        ),
+        (
+            commit("d4", "repository:r1", "3123456789abcdef0123456789abcdef01234567", &[("committer", "NONE")]),
+            "field `committer`",
+            "a commit with no committer",
+        ),
+        (
+            "CREATE placement CONTENT { commit: commit:m1, crawl: crawl:c1, place: 'merged', first_parent: false, valid_from: time::now() }".to_string(),
+            "field `place`",
+            "a place outside the list",
+        ),
+        (
+            "CREATE survival CONTENT { commit: commit:m1, crawl: crawl:c1, alive: -1, valid_from: time::now() }".to_string(),
+            "field `alive`",
+            "a negative survival",
+        ),
+        (
+            "CREATE head_move CONTENT { checkout: checkout:k1, at: d'2026-10-20T10:00:00Z', branch: 'feat', valid_from: time::now() }".to_string(),
+            "index `idx_head_move`",
+            "a second row for one HEAD move",
+        ),
+        (
+            "CREATE directory CONTENT { path: '/w/b', source: 'guess', checkout: NONE, exact: false, valid_from: time::now() }".to_string(),
+            "field `source`",
+            "a directory from a source outside the list",
+        ),
+        (
+            "CREATE landed_via CONTENT { commit: commit:m1, path: 'a.rs', via: commit:m2, crawl: crawl:c1, valid_from: time::now() }".to_string(),
+            "index `idx_landed_via`",
+            "a second row for one landing",
+        ),
+        (crawl("g1", &[("mainline_from", "'guessed'")]), "field `mainline_from`", "a main line chosen some way outside the list"),
+        (crawl("g2", &[("refs_read", "-1")]), "field `refs_read`", "a crawl count below zero"),
+        (
+            commit_file(&[("path", "'b.rs'"), ("change", "'renamed'")]),
+            "field `change`",
+            "a change outside the list: renames read as a delete and an add",
+        ),
+        (survival_file(&[("alive", "-1")]), "field `alive`", "a negative survival in a file"),
+        (ref_state(&[("tip", "'abc123'")]), "field `tip`", "a ref tip that is not a whole commit id"),
+        (worktree_file(&[("state", "'stashed'")]), "field `state`", "an uncommitted state outside the list"),
+        (crawl_step(&[("step", "'guess'")]), "field `step`", "a step outside the list"),
+        (git_call(&[("ms", "-5")]), "field `ms`", "a git call that took less than no time"),
+        (git_call(&[("step", "'write'")]), "field `step`", "a git call in the step that writes rows"),
+        (pass(":p3", &[("outcome", "'done'")]), "field `outcome`", "a pass that ended some way outside the list"),
+        (pass(":p4", &[("rows_written", "-1")]), "field `rows_written`", "a negative count of rows written"),
+        (pass_source(&[("source", "'hosts'")]), "field `source`", "a source the crawler does not have yet"),
+        (pass_source(&[("pass", "pass:nope")]), "field `pass`", "a source's record in a pass that does not exist"),
+        (pass_source(&[("rows", "{ reply: -1 }")]), "field `rows`", "a negative count of rows"),
+        (pass_source(&[("counts", "{ repositories_new: 'two' }")]), "field `counts`", "a count written as text"),
+        (pass_source(&[("crawls", "[crawl:c1, crawl:nothing]")]), "field `crawls`", "a crawl that does not exist"),
+        (pass_source(&[("outcome", "'aborted'")]), "field `outcome`", "a source that ended some way outside the list"),
+        (pass_source(&[("unread", "-1")]), "field `unread`", "a negative count of items not understood"),
     ];
     for (sql, rule, what) in refused {
         let Some(why) = refusal(&db, &sql).await else {

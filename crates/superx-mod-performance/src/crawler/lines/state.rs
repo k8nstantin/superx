@@ -16,11 +16,12 @@ use chrono::{DateTime, Utc};
 use superx_kernel::types::{RecordId, Uuid};
 use superx_kernel::{Db, Kernel, Result};
 
-use crate::reader::commands;
-use crate::reader::facts::{Call, Fact, GitEvent, Outcome, Prompt, Read, ReplyLine, ToolResult};
-use crate::reader::formats;
-use crate::reader::kernel::{self as kernel_lines, Cursor, Line, Names};
-use crate::reader::store::{self, Batch, Row, State as Counted};
+use crate::crawler::lines::commands;
+use crate::crawler::lines::facts::{Call, Fact, GitEvent, Outcome, Prompt, Read, ReplyLine, ToolResult};
+use crate::crawler::lines::formats;
+use crate::crawler::lines::kernel::{self as kernel_lines, Cursor, Line, Names};
+use crate::crawler::lines::store::{self, State as Counted};
+use crate::crawler::store::{Batch, Row};
 
 /// Lines read per page when a reply is read again.
 const REPLY_PAGE: u32 = 200; // skill-allow: §9-const — read-path bound, not a policy tunable
@@ -61,7 +62,7 @@ struct Reply {
     offsets: HashMap<Uuid, i64>,
     total: i64,
     blocks: i64,
-    counts: Option<crate::reader::facts::Counts>,
+    counts: Option<crate::crawler::lines::facts::Counts>,
     newest: Option<Counted>,
     thinking: HashSet<i64>,
     calls: Vec<String>,
@@ -307,7 +308,7 @@ impl Session {
             self.keyed(line)
                 .text("kind", p.kind.as_str())
                 .text("text", p.text.clone())
-                .int("chars", crate::reader::value::chars(&p.text))
+                .int("chars", crate::crawler::value::chars(&p.text))
                 .int("images", p.images),
         );
         if p.stops_tools {
@@ -416,7 +417,7 @@ impl Session {
         let Some(reply) = self.replies.get_mut(agent_id) else { return Ok(()) };
         for (l, r) in again {
             if reply.lines.insert(l.id) {
-                if let crate::reader::facts::Text::Added(n) = r.text {
+                if let crate::crawler::lines::facts::Text::Added(n) = r.text {
                     reply.text.insert(l.id, n);
                 }
                 reply.offsets.insert(l.id, reply.blocks);
@@ -437,7 +438,7 @@ impl Session {
         let Some(row) = reply.row.clone() else { return };
         let first_time = reply.lines.insert(line.id);
         if first_time && !r.cumulative {
-            if let crate::reader::facts::Text::Added(n) = r.text {
+            if let crate::crawler::lines::facts::Text::Added(n) = r.text {
                 reply.text.insert(line.id, n);
             }
             reply.offsets.insert(line.id, reply.blocks);
@@ -489,7 +490,7 @@ impl Session {
                 reply.counts = Some(c.clone());
             }
         }
-        if let crate::reader::facts::Text::Total(n) = r.text {
+        if let crate::crawler::lines::facts::Text::Total(n) = r.text {
             reply.total = reply.total.max(n);
         }
         if let Some(counts) = reply.counts.clone() {

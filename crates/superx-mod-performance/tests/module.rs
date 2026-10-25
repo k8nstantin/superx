@@ -229,18 +229,27 @@ async fn holdings_counts_what_the_database_has() {
         CREATE compaction CONTENT { session: session:s1, kernel_message: rand::uuid::v7(), at: time::now(), trigger: 'auto', \
             tokens_before: 1, tokens_after: NONE, tokens_dropped: NONE, ms: NONE, valid_from: time::now() };\
         CREATE away CONTENT { session: session:s1, kernel_message: rand::uuid::v7(), at: time::now(), text: 'recap', \
-            valid_from: time::now() };";
+            valid_from: time::now() };\
+        CREATE repository:r1 CONTENT { common_dir: '/w/.git', name: 'w', found_at: time::now(), valid_from: time::now() };\
+        CREATE checkout:k1 CONTENT { repository: repository:r1, toplevel: '/w', found_at: time::now(), valid_from: time::now() };\
+        CREATE directory CONTENT { path: '/w', source: 'session', checkout: checkout:k1, exact: true, valid_from: time::now() };";
     db.query(chain).await.expect("query").check().expect("rows taken");
-    let pass = |finished: &str, outcome: &str, read: u32| {
+    // Two passes, each with its sources; the newest is the one `status` says.
+    let pass = |id: &str, finished: &str, outcome: &str, read: u32| {
         format!(
-            "CREATE pass CONTENT {{ started_at: d'{finished}', finished_at: d'{finished}', from_line: NONE, to_line: NONE, \
-             lines_read: {read}, lines_unread: 2, sessions_new: 0, places_new: 0, prompts_new: 0, replies_new: 0, \
-             reply_states_new: 0, thinking_new: 0, tool_calls_new: 0, tool_results_new: 0, edits_new: 0, git_events_new: 0, \
-             test_runs_new: 0, build_runs_new: 0, turns_new: 0, compactions_new: 0, aways_new: 0, rows_written: 17, \
-             outcome: '{outcome}', note: NONE, valid_from: d'{finished}' }}"
+            "CREATE pass:{id} CONTENT {{ started_at: d'{finished}', finished_at: d'{finished}', rows_written: 17, \
+             outcome: '{outcome}', note: NONE, valid_from: d'{finished}' }};\
+             CREATE pass_source CONTENT {{ pass: pass:{id}, source: 'lines', started_at: d'{finished}', \
+             finished_at: d'{finished}', items: {read}, unread: 2, calls: 0, failed: 0, timed_out: 0, \
+             rows: {{ prompt: 2, reply: 1 }}, counts: {{}}, from_id: NONE, to_id: NONE, crawls: [], outcome: 'complete', \
+             note: NONE, valid_from: d'{finished}' }};\
+             CREATE pass_source CONTENT {{ pass: pass:{id}, source: 'repos', started_at: d'{finished}', \
+             finished_at: d'{finished}', items: 3, unread: 0, calls: 9, failed: 1, timed_out: 0, rows: {{ directory: 1 }}, \
+             counts: {{ repositories_new: 1 }}, from_id: NONE, to_id: NONE, crawls: [], outcome: '{outcome}', \
+             note: NONE, valid_from: d'{finished}' }};"
         )
     };
-    for sql in [pass("2026-10-24T09:00:00Z", "partial", 100), pass("2026-10-24T10:00:00Z", "complete", 500)] {
+    for sql in [pass("p1", "2026-10-24T09:00:00Z", "partial", 100), pass("p2", "2026-10-24T10:00:00Z", "complete", 500)] {
         db.query(sql).await.expect("query").check().expect("pass taken");
     }
 
@@ -263,12 +272,31 @@ async fn holdings_counts_what_the_database_has() {
             ("git_event", 1),
             ("test_run", 1),
             ("build_run", 1),
+            ("repository", 1),
+            ("checkout", 1),
+            ("checkout_state", 0),
+            ("directory", 1),
+            ("head_move", 0),
+            ("commit", 0),
+            ("commit_file", 0),
+            ("placement", 0),
+            ("landed_via", 0),
+            ("survival", 0),
+            ("survival_file", 0),
+            ("ref_state", 0),
+            ("worktree_file", 0),
+            ("crawl", 0),
+            ("crawl_step", 0),
+            ("git_call", 0),
         ]
     );
     let last = h.last_pass.expect("a pass ran");
     assert_eq!(last.outcome, "complete", "the newest pass, not the first");
     assert_eq!(last.finished_at.to_rfc3339(), "2026-10-24T10:00:00+00:00");
-    assert_eq!((last.lines_read, last.lines_unread, last.rows_written), (500, 2, 17));
+    assert_eq!(last.rows_written, 17);
+    let sources: Vec<(&str, i64, i64, i64, i64)> =
+        last.sources.iter().map(|s| (s.source.as_str(), s.items, s.unread, s.calls, s.rows_written)).collect();
+    assert_eq!(sources, [("lines", 500, 2, 0, 3), ("repos", 3, 0, 9, 1)], "the newest pass's own sources");
 }
 
 #[test]

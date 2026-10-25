@@ -9,8 +9,8 @@
 //! mentions git, or a file that is only read adds nothing. Only the
 //! command line and its output are read, never a repository (#446).
 
-use crate::reader::facts::{BuildRun, Builder, GitAction, GitEvent, TestRun, TestRunner};
-use crate::reader::formats::is_hash;
+use crate::crawler::lines::facts::{BuildRun, Builder, GitAction, GitEvent, TestRun, TestRunner};
+use crate::crawler::lines::formats::is_hash;
 
 /// What one shell command did.
 #[derive(Debug, Default, PartialEq, Eq)]

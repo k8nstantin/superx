@@ -1,6 +1,6 @@
 //! `superx-performance status`, and the module's own URL: whether its
-//! database is there, what it holds, the reader's newest pass, and the
-//! parameters it runs on.
+//! database is there, what it holds, the crawler's newest pass and what
+//! each of its sources did in it, and the parameters it runs on.
 
 use std::fmt::Write as _;
 
@@ -12,9 +12,9 @@ use crate::params::{self, Resolved};
 use crate::MODULE_NAME;
 
 /// The tables of facts, as `status` lists them: what happened in the
-/// sessions, what the models answered, and what their tools did; each
-/// table with what its rows are called there. `pass`, the reader's own
-/// record, is said apart.
+/// sessions, what the models answered, what their tools did, and what the
+/// repositories hold; each table with what its rows are called there. The
+/// crawler's own record (`pass`, `pass_source`) is said apart.
 pub const FACTS: &[(&str, &[(&str, &str)])] = &[
     (
         "sessions",
@@ -39,6 +39,27 @@ pub const FACTS: &[(&str, &[(&str, &str)])] = &[
             ("build_run", "build runs"),
         ],
     ),
+    (
+        "repos",
+        &[
+            ("repository", "repositories"),
+            ("checkout", "checkouts"),
+            ("checkout_state", "checkout states"),
+            ("directory", "directory records"),
+            ("head_move", "head moves"),
+            ("commit", "commits"),
+            ("commit_file", "commit files"),
+            ("placement", "placements"),
+            ("landed_via", "landings"),
+            ("survival", "survival records"),
+            ("survival_file", "survival by file"),
+            ("ref_state", "ref states"),
+            ("worktree_file", "uncommitted files"),
+            ("crawl", "crawls"),
+            ("crawl_step", "crawl steps"),
+            ("git_call", "git calls"),
+        ],
+    ),
 ];
 
 /// Every table of facts, in the order `status` lists them.
@@ -51,28 +72,46 @@ pub fn fact_tables() -> impl Iterator<Item = &'static str> {
 pub struct Holdings {
     /// Rows in each table of facts, in the order of [`fact_tables`].
     pub rows: Vec<(&'static str, i64)>,
-    /// The reader's newest pass.
+    /// The crawler's newest pass.
     pub last_pass: Option<LastPass>,
 }
 
-/// The reader's newest pass, as `status` prints it.
+/// The crawler's newest pass, as `status` prints it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastPass {
     pub finished_at: DateTime<Utc>,
     pub outcome: String,
-    pub lines_read: i64,
-    pub lines_unread: i64,
     pub rows_written: i64,
+    pub sources: Vec<LastSource>,
 }
 
-/// One count per table of facts, then the newest pass. A count is NONE for
-/// an empty table: `GROUP ALL` over no rows returns no row.
+/// What one source did in the newest pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastSource {
+    pub source: String,
+    pub items: i64,
+    pub unread: i64,
+    pub calls: i64,
+    pub failed: i64,
+    pub timed_out: i64,
+    pub rows_written: i64,
+    pub outcome: String,
+    pub note: Option<String>,
+}
+
+/// One count per table of facts, then the newest pass and its sources. A
+/// count is NONE for an empty table: `GROUP ALL` over no rows returns no
+/// row. Passes are seconds apart, so the index's misorder within a second
+/// (#486) cannot pick the wrong one.
 fn holdings_query() -> String {
     let mut sql: String =
         fact_tables().map(|table| format!("RETURN (SELECT count() AS n FROM {table} GROUP ALL)[0].n;")).collect();
     sql.push_str(
-        "SELECT finished_at, outcome, lines_read, lines_unread, rows_written, valid_from FROM pass \
-         ORDER BY valid_from DESC LIMIT 1;",
+        "LET $last = (SELECT id, finished_at, outcome, rows_written, valid_from FROM pass \
+         ORDER BY valid_from DESC LIMIT 1)[0];\
+         RETURN $last;\
+         SELECT source, items, unread, calls, failed, timed_out, rows, outcome, note FROM pass_source \
+         WHERE pass = $last.id ORDER BY source;",
     );
     sql
 }
@@ -89,29 +128,62 @@ pub async fn holdings(db: &Db) -> Result<Holdings> {
         let count: Option<i64> = res.take(i)?;
         rows.push((table, count.unwrap_or_default()));
     }
-    let passes: Vec<Value> = res.take(rows.len())?;
-    Ok(Holdings { rows, last_pass: passes.first().and_then(last_pass) })
+    let last: Option<Value> = res.take(rows.len() + 1)?;
+    let sources: Vec<Value> = res.take(rows.len() + 2)?;
+    Ok(Holdings { rows, last_pass: last.as_ref().and_then(|p| last_pass(p, &sources)) })
 }
 
-fn last_pass(row: &Value) -> Option<LastPass> {
-    let Value::Object(o) = row else { return None };
-    let n = |key: &str| match o.get(key) {
-        Some(Value::Number(n)) => n.to_int(),
-        _ => None,
-    };
+fn last_pass(row: &Value, sources: &[Value]) -> Option<LastPass> {
     Some(LastPass {
-        finished_at: match o.get("finished_at") {
+        finished_at: match field(row, "finished_at") {
             Some(Value::Datetime(d)) => DateTime::<Utc>::from(*d),
             _ => return None,
         },
-        outcome: match o.get("outcome") {
-            Some(Value::String(s)) => s.clone(),
-            _ => return None,
-        },
-        lines_read: n("lines_read")?,
-        lines_unread: n("lines_unread")?,
-        rows_written: n("rows_written")?,
+        outcome: text(row, "outcome")?,
+        rows_written: int(row, "rows_written")?,
+        sources: sources
+            .iter()
+            .filter_map(|s| {
+                Some(LastSource {
+                    source: text(s, "source")?,
+                    items: int(s, "items")?,
+                    unread: int(s, "unread")?,
+                    calls: int(s, "calls")?,
+                    failed: int(s, "failed")?,
+                    timed_out: int(s, "timed_out")?,
+                    rows_written: match field(s, "rows") {
+                        Some(Value::Object(o)) => {
+                            o.values().filter_map(|v| if let Value::Number(n) = v { n.to_int() } else { None }).sum()
+                        }
+                        _ => 0,
+                    },
+                    outcome: text(s, "outcome")?,
+                    note: text(s, "note"),
+                })
+            })
+            .collect(),
     })
+}
+
+fn field<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+    match v {
+        Value::Object(o) => o.get(key),
+        _ => None,
+    }
+}
+
+fn text(v: &Value, key: &str) -> Option<String> {
+    match field(v, key)? {
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn int(v: &Value, key: &str) -> Option<i64> {
+    match field(v, key)? {
+        Value::Number(n) => n.to_int(),
+        _ => None,
+    }
 }
 
 /// The module's own database, as `status` found it.
@@ -135,7 +207,7 @@ pub async fn render(kernel: &Kernel) -> Result<String> {
         Ok(db) => Database::Ready(holdings(&db).await?),
         Err(e) => Database::Unavailable(own_hint(&e.to_string())),
     };
-    Ok(text(&database, &resolved))
+    Ok(text_of(&database, &resolved))
 }
 
 /// The kernel names `superx modules provision <name>` for a module database
@@ -148,9 +220,10 @@ pub(crate) fn own_hint(kernel_words: &str) -> String {
 
 /// The status text for what was found.
 #[must_use]
-pub fn text(database: &Database, resolved: &Resolved) -> String {
+pub fn text_of(database: &Database, resolved: &Resolved) -> String {
     let mut out = String::from(
-        "superx-performance: the models, the agents, thinking effort and the operator, measured from every captured line\n",
+        "superx-performance: the models, the agents, thinking effort and the operator, measured from every captured \
+         line and every repository the agents worked in\n",
     );
     match database {
         Database::Ready(h) => {
@@ -170,13 +243,14 @@ pub fn text(database: &Database, resolved: &Resolved) -> String {
                 Some(p) => {
                     let _ = writeln!(
                         out,
-                        "last pass   {} ({}): {} lines read, {} of them in a shape it does not know · {} rows written",
+                        "last pass   {} ({}): {} rows written",
                         p.finished_at.to_rfc3339(),
                         p.outcome,
-                        p.lines_read,
-                        p.lines_unread,
                         p.rows_written
                     );
+                    for s in &p.sources {
+                        let _ = writeln!(out, "  {:<width$}  {}", s.source, source_line(s));
+                    }
                 }
                 None => {
                     let _ = writeln!(out, "last pass   none yet");
@@ -203,6 +277,22 @@ pub fn text(database: &Database, resolved: &Resolved) -> String {
     out
 }
 
+/// What one source did, in a line: what it worked through, its outside
+/// calls when it made any, the rows it added, and how it ended when it did
+/// not end well.
+fn source_line(s: &LastSource) -> String {
+    let mut parts = vec![format!("{} read, {} in a shape it does not know", s.items, s.unread)];
+    if s.calls > 0 {
+        parts.push(format!("{} calls, {} failed, {} cut off", s.calls, s.failed, s.timed_out));
+    }
+    parts.push(format!("{} rows", s.rows_written));
+    let mut line = parts.join(" · ");
+    if s.outcome != "complete" {
+        let _ = write!(line, " ({}{})", s.outcome, s.note.as_ref().map_or(String::new(), |n| format!(": {n}")));
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -211,27 +301,28 @@ mod tests {
     use crate::params::{from_values, PORT_PARAM};
 
     #[test]
-    fn every_table_of_facts_is_counted_once_and_the_readers_own_record_apart() {
+    fn every_table_of_facts_is_counted_once_and_the_crawlers_own_record_apart() {
         let tables: Vec<&str> = fact_tables().collect();
         let unique: std::collections::BTreeSet<&str> = tables.iter().copied().collect();
-        assert_eq!(tables.len(), 15, "{tables:?}");
+        assert_eq!(tables.len(), 31, "{tables:?}");
         assert_eq!(unique.len(), tables.len(), "a table counted twice: {tables:?}");
-        assert!(!unique.contains("pass"));
+        assert!(!unique.contains("pass") && !unique.contains("pass_source"));
     }
 
     #[test]
     fn a_fresh_database_says_it_holds_nothing_and_lists_every_parameter() {
-        let t = text(&Database::Ready(Holdings::default()), &from_values(&BTreeMap::new()));
+        let t = text_of(&Database::Ready(Holdings::default()), &from_values(&BTreeMap::new()));
         assert!(
             t.contains(
                 "database    superx/performance\n\
                  \x20 sessions  0 sessions · 0 places · 0 prompts · 0 turns · 0 compactions · 0 recaps\n\
                  \x20 models    0 replies · 0 reply states · 0 thinking spans\n\
                  \x20 tools     0 tool calls · 0 tool results · 0 edits · 0 git events · 0 test runs · 0 build runs\n\
-                 last pass   none yet\n"
+                 \x20 repos     0 repositories · 0 checkouts · 0 checkout states"
             ),
             "{t}"
         );
+        assert!(t.contains("last pass   none yet\n"), "{t}");
         for name in crate::params::NAMES {
             assert!(t.contains(name), "{name} is listed:\n{t}");
         }
@@ -241,29 +332,46 @@ mod tests {
     #[test]
     fn every_count_sits_beside_its_own_table() {
         let rows = fact_tables().zip(1..).collect();
-        let t = text(&Database::Ready(Holdings { rows, last_pass: None }), &from_values(&BTreeMap::new()));
+        let t = text_of(&Database::Ready(Holdings { rows, last_pass: None }), &from_values(&BTreeMap::new()));
         assert!(t.contains("1 sessions · 2 places · 3 prompts · 4 turns · 5 compactions · 6 recaps"), "{t}");
         assert!(t.contains("7 replies · 8 reply states · 9 thinking spans"), "{t}");
         assert!(t.contains("10 tool calls · 11 tool results · 12 edits · 13 git events · 14 test runs · 15 build runs"), "{t}");
+        assert!(t.contains("16 repositories · 17 checkouts · 18 checkout states · 19 directory records"), "{t}");
+        assert!(t.contains("29 crawls · 30 crawl steps · 31 git calls"), "{t}");
     }
 
     #[test]
-    fn the_last_pass_says_when_how_it_ended_and_what_it_read() {
+    fn the_last_pass_says_when_how_it_ended_and_what_each_source_did() {
+        let source = |name: &str, items, unread, calls, failed, rows, outcome: &str, note: Option<&str>| LastSource {
+            source: name.to_string(),
+            items,
+            unread,
+            calls,
+            failed,
+            timed_out: 0,
+            rows_written: rows,
+            outcome: outcome.to_string(),
+            note: note.map(str::to_string),
+        };
         let h = Holdings {
             last_pass: Some(LastPass {
-                finished_at: DateTime::parse_from_rfc3339("2026-10-24T15:00:00Z").expect("time").to_utc(),
+                finished_at: DateTime::parse_from_rfc3339("2026-10-25T15:00:00Z").expect("time").to_utc(),
                 outcome: "partial".to_string(),
-                lines_read: 500,
-                lines_unread: 3,
                 rows_written: 1_204,
+                sources: vec![
+                    source("lines", 500, 3, 0, 0, 1_190, "complete", None),
+                    source("repos", 125, 0, 149, 1, 14, "partial", Some("1 git calls cut off")),
+                ],
             }),
             ..Holdings::default()
         };
-        let t = text(&Database::Ready(h), &from_values(&BTreeMap::new()));
+        let t = text_of(&Database::Ready(h), &from_values(&BTreeMap::new()));
+        assert!(t.contains("last pass   2026-10-25T15:00:00+00:00 (partial): 1204 rows written\n"), "{t}");
+        assert!(t.contains("  lines     500 read, 3 in a shape it does not know · 1190 rows\n"), "{t}");
         assert!(
             t.contains(
-                "last pass   2026-10-24T15:00:00+00:00 (partial): 500 lines read, 3 of them in a shape it does not \
-                 know · 1204 rows written"
+                "  repos     125 read, 0 in a shape it does not know · 149 calls, 1 failed, 0 cut off · 14 rows \
+                 (partial: 1 git calls cut off)\n"
             ),
             "{t}"
         );
@@ -286,7 +394,7 @@ mod tests {
         let mut values = BTreeMap::new();
         values.insert(PORT_PARAM, Value::String("five".to_string()));
         let why = "module 'performance' db signin refused. Provision it with `superx-performance --initialize`";
-        let t = text(&Database::Unavailable(why.to_string()), &from_values(&values));
+        let t = text_of(&Database::Unavailable(why.to_string()), &from_values(&values));
         assert!(t.contains(&format!("superx/performance: not available. {why}")), "{t}");
         assert!(t.contains("attr_performance_port is \"five\", not a port, 1 to 65535: running on 5153"), "{t}");
     }

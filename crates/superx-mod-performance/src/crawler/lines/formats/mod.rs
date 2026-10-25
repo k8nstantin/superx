@@ -9,7 +9,7 @@ pub mod gemini_cli;
 use chrono::{DateTime, Utc};
 use superx_kernel::types::Value;
 
-use crate::reader::facts::Read;
+use crate::crawler::lines::facts::Read;
 
 /// One captured line, read as its agent writes lines.
 #[must_use]
