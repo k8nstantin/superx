@@ -98,14 +98,20 @@ fn assistant(line: &Value, at_time: DateTime<Utc>) -> Read {
         let on_line = i64::try_from(i).unwrap_or(i64::MAX);
         match text(block, &["type"]) {
             Some("text") => added += chars(text(block, &["text"]).unwrap_or_default()),
-            Some(kind @ ("thinking" | "redacted_thinking")) => thinking.push(Thinking {
-                position: first.map(|f| f + on_line),
-                on_line,
-                at: at_time,
-                ms: int(line, &["thinkingDurationMs"]).filter(|ms| *ms >= 0),
-                chars: if kind == "thinking" { chars(text(block, &["thinking"]).unwrap_or_default()) } else { 0 },
-                display: some_text(line, &["thinkingDisplay"]),
-            }),
+            Some(kind @ ("thinking" | "redacted_thinking")) => {
+                let said = if kind == "thinking" { text(block, &["thinking"]).unwrap_or_default() } else { "" };
+                thinking.push(Thinking {
+                    position: first.map(|f| f + on_line),
+                    on_line,
+                    at: at_time,
+                    ms: int(line, &["thinkingDurationMs"]).filter(|ms| *ms >= 0),
+                    chars: chars(said),
+                    display: some_text(line, &["thinkingDisplay"]),
+                    text: said.to_string(),
+                    subject: None,
+                    signature_chars: chars(text(block, &["signature"]).unwrap_or_default()),
+                });
+            }
             Some("tool_use") => match call(block, at_time) {
                 Some(c) => calls.push(c),
                 None => known = false,
@@ -139,9 +145,20 @@ fn assistant(line: &Value, at_time: DateTime<Utc>) -> Read {
             results: Vec::new(),
             blocks: i64::try_from(blocks.len()).unwrap_or(i64::MAX),
             cumulative: false,
+            thinking_dropped: thinking_dropped(line),
         }))],
         ..Read::default()
     }
+}
+
+/// The earlier thinking a request left out: its `input_transformations` of
+/// type `thinking_dropped`.
+fn thinking_dropped(line: &Value) -> i64 {
+    let dropped = list(line, &["message", "input_transformations"])
+        .iter()
+        .filter(|t| text(t, &["type"]) == Some("thinking_dropped"))
+        .count();
+    i64::try_from(dropped).unwrap_or(i64::MAX)
 }
 
 /// The reply's counts, from its `usage`; none when a count is missing or
@@ -185,6 +202,7 @@ fn call(block: &Value, at_time: DateTime<Utc>) -> Option<Call> {
         subagent_type: field("subagent_type"),
         background: input.and_then(|i| flag(i, &["run_in_background"])).unwrap_or(false),
         input_bytes: input.map_or(0, json_len),
+        sandbox_off: input.and_then(|i| flag(i, &["dangerouslyDisableSandbox"])).unwrap_or(false),
         dir: None,
     })
 }
@@ -246,10 +264,12 @@ fn prompt(line: &Value, message: String, images: i64) -> Option<Prompt> {
 }
 
 /// A user line of tool results: one block each, with what the tool
-/// reported beside it when the line holds one.
+/// reported beside it, and the hosts its sandbox stopped, when the line
+/// holds one.
 fn results(line: &Value, blocks: &[Value], at_time: DateTime<Utc>) -> Read {
     let reported = at(line, &["toolUseResult"]);
     let only_one = blocks.iter().filter(|b| text(b, &["type"]) == Some("tool_result")).count() == 1;
+    let hosts = if only_one { sandbox_hosts(line) } else { Vec::new() };
     let mut known = true;
     let mut facts = Vec::new();
     for b in blocks {
@@ -259,7 +279,8 @@ fn results(line: &Value, blocks: &[Value], at_time: DateTime<Utc>) -> Read {
                     known = false;
                     continue;
                 };
-                facts.push(Fact::Result(result(call_id, b, if only_one { reported } else { None }, at_time)));
+                let r = result(call_id, b, if only_one { reported } else { None }, at_time);
+                facts.push(Fact::Result(ToolResult { sandbox_hosts: hosts.clone(), ..r }));
             }
             Some("text" | "image") => {}
             _ => known = false,
@@ -313,7 +334,20 @@ fn result(call_id: String, block: &Value, reported: Option<&Value>, at_time: Dat
         edits: if outcome == Outcome::Ok { reported.and_then(edit).into_iter().collect() } else { Vec::new() },
         output,
         noted: reported.map(noted).unwrap_or_default(),
+        sandbox_hosts: Vec::new(),
     }
+}
+
+/// The hosts a sandbox stopped a command reaching (`sandboxViolations`),
+/// each once, in the order the line gives them.
+fn sandbox_hosts(line: &Value) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for host in list(line, &["sandboxViolations"]).iter().filter_map(|v| some_text(v, &["host"])) {
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
 }
 
 /// A tool result's content as text: a string, or its text blocks.
@@ -556,8 +590,19 @@ mod tests {
         assert_eq!((r.effort.as_deref(), r.turn_effort.as_deref(), r.advisor_model.as_deref()), (Some("max"), Some("max"), Some("claude-opus-5-5")));
         assert_eq!(
             r.thinking,
-            vec![Thinking { position: Some(1), on_line: 0, at: when(), ms: Some(4200), chars: 0, display: Some("summarized".into()) }]
+            vec![Thinking {
+                position: Some(1),
+                on_line: 0,
+                at: when(),
+                ms: Some(4200),
+                chars: 0,
+                display: Some("summarized".into()),
+                text: String::new(),
+                subject: None,
+                signature_chars: 3,
+            }]
         );
+        assert_eq!(r.thinking_dropped, 0);
         let c = r.counts.as_ref().expect("counts");
         assert_eq!(
             (c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.output_tokens, c.thinking_tokens),
@@ -566,6 +611,69 @@ mod tests {
         assert_eq!((c.web_searches, c.web_fetches, c.tool_tokens), (Some(1), Some(0), None));
         assert_eq!(r.text, Text::Added(0));
         assert!(!r.cumulative);
+    }
+
+    #[test]
+    fn thinking_keeps_its_summary_and_the_request_says_what_thinking_it_left_out() {
+        let read = read(
+            &line(serde_json::json!({
+                "type": "assistant", "sessionId": "s1", "cwd": "/repo", "apiBlockIndex": 0,
+                "message": {
+                    "id": "msg_2", "model": "claude-opus-5-5", "stop_reason": "tool_use",
+                    "content": [{ "type": "thinking", "thinking": "Weighing the spec against the tests", "signature": "abcdef" }],
+                    "input_transformations": [
+                        { "type": "thinking_dropped", "path": "messages.2.content.0", "reason": "prefix_binding_mismatch" },
+                        { "type": "thinking_dropped", "path": "messages.2.content.1", "reason": "prefix_binding_mismatch" },
+                        { "type": "something_else" }
+                    ],
+                    "usage": { "input_tokens": 1, "output_tokens": 9 }
+                }
+            })),
+            when(),
+        );
+        let r = only_reply(&read);
+        let t = &r.thinking[0];
+        assert_eq!((t.text.as_str(), t.chars, t.signature_chars, t.subject.as_deref()), ("Weighing the spec against the tests", 35, 6, None));
+        assert_eq!(r.thinking_dropped, 2, "two thinking_dropped transformations, the third is another kind");
+    }
+
+    #[test]
+    fn a_call_says_when_it_asked_to_leave_the_sandbox_and_its_result_what_the_sandbox_stopped() {
+        let off = read(
+            &assistant(
+                serde_json::json!({ "type": "tool_use", "id": "toolu_9", "name": "Bash", "input": { "command": "git push", "dangerouslyDisableSandbox": true } }),
+                serde_json::json!({}),
+            ),
+            when(),
+        );
+        assert!(only_reply(&off).calls[0].sandbox_off);
+        let on = read(
+            &assistant(serde_json::json!({ "type": "tool_use", "id": "toolu_8", "name": "Bash", "input": { "command": "ls" } }), serde_json::json!({})),
+            when(),
+        );
+        assert!(!only_reply(&on).calls[0].sandbox_off);
+
+        let stopped = read(
+            &user(
+                serde_json::json!([{ "type": "tool_result", "tool_use_id": "toolu_9", "content": "ssh: connect to host bitbucket.org port 22: blocked", "is_error": true }]),
+                serde_json::json!({
+                    "toolUseResult": "Error: blocked",
+                    "sandboxed": true,
+                    "sandboxViolations": [
+                        { "host": "bitbucket.org", "kind": "network", "port": 22 },
+                        { "host": "bitbucket.org", "kind": "network", "port": 443 },
+                        { "host": "github.com", "kind": "network", "port": 22 }
+                    ]
+                }),
+            ),
+            when(),
+        );
+        assert_eq!(only_result(&stopped).sandbox_hosts, vec!["bitbucket.org".to_string(), "github.com".to_string()]);
+        let clean = read(
+            &result_line(serde_json::json!({ "type": "tool_result", "tool_use_id": "toolu_8", "content": "a.rs" }), serde_json::json!({ "stdout": "a.rs", "stderr": "" })),
+            when(),
+        );
+        assert!(only_result(&clean).sandbox_hosts.is_empty());
     }
 
     #[test]

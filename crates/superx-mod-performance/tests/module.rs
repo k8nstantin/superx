@@ -188,6 +188,21 @@ async fn its_url_answers_no_request_addressed_to_another_name() {
     }
 }
 
+/// `status` counts every table the provisioned database has, but the
+/// crawler's own record, which it says apart: a table added to the schema
+/// and left out of `status` fails here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_counts_every_table_the_schema_gives_the_database() {
+    let db = own_db().await;
+    let info: Value = db.query("INFO FOR DB").await.expect("info").take(0).expect("decodes");
+    let Value::Object(info) = info else { unreachable!("INFO FOR DB is an object") };
+    let Some(Value::Object(tables)) = info.get("tables") else { unreachable!("INFO FOR DB lists its tables") };
+    let in_database: std::collections::BTreeSet<&str> =
+        tables.keys().map(String::as_str).filter(|t| !["pass", "pass_source"].contains(t)).collect();
+    let counted: std::collections::BTreeSet<&str> = fact_tables().collect();
+    assert_eq!(counted, in_database, "status counts exactly the database's tables of facts");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn holdings_counts_what_the_database_has() {
     let db = own_db().await;
@@ -203,19 +218,26 @@ async fn holdings_counts_what_the_database_has() {
             text: 'x', chars: 1, images: 0, valid_from: time::now() };\
         CREATE prompt CONTENT { session: session:s1, kernel_message: rand::uuid::v7(), at: time::now(), kind: 'queued', \
             text: 'y', chars: 1, images: 0, valid_from: time::now() };\
+        CREATE trigger CONTENT { session: session:s1, kernel_message: rand::uuid::v7(), at: time::now(), \
+            kind: 'task-notification', source: NONE, prompt_id: NONE, text: 'done', chars: 4, valid_from: time::now() };\
+        CREATE line CONTENT { session: session:s1, kernel_message: rand::uuid::v7(), at: time::now(), agent: 'claude_code', \
+            kind: 'user', agent_uuid: NONE, parent_uuid: NONE, prompt_id: NONE, sidechain: false, client_version: NONE, \
+            bytes: 120, read_as: ['prompt'], valid_from: time::now() };\
         CREATE reply:r1 CONTENT { session: session:s1, agent_id: 'msg_01', request_id: NONE, kernel_message: rand::uuid::v7(), \
             at: time::now(), model: 'claude-opus-5-5', requested_model: NONE, advisor_model: NONE, effort: NONE, \
-            turn_effort: NONE, stop_reason: NONE, subagent: false, valid_from: time::now() };\
+            turn_effort: NONE, stop_reason: NONE, subagent: false, thinking_dropped: 0, valid_from: time::now() };\
         CREATE reply_state CONTENT { reply: reply:r1, input_tokens: 1, cache_read_tokens: 0, cache_write_tokens: 0, \
             output_tokens: 1, thinking_tokens: 0, tool_tokens: NONE, web_searches: NONE, web_fetches: NONE, \
             service_tier: NONE, text_chars: 0, usage: {}, valid_from: time::now() };\
         CREATE thinking CONTENT { reply: reply:r1, position: 0, kernel_message: rand::uuid::v7(), at: time::now(), ms: 5, \
-            chars: 0, display: NONE, valid_from: time::now() };\
+            chars: 0, display: NONE, text: '', signature_chars: 0, valid_from: time::now() };\
+        CREATE said CONTENT { reply: reply:r1, position: 1, kernel_message: rand::uuid::v7(), at: time::now(), \
+            text: 'Done.', chars: 5, valid_from: time::now() };\
         CREATE tool_call:t1 CONTENT { reply: reply:r1, call_id: 'toolu_01', kernel_message: rand::uuid::v7(), at: time::now(), \
             tool: 'Bash', path: NONE, command: 'cargo test', description: NONE, pattern: NONE, url: NONE, query: NONE, \
-            subagent_type: NONE, background: false, input_bytes: 10, valid_from: time::now() };\
+            subagent_type: NONE, background: false, input_bytes: 10, sandbox_off: false, valid_from: time::now() };\
         CREATE tool_result CONTENT { tool_call: tool_call:t1, kernel_message: rand::uuid::v7(), at: time::now(), \
-            outcome: 'ok', ms: NONE, bytes: 10, valid_from: time::now() };\
+            outcome: 'ok', ms: NONE, bytes: 10, sandbox_hosts: [], valid_from: time::now() };\
         CREATE edit CONTENT { tool_call: tool_call:t1, path: 'a.rs', kind: 'created', added: 1, removed: 0, \
             counted_from: 'content', operator_changed: false, valid_from: time::now() };\
         CREATE git_event CONTENT { tool_call: tool_call:t1, at: time::now(), action: 'commit', dir: NONE, hash: '5574e81', \
@@ -260,18 +282,36 @@ async fn holdings_counts_what_the_database_has() {
             ("session", 1),
             ("session_place", 1),
             ("prompt", 2),
+            ("trigger", 1),
             ("turn", 1),
             ("compaction", 1),
             ("away", 1),
+            ("session_state", 0),
+            ("session_link", 0),
+            ("queue_event", 0),
+            ("git_state", 0),
+            ("session_cost", 0),
+            ("model_cost", 0),
+            ("request", 0),
+            ("request_part", 0),
+            ("request_shape", 0),
+            ("context", 0),
+            ("hook_run", 0),
+            ("notice", 0),
             ("reply", 1),
             ("reply_state", 1),
             ("thinking", 1),
+            ("said", 1),
             ("tool_call", 1),
             ("tool_result", 1),
             ("edit", 1),
             ("git_event", 1),
             ("test_run", 1),
             ("build_run", 1),
+            ("question", 0),
+            ("task_event", 0),
+            ("plan", 0),
+            ("subagent_run", 0),
             ("repository", 1),
             ("checkout", 1),
             ("checkout_state", 0),
@@ -288,6 +328,14 @@ async fn holdings_counts_what_the_database_has() {
             ("crawl", 0),
             ("crawl_step", 0),
             ("git_call", 0),
+            ("remote_state", 0),
+            ("ref_move", 0),
+            ("commit_rename", 0),
+            ("tip_file", 0),
+            ("repository_state", 0),
+            ("commit_session", 0),
+            ("line", 1),
+            ("line_field", 0),
         ]
     );
     let last = h.last_pass.expect("a pass ran");

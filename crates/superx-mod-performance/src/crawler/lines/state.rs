@@ -329,7 +329,8 @@ impl Session {
                                 .uuid("kernel_message", line.id)
                                 .time("at", line.at)
                                 .text("outcome", Outcome::Interrupted.as_str())
-                                .int("bytes", 0),
+                                .int("bytes", 0)
+                                .texts("sandbox_hosts", &[]),
                         );
                     }
                 }
@@ -361,7 +362,8 @@ impl Session {
                     .some_text("effort", r.effort.clone())
                     .some_text("turn_effort", r.turn_effort.clone())
                     .some_text("stop_reason", r.stop_reason.clone())
-                    .flag("subagent", r.subagent),
+                    .flag("subagent", r.subagent)
+                    .int("thinking_dropped", r.thinking_dropped),
             );
             if let Some(reply) = self.replies.get_mut(&r.agent_id) {
                 reply.row = Some(row);
@@ -457,7 +459,10 @@ impl Session {
                         .time("at", t.at)
                         .some_int("ms", t.ms)
                         .int("chars", t.chars)
-                        .some_text("display", t.display.clone()),
+                        .some_text("display", t.display.clone())
+                        .text("text", t.text.clone())
+                        .some_text("subject", t.subject.clone())
+                        .int("signature_chars", t.signature_chars),
                 );
             }
         }
@@ -540,7 +545,8 @@ impl Session {
                     .time("at", r.at)
                     .text("outcome", r.outcome.as_str())
                     .some_int("ms", r.ms)
-                    .int("bytes", r.bytes),
+                    .int("bytes", r.bytes)
+                    .texts("sandbox_hosts", &r.sandbox_hosts),
             );
         }
         for e in &r.edits {
@@ -632,7 +638,8 @@ fn create_call(batch: &mut Batch, reply: &RecordId, line_id: Uuid, c: &Call) -> 
             .some_text("query", c.query.clone())
             .some_text("subagent_type", c.subagent_type.clone())
             .flag("background", c.background)
-            .int("input_bytes", c.input_bytes),
+            .int("input_bytes", c.input_bytes)
+            .flag("sandbox_off", c.sandbox_off),
     )
 }
 
