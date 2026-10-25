@@ -31,11 +31,11 @@
 use chrono::{DateTime, Utc};
 use superx_kernel::types::Value;
 
-use crate::reader::facts::{
+use crate::crawler::lines::facts::{
     Away, Call, Compaction, Counts, CountedFrom, Edit, EditKind, Fact, GitAction, GitEvent, Header, Outcome, Place,
     Prompt, PromptKind, Read, ReplyLine, Text, Thinking, ToolResult, Turn,
 };
-use crate::reader::value::{at, chars, flag, float, int, json_len, lines, list, object, some_text, text};
+use crate::crawler::value::{at, chars, flag, float, int, json_len, lines, list, object, some_text, text};
 
 /// The agent, as the kernel names it.
 pub const AGENT: &str = superx_kernel::adapters::claude_code::AGENT_NAME;
@@ -478,7 +478,7 @@ mod tests {
     use superx_kernel::message::json_to_object;
 
     use super::*;
-    use crate::reader::facts::{GitAction, PromptKind};
+    use crate::crawler::lines::facts::{GitAction, PromptKind};
 
     fn line(json: serde_json::Value) -> Value {
         Value::Object(json_to_object(&json))

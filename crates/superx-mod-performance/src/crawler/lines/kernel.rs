@@ -20,8 +20,8 @@ use chrono::{DateTime, TimeZone as _, Utc};
 use superx_kernel::types::{RecordId, RecordIdKey, Uuid, Value};
 use superx_kernel::{Kernel, Result};
 
-use crate::reader::formats;
-use crate::reader::value::{at, text, time};
+use crate::crawler::lines::formats;
+use crate::crawler::value::{at, text, time};
 
 /// Where a page of lines starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

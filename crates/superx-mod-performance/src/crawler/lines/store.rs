@@ -1,36 +1,34 @@
-//! Every query the reader issues against the module's own database, in one
-//! place: the newest pass, what a session and a reply already hold, and
-//! the rows a pass writes. Nothing here emits UPDATE or DELETE (§10). Row
-//! ids are UUIDv7, set here (§11). Of several rows for one thing, the
-//! newest is picked here by `valid_from`, never by an index's order:
-//! SurrealDB 3.1's index on a datetime orders rows within a second wrongly
-//! (#486).
+//! Every query the `lines` source issues against the module's own
+//! database, in one place: where it last stopped reading, and what a
+//! session and a reply already hold. The rows it writes go through
+//! [`crate::crawler::store`]. Nothing here emits UPDATE or DELETE (§10).
+//! Of several rows for one thing, the newest is picked here by
+//! `valid_from`, never by an index's order: SurrealDB 3.1's index on a
+//! datetime orders rows within a second wrongly (#486).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
-use superx_kernel::types::{Datetime, Number, Object, RecordId, Uuid, Value};
+use superx_kernel::types::{RecordId, Uuid, Value};
 use superx_kernel::{Db, Result};
 
-use crate::reader::facts::Counts;
-use crate::reader::value::{at, int, text};
+use crate::crawler::lines::facts::Counts;
+use crate::crawler::value::{at, int, text};
 
-/// Statements in one write: a page of rows goes in a few round trips.
-const STATEMENTS_PER_WRITE: usize = 200; // skill-allow: §9-const — write-path bound, not a policy tunable
+/// The last line the `lines` source read in the newest pass that read
+/// one: where it starts next. Passes are seconds apart, so the index's
+/// misorder within a second cannot pick the wrong one.
+const LAST_LINE: &str = "SELECT to_id, valid_from FROM pass_source WHERE source = 'lines' AND to_id != NONE \
+     ORDER BY valid_from DESC LIMIT 1";
 
-/// The last line of the newest pass that read one, where the next pass
-/// starts. Passes are seconds apart: the index's misorder within a second
-/// cannot pick the wrong one.
-const LAST_PASS: &str = "SELECT to_line, valid_from FROM pass WHERE to_line != NONE ORDER BY valid_from DESC LIMIT 1";
-
-/// Where the newest pass stopped reading, when there is one.
+/// Where the `lines` source last stopped reading, when it has read.
 ///
 /// # Errors
 ///
 /// [`superx_kernel::KernelError`] when the database cannot answer.
 pub async fn last_line(db: &Db) -> Result<Option<Uuid>> {
-    let rows: Vec<Value> = db.query(LAST_PASS).await?.take(0)?;
-    Ok(rows.first().and_then(|r| match at(r, &["to_line"]) {
+    let rows: Vec<Value> = db.query(LAST_LINE).await?.take(0)?;
+    Ok(rows.first().and_then(|r| match at(r, &["to_id"]) {
         Some(Value::Uuid(u)) => Some(*u),
         _ => None,
     }))
@@ -273,137 +271,6 @@ pub async fn reply_holds(db: &Db, reply: &RecordId) -> Result<ReplyHolds> {
     })
 }
 
-/// Rows to create, in the order they must be created: a row's links name
-/// rows created before it, and the engine checks each link exists.
-#[derive(Debug, Default)]
-pub struct Batch {
-    rows: Vec<(RecordId, Object)>,
-    /// Rows added, by table, since the pass began.
-    pub added: BTreeMap<&'static str, i64>,
-}
-
-impl Batch {
-    /// A row of `table`, its id set here, its `valid_from` now.
-    pub fn create(&mut self, table: &'static str, mut content: Row) -> RecordId {
-        let id = RecordId::new(table, Uuid::new_v7());
-        content.0.insert("valid_from", Value::Datetime(Datetime::from(Utc::now())));
-        self.rows.push((id.clone(), content.0));
-        *self.added.entry(table).or_default() += 1;
-        id
-    }
-
-    /// Rows waiting to be written.
-    #[must_use]
-    pub fn waiting(&self) -> usize {
-        self.rows.len()
-    }
-
-    /// Rows added in all, since the pass began.
-    #[must_use]
-    pub fn total(&self) -> i64 {
-        self.added.values().sum()
-    }
-}
-
-/// Write every waiting row, in order.
-///
-/// # Errors
-///
-/// [`superx_kernel::KernelError`] when the engine refuses a row: the rows
-/// before it in its write are written, the rest are not.
-pub async fn flush(db: &Db, batch: &mut Batch) -> Result<()> {
-    for chunk in batch.rows.chunks(STATEMENTS_PER_WRITE) {
-        let mut sql = String::new();
-        let mut vars = Object::new();
-        for (i, (id, content)) in chunk.iter().enumerate() {
-            sql.push_str(&format!("CREATE $i{i} CONTENT $c{i};\n"));
-            vars.insert(format!("i{i}"), Value::RecordId(id.clone()));
-            vars.insert(format!("c{i}"), Value::Object(content.clone()));
-        }
-        db.query(sql).bind(vars).await?.check()?;
-    }
-    batch.rows.clear();
-    Ok(())
-}
-
-/// A row's content, built a field at a time; a field with no value is left
-/// out, which the schema reads as NONE.
-#[derive(Debug, Default, Clone)]
-pub struct Row(Object);
-
-impl Row {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn text(mut self, key: &str, v: impl Into<String>) -> Self {
-        self.0.insert(key, Value::String(v.into()));
-        self
-    }
-
-    #[must_use]
-    pub fn some_text(self, key: &str, v: Option<impl Into<String>>) -> Self {
-        match v {
-            Some(v) => self.text(key, v),
-            None => self,
-        }
-    }
-
-    #[must_use]
-    pub fn int(mut self, key: &str, v: i64) -> Self {
-        self.0.insert(key, Value::Number(Number::Int(v)));
-        self
-    }
-
-    #[must_use]
-    pub fn some_int(self, key: &str, v: Option<i64>) -> Self {
-        match v {
-            Some(v) => self.int(key, v),
-            None => self,
-        }
-    }
-
-    #[must_use]
-    pub fn flag(mut self, key: &str, v: bool) -> Self {
-        self.0.insert(key, Value::Bool(v));
-        self
-    }
-
-    #[must_use]
-    pub fn time(mut self, key: &str, v: DateTime<Utc>) -> Self {
-        self.0.insert(key, Value::Datetime(Datetime::from(v)));
-        self
-    }
-
-    #[must_use]
-    pub fn uuid(mut self, key: &str, v: Uuid) -> Self {
-        self.0.insert(key, Value::Uuid(v));
-        self
-    }
-
-    #[must_use]
-    pub fn some_uuid(self, key: &str, v: Option<Uuid>) -> Self {
-        match v {
-            Some(v) => self.uuid(key, v),
-            None => self,
-        }
-    }
-
-    #[must_use]
-    pub fn link(mut self, key: &str, v: &RecordId) -> Self {
-        self.0.insert(key, Value::RecordId(v.clone()));
-        self
-    }
-
-    #[must_use]
-    pub fn object(mut self, key: &str, v: Object) -> Self {
-        self.0.insert(key, Value::Object(v));
-        self
-    }
-}
-
 fn uuid(v: &Value) -> Option<Uuid> {
     match v {
         Value::Uuid(u) => Some(*u),
@@ -420,7 +287,7 @@ fn record(v: &Value, key: &str) -> Option<RecordId> {
 
 fn record_uuid(v: &Value) -> Option<Uuid> {
     match v {
-        Value::RecordId(id) => crate::reader::kernel::record_uuid_of(id),
+        Value::RecordId(id) => crate::crawler::lines::kernel::record_uuid_of(id),
         _ => None,
     }
 }

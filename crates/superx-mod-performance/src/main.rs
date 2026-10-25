@@ -21,7 +21,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use superx_kernel::Kernel;
 use superx_mod_performance::instance::{Instance, PASSWORD_ENV};
-use superx_mod_performance::{daemon, params, reader, registry, server, status, MODULE_NAME, SCHEMA_DDL};
+use superx_mod_performance::{crawler, daemon, params, registry, server, status, MODULE_NAME, SCHEMA_DDL};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::watch;
@@ -204,12 +204,12 @@ async fn run(instance: &Instance) -> Result<(), String> {
         }
     };
     tracing::info!(target: "performance", %url, "running");
-    // The reader runs beside the page until the stop that ends the page.
-    // However the page ends, the reader is told and waited for, so a pass
+    // The crawler runs beside the page until the stop that ends the page.
+    // However the page ends, the crawler is told and waited for, so a pass
     // it was in is recorded as stopped.
     let (asked, watched) = watch::channel(false);
     let asked = Arc::new(asked);
-    let reading = tokio::spawn(reader::run(kernel.clone(), reader::Stop::new(watched)));
+    let crawling = tokio::spawn(crawler::run(kernel.clone(), crawler::Stop::new(watched)));
     let on_stop = {
         let asked = Arc::clone(&asked);
         async move {
@@ -219,8 +219,8 @@ async fn run(instance: &Instance) -> Result<(), String> {
     };
     let served = axum::serve(listener, server::app(kernel.clone(), port)).with_graceful_shutdown(on_stop).await;
     asked.send_replace(true);
-    if let Err(e) = reading.await {
-        tracing::warn!(target: "performance", error = %e, "the reader did not end cleanly");
+    if let Err(e) = crawling.await {
+        tracing::warn!(target: "performance", error = %e, "the crawler did not end cleanly");
     }
     match &served {
         Ok(()) => told(registry::stopped(&kernel).await, "stopped"),

@@ -1,14 +1,15 @@
 //! superx-mod-performance — the models, the agents, thinking effort and the
 //! operator, measured (#466).
 //!
-//! The kernel captures every line the agents and the operator write. This
-//! module keeps the facts those lines hold in its own database: what the
-//! operator asked and how, which model answered, how long it thought and
+//! ONE MODULE, ONE SCHEMA, ONE CRAWLER (operator, 2026-10-25): the main
+//! tool. It gathers what the agents did and what the operator asked from
+//! every line the kernel captured, and what became of the work from the git
+//! repositories the agents worked in, and keeps both in one database for
+//! correlation and analysis: which model answered, how long it thought and
 //! what it spent, which tools it ran and how they ended, which files it
-//! changed, and what it committed, tested and built. The measurement tab
-//! reads those facts, so the models, the agents, thinking effort and the
-//! operator can be measured now and against any earlier period. The
-//! repositories are one source among them, read by `superx-repos`.
+//! changed, what it committed, tested and built, and what of it landed and
+//! lasted. One crawler fills it through its sources ([`crawler`]); a new
+//! source (the GitHub and Bitbucket hosts, others) plugs in beside them.
 //!
 //! ITS OWN EXECUTABLE (operator, 2026-10-24): `superx-performance`, with its
 //! own process, pid file and log under `<home>/modules/performance/`, its
@@ -21,13 +22,14 @@
 //! its URL there (`attr_module_ui_url`), where the core UI links to it.
 //!
 //! READ-ONLY toward everything but its own database. It reads the kernel's
-//! captured lines with SELECT and writes nothing outside its own database,
-//! except its own registry entry. It never reads a repository.
+//! captured lines with SELECT and the repositories with git, read-only
+//! (#446), and writes nothing outside its own database, except its own
+//! registry entry.
 
+pub mod crawler;
 pub mod daemon;
 pub mod instance;
 pub mod params;
-pub mod reader;
 pub mod registry;
 pub mod server;
 pub mod status;

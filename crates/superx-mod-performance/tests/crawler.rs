@@ -1,14 +1,20 @@
-//! The reader (#508), end to end: a kernel holding a session's lines as
-//! capture keeps them, and the module's own database, both on the
-//! in-memory engine. What a pass writes is read back from the database.
-//! Every pass after the first reads the minute before the last one stopped,
-//! so these tests read lines again on purpose.
+//! The one crawler (#510), end to end: a kernel holding sessions' lines as
+//! capture keeps them, real git repositories in a scratch directory, and
+//! the module's own database, on the in-memory engine. What a pass writes
+//! is read back from the database. Every pass after the first reads the
+//! minute before the last one stopped, so these tests read lines again on
+//! purpose.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
 use superx_kernel::message::json_to_object;
 use superx_kernel::types::{Object, RecordId, Value};
 use superx_kernel::{Kernel, REQUIRED_METAMODEL_TYPES};
-use superx_mod_performance::reader::{pass_on, Reader, Stop};
+use superx_mod_performance::crawler::{pass_on, Crawler, Pass, Stop};
+use superx_mod_performance::params::{from_values, Params, EXCLUDE_PARAM, INCLUDE_PARAM};
 use superx_mod_performance::{MODULE_NAME, SCHEMA_DDL};
 use tokio::sync::watch;
 
@@ -234,6 +240,23 @@ fn sorted<T: Ord>(items: impl Iterator<Item = T>) -> Vec<T> {
     v
 }
 
+fn params(set: &[(&'static str, Value)]) -> Params {
+    let values: BTreeMap<&'static str, Value> = set.iter().cloned().collect();
+    from_values(&values).params
+}
+
+fn lines_read(p: &Pass) -> i64 {
+    p.source("lines").map_or(0, |s| s.items)
+}
+
+fn lines_unread(p: &Pass) -> i64 {
+    p.source("lines").map_or(0, |s| s.unread)
+}
+
+fn lines_rows(p: &Pass) -> i64 {
+    p.source("lines").map_or(0, superx_mod_performance::crawler::SourceRun::rows_written)
+}
+
 fn never_stop() -> (watch::Sender<bool>, Stop) {
     let (asked, watched) = watch::channel(false);
     (asked, Stop::new(watched))
@@ -261,9 +284,9 @@ async fn a_pass_reads_every_line_into_its_facts_and_a_second_pass_writes_nothing
     claude_session(&mut c).await;
 
     let (_asked, mut stop) = never_stop();
-    let mut reader = Reader::default();
-    let first = pass_on(&kernel, &db, &mut reader, &mut stop).await.expect("pass");
-    assert_eq!((first.outcome, first.lines_read, first.lines_unread), ("complete", 15, 0), "{first:?}");
+    let mut crawler = Crawler::default();
+    let first = pass_on(&kernel, &db, &params(&[]), &mut crawler, &mut stop).await.expect("pass");
+    assert_eq!((first.outcome, lines_read(&first), lines_unread(&first)), ("complete", 15, 0), "{first:?}");
     let counts = every_count(&db).await;
     assert_eq!(
         counts,
@@ -285,7 +308,12 @@ async fn a_pass_reads_every_line_into_its_facts_and_a_second_pass_writes_nothing
             ("away", 1),
         ]
     );
-    assert_eq!(first.rows_written, counts.iter().map(|(_, n)| n).sum::<i64>());
+    assert_eq!(lines_rows(&first), counts.iter().map(|(_, n)| n).sum::<i64>());
+    assert_eq!(
+        sorted(rows(&db, "SELECT path, exact FROM directory").await.iter().filter_map(|d| text(d, "path"))),
+        ["/repo", "/repo/sub"],
+        "the repos source followed both directories the session worked in: no repository holds them"
+    );
 
     let s = rows(&db, "SELECT agent, agent_id, entrypoint, client_version FROM session").await;
     assert_eq!(
@@ -330,16 +358,17 @@ async fn a_pass_reads_every_line_into_its_facts_and_a_second_pass_writes_nothing
     let places = rows(&db, "SELECT cwd, at FROM session_place ORDER BY at").await;
     assert_eq!(places.iter().map(|p| text(p, "cwd").unwrap_or_default()).collect::<Vec<_>>(), ["/repo", "/repo/sub"]);
 
-    let second = pass_on(&kernel, &db, &mut reader, &mut stop).await.expect("second pass");
+    let second = pass_on(&kernel, &db, &params(&[]), &mut crawler, &mut stop).await.expect("second pass");
     assert_eq!((second.outcome, second.rows_written), ("complete", 0), "{second:?}");
-    assert!(second.lines_read > 0, "it read the minute before the last pass stopped");
+    assert!(lines_read(&second) > 0, "it read the minute before the last pass stopped");
     assert_eq!(every_count(&db).await, counts, "nothing written twice");
 
-    let mut restarted = Reader::default();
-    let third = pass_on(&kernel, &db, &mut restarted, &mut stop).await.expect("pass after a restart");
+    let mut restarted = Crawler::default();
+    let third = pass_on(&kernel, &db, &params(&[]), &mut restarted, &mut stop).await.expect("pass after a restart");
     assert_eq!(third.rows_written, 0, "{third:?}");
     assert_eq!(every_count(&db).await, counts, "nothing written twice after a restart");
     assert_eq!(count(&db, "pass").await, 3, "one row per pass");
+    assert_eq!(count(&db, "pass_source").await, 6, "and one per source in it");
 }
 
 #[tokio::test]
@@ -351,12 +380,12 @@ async fn a_reply_read_again_from_the_middle_after_a_restart_counts_its_text_once
     c.message(block("msg_9", 0, serde_json::json!({ "type": "text", "text": "Part one." }), serde_json::json!({}))).await;
     c.message(block("msg_9", 1, serde_json::json!({ "type": "text", "text": "Part two!" }), serde_json::json!({}))).await;
     let (_asked, mut stop) = never_stop();
-    pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("first pass");
+    pass_on(&kernel, &db, &params(&[]), &mut Crawler::default(), &mut stop).await.expect("first pass");
 
     // The reply goes on after the pass; the module restarts before the next.
     c.message(block("msg_9", 2, serde_json::json!({ "type": "text", "text": "And three." }), serde_json::json!({}))).await;
     c.message(block("msg_9", 3, serde_json::json!({ "type": "thinking", "thinking": "hmm", "signature": "s" }), serde_json::json!({}))).await;
-    let after = pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("pass after a restart");
+    let after = pass_on(&kernel, &db, &params(&[]), &mut Crawler::default(), &mut stop).await.expect("pass after a restart");
     assert_eq!(after.outcome, "complete");
     let states = rows(&db, "SELECT text_chars FROM reply_state").await;
     assert_eq!(
@@ -377,12 +406,12 @@ async fn a_pass_that_was_never_recorded_is_read_again_without_writing_twice() {
     let mut c = Capture { kernel: &kernel, agent, session, key: "s3".to_string(), at: start() };
     claude_session(&mut c).await;
     let (_asked, mut stop) = never_stop();
-    pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("pass");
+    pass_on(&kernel, &db, &params(&[]), &mut Crawler::default(), &mut stop).await.expect("pass");
     let counts = every_count(&db).await;
     // As if the process died after writing its rows, before its pass row.
-    db.query("DELETE pass").await.expect("forget the pass").check().expect("forgotten");
-    let again = pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("the pass again");
-    assert_eq!((again.lines_read, again.rows_written), (15, 0), "{again:?}");
+    db.query("DELETE pass_source; DELETE pass;").await.expect("forget the pass").check().expect("forgotten");
+    let again = pass_on(&kernel, &db, &params(&[]), &mut Crawler::default(), &mut stop).await.expect("the pass again");
+    assert_eq!((lines_read(&again), again.rows_written), (15, 0), "{again:?}");
     assert_eq!(every_count(&db).await, counts);
 }
 
@@ -395,9 +424,10 @@ async fn a_pass_asked_to_stop_is_recorded_as_stopped() {
     claude_session(&mut c).await;
     let (asked, mut stop) = never_stop();
     asked.send_replace(true);
-    let stopped = pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("pass");
-    assert_eq!((stopped.outcome, stopped.lines_read), ("stopped", 0));
-    let recorded = rows(&db, "SELECT outcome, note, to_line FROM pass").await;
+    let stopped = pass_on(&kernel, &db, &params(&[]), &mut Crawler::default(), &mut stop).await.expect("pass");
+    assert_eq!((stopped.outcome, lines_read(&stopped)), ("stopped", 0));
+    assert!(stopped.source("repos").is_none(), "a stopped pass runs no further source");
+    let recorded = rows(&db, "SELECT outcome FROM pass").await;
     assert_eq!(text(&recorded[0], "outcome").as_deref(), Some("stopped"));
 }
 
@@ -423,8 +453,8 @@ async fn a_gemini_reply_grows_line_by_line_and_older_lines_read_again_change_not
     c.message(emission("Here", 20, 2, "success")).await;
     c.message(emission("Here are the files.", 40, 2, "success")).await;
     let (_asked, mut stop) = never_stop();
-    let mut reader = Reader::default();
-    pass_on(&kernel, &db, &mut reader, &mut stop).await.expect("pass");
+    let mut crawler = Crawler::default();
+    pass_on(&kernel, &db, &params(&[]), &mut crawler, &mut stop).await.expect("pass");
     assert_eq!(count(&db, "reply").await, 1);
     let reply = rows(&db, "SELECT kernel_message, model FROM reply").await;
     assert_eq!(text(&reply[0], "model").as_deref(), Some("gemini-3.1-pro-preview"));
@@ -436,7 +466,7 @@ async fn a_gemini_reply_grows_line_by_line_and_older_lines_read_again_change_not
     assert_eq!((count(&db, "thinking").await, count(&db, "tool_call").await, count(&db, "tool_result").await), (2, 1, 1));
     assert_eq!(count(&db, "prompt").await, 1);
     let counts = every_count(&db).await;
-    pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("after a restart");
+    pass_on(&kernel, &db, &params(&[]), &mut Crawler::default(), &mut stop).await.expect("after a restart");
     assert_eq!(every_count(&db).await, counts, "older emissions read again add no state");
 }
 
@@ -449,11 +479,11 @@ async fn a_line_of_an_unknown_shape_is_counted_and_the_rest_is_read() {
     c.message(serde_json::json!({ "type": "hologram" })).await;
     c.message(block("msg_5", 0, serde_json::json!({ "type": "text", "text": "ok" }), serde_json::json!({}))).await;
     let (_asked, mut stop) = never_stop();
-    let p = pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("pass");
-    assert_eq!((p.lines_read, p.lines_unread, p.outcome), (2, 1, "complete"));
+    let p = pass_on(&kernel, &db, &params(&[]), &mut Crawler::default(), &mut stop).await.expect("pass");
+    assert_eq!((lines_read(&p), lines_unread(&p), p.outcome), (2, 1, "complete"));
     assert_eq!(count(&db, "reply").await, 1);
-    let recorded = rows(&db, "SELECT lines_read, lines_unread, replies_new FROM pass").await;
-    assert_eq!((int(&recorded[0], "lines_unread"), int(&recorded[0], "replies_new")), (Some(1), Some(1)));
+    let recorded = rows(&db, "SELECT items, unread, rows.reply AS replies FROM pass_source WHERE source = 'lines'").await;
+    assert_eq!((int(&recorded[0], "unread"), int(&recorded[0], "replies")), (Some(1), Some(1)));
 }
 
 #[tokio::test]
@@ -473,12 +503,248 @@ async fn spans_without_an_index_keep_their_places_when_read_again() {
     c.message(unindexed(serde_json::json!({ "type": "text", "text": "b" }))).await;
     c.message(unindexed(serde_json::json!({ "type": "thinking", "thinking": "cc", "signature": "s" }))).await;
     let (_asked, mut stop) = never_stop();
-    let mut reader = Reader::default();
-    pass_on(&kernel, &db, &mut reader, &mut stop).await.expect("pass");
+    let mut crawler = Crawler::default();
+    pass_on(&kernel, &db, &params(&[]), &mut crawler, &mut stop).await.expect("pass");
     let places = |rows: Vec<Value>| sorted(rows.iter().map(|t| (int(t, "position"), int(t, "chars"))));
     let first = places(rows(&db, "SELECT position, chars FROM thinking").await);
     assert_eq!(first, [(Some(0), Some(1)), (Some(2), Some(2))]);
-    pass_on(&kernel, &db, &mut reader, &mut stop).await.expect("the same reader again");
-    pass_on(&kernel, &db, &mut Reader::default(), &mut stop).await.expect("after a restart");
+    pass_on(&kernel, &db, &params(&[]), &mut crawler, &mut stop).await.expect("the same crawler again");
+    pass_on(&kernel, &db, &params(&[]), &mut Crawler::default(), &mut stop).await.expect("after a restart");
     assert_eq!(places(rows(&db, "SELECT position, chars FROM thinking").await), first, "read again, the same places");
+}
+
+// The repositories the sessions worked in ------------------------------------
+
+fn git(dir: &Path, args: &[&str]) {
+    let ok = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@x", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .status()
+        .expect("git runs")
+        .success();
+    assert!(ok, "git {args:?} in {}", dir.display());
+}
+
+/// A repository with one commit on `main`.
+fn repo(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("dir");
+    git(dir, &["init", "-q"]);
+    git(dir, &["commit", "-q", "--allow-empty", "-m", "first"]);
+}
+
+/// A scratch directory, by its real path: git names the real one.
+fn scratch() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("superx-performance-crawl-{}", superx_kernel::types::Uuid::new_v7()));
+    std::fs::create_dir_all(&dir).expect("scratch");
+    std::fs::canonicalize(&dir).expect("real path")
+}
+
+fn strings(paths: &[&Path]) -> Value {
+    Value::Array(paths.iter().map(|p| Value::String(p.to_string_lossy().into_owned())).collect::<Vec<_>>().into())
+}
+
+/// The operator, typing in `dir`.
+fn worked_in(dir: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "type": "user", "cwd": dir, "gitBranch": "main", "origin": { "kind": "human" },
+        "message": { "role": "user", "content": "work here" }
+    })
+}
+
+/// The newest row for a directory, as `(checkout's root or "none", exact,
+/// source)`.
+async fn directory(db: &superx_kernel::Db, path: &Path) -> (String, bool, String) {
+    let found = rows(
+        db,
+        &format!(
+            "SELECT checkout.toplevel ?? 'none' AS top, exact, source, valid_from FROM directory \
+             WHERE path = '{}' ORDER BY valid_from DESC",
+            path.display()
+        ),
+    )
+    .await;
+    let newest = found.first().expect("a row for the directory");
+    let exact = matches!(newest, Value::Object(o) if matches!(o.get("exact"), Some(Value::Bool(true))));
+    (text(newest, "top").expect("top"), exact, text(newest, "source").expect("source"))
+}
+
+/// A checkout's newest state, as `(present, branch)`.
+async fn state(db: &superx_kernel::Db, toplevel: &Path) -> (bool, Option<String>) {
+    let found = rows(
+        db,
+        &format!(
+            "SELECT present, branch, valid_from FROM checkout_state WHERE checkout.toplevel = '{}' ORDER BY valid_from DESC",
+            toplevel.display()
+        ),
+    )
+    .await;
+    let newest = found.first().expect("a state for the checkout");
+    let present = matches!(newest, Value::Object(o) if matches!(o.get("present"), Some(Value::Bool(true))));
+    (present, text(newest, "branch"))
+}
+
+/// What the `repos` source counted in a pass, by name.
+fn repos(p: &Pass, name: &str) -> i64 {
+    p.source("repos").and_then(|s| s.counts.get(name).copied()).unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_pass_reads_the_lines_and_follows_them_to_their_repositories() {
+    let kernel = booted_kernel().await;
+    let db = own_db().await;
+    let (agent, session) = agent_and_session(&kernel, "claude_code", "r1").await;
+    let mut c = Capture { kernel: &kernel, agent, session, key: "r1".to_string(), at: Utc::now() - TimeDelta::hours(2) };
+    let root = scratch();
+    let (a, wt, b, inc, d) = (root.join("a"), root.join("a-wt"), root.join("b"), root.join("c"), root.join("d"));
+    repo(&a);
+    std::fs::create_dir_all(a.join("src")).expect("src");
+    git(&a, &["worktree", "add", "-q", "-b", "feat", &wt.to_string_lossy()]);
+    repo(&b);
+    repo(&inc);
+    let plain = root.join("plain");
+    std::fs::create_dir_all(&plain).expect("plain");
+    let vanished = a.join("gone").join("deep");
+    for dir in [a.join("src"), wt.clone(), b.clone(), plain.clone(), vanished.clone()] {
+        c.message(worked_in(&dir)).await;
+    }
+    let p = params(&[(INCLUDE_PARAM, strings(&[&inc]))]);
+    let (_asked, mut stop) = never_stop();
+    let mut crawler = Crawler::default();
+
+    // One pass: the lines, then the repositories they lead to.
+    let first = pass_on(&kernel, &db, &p, &mut crawler, &mut stop).await.expect("first pass");
+    assert_eq!(first.outcome, "complete", "{first:?}");
+    assert_eq!(lines_read(&first), 5);
+    assert_eq!(
+        ["directories_read", "directories_new", "repositories_new", "repositories_known", "checkouts_new", "checkouts_known"]
+            .map(|n| repos(&first, n)),
+        [6, 6, 3, 3, 4, 4],
+        "five directories the session worked in, one root named: {first:?}"
+    );
+    let names: Vec<String> = sorted(rows(&db, "SELECT name FROM repository").await.iter().filter_map(|r| text(r, "name")));
+    assert_eq!(names, ["a", "b", "c"], "a worktree is its repository's");
+    assert_eq!(directory(&db, &a.join("src")).await, (a.display().to_string(), true, "session".to_string()));
+    assert_eq!(directory(&db, &wt).await, (wt.display().to_string(), true, "session".to_string()));
+    assert_eq!(directory(&db, &plain).await, ("none".to_string(), true, "session".to_string()), "no repository holds it");
+    assert_eq!(
+        directory(&db, &vanished).await,
+        (a.display().to_string(), false, "session".to_string()),
+        "gone: its repository is known through its nearest folder, not exactly"
+    );
+    assert_eq!(directory(&db, &inc).await, (inc.display().to_string(), true, "include".to_string()));
+    assert_eq!(state(&db, &a).await, (true, Some("main".to_string())));
+    assert_eq!(state(&db, &wt).await, (true, Some("feat".to_string())));
+    let recorded = rows(&db, "SELECT source, calls FROM pass_source WHERE source = 'repos'").await;
+    assert!(int(&recorded[0], "calls").is_some_and(|n| n > 0), "every git call is counted: {recorded:?}");
+
+    // Nothing new: the next pass follows nothing and writes nothing.
+    let second = pass_on(&kernel, &db, &p, &mut crawler, &mut stop).await.expect("second pass");
+    assert_eq!((second.rows_written, repos(&second, "directories_read")), (0, 0), "{second:?}");
+
+    // The logs report a change first. Branches change in `a`, where the
+    // session goes on working, and in the named root, where no session
+    // is: the next pass reads `a`'s checkout because the lines it read were
+    // written there, and leaves the other to the next full pass.
+    git(&a, &["switch", "-q", "-c", "topic"]);
+    git(&inc, &["switch", "-q", "-c", "elsewhere"]);
+    c.at = Utc::now();
+    c.message(worked_in(&a.join("src"))).await;
+    let followed = pass_on(&kernel, &db, &p, &mut crawler, &mut stop).await.expect("a pass after the session worked");
+    assert_eq!(state(&db, &a).await, (true, Some("topic".to_string())), "{followed:?}");
+    assert_eq!(state(&db, &inc).await, (true, Some("main".to_string())), "no session worked there yet");
+    assert!(repos(&followed, "checkouts_read") >= 1, "{followed:?}");
+
+    // A repository's folder is gone. The next full pass (here, after a
+    // restart) finds its checkout gone, and the repository stale.
+    std::fs::remove_dir_all(&b).expect("remove b");
+    let third = pass_on(&kernel, &db, &p, &mut Crawler::default(), &mut stop).await.expect("third pass");
+    assert_eq!(
+        ["checkouts_gone", "repositories_stale", "directories_moved"].map(|n| repos(&third, n)),
+        [1, 1, 1],
+        "{third:?}"
+    );
+    assert_eq!(state(&db, &b).await, (false, None));
+    assert_eq!(directory(&db, &b).await, ("none".to_string(), false, "session".to_string()));
+    assert_eq!(state(&db, &inc).await, (true, Some("elsewhere".to_string())), "a full pass reads every checkout");
+
+    // It is back: the same repository and checkout, present again.
+    repo(&b);
+    let fourth = pass_on(&kernel, &db, &p, &mut Crawler::default(), &mut stop).await.expect("fourth pass");
+    assert_eq!(["checkouts_back", "repositories_new", "checkouts_new"].map(|n| repos(&fourth, n)), [1, 0, 0], "{fourth:?}");
+    assert_eq!(state(&db, &b).await, (true, Some("main".to_string())));
+
+    // The session moves to a new repository: the same pass that reads the
+    // line follows it there, without waiting for a full pass.
+    repo(&d);
+    c.at = Utc::now();
+    c.message(worked_in(&d)).await;
+    let fifth = pass_on(&kernel, &db, &p, &mut crawler, &mut stop).await.expect("fifth pass");
+    assert_eq!(
+        ["directories_read", "repositories_new", "checkouts_new", "repositories_known"].map(|n| repos(&fifth, n)),
+        [1, 1, 1, 4],
+        "{fifth:?}"
+    );
+    assert_eq!(state(&db, &d).await, (true, Some("main".to_string())));
+    assert_eq!(count(&db, "pass").await, 6, "every pass is recorded");
+    std::fs::remove_dir_all(&root).expect("clean up");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_excluded_repository_is_never_listed() {
+    let kernel = booted_kernel().await;
+    let db = own_db().await;
+    let (agent, session) = agent_and_session(&kernel, "claude_code", "r2").await;
+    let mut c = Capture { kernel: &kernel, agent, session, key: "r2".to_string(), at: Utc::now() - TimeDelta::hours(1) };
+    let root = scratch();
+    let (a, b) = (root.join("a"), root.join("b"));
+    repo(&a);
+    repo(&b);
+    c.message(worked_in(&a)).await;
+    c.message(worked_in(&b)).await;
+    let p = params(&[(EXCLUDE_PARAM, Value::Array(vec![Value::String("b".to_string())].into()))]);
+    let (_asked, mut stop) = never_stop();
+    let s = pass_on(&kernel, &db, &p, &mut Crawler::default(), &mut stop).await.expect("pass");
+    assert_eq!(["excluded", "repositories_known", "checkouts_known"].map(|n| repos(&s, n)), [1, 1, 1], "{s:?}");
+    let names: Vec<String> = rows(&db, "SELECT name FROM repository").await.iter().filter_map(|r| text(r, "name")).collect();
+    assert_eq!(names, ["a"]);
+    std::fs::remove_dir_all(&root).expect("clean up");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_repositories_pause_while_their_crawl_is_0() {
+    let kernel = booted_kernel().await;
+    let db = own_db().await;
+    let (agent, session) = agent_and_session(&kernel, "claude_code", "r3").await;
+    let mut c = Capture { kernel: &kernel, agent, session, key: "r3".to_string(), at: Utc::now() - TimeDelta::hours(1) };
+    let root = scratch();
+    repo(&root.join("a"));
+    c.message(worked_in(&root.join("a"))).await;
+    let p = params(&[(superx_mod_performance::params::CRAWL_SECS_PARAM, Value::Number(superx_kernel::types::Number::Int(0)))]);
+    let (_asked, mut stop) = never_stop();
+    let s = pass_on(&kernel, &db, &p, &mut Crawler::default(), &mut stop).await.expect("pass");
+    let repos_run = s.source("repos").expect("the source is recorded");
+    assert_eq!((repos_run.items, repos_run.calls), (0, 0), "{s:?}");
+    assert!(repos_run.note.as_deref().is_some_and(|n| n.contains("paused")), "{s:?}");
+    assert_eq!(count(&db, "repository").await, 0);
+    assert_eq!(lines_read(&s), 1, "the lines are read all the same");
+    std::fs::remove_dir_all(&root).expect("clean up");
+}
+
+/// How long the test gives the crawler to start waiting, and then to end.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(200); // skill-allow: §9-duration — test fixture, not a policy
+const LIMIT: std::time::Duration = std::time::Duration::from_secs(5); // skill-allow: §9-duration — test fixture, not a policy
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_crawler_ends_when_asked_even_while_it_waits() {
+    // A test handle has no database of its own behind it, so the crawler
+    // finds nothing to pass over and waits a minute before it looks again.
+    let kernel = booted_kernel().await;
+    let (asked, watched) = watch::channel(false);
+    let crawler = tokio::spawn(superx_mod_performance::crawler::run(kernel, Stop::new(watched)));
+    tokio::time::sleep(SETTLE).await;
+    asked.send_replace(true);
+    let ended = tokio::time::timeout(LIMIT, crawler).await;
+    assert!(matches!(ended, Ok(Ok(()))), "it ended when asked: {ended:?}");
 }
