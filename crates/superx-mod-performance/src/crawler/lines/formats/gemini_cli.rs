@@ -103,14 +103,18 @@ fn gemini(line: &Value, at_time: DateTime<Utc>) -> Read {
         .enumerate()
         .map(|(i, t)| {
             let position = i64::try_from(i).unwrap_or(i64::MAX);
+            let said = text(t, &["description"]).unwrap_or_default();
+            let subject = some_text(t, &["subject"]);
             Thinking {
                 position: Some(position),
                 on_line: position,
                 at: time(t, &["timestamp"]).unwrap_or(at_time),
                 ms: None,
-                chars: chars(text(t, &["subject"]).unwrap_or_default())
-                    + chars(text(t, &["description"]).unwrap_or_default()),
+                chars: subject.as_deref().map_or(0, chars) + chars(said),
                 display: None,
+                text: said.to_string(),
+                subject,
+                signature_chars: 0,
             }
         })
         .collect();
@@ -145,6 +149,7 @@ fn gemini(line: &Value, at_time: DateTime<Utc>) -> Read {
             results,
             blocks: 0,
             cumulative: true,
+            thinking_dropped: 0,
         }))],
         ..Read::default()
     }
@@ -189,6 +194,7 @@ fn call(c: &Value, at_time: DateTime<Utc>) -> Option<Call> {
         subagent_type: field("agent_name"),
         background: args.and_then(|a| flag(a, &["is_background"])).unwrap_or(false),
         input_bytes: args.map_or(0, json_len),
+        sandbox_off: false,
     })
 }
 
@@ -247,6 +253,7 @@ fn result(c: &Value, call: &Call, at_time: DateTime<Utc>) -> Option<ToolResult> 
         edits: edit.into_iter().collect(),
         output: (!said.is_empty()).then_some(said),
         noted: Vec::new(),
+        sandbox_hosts: Vec::new(),
     })
 }
 
@@ -323,6 +330,12 @@ mod tests {
         );
         assert_eq!(r.thinking.len(), 1);
         assert_eq!((r.thinking[0].position, r.thinking[0].chars, r.thinking[0].ms), (Some(0), 17, None));
+        assert_eq!(
+            (r.thinking[0].text.as_str(), r.thinking[0].subject.as_deref(), r.thinking[0].signature_chars),
+            ("Read the file", Some("Plan"), 0),
+            "a thought keeps its description whole, its subject apart, and no signature"
+        );
+        assert_eq!(r.thinking_dropped, 0);
         assert_eq!(r.calls.iter().map(|c| c.call_id.as_str()).collect::<Vec<_>>(), ["c1", "c2", "c3"]);
         assert_eq!((r.calls[1].command.as_deref(), r.calls[1].dir.as_deref(), r.calls[1].path.as_deref()), (Some("cargo test"), Some("/repo"), None));
         assert_eq!(r.results.len(), 2, "a call still running has no result");

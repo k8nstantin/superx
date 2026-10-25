@@ -145,6 +145,13 @@ impl Row {
 
 impl Row {
     #[must_use]
+    pub fn texts(mut self, key: &str, v: &[String]) -> Self {
+        let items: Vec<Value> = v.iter().cloned().map(Value::String).collect();
+        self.0.insert(key, Value::Array(Array::from(items)));
+        self
+    }
+
+    #[must_use]
     pub fn links(mut self, key: &str, v: &[RecordId]) -> Self {
         let items: Vec<Value> = v.iter().cloned().map(Value::RecordId).collect();
         self.0.insert(key, Value::Array(Array::from(items)));

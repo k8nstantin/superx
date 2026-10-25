@@ -12,8 +12,9 @@ use crate::params::{self, Resolved};
 use crate::MODULE_NAME;
 
 /// The tables of facts, as `status` lists them: what happened in the
-/// sessions, what the models answered, what their tools did, and what the
-/// repositories hold; each table with what its rows are called there. The
+/// sessions, what was put before the models, what they answered, what their
+/// tools did, what the repositories hold, and every line and field the
+/// crawler has seen; each table with what its rows are called there. The
 /// crawler's own record (`pass`, `pass_source`) is said apart.
 pub const FACTS: &[(&str, &[(&str, &str)])] = &[
     (
@@ -22,12 +23,33 @@ pub const FACTS: &[(&str, &[(&str, &str)])] = &[
             ("session", "sessions"),
             ("session_place", "places"),
             ("prompt", "prompts"),
+            ("trigger", "triggers"),
             ("turn", "turns"),
             ("compaction", "compactions"),
             ("away", "recaps"),
+            ("session_state", "session states"),
+            ("session_link", "links"),
+            ("queue_event", "queue changes"),
+            ("git_state", "git states"),
+            ("session_cost", "costs"),
+            ("model_cost", "costs by model"),
         ],
     ),
-    ("models", &[("reply", "replies"), ("reply_state", "reply states"), ("thinking", "thinking spans")]),
+    (
+        "context",
+        &[
+            ("request", "requests"),
+            ("request_part", "request pieces"),
+            ("request_shape", "request shapes"),
+            ("context", "attachments"),
+            ("hook_run", "hook runs"),
+            ("notice", "notices"),
+        ],
+    ),
+    (
+        "models",
+        &[("reply", "replies"), ("reply_state", "reply states"), ("thinking", "thinking spans"), ("said", "texts")],
+    ),
     (
         "tools",
         &[
@@ -37,6 +59,10 @@ pub const FACTS: &[(&str, &[(&str, &str)])] = &[
             ("git_event", "git events"),
             ("test_run", "test runs"),
             ("build_run", "build runs"),
+            ("question", "questions"),
+            ("task_event", "task changes"),
+            ("plan", "plans"),
+            ("subagent_run", "subagent runs"),
         ],
     ),
     (
@@ -58,8 +84,15 @@ pub const FACTS: &[(&str, &[(&str, &str)])] = &[
             ("crawl", "crawls"),
             ("crawl_step", "crawl steps"),
             ("git_call", "git calls"),
+            ("remote_state", "remote states"),
+            ("ref_move", "reflog entries"),
+            ("commit_rename", "renames"),
+            ("tip_file", "files at a tip"),
+            ("repository_state", "repository states"),
+            ("commit_session", "commits tied to sessions"),
         ],
     ),
+    ("census", &[("line", "lines"), ("line_field", "fields")]),
 ];
 
 /// Every table of facts, in the order `status` lists them.
@@ -300,11 +333,14 @@ mod tests {
     use super::*;
     use crate::params::{from_values, PORT_PARAM};
 
+    /// Every table of facts is counted once, and the crawler's own record
+    /// is said apart. That these are exactly the tables the schema defines
+    /// is read from the engine in `tests/module.rs`.
     #[test]
     fn every_table_of_facts_is_counted_once_and_the_crawlers_own_record_apart() {
         let tables: Vec<&str> = fact_tables().collect();
         let unique: std::collections::BTreeSet<&str> = tables.iter().copied().collect();
-        assert_eq!(tables.len(), 31, "{tables:?}");
+        assert_eq!(tables.len(), 57, "{tables:?}");
         assert_eq!(unique.len(), tables.len(), "a table counted twice: {tables:?}");
         assert!(!unique.contains("pass") && !unique.contains("pass_source"));
     }
@@ -315,13 +351,17 @@ mod tests {
         assert!(
             t.contains(
                 "database    superx/performance\n\
-                 \x20 sessions  0 sessions · 0 places · 0 prompts · 0 turns · 0 compactions · 0 recaps\n\
-                 \x20 models    0 replies · 0 reply states · 0 thinking spans\n\
-                 \x20 tools     0 tool calls · 0 tool results · 0 edits · 0 git events · 0 test runs · 0 build runs\n\
+                 \x20 sessions  0 sessions · 0 places · 0 prompts · 0 triggers · 0 turns · 0 compactions · 0 recaps · \
+                 0 session states · 0 links · 0 queue changes · 0 git states · 0 costs · 0 costs by model\n\
+                 \x20 context   0 requests · 0 request pieces · 0 request shapes · 0 attachments · 0 hook runs · 0 notices\n\
+                 \x20 models    0 replies · 0 reply states · 0 thinking spans · 0 texts\n\
+                 \x20 tools     0 tool calls · 0 tool results · 0 edits · 0 git events · 0 test runs · 0 build runs · \
+                 0 questions · 0 task changes · 0 plans · 0 subagent runs\n\
                  \x20 repos     0 repositories · 0 checkouts · 0 checkout states"
             ),
             "{t}"
         );
+        assert!(t.contains("  census    0 lines · 0 fields\n"), "{t}");
         assert!(t.contains("last pass   none yet\n"), "{t}");
         for name in crate::params::NAMES {
             assert!(t.contains(name), "{name} is listed:\n{t}");
@@ -333,11 +373,16 @@ mod tests {
     fn every_count_sits_beside_its_own_table() {
         let rows = fact_tables().zip(1..).collect();
         let t = text_of(&Database::Ready(Holdings { rows, last_pass: None }), &from_values(&BTreeMap::new()));
-        assert!(t.contains("1 sessions · 2 places · 3 prompts · 4 turns · 5 compactions · 6 recaps"), "{t}");
-        assert!(t.contains("7 replies · 8 reply states · 9 thinking spans"), "{t}");
-        assert!(t.contains("10 tool calls · 11 tool results · 12 edits · 13 git events · 14 test runs · 15 build runs"), "{t}");
-        assert!(t.contains("16 repositories · 17 checkouts · 18 checkout states · 19 directory records"), "{t}");
-        assert!(t.contains("29 crawls · 30 crawl steps · 31 git calls"), "{t}");
+        assert!(t.contains("1 sessions · 2 places · 3 prompts · 4 triggers · 5 turns · 6 compactions · 7 recaps"), "{t}");
+        assert!(t.contains("12 costs · 13 costs by model\n"), "{t}");
+        assert!(t.contains("14 requests · 15 request pieces · 16 request shapes · 17 attachments · 18 hook runs · 19 notices"), "{t}");
+        assert!(t.contains("20 replies · 21 reply states · 22 thinking spans · 23 texts"), "{t}");
+        assert!(t.contains("24 tool calls · 25 tool results · 26 edits · 27 git events · 28 test runs · 29 build runs"), "{t}");
+        assert!(t.contains("30 questions · 31 task changes · 32 plans · 33 subagent runs"), "{t}");
+        assert!(t.contains("34 repositories · 35 checkouts · 36 checkout states · 37 directory records"), "{t}");
+        assert!(t.contains("47 crawls · 48 crawl steps · 49 git calls · 50 remote states · 51 reflog entries"), "{t}");
+        assert!(t.contains("55 commits tied to sessions\n"), "{t}");
+        assert!(t.contains("56 lines · 57 fields"), "{t}");
     }
 
     #[test]

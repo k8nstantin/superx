@@ -128,6 +128,9 @@ pub struct ReplyLine {
     /// The line repeats the whole reply so far (Gemini), rather than adding
     /// to it (Claude Code).
     pub cumulative: bool,
+    /// Earlier thinking the request left out (Claude's
+    /// `input_transformations` of type `thinking_dropped`).
+    pub thinking_dropped: i64,
 }
 
 /// What a reply had used and produced, as its usage says.
@@ -166,6 +169,13 @@ pub struct Thinking {
     pub ms: Option<i64>,
     pub chars: i64,
     pub display: Option<String>,
+    /// The thinking as recorded, whole: Claude's summary where the display
+    /// shows one, Gemini's thought; empty when only the signature is kept.
+    pub text: String,
+    /// A Gemini thought's subject.
+    pub subject: Option<String>,
+    /// The length of the signature Claude keeps in place of the thinking.
+    pub signature_chars: i64,
 }
 
 /// One tool call, as the model made it.
@@ -183,6 +193,8 @@ pub struct Call {
     pub subagent_type: Option<String>,
     pub background: bool,
     pub input_bytes: i64,
+    /// The call asked to run outside the sandbox.
+    pub sandbox_off: bool,
     /// Where a shell command ran, when the call says (Gemini); otherwise
     /// the session's working directory at the call.
     pub dir: Option<String>,
@@ -234,6 +246,8 @@ pub struct ToolResult {
     pub output: Option<String>,
     /// The git or GitHub actions the agent itself noted on the result.
     pub noted: Vec<GitEvent>,
+    /// The hosts the sandbox stopped the command reaching.
+    pub sandbox_hosts: Vec<String>,
 }
 
 /// How a file was changed.
