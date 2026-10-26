@@ -161,6 +161,54 @@ fn session_key_of_reads_only_object_payloads() {
     assert_eq!(session_key_of(&Value::Object(Object::new())), None);
 }
 
+/// Every session's action count in one read per agent (#530), as its own
+/// read counted it: an event whose subject is the session, or that its
+/// agent emitted for its source key, an event both ways once; another
+/// source key's event and a global event never.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn action_counts_count_each_sessions_events_once() {
+    use superx_kernel::types::{Object, Value};
+    use superx_mod_ui::activity::action_counts;
+
+    let kernel = fresh_kernel().await;
+    let (agent, a) = seed_agent_and_session(&kernel, "claude_code", "src-a").await;
+    let b = kernel.create_entity("node_session").await.expect("session");
+    let mut desc = Object::new();
+    desc.insert("name".to_string(), Value::String("claude_code/src-b".to_string()));
+    desc.insert("session".to_string(), Value::String("src-b".to_string()));
+    kernel
+        .supersede_state(b.clone(), "attr_session_descriptor", Value::Object(desc))
+        .await
+        .expect("session descriptor");
+    let for_src = |src: &str| {
+        let mut o = Object::new();
+        o.insert("session".to_string(), Value::String(src.to_string()));
+        Value::Object(o)
+    };
+    // A: subject and source key both (once), source key only, and subject
+    // only from its agent.
+    kernel.log_telemetry_for_agent("message_captured", for_src("src-a"), Some(a.clone()), Some(agent.clone())).await.expect("a1");
+    kernel.log_telemetry_for_agent("tool_call", for_src("src-a"), Some(agent.clone()), Some(agent.clone())).await.expect("a2");
+    kernel.log_telemetry_for_agent("session_note", Value::String("a".to_string()), Some(a.clone()), Some(agent.clone())).await.expect("a3");
+    // B: source key only, and subject only with no agent.
+    kernel.log_telemetry_for_agent("tool_call", for_src("src-b"), Some(agent.clone()), Some(agent.clone())).await.expect("b1");
+    kernel.log_telemetry("session_note", Value::String("b".to_string()), Some(b.clone())).await.expect("b2");
+    // Neither: another source key, and a global event.
+    kernel.log_telemetry_for_agent("tool_call", for_src("src-z"), Some(agent.clone()), Some(agent.clone())).await.expect("z");
+    kernel.log_telemetry("system_boot", Value::String("global".to_string()), None).await.expect("boot");
+
+    let scoped = vec![
+        (a.clone(), Some((agent.clone(), "src-a".to_string()))),
+        (b.clone(), Some((agent.clone(), "src-b".to_string()))),
+    ];
+    let counts = action_counts(&kernel, &scoped).await.expect("counts");
+    assert_eq!(counts.get(&superx_ops::record_uuid(&a)), Some(&3), "{counts:?}");
+    assert_eq!(counts.get(&superx_ops::record_uuid(&b)), Some(&2), "{counts:?}");
+    // Without a scope, a session counts the events whose subject it is.
+    let unscoped = action_counts(&kernel, &[(a.clone(), None)]).await.expect("counts");
+    assert_eq!(unscoped.get(&superx_ops::record_uuid(&a)), Some(&2), "{unscoped:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_activity_merges_messages_and_actions_for_one_session() {
     use superx_kernel::types::{Object, Value};

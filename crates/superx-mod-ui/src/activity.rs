@@ -24,6 +24,8 @@
 //! Everything here is pure SELECT — readers must not mutate the
 //! stream they observe.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
 use superx_kernel::types::{RecordId, Value};
 use superx_kernel::{Kernel, MessageRecord, Result, TelemetryRecord};
 
@@ -890,68 +892,107 @@ pub async fn session_token_stats(
     Ok((context, output_total))
 }
 
-/// Count of a session's action events (same matching as
-/// [`session_activity`]) — the sessions list shows TOTAL activity
-/// (messages + actions), not messages alone (issue #187).
+/// Every listed session's count of action events, matched as
+/// [`session_activity`] matches them: the events whose subject is the
+/// session, or which its agent emitted for its source key, an event both
+/// ways counted once. The sessions list shows TOTAL activity (messages and
+/// actions, issue #187).
 ///
-/// `scope` is the pre-resolved `(agent entity, source key)` pair —
-/// callers iterating many sessions resolve agents ONCE and pass the
-/// scope in, instead of paying a descriptor re-read + agent lookup
-/// per session (review finding). `None` drops the payload.session
-/// arm (matches nothing, never everything).
+/// One read per agent, and one for the events no listed agent emitted,
+/// never one per session (#530): `payload.session` has no index, so a
+/// session's own read scanned every event, its payload read, once for
+/// each session.
+///
+/// `sessions` pairs each session with its pre-resolved `(agent entity,
+/// source key)` scope. `None` drops the source-key arm for that session
+/// (matches nothing, never everything). The counts are keyed by the
+/// session's uuid; a session with no events is absent.
 ///
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
-pub async fn session_action_count(
+pub async fn action_counts(
     kernel: &Kernel,
-    session: RecordId,
-    scope: Option<(RecordId, String)>,
-) -> Result<i64> {
-    let rows: Vec<Value> = match scope {
-        Some((agent, src_key)) => {
-            crate::answered("session events", || async {
-                Ok(kernel
+    sessions: &[(RecordId, Option<(RecordId, String)>)],
+) -> Result<HashMap<String, i64>> {
+    let listed: HashSet<String> = sessions.iter().map(|(s, _)| superx_ops::record_uuid(s)).collect();
+    // Each agent's sessions, by their source key.
+    let mut by_agent: BTreeMap<String, (RecordId, HashMap<String, String>)> = BTreeMap::new();
+    for (session, scope) in sessions {
+        if let Some((agent, src)) = scope {
+            by_agent
+                .entry(superx_ops::record_uuid(agent))
+                .or_insert_with(|| (agent.clone(), HashMap::new()))
+                .1
+                .insert(src.clone(), superx_ops::record_uuid(session));
+        }
+    }
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    for (agent, by_src) in by_agent.values() {
+        let rows: Vec<Value> = crate::answered("session events", || async {
+            Ok(kernel
                 .db()
                 .query(
-                    "SELECT count() AS c FROM telemetry_stream \
-                     WHERE subject = $sess \
-                        OR (agent = $agent AND payload.session = $src) \
-                     GROUP ALL",
+                    "SELECT subject, payload.session AS src, count() AS c FROM telemetry_stream \
+                     WHERE agent = $agent GROUP BY subject, src",
                 )
-                .bind(("sess", session.clone()))
                 .bind(("agent", agent.clone()))
-                .bind(("src", src_key.clone()))
                 .await?
                 .take(0)?)
-            })
-            .await?
-        }
-        None => {
-            crate::answered("session events", || async {
-                Ok(kernel
-                .db()
-                .query(
-                    "SELECT count() AS c FROM telemetry_stream \
-                     WHERE subject = $sess GROUP ALL",
-                )
-                .bind(("sess", session.clone()))
-                .await?
-                .take(0)?)
-            })
-            .await?
-        }
-    };
-    // Row shape: {c: <count>} — read through the kernel's re-exported
-    // Value, per the module layering rule (no direct surrealdb dep).
-    Ok(rows
-        .first()
-        .and_then(|row| match row {
-            Value::Object(o) => match o.get("c") {
-                Some(Value::Number(n)) => n.to_int(),
-                _ => None,
-            },
-            _ => None,
         })
-        .unwrap_or(0))
+        .await?;
+        for row in &rows {
+            let Value::Object(o) = row else { continue };
+            let mut sessions_of: BTreeSet<String> = BTreeSet::new();
+            if let Some(Value::RecordId(subject)) = o.get("subject") {
+                let uuid = superx_ops::record_uuid(subject);
+                if listed.contains(&uuid) {
+                    sessions_of.insert(uuid);
+                }
+            }
+            if let Some(Value::String(src)) = o.get("src") {
+                if let Some(uuid) = by_src.get(src) {
+                    sessions_of.insert(uuid.clone());
+                }
+            }
+            let n = count_of(o);
+            for uuid in sessions_of {
+                *counts.entry(uuid).or_default() += n;
+            }
+        }
+    }
+    // An event no listed agent emitted counts for the session that is its
+    // subject.
+    let agents: Vec<RecordId> = by_agent.values().map(|(agent, _)| agent.clone()).collect();
+    let rows: Vec<Value> = crate::answered("session events", || async {
+        Ok(kernel
+            .db()
+            .query(
+                "SELECT subject, count() AS c FROM telemetry_stream \
+                 WHERE subject != NONE AND agent NOTINSIDE $agents GROUP BY subject",
+            )
+            .bind(("agents", agents.clone()))
+            .await?
+            .take(0)?)
+    })
+    .await?;
+    for row in &rows {
+        let Value::Object(o) = row else { continue };
+        if let Some(Value::RecordId(subject)) = o.get("subject") {
+            let uuid = superx_ops::record_uuid(subject);
+            if listed.contains(&uuid) {
+                *counts.entry(uuid).or_default() += count_of(o);
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// A grouped row's `c`, read through the kernel's re-exported `Value`, per
+/// the module layering rule (no direct surrealdb dep).
+fn count_of(row: &superx_kernel::types::Object) -> i64 {
+    match row.get("c") {
+        Some(Value::Number(n)) => n.to_int().unwrap_or(0),
+        _ => 0,
+    }
 }
