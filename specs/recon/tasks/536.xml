@@ -119,7 +119,7 @@
     </gate>
     <gate id="G3" kind="local" proves="the mandates the audit reads, over every file the task owns">
       <cmd>python3 tools/skill_audit.py</cmd>
-      <expect>`SKILL AUDIT CLEAN`</expect>
+      <expect>no violation in a file this task owns; every violation it names is one it names on main too, in crates/superx-mod-entities, which stands as main's (root method lint)</expect>
     </gate>
     <gate id="G4" kind="local" proves="step 11: the bundle the core UI serves holds no module link">
       <cmd>npm --prefix crates/superx-mod-ui/ui run build</cmd>
