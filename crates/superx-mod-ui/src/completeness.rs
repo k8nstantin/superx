@@ -34,6 +34,13 @@ pub const WATCH_SECS_PARAM: &str = "attr_ui_capture_watch_secs";
 /// Where it stands when the parameter is unset.
 pub const DEFAULT_WATCH_SECS: u64 = 3_600; // skill-allow: §9-const — bootstrap fallback, param-overridable
 
+/// How long a complete line may wait unread before the page calls capture
+/// behind, in seconds.
+pub const STALL_SECS_PARAM: &str = "attr_ui_capture_stall_secs";
+
+/// Where it stands when the parameter is unset.
+pub const DEFAULT_STALL_SECS: u64 = 300; // skill-allow: §9-const — bootstrap fallback, param-overridable
+
 /// The agent whose transcripts this reads, as the adapter names it.
 const AGENT: &str = "claude_code";
 

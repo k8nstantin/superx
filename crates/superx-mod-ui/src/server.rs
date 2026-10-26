@@ -40,9 +40,6 @@ struct AppState {
     kernel: Kernel,
     events: broadcast::Sender<String>,
     answers: Answers,
-    /// Since when a transcript change has been waiting to be taken in, as
-    /// this server's polls have seen it (#452).
-    capture_waiting: std::sync::Arc<std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
     /// What the completeness check has counted of each watched transcript,
     /// across its polls (#489). One check at a time: a second would count
     /// from the same place.
@@ -205,7 +202,6 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
         kernel: kernel.clone(),
         events: events.clone(),
         answers: Answers::default(),
-        capture_waiting: std::sync::Arc::default(),
         capture_watch: std::sync::Arc::default(),
     };
     // Read once, here: resolving it per request would itself await the
@@ -360,46 +356,27 @@ fn names_a_file(path: &str) -> bool {
     path.starts_with("assets/") || path.rsplit('/').next().is_some_and(|last| last.contains('.'))
 }
 
-/// Is capture keeping up (#452)? Cached like the session list: every page
-/// asks, and the answer moves slowly.
+/// Is every transcript line captured (#489)? Cached like the session list:
+/// the answer moves slowly.
 async fn api_capture(State(state): State<AppState>) -> axum::response::Response {
     let kernel = &state.kernel;
     let ttl = crate::resolved_cache_secs(kernel).await;
     if let Some(body) = state.cached("capture", ttl) {
         return json_body(body);
     }
-    let stall = crate::resolved_stall_secs(kernel).await;
-    match crate::health::read(kernel).await {
-        Ok(facts) => {
-            let mut view = match state.capture_waiting.lock() {
-                Ok(mut since) => {
-                    let (view, kept) = crate::health::judge(&facts, *since, chrono::Utc::now(), stall);
-                    *since = kept;
-                    view
-                }
-                Err(_) => crate::health::judge(&facts, None, chrono::Utc::now(), stall).0,
-            };
-            let window = crate::resolved_watch_secs(kernel).await;
-            let mut watch = state.capture_watch.lock().await;
-            view.files = match crate::completeness::check(kernel, &mut watch, chrono::Utc::now(), window).await {
-                Ok(files) => Some(files),
-                Err(e) => {
-                    tracing::warn!(target: "ui", error = %e, "capture completeness got no answer");
-                    None
-                }
-            };
-            let body = serde_json::to_string(&view).unwrap_or_else(|_| "{}".to_string());
-            state.remember("capture", &body);
-            json_body(body)
-        }
+    let stall_secs = i64::try_from(crate::resolved_stall_secs(kernel).await).unwrap_or(i64::MAX);
+    let window = crate::resolved_watch_secs(kernel).await;
+    let mut watch = state.capture_watch.lock().await;
+    let files = match crate::completeness::check(kernel, &mut watch, chrono::Utc::now(), window).await {
+        Ok(files) => Some(files),
         Err(e) => {
-            use axum::response::IntoResponse as _;
-            // The same `{ output, is_error }` the budget layer answers with,
-            // so the page shows the engine's own words.
-            (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({ "output": e.to_string(), "is_error": true })))
-                .into_response()
+            tracing::warn!(target: "ui", error = %e, "capture completeness got no answer");
+            None
         }
-    }
+    };
+    let body = serde_json::to_string(&crate::api::CaptureView { stall_secs, files }).unwrap_or_else(|_| "{}".to_string());
+    state.remember("capture", &body);
+    json_body(body)
 }
 
 async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
