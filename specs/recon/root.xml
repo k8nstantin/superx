@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SuperX Recon: the root of the build spec. Version 0.
+
+  An agent reads the merged code its task file names, this root, rules.xml, its one task file under tasks/ and the files
+  that task file names, in the order the method's read step gives, and nothing else. The root says where the truth is
+  and how the work is done; of the authority files and the merged code it says only what a task relies on, and leaves
+  the rest to them.
+  Parts: identity, authority, method, sequence, decisions.
+  Nothing here writes a count of the captured lines, the sessions, the repositories or the hosts, or a value of the
+  operator's instance: a home, a session, a token.
+-->
+<root product="SuperX Recon" epic="466" version="0" date="2026-10-26">
+
+  <identity>
+    <product>The models, the agents, thinking effort and the operator, measured. One crawler crawls every line the kernel captured, every repository those lines lead to and every host those repositories live on, in depth, into one structure, and the module reports on it in its own tab, on its own port. The crawler is the only thing in the module that reads: it finds the details that are not readily apparent, ties what the agents did to what became of their work, and delivers the critical data no one knew to look for.</product>
+    <repository path="crates/superx-mod-recon/">The module. schema/, the structure, one file, recon.surql: every table the crawler writes, designed with the operator and approved by the operator change by change, in the place CI guards a module's schema; no task writes it. Made by t01 from the merged superx-mod-performance: Cargo.toml; src/, its code, the executable superx-recon and the crawler, one part per source it crawls; tests/, the tests that cross its parts.</repository>
+    <platform path="crates/">The code merged on main is what every task builds on: superx-kernel, which captures every agent's lines into the kernel's database and holds the substrate verbs, the adapters and the module system; superx-ops; superx, the CLI and the daemon; superx-mod-ui, the core UI; superx-mod-performance, which t01 makes this module; and after it what each task merged. An agent reads of it what its task file's reads element names. No task changes superx-kernel, superx or superx-ops; a change outside the module's own crate is named in its task file, or it is not made.</platform>
+    <specs path="specs/recon/">rules.xml, the rules; root.xml, this file; tasks/, one XML file per task, named by the task's id and name as the sequence gives them, renamed to its GitHub issue number once the issue exists; build_issues.py, the issues rendered from these files; build_page.py, the Build Spec page rendered from them into build_spec.html; check.py, the spec check; mutate_check.py, its mutation test, which plants one defect of each class the check guards and proves the check names it.</specs>
+    <data>What the crawler reads and never writes: the kernel's captured lines, in message and telemetry_stream, with SELECT; the repositories the sessions worked in, with git, read-only; the hosts those repositories live on, through their APIs, with GET. What it writes: its own database, superx/recon, with CREATE only; and its mirror clones, in the repos folder of its module folder, &lt;home&gt;/modules/recon/repos/, which nothing else writes. The operator's checkouts are never written, fetched into or run.</data>
+    <branches>main, and one branch per build of a task, cut from the head of main and merged into it by the operator; the next task starts from the merged head and reads nothing of an unmerged branch.</branches>
+    <issues site="github.com/k8nstantin/superx" epic="466">One issue per task, under the epic; its number names the task file, the branch and the PR.</issues>
+  </identity>
+
+  <authority>
+    <note>The files that decide. A task reads them by the sections its file names; what they say is the contract. Every quote below is the file's own sentence, verbatim, runs of white space read as one; check.py refuses a quote the file does not hold.</note>
+
+    <file path="BLUEPRINT.md" decides="the architecture: what the kernel does and nothing else, that everything else is a module, the module facility contract, the decisions record, and the module's row in the phase plan">
+      <quote>The kernel has zero knowledge of any module's domain.</quote>
+      <quote>SELECT + CREATE only, no verb ever issues UPDATE / DELETE / DDL.</quote>
+      <quote>A module is a self-contained mini-app: own db `superx/&lt;name&gt;` + service account (via `modules provision`), own dir, own log target, own CLI namespace, own parameters; kernel is the hub — modules depend on the kernel only, never on each other</quote>
+      <quote>It is never linked into `superx`, so nothing it does can reach capture.</quote>
+      <quote>It correlates what the agents did with what the code bases show, diligence before speed.</quote>
+    </file>
+
+    <file path=".claude/skills/zero-trust-execution/SKILL.md" decides="the mandates every change obeys, §1 to §14, which CI and tools/skill_audit.py read by their numbers">
+      <quote>NEVER optimize for speed.</quote>
+      <quote>Code does not exist until `cargo test --workspace` passes.</quote>
+      <quote>Facts go in columns; judgments do not.</quote>
+      <quote>A `record&lt;table&gt;` is a `Thing` everywhere.</quote>
+    </file>
+
+    <file path="SUPERX_SCHEMA.md" decides="the kernel's tables, of which the crawler reads message, telemetry_stream, and the entities and states that name the agents and the sessions">
+      <quote>No kernel verb ever emits UPDATE, DELETE, UPSERT, DEFINE, REMOVE, or ALTER.</quote>
+      <quote>Every row id is a UUIDv7 generated by the kernel at insert time — never SurrealDB auto-ids.</quote>
+    </file>
+
+    <file path="crates/superx-mod-recon/schema/recon.surql" decides="the structure: every table the crawler writes, its fields, its links, its indexes and its vocabularies, approved by the operator change by change; the module applies it as its own schema, byte for byte, and no task writes it">
+      <quote>Nothing here is judged.</quote>
+      <quote>EVERY ROW IS DERIVED, from the kernel's captured lines and from git,</quote>
+      <quote>Nothing is overwritten and nothing is removed (§10).</quote>
+    </file>
+
+    <file path="crates/superx-kernel/src/adapters/claude_code.rs" decides="how Claude Code's lines are captured: a user or assistant line as a message row with the line whole; every other line whole as a transcript_event; a line that is not JSON as a transcript_raw; every file beside the transcripts as a transcript_event of kind file">
+      <quote>The whole line, whatever its length: nothing is dropped (#471).</quote>
+    </file>
+    <file path="crates/superx-kernel/src/adapters/gemini_cli.rs" decides="how Gemini CLI's lines are captured: a user or gemini record as a message row; a header, a header change, an info, error or warning line, and every earlier write of a record, whole, as a transcript_event; an unknown shape as a transcript_raw"/>
+    <file path="crates/superx-kernel/src/adapters/claude_desktop.rs" decides="how Claude Desktop's log records are captured: each record whole as a desktop_event"/>
+
+    <params decides="every tunable of the module: attr_recon_* on its registry entity, set with superx param set recon &lt;name&gt; &lt;json&gt;, each running on its fallback until it is set; a limit's fallback is no limit">The module's params.rs names each one and its fallback; a task that adds one names it, its fallback and what it tunes in its file.</params>
+    <credentials decides="the hosts' credentials: &lt;home&gt;/modules/recon/credentials.json, written by the operator, mode 600, read by the crawler alone">Its shape is decision credentials-file.</credentials>
+
+    <code path="crates/" decides="how the module runs: what the merged code does is what is merged, never what a spec says about it">Read as the task file's reads element names.</code>
+
+    <not_sources>Earlier spec versions, earlier build branches, the issues' own text, conversations, memory files, the pages, CLAUDE.md, the README files, docs/, any document outside the repository.</not_sources>
+  </authority>
+
+  <method>
+    <note>How a task is done. Every step binds every task; a task file never loosens one.</note>
+
+    <read>A build starts at the task file (rules.xml kickoff); its start element sends the model here. Then, in this order: the merged code its task file's reads element names, this root, rules.xml and your task file, each whole; then the files your task file names, by the sections it lists. Nothing else: nothing authority not_sources names. The order is required: a session that reads a file out of this order reads again from the first file in order before it writes anything.</read>
+
+    <silence>Everything the task needs is in those files; an agent assumes nothing and figures nothing out. When something is missing or two of them disagree, stop: build nothing around it, and hand the operator the branch and the PR with exactly which element is silent or which two lines conflict and what was needed (method pr). An agent never changes the structure, the kernel or an authority file; a task that needs one changed is a stop, and the operator holds a design session. What an agent decides on its own is only what its task file lists under agent-decides.</silence>
+
+    <agent>A session opened for the build, with the kickoff line as its first message and nothing before it but what rules.xml kickoff allows the harness: not the spec's own session, not one that built or reviewed another build. One session, one agent, sequential: the agent that holds the task does every step itself, reading, writing, testing, running the gates, writing the PR. It never spawns, delegates to, forks or messages another agent, subagent, worker, team or background session, and never asks another model to build or verify a part. A PR whose history shows another agent's hand is closed.</agent>
+
+    <build>Each version of a task file is built once: one agent, one branch from the head of main, one PR into main, reviewed and merged by the operator before the next task starts. The next task's agent starts from the merged head. The model is the operator's choice per task and the label records it. Exception, only when the task file's comparison attribute is yes: one agent per model, each from the same file version on its own branch with its own PR, none merged until the operator compares the results and chooses one; the others are closed unmerged.</build>
+
+    <branch>feat/&lt;issue&gt;-&lt;name&gt;-v&lt;file version&gt;-&lt;model&gt;-&lt;effort&gt;, cut from the head of main: the task's issue number, the task's name as its file gives it with spaces as hyphens, the task file's version attribute, the label the model wrote at kickoff. The task file's start element writes it out. One branch per build; never amended after its PR is merged; a build of a later file version has a branch of its own beside it.</branch>
+
+    <model>The model label is &lt;model&gt;-&lt;effort&gt;: the model's own name and the effort it runs at, as its session reports them, lowercase, dots and spaces as hyphens; the model writes it itself at kickoff; when its session does not report its effort, it asks the operator for that before it cuts the branch, and is told nothing else. The label names the branch and the PR title's suffix. The agent never changes it during a build.</model>
+
+    <commits>Every commit message starts with #&lt;issue&gt;. No attribution trailer of any kind. Small commits, each a step that leaves the local gates green. Paths are staged by name, never all at once.</commits>
+
+    <tests>Rust tests, run with cargo test, written as the module's merged tests are: a module's own rules in its tests module, what crosses its parts under crates/superx-mod-recon/tests/, on SurrealDB's in-memory engine with the kernel's schema and the module's own applied, as the merged tests apply them. A task file's tests element lists every rule its steps state, one item each, and the agent writes one test per item, named by it, and none outside the list: a rule the list lacks is a stop, not a test. A fixture property one item needs is stated in that item; a property every test shares is stated once in the tests element's how. The fixtures are the test's own: lines built in the shapes the adapters write, repositories made with git in a scratch folder, hosts answered by a server of the test's own on the loopback; no test reads the operator's instance, transcripts, repositories or a real host, and no fixture copies a real line, name or token.</tests>
+
+    <lint>cargo clippy --workspace --all-targets --all-features -- -D warnings exits 0, and python3 tools/skill_audit.py names no breach in a file the task owns, before every commit. The audit names each breach under the mandate it breaks, by its number; main's own breaches, in files no task owns, stand as main's.</lint>
+
+    <gates>Run the task's gates in their order; each is a command and an expectation that is a relation over what the command prints, never a number written down.
+      A gate of kind local runs in the checkout, from the repository root; its output goes into the gate table (method pr).
+      A gate of kind live runs on the operator's instance after the operator has deployed the build it names (method deploy), at the agent's request and on the operator's word: the agent runs the command the gate gives, superx-recon at the instance's home, and reads only what superx-recon prints and what its own URL answers; it never reads the kernel's database or the module's with any other client, and never runs a command the gate does not give. A gate run any other way does not count. A gate that fails is a stop.</gates>
+
+    <ownership>Create, modify and touch only the paths the task file lists under owns; a path it lists under forbid is never opened for writing; a path it does not list is not touched. A PR that touches another path is closed.</ownership>
+
+    <pr>One PR per branch, into main, titled "#&lt;issue&gt; &lt;name&gt; v&lt;file version&gt; · &lt;model&gt;-&lt;effort&gt;" as the task file's start element writes it, opened by the agent with gh once every local gate is green, or when the build stops (method silence, gates). Its body, in this order: the spec version built, the root's version and the task file's version attribute; the model label; the session: that the kickoff line was its first message, the order the files were read (method read) and the main head the branch was cut from; the gate table: id, the command as run, exit, the matched line or the gate's output, local or live, and for a live gate the build it ran on; what stopped, if anything: the element that is silent or the two lines that conflict, and what was needed; the lint and test commands as run with their last line; for every step of the task file, the function or test that carries it, so a reviewer who finds a fault knows which step to look at; and the Skill compliance section CI requires, each of the three gates with its result. The operator reviews and merges; the agent never merges.</pr>
+
+    <deliverable>A task delivers code, tests and the PR with its gate table. Nothing else: no change to the structure beyond its task file, none to the kernel, no data, no deploy.</deliverable>
+
+    <rerun>A task is re-run when its task file changes: a new file version, and a new branch from the head of main carrying that version in its name, so it stands beside the earlier build's branch; the earlier branch is not amended, and one that is not merged is closed unmerged. A change to the root or the rules alone re-runs a built task only when the build as made no longer follows them as changed; the review names such a task, and its task file takes a new version. Nothing is patched on a merged branch. A task already merged is re-run only after the operator has reverted, on main, its merge and the merge of every task after it, so that the re-run starts from what its file's before element states; the tasks after it are then re-run in the order of the sequence.</rerun>
+
+    <deploy>
+      <note>The operator runs the module from a build of one commit. At the agent's request (method gates) the operator deploys it by the steps below in their order; an agent never builds the release, installs, provisions, starts or stops anything on the instance, and never touches the superx daemon or its binary. &lt;home&gt; is the instance's home and &lt;bin&gt; the folder its executables are installed in. The agent's request names these commands with every value filled.</note>
+      <step n="1" name="build">
+        <where>a worktree checked out at the commit, never a checkout on another branch</where>
+        <cmd>cargo build --release -p superx-mod-recon</cmd>
+        <result>target/release/superx-recon, built from that commit</result>
+      </step>
+      <step n="2" name="install">
+        <cmd>cp -p &lt;bin&gt;/superx-recon &lt;home&gt;/backup/superx-recon-&lt;the running build's commit&gt;</cmd>
+        <cmd>cp target/release/superx-recon &lt;bin&gt;/superx-recon.new &amp;&amp; mv -f &lt;bin&gt;/superx-recon.new &lt;bin&gt;/superx-recon</cmd>
+      </step>
+      <step n="3" name="provision">
+        <note>Only when the task file says the structure changed: the database is rebuilt from the file, run by the operator in a terminal, the root password typed there; every row is crawled again (rules derived-and-rebuilt).</note>
+        <cmd>superx-recon --home &lt;home&gt; --initialize</cmd>
+      </step>
+      <step n="4" name="restart">
+        <cmd>superx-recon --home &lt;home&gt; stop</cmd>
+        <cmd>superx-recon --home &lt;home&gt; start</cmd>
+      </step>
+    </deploy>
+  </method>
+
+  <sequence>
+    <note>Four tasks, four PRs at most: the structure first, whole, before anything fills it; then the crawler that fills it, the lines in one task and the repositories with their hosts in the next; then the tab, designed with the operator once the crawler is merged. Each task is one build an agent does from its file; the operator deploys and runs what it builds. A task starts when the task before it is merged on main. Its file under tasks/ carries, verbatim, what the structure and the authority files say about its piece, what it builds, its gates and what it owns; this list carries the piece, the files it reflects and what it builds.</note>
+
+    <task id="t01" issue="536" name="structure" file="specs/recon/tasks/536.xml" reflects="crates/superx-mod-recon/schema/recon.surql BLUEPRINT.md" command="superx-recon --initialize; superx-recon start; superx-recon stop; superx-recon status; superx-recon run" builds="crates/superx-mod-recon/">
+      <piece>The module becomes superx-mod-recon, and its structure is built whole before anything fills it: the crate, from superx-mod-performance, its code moved and renamed and its crawler doing what it does today; the executable superx-recon; the database superx/recon, from the structure, crates/superx-mod-recon/schema/recon.surql, which the crate applies byte for byte and never writes: the deep crawl's tables as approved, the hosts' and the mirrors' tables, every answer of every read API kept whole beside typed tables for what is measured; the parameters attr_recon_*; the module folder with its repos folder and its credentials file; the status, listing every table and which hosts have credentials. superx-mod-performance and superx-mod-repos leave the workspace, and the core UI links to no module's own UI (#534).</piece>
+      <quote from="BLUEPRINT.md">It is never linked into `superx`, so nothing it does can reach capture.</quote>
+      <quote from="crates/superx-mod-recon/schema/recon.surql">Nothing is overwritten and nothing is removed (§10).</quote>
+    </task>
+
+    <task id="t02" issue="537" name="lines" file="specs/recon/tasks/537.xml" depends="t01" reflects="crates/superx-mod-recon/schema/recon.surql crates/superx-kernel/src/adapters/" command="superx-recon run" builds="crates/superx-mod-recon/src/crawler/lines/">
+      <piece>The crawler crawls the captured lines in depth. Every line the kernel holds, of every agent and every kind, is read once into the tables it feeds, and is itself a line row that names those tables, none when it fed none; every field seen on a kind of line is a line_field row that says whether a column holds it; every pass checks the lines it read against the lines the kernel holds in the same range, and a difference makes the pass partial and is named. It fills the lines' tables whole: sessions and their places, prompts, triggers, replies and what they said, their states, thinking, tool calls and their results, edits, git events, tests and builds, turns, compactions, recaps, requests with their pieces and shapes, context, hooks, session states, costs by session and by model, links, git states, notices, questions, task changes, plans, subagent runs and queue changes.</piece>
+      <quote from="crates/superx-kernel/src/adapters/claude_code.rs">The whole line, whatever its length: nothing is dropped (#471).</quote>
+    </task>
+
+    <task id="t03" issue="538" name="repositories" file="specs/recon/tasks/538.xml" depends="t02" reflects="crates/superx-mod-recon/schema/recon.surql" command="superx-recon run" builds="crates/superx-mod-recon/src/crawler/repos/ crates/superx-mod-recon/src/crawler/hosts/">
+      <piece>The crawler crawls the repositories and their hosts. From the working directories the lines name, and the roots the operator names, every checkout and repository; one worker per repository, as many at once as attr_recon_repos_at_once allows. For each repository its mirror clone in the repos folder, fetched with the credentials, and every fact git holds: commits with their files and renames, refs and every reflog entry, HEAD moves, where each commit sits and what landed through another commit, what each commit still holds at the main line's tip, the files at the tip, uncommitted work, remotes and set-up, and every git call. From the hosts, with the credentials and GET only, what the hosts' tables hold. Every commit tied to the session that made it.</piece>
+      <quote from="BLUEPRINT.md">It correlates what the agents did with what the code bases show, diligence before speed.</quote>
+    </task>
+
+    <task id="t04" issue="539" name="tab" file="specs/recon/tasks/539.xml" depends="t03" reflects="crates/superx-mod-recon/schema/recon.surql" command="superx-recon run" builds="crates/superx-mod-recon/">
+      <piece>The tab: what the module shows on its own port, from what t02 and t03 filled. Designed with the operator once t03 is merged (decision the-tab).</piece>
+    </task>
+  </sequence>
+
+  <decisions>
+    <note>What was decided, when, and where it lives; what is still open. A confirmed decision is written into the file or element named, which is the authority; it is listed here so an agent knows a question is closed. An open decision is a question an agent never answers: a task that needs it stops. An open decision names in closes-before the task before whose file it is closed, and check.py refuses that file while the decision is open.</note>
+
+    <decision id="recon" status="confirmed" date="2026-10-26" where="identity; sequence t01">The module is superx-mod-recon: the executable superx-recon, the database superx/recon, the parameters attr_recon_*, the module folder &lt;home&gt;/modules/recon/. It replaces superx-mod-performance, whose name the operator rejected.</decision>
+    <decision id="one-module-one-crawler" status="confirmed" date="2026-10-25" where="BLUEPRINT.md; rules one-module-its-own-process">One module, one schema, one crawler: the lines and the repositories are crawled by one crawler into one database, through its sources, and a new source plugs in beside them.</decision>
+    <decision id="own-process" status="confirmed" date="2026-10-24" where="rules one-module-its-own-process">Its own executable, process, database, port and tab, never linked into superx; it reads the kernel's data and the kernel never depends on it.</decision>
+    <decision id="crawler-is-the-reader" status="confirmed" date="2026-10-26" where="rules crawler-is-the-reader">The crawler is the only thing that reads; nothing beside it, and no part of it, is called a reader.</decision>
+    <decision id="crawl-not-skim" status="confirmed" date="2026-10-25" where="rules crawl-not-skim">Slow, diligent, methodical: every line, field, commit and ref accounted for and checked against its source; the details that are not readily apparent found and tied together.</decision>
+    <decision id="repos-from-the-logs" status="confirmed" date="2026-10-25" where="rules repos-from-the-logs">The repositories come from the session logs; the logs report a change first and the crawler follows them.</decision>
+    <decision id="hosts-and-mirrors" status="confirmed" date="2026-10-26" where="rules hosts-read-only-with-credentials, never-write-a-measured-repository; sequence t01, t03">The credentials serve both: the hosts' APIs, read-only, and the crawler's own mirror clones, fetched with them. The approved structure's sentence that git is read with never a fetch holds for the operator's checkouts; t01 rewrites it to say the mirrors are fetched and nothing else is.</decision>
+    <decision id="repos-folder" status="confirmed" date="2026-10-26" where="identity data">The mirror clones live in a folder of their own, under the module's folder, which nothing else writes.</decision>
+    <decision id="mirrors-take-everything" status="confirmed" date="2026-10-26" where="rules never-write-a-measured-repository; sequence t03">The crawler fetches into its own mirrors freely: one mirror per remote, a fetch takes every ref the remote advertises, and nothing a mirror has fetched is ever pruned or collected, so a branch rewritten or deleted on the host keeps what the crawler saw. The more it holds, the more it can find.</decision>
+    <decision id="parallel-by-repository" status="confirmed" date="2026-10-26" where="rules parallel-by-repository; sequence t03">The crawler scales by repository: one worker per repository, as many at once as a parameter allows.</decision>
+    <decision id="structure-first" status="confirmed" date="2026-10-26" where="sequence">The structure first, whole; then the crawler that fills it; then the tab, designed after.</decision>
+    <decision id="four-prs" status="confirmed" date="2026-10-26" where="sequence">Four PRs at most; fewer PRs, more work in each.</decision>
+    <decision id="specs-are-the-truth" status="confirmed" date="2026-10-26" where="rules specs-are-the-truth; identity specs">The XML files are the source of truth, in the data lake's pack: a root, the rules, one file per task, and the tools that check and render them; a branch and a PR are built from a task file.</decision>
+    <decision id="deep-structure" status="confirmed" date="2026-10-25" where="crates/superx-mod-recon/schema/recon.surql">The deep crawl's tables, approved whole: every field the agents write and everything git holds gets a column, a table, or a stated reason to stay in the kernel line.</decision>
+    <decision id="old-data" status="confirmed" date="2026-10-25" where="rules derived-and-rebuilt">The kernel's lines captured before a capture fix are read as they are: nothing is recaptured or repaired.</decision>
+
+    <decision id="hosts-take-everything" status="confirmed" date="2026-10-26" where="sequence t01, t03; rules crawl-not-skim">From the hosts, everything their read APIs return for each repository the crawler crawls: every answer kept whole, beside typed tables for what is measured, pull requests, their commits, reviews, comments, checks and pipelines, merges, issues, releases and the rest the answers hold, and every call recorded. Less data is more assumption; the operator has intuition already, and the crawler exists for the facts the operator does not know. The tables themselves are designed into the structure from the hosts' own API documentation, and the operator approves the structure (§7, §11).</decision>
+    <decision id="credentials-file" status="confirmed" date="2026-10-26" where="authority credentials; rules hosts-read-only-with-credentials">&lt;home&gt;/modules/recon/credentials.json, in JSON as the instance's own files are, written by the operator: one entry per host, each a token with every read scope the host offers and no write scope; the crawler refuses the file when anyone but its owner can read it. A mirror's fetch gets its credential from superx-recon itself, answering git as its askpass program, so a token is never written into git's configuration, a URL, a command line or the environment.</decision>
+    <decision id="live-gates" status="confirmed" date="2026-10-26" where="method gates, deploy">A task's live gates run before its merge, on the operator's instance, once the operator has deployed the branch's build of superx-recon; superx and its daemon are never touched, and every row the build writes is derived, so the next deploy rebuilds what it needs.</decision>
+    <decision id="retire-performance" status="confirmed" date="2026-10-26" where="sequence t01">At t01's deploy superx-performance is stopped and superx-recon started in its place; once recon's first pass is complete, the operator drops superx/performance and superx/repos under root. Every row they hold is derived, and recon derives it again from the same lines and repositories.</decision>
+    <decision id="repos-at-once" status="confirmed" date="2026-10-26" where="rules parallel-by-repository, nothing-dropped">attr_recon_repos_at_once falls back to no limit: every repository a pass crawls gets its own worker at once, unless the operator sets a number. A limit's fallback is no limit.</decision>
+    <decision id="structure" status="confirmed" date="2026-10-26" where="crates/superx-mod-recon/schema/recon.surql">The structure as designed on 2026-10-26: the deep crawl's tables as approved, the changes to tables 26, 28, 30, 31, 33, 55 and 59, and the hosts' and mirrors' tables 60–82, read from the hosts' own API documentation and checked on an empty SurrealDB 3.1.4, a good row of every table taken and every bad row refused by the rule it breaks. Approved by the operator on 2026-10-26 (§7, §11). It lives where CI guards a module's schema, so every change to it carries the operator's approval marker.</decision>
+    <decision id="the-tab" status="open" closes-before="t04" where="sequence t04">What the tab shows and how, designed with the operator from what t02 and t03 filled.</decision>
+  </decisions>
+</root>
