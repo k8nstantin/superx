@@ -31,6 +31,15 @@
 -- for the facts the operator does not know). It adds the hosts' and the
 -- mirrors' tables 60–82, and changes tables 26, 28, 30, 31, 33, 55 and 59.
 --
+-- Git's facts (operator, 2026-10-26: "1 -9 yes change the schema for more
+-- data"), from git's own documentation read whole (git 2.50.1): where
+-- each commit was made in local time, files copied beside files moved,
+-- how each merge's conflicts were resolved, the commits that make the
+-- same change, operations a checkout is in the middle of, each branch's
+-- upstream and how far it is ahead and behind, line counts blind to
+-- whitespace, annotated tags and signatures, and commit trailers. It adds
+-- tables 83–85, and changes tables 18, 21, 22, 28, 30, 31 and 56.
+--
 --
 -- WHAT THIS DATABASE HOLDS -------------------------------------------
 --
@@ -132,10 +141,14 @@
 --   git_call       one row per git call a crawl made
 --   remote_state   one row per change in a repository's remotes
 --   ref_move       one row per reflog entry of any ref, ever
---   commit_rename  one row per file a commit moved
+--   commit_rename  one row per file a commit moved or copied
 --   tip_file       one row per change in a file at the main line's tip
 --   repository_state one row per change in how a repository is set up
 --   commit_session one row per commit tied to the session that made it
+--   merge_resolution one row per file a merge resolved differently from
+--                  git's own merge of its parents
+--   tag            one row per annotated tag, ever
+--   commit_trailer one row per trailer of a commit's message
 --
 --   From the hosts and the mirrors
 --   host_repository one row per repository on a host, ever
@@ -225,7 +238,9 @@
 --     (`host_repository`), pull request and issue (`host_repository,
 --     number`), CI run (`host_repository, kind, host_id`), log (`ci_run`),
 --     deployment (`host_repository, host_id`), timeline event and comment
---     (`object`): UNIQUE indexes, held by the engine, not by care. With one
+--     (`object`); per file a merge resolved (`commit, path`), annotated tag
+--     (`repository, object`) and trailer (`commit, position`): UNIQUE
+--     indexes, held by the engine, not by care. With one
 --     gap, the engine's: SurrealDB 3.1.4 holds no unique index for a row
 --     whose indexed field is NONE (checked 2026-10-26), so a HEAD move to a
 --     detached HEAD, and a reflog entry with no checkout, no old commit or
@@ -241,7 +256,9 @@
 --     changed a file, a crawl's steps, a file's uncommitted state, how a
 --     commit was tied to a session, how a crawl, a source or a pass ended,
 --     which sources the crawler has; the hosts it reads, the kinds of object
---     and of CI run, rule and comment it keeps, how a host crawl ended. Words
+--     and of CI run, rule and comment it keeps, how a host crawl ended;
+--     whether git found a file moved or copied, the operations a checkout
+--     can be in the middle of, what an annotated tag points at. Words
 --     an agent or a host writes (a model, an effort, a permission mode, an
 --     error, an attachment's type; a pull request's state, a review's, a
 --     check's conclusion, an event's kind) are kept as written: a new one is
@@ -779,6 +796,17 @@ DEFINE INDEX idx_checkout_repo ON TABLE checkout FIELDS repository;
 -- `first_branch` is the branch before the oldest move its reflog still
 -- holds: what the checkout was on before any recorded move. `present` is
 -- whether its root still exists.
+--
+-- What git is in the middle of there, as its own state files say (the
+-- ones `git status` reads): `operations` names each (`merge`, `am`,
+-- `rebase`, `rebase_interactive`, `cherry_pick`, `revert`, `bisect`),
+-- empty when none; NONE when they were not read. `operation_commits` are
+-- the commits it brings in (`MERGE_HEAD`, `CHERRY_PICK_HEAD`,
+-- `REVERT_HEAD`); `rebase_branch` and `rebase_onto` the branch a rebase
+-- replays and the commit it replays onto; `rebase_done` and `rebase_left`
+-- the commands of an interactive rebase done and left; `bisect_start` what
+-- a bisect started from. A checkout an agent left mid-rebase stays on
+-- record here.
 
 DEFINE TABLE checkout_state SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
 
@@ -787,6 +815,18 @@ DEFINE FIELD checkout     ON TABLE checkout_state TYPE record<checkout>
 DEFINE FIELD branch       ON TABLE checkout_state TYPE option<string>;
 DEFINE FIELD first_branch ON TABLE checkout_state TYPE option<string>;
 DEFINE FIELD present      ON TABLE checkout_state TYPE bool;
+DEFINE FIELD operations   ON TABLE checkout_state TYPE option<array<string>>
+    ASSERT $value == NONE OR array::all($value, |$o| $o INSIDE ['merge', 'am', 'rebase', 'rebase_interactive', 'cherry_pick', 'revert', 'bisect']);
+DEFINE FIELD operation_commits ON TABLE checkout_state TYPE option<array<string>>
+    ASSERT $value == NONE OR array::all($value, |$h| string::len($h) INSIDE [40, 64]);
+DEFINE FIELD rebase_branch ON TABLE checkout_state TYPE option<string>;
+DEFINE FIELD rebase_onto   ON TABLE checkout_state TYPE option<string>
+    ASSERT $value == NONE OR string::len($value) INSIDE [40, 64];
+DEFINE FIELD rebase_done   ON TABLE checkout_state TYPE option<int>
+    ASSERT $value == NONE OR $value >= 0;
+DEFINE FIELD rebase_left   ON TABLE checkout_state TYPE option<int>
+    ASSERT $value == NONE OR $value >= 0;
+DEFINE FIELD bisect_start  ON TABLE checkout_state TYPE option<string>;
 DEFINE FIELD valid_from   ON TABLE checkout_state TYPE datetime;
 
 DEFINE INDEX idx_checkout_state ON TABLE checkout_state FIELDS checkout, valid_from;
@@ -841,6 +881,16 @@ DEFINE INDEX idx_head_move ON TABLE head_move FIELDS checkout, at, branch UNIQUE
 -- `parent_hashes` the parents themselves, first parent first, and `tree`
 -- the tree it records: the history's shape and content stay readable here
 -- when git has pruned a commit.
+--
+-- `author_offset` and `committer_offset` are the UTC offsets git recorded
+-- beside each time, in minutes east of UTC (`-0400` is -240): the hour of
+-- the day the work was done where it was done. `patch_id` is git's stable
+-- patch id of the commit's change against its first parent (`git
+-- patch-id --stable`): commits with the same one make the same change, so
+-- a rebased or cherry-picked copy shares its original's; NONE for a merge
+-- and for a commit that changes nothing. `signature` is the signature the
+-- commit object carries (its `gpgsig` header), whole, NONE when unsigned:
+-- kept, never verified, since verifying runs a program.
 
 DEFINE TABLE commit SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
 
@@ -863,10 +913,16 @@ DEFINE FIELD parent_hashes  ON TABLE commit TYPE array<string>
     ASSERT array::all($value, |$h| string::len($h) INSIDE [40, 64]);
 DEFINE FIELD tree           ON TABLE commit TYPE string
     ASSERT string::len($value) INSIDE [40, 64];
+DEFINE FIELD author_offset    ON TABLE commit TYPE int;
+DEFINE FIELD committer_offset ON TABLE commit TYPE int;
+DEFINE FIELD patch_id       ON TABLE commit TYPE option<string>
+    ASSERT $value == NONE OR string::len($value) INSIDE [40, 64];
+DEFINE FIELD signature      ON TABLE commit TYPE option<string>;
 DEFINE FIELD valid_from   ON TABLE commit TYPE datetime;
 
 DEFINE INDEX idx_commit_hash   ON TABLE commit FIELDS repository, hash UNIQUE;
 DEFINE INDEX idx_commit_author ON TABLE commit FIELDS repository, authored_at;
+DEFINE INDEX idx_commit_patch  ON TABLE commit FIELDS patch_id;
 
 
 -- 22 ── commit_file ─────────────────────── one file a commit changed ───
@@ -875,6 +931,9 @@ DEFINE INDEX idx_commit_author ON TABLE commit FIELDS repository, authored_at;
 -- it, modified it, deleted it, or changed its type (a file became a link,
 -- or back). `binary` is a file git counted no lines in (a binary, or
 -- anything `.gitattributes` marks `-diff`); its counts are zero.
+-- `added_ignoring_space` and `removed_ignoring_space` count the same
+-- change with whitespace ignored (`--ignore-all-space`): lines changed
+-- only in their spacing count in `added` and `removed` and not here.
 
 DEFINE TABLE commit_file SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
 
@@ -885,6 +944,8 @@ DEFINE FIELD change     ON TABLE commit_file TYPE string
     ASSERT $value INSIDE ['added', 'modified', 'deleted', 'type_changed'];
 DEFINE FIELD added      ON TABLE commit_file TYPE int;
 DEFINE FIELD removed    ON TABLE commit_file TYPE int;
+DEFINE FIELD added_ignoring_space   ON TABLE commit_file TYPE int ASSERT $value >= 0;
+DEFINE FIELD removed_ignoring_space ON TABLE commit_file TYPE int ASSERT $value >= 0;
 DEFINE FIELD binary     ON TABLE commit_file TYPE bool;
 DEFINE FIELD valid_from ON TABLE commit_file TYPE datetime;
 
@@ -1053,6 +1114,12 @@ DEFINE INDEX idx_survival_file ON TABLE survival_file FIELDS commit, path, valid
 -- rebase, an amend, a force-push). A branch thrown away stays on record.
 -- `mirror` names the crawler's own clone the ref is in, the host's branch
 -- as the host had it; NONE for a ref of the repository on this machine.
+-- `upstream` is the ref a local branch tracks (`%(upstream)`), and
+-- `upstream_ahead` and `upstream_behind` how many commits the branch has
+-- that it lacks and lacks that it has: work not pushed, and work not
+-- pulled. `mainline_ahead` and `mainline_behind` are the same against the
+-- crawl's main line (`%(ahead-behind:<main line>)`), for every branch. A
+-- row is appended when the tip, the upstream or a count changes.
 
 DEFINE TABLE ref_state SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
 
@@ -1066,6 +1133,15 @@ DEFINE FIELD name       ON TABLE ref_state TYPE string;
 DEFINE FIELD tip        ON TABLE ref_state TYPE option<string>
     ASSERT $value == NONE OR string::len($value) INSIDE [40, 64];
 DEFINE FIELD rewritten  ON TABLE ref_state TYPE bool;
+DEFINE FIELD upstream        ON TABLE ref_state TYPE option<string>;
+DEFINE FIELD upstream_ahead  ON TABLE ref_state TYPE option<int>
+    ASSERT $value == NONE OR $value >= 0;
+DEFINE FIELD upstream_behind ON TABLE ref_state TYPE option<int>
+    ASSERT $value == NONE OR $value >= 0;
+DEFINE FIELD mainline_ahead  ON TABLE ref_state TYPE option<int>
+    ASSERT $value == NONE OR $value >= 0;
+DEFINE FIELD mainline_behind ON TABLE ref_state TYPE option<int>
+    ASSERT $value == NONE OR $value >= 0;
 DEFINE FIELD valid_from ON TABLE ref_state TYPE datetime;
 
 DEFINE INDEX idx_ref_state ON TABLE ref_state FIELDS repository, mirror, name, valid_from;
@@ -1103,14 +1179,15 @@ DEFINE INDEX idx_worktree_file ON TABLE worktree_file FIELDS checkout, path, val
 -- calls, what it read and what it wrote. `setup` reads the remotes, the
 -- hooks and whether the clone is shallow; `tip` reads every file at the
 -- main line's tip; `fetch` fetches the repository's mirror; `hosts` reads
--- its host.
+-- its host; `tags` reads its annotated tags; `merges` reads how its merges
+-- were resolved; `patches` reads its commits' patch ids.
 
 DEFINE TABLE crawl_step SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
 
 DEFINE FIELD crawl        ON TABLE crawl_step TYPE record<crawl>
     ASSERT record::exists($value);
 DEFINE FIELD step         ON TABLE crawl_step TYPE string
-    ASSERT $value INSIDE ['setup', 'fetch', 'checkouts', 'refs', 'log', 'reflog', 'unreachable', 'placement', 'landed', 'blame', 'tip', 'hosts', 'write'];
+    ASSERT $value INSIDE ['setup', 'fetch', 'checkouts', 'refs', 'log', 'reflog', 'unreachable', 'placement', 'landed', 'blame', 'tip', 'tags', 'merges', 'patches', 'hosts', 'write'];
 DEFINE FIELD started_at   ON TABLE crawl_step TYPE datetime;
 DEFINE FIELD ms           ON TABLE crawl_step TYPE int ASSERT $value >= 0;
 DEFINE FIELD git_calls    ON TABLE crawl_step TYPE int ASSERT $value >= 0;
@@ -1136,7 +1213,7 @@ DEFINE TABLE git_call SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, F
 DEFINE FIELD crawl      ON TABLE git_call TYPE record<crawl>
     ASSERT record::exists($value);
 DEFINE FIELD step       ON TABLE git_call TYPE string
-    ASSERT $value INSIDE ['setup', 'fetch', 'checkouts', 'refs', 'log', 'reflog', 'unreachable', 'placement', 'landed', 'blame', 'tip'];
+    ASSERT $value INSIDE ['setup', 'fetch', 'checkouts', 'refs', 'log', 'reflog', 'unreachable', 'placement', 'landed', 'blame', 'tip', 'tags', 'merges', 'patches'];
 DEFINE FIELD dir        ON TABLE git_call TYPE string;
 DEFINE FIELD args       ON TABLE git_call TYPE array<string>;
 DEFINE FIELD started_at ON TABLE git_call TYPE datetime;
@@ -1838,15 +1915,19 @@ DEFINE INDEX idx_ref_move_mirror ON TABLE ref_move FIELDS mirror, ref, at, old, 
 DEFINE INDEX idx_ref_move_at ON TABLE ref_move FIELDS repository, at;
 
 
--- 56 ── commit_rename ──────────────────────────── a file a commit moved ───
--- Git's rename detection, kept beside the commit's files (which read a
--- rename as a delete and an add): the old path, the new path, and how
--- similar git found the two, as a percentage.
+-- 56 ── commit_rename ───────────────────────── a file a commit moved or copied ───
+-- Git's rename and copy detection, kept beside the commit's files (which
+-- read a rename as a delete and an add, and a copy as an add): `kind`
+-- says whether git found the file `rename`d or `copy`d, from the old path
+-- to the new path, and `similarity` how similar it found the two, as a
+-- percentage. Code copied into a new file is told apart from new code.
 
 DEFINE TABLE commit_rename SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
 
 DEFINE FIELD commit     ON TABLE commit_rename TYPE record<commit>
     ASSERT record::exists($value);
+DEFINE FIELD kind       ON TABLE commit_rename TYPE string
+    ASSERT $value INSIDE ['rename', 'copy'];
 DEFINE FIELD from_path  ON TABLE commit_rename TYPE string;
 DEFINE FIELD to_path    ON TABLE commit_rename TYPE string;
 DEFINE FIELD similarity ON TABLE commit_rename TYPE int
@@ -2552,3 +2633,80 @@ DEFINE FIELD object     ON TABLE deployment_state TYPE record<host_object>
 DEFINE FIELD valid_from ON TABLE deployment_state TYPE datetime;
 
 DEFINE INDEX idx_deployment_state ON TABLE deployment_state FIELDS deployment, valid_from;
+
+
+-- 83 ── merge_resolution ─────────── a file a merge resolved by hand ───
+-- Where a merge commit's result differs from git's own merge of its two
+-- parents (`--remerge-diff`): one row per file. `added` and `removed`
+-- count the lines the merge's result has that git's merge did not and
+-- lacks that it had; `conflicted` says git's merge left conflict markers
+-- in the file, so the difference is how the conflict was resolved; and
+-- `binary` that git counted no lines in it. A merge git would have made
+-- the same way has no row. Git's merge is made in a folder of the
+-- crawler's own, never in the repository.
+
+DEFINE TABLE merge_resolution SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
+
+DEFINE FIELD commit     ON TABLE merge_resolution TYPE record<commit>
+    ASSERT record::exists($value);
+DEFINE FIELD path       ON TABLE merge_resolution TYPE string;
+DEFINE FIELD added      ON TABLE merge_resolution TYPE int ASSERT $value >= 0;
+DEFINE FIELD removed    ON TABLE merge_resolution TYPE int ASSERT $value >= 0;
+DEFINE FIELD conflicted ON TABLE merge_resolution TYPE bool;
+DEFINE FIELD binary     ON TABLE merge_resolution TYPE bool;
+DEFINE FIELD valid_from ON TABLE merge_resolution TYPE datetime;
+
+DEFINE INDEX idx_merge_resolution ON TABLE merge_resolution FIELDS commit, path UNIQUE;
+
+
+-- 84 ── tag ────────────────────────────────── an annotated tag, ever ───
+-- An annotated tag object, read whole: `name` is the tag's own name as the
+-- object holds it, `ref` the ref it was read through, `object` the tag
+-- object's hash, `target` and `target_type` what it tags. Who tagged it,
+-- when, and at what UTC offset (minutes east of UTC); `message` what it
+-- says, whole, without its signature; `signature` the signature it
+-- carries, whole, NONE when unsigned: kept, never verified. A lightweight
+-- tag is only a ref (`ref_state`).
+
+DEFINE TABLE tag SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
+
+DEFINE FIELD repository    ON TABLE tag TYPE record<repository>
+    ASSERT record::exists($value);
+DEFINE FIELD name          ON TABLE tag TYPE string;
+DEFINE FIELD ref           ON TABLE tag TYPE option<string>;
+DEFINE FIELD object        ON TABLE tag TYPE string
+    ASSERT string::len($value) INSIDE [40, 64];
+DEFINE FIELD target        ON TABLE tag TYPE string
+    ASSERT string::len($value) INSIDE [40, 64];
+DEFINE FIELD target_type   ON TABLE tag TYPE string
+    ASSERT $value INSIDE ['commit', 'tree', 'blob', 'tag'];
+DEFINE FIELD tagger        ON TABLE tag TYPE option<string>;
+DEFINE FIELD tagger_name   ON TABLE tag TYPE option<string>;
+DEFINE FIELD tagged_at     ON TABLE tag TYPE option<datetime>;
+DEFINE FIELD tagger_offset ON TABLE tag TYPE option<int>;
+DEFINE FIELD message       ON TABLE tag TYPE option<string>;
+DEFINE FIELD signature     ON TABLE tag TYPE option<string>;
+DEFINE FIELD valid_from    ON TABLE tag TYPE datetime;
+
+DEFINE INDEX idx_tag        ON TABLE tag FIELDS repository, object UNIQUE;
+DEFINE INDEX idx_tag_target ON TABLE tag FIELDS repository, target;
+
+
+-- 85 ── commit_trailer ─────────────────── a trailer of a commit's message ───
+-- Each trailer line git finds at the end of a commit's message (`git
+-- interpret-trailers`: `Co-Authored-By: …`, `Signed-off-by: …`,
+-- `Reviewed-by: …`), unfolded: `key` and `value` as written, `position`
+-- its place among the commit's trailers. The message itself stays whole in
+-- `commit.body`; these rows join a commit to who it names.
+
+DEFINE TABLE commit_trailer SCHEMAFULL PERMISSIONS FOR select FULL, FOR create FULL, FOR update NONE, FOR delete NONE;
+
+DEFINE FIELD commit     ON TABLE commit_trailer TYPE record<commit>
+    ASSERT record::exists($value);
+DEFINE FIELD position   ON TABLE commit_trailer TYPE int ASSERT $value >= 0;
+DEFINE FIELD key        ON TABLE commit_trailer TYPE string;
+DEFINE FIELD value      ON TABLE commit_trailer TYPE string;
+DEFINE FIELD valid_from ON TABLE commit_trailer TYPE datetime;
+
+DEFINE INDEX idx_commit_trailer     ON TABLE commit_trailer FIELDS commit, position UNIQUE;
+DEFINE INDEX idx_commit_trailer_key ON TABLE commit_trailer FIELDS key;
