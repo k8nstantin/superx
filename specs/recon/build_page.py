@@ -42,47 +42,147 @@ def key(t):
     return f"#{t.get('issue')}" if t.get("issue") else t.get("id")
 
 
-# ---------------------------------------------------------------- the map
-def map_svg():
-    cols, bw, bh, gx, gy = 4, 200, 58, 44, 46
-    left, top = 24, 24
-    boxes, arrows = [], []
-    rx = left + (cols * (bw + gx) - gx) // 2 - bw // 2
+# ---------------------------------------------------------------- the map: every box a file of the repository
+def slug(path):
+    return "src-" + "".join(c if c.isalnum() else "-" for c in path).strip("-")
+
+
+def authority_paths():
+    """The files the root's authority names, in its order: what the root and the rules quote."""
+    out = []
+    for f in ROOT.find("authority").findall("file"):
+        if f.get("path") not in out:
+            out.append(f.get("path"))
+    return out
+
+
+def decides(path):
+    """What the root says a file decides, to its first colon or comma."""
+    for f in ROOT.find("authority").findall("file"):
+        if f.get("path") == path:
+            d = " ".join((f.get("decides") or "").split())
+            for stop in (":", ","):
+                d = d.split(stop)[0]
+            return d
+    return ""
+
+
+ROW = {"authority": (12, 46), "spec": (172, 58), "task": (322, 58), "tool": (424, 50)}
+
+
+def map_files():
+    """Every file the map draws, by its place: (path, line 1, line 2, x, y, w, h, kind)."""
+    files = []
+    auth = [p for p in authority_paths() if not p.endswith(".surql")]
+    for i, p in enumerate(auth):
+        r, c = divmod(i, 3)
+        files.append((p, os.path.basename(p), decides(p), 20 + c * 330, ROW["authority"][0] + r * 56, 300, ROW["authority"][1], "authority"))
+    structure = next(p for p in authority_paths() if p.endswith(".surql"))
     open_n = sum(1 for d in ROOT.iter("decision") if d.get("status") == "open")
-    boxes.append((rx, top, "root · rules · decisions", f"{open_n} decisions open", "#s-decisions", True))
-    pos = {}
+    y, h = ROW["spec"]
+    files.append(("specs/recon/rules.xml", "rules.xml", f"{len(RULES.findall('rule'))} rules, each binding every task", 40, y, 220, h, "spec"))
+    files.append(("specs/recon/root.xml", "root.xml", f"method, sequence, decisions · {open_n} open", 390, y, 220, h, "root"))
+    files.append((structure, "recon.surql", "the structure · no task writes it", 740, y, 240, h, "structure"))
+    tw, tgap = 220, (1000 - 40 - 4 * 220) / 3
+    y, h = ROW["task"]
     for i, t in enumerate(TASKS):
-        r, c = divmod(i, cols)
-        x = left + c * (bw + gx)
-        y = top + bh + gy + r * (bh + gy)
-        pos[t.get("id")] = (x, y)
-        boxes.append((x, y, f"{i + 1} · {key(t)}", t.get("name"), f"#t-{t.get('id')}", False))
-    if TASKS:
-        x0, y0 = pos[TASKS[0].get("id")]
-        arrows.append(f"M{rx + bw // 2},{top + bh} V{top + bh + gy // 2} H{x0 + bw // 2} V{y0 - 3}")
-    for t in TASKS:
-        for dep in (t.get("depends") or "").split():
-            if dep not in pos:
-                continue
-            ax, ay = pos[dep]
-            bx, by = pos[t.get("id")]
-            if ay == by:
-                arrows.append(f"M{ax + bw},{ay + bh // 2} H{bx - 3}")
-            else:
-                mid = ay + bh + gy // 2
-                arrows.append(f"M{ax + bw // 2},{ay + bh} V{mid} H{bx + bw // 2} V{by - 3}")
-    rows = (len(TASKS) + cols - 1) // cols
-    width = left * 2 + cols * (bw + gx) - gx
-    height = top * 2 + bh + gy + rows * (bh + gy) - gy
-    out = [f'<svg class="map" viewBox="0 0 {width} {height}" role="group" aria-label="The build: the root, then every task in its order, each pointing at the next.">',
-           '<defs><marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="mk"/></marker></defs>']
-    out += [f'<path d="{d}" class="edge" marker-end="url(#arrow)"/>' for d in arrows]
-    for x, y, l1, l2, href, is_root in boxes:
-        out.append(f'<a href="{href}"><title>{esc(l1)}: {esc(l2)}</title><rect x="{x}" y="{y}" width="{bw}" height="{bh}" rx="9" class="box{" root" if is_root else ""}"/>'
-                   f'<text x="{x + bw // 2}" y="{y + 24}" text-anchor="middle" class="l1">{esc(l1)}</text>'
-                   f'<text x="{x + bw // 2}" y="{y + 44}" text-anchor="middle" class="l2">{esc(l2)}</text></a>')
+        path = os.path.relpath(task_file(t), REPO) if task_file(t) else t.get("file")
+        sub = f"{key(t)} · {t.get('name')}" + ("" if task_file(t) else " · not written yet")
+        files.append((path, f"tasks/{os.path.basename(path)}", sub, 20 + i * (tw + tgap), y, tw, h, "task" if task_file(t) else "missing"))
+    tools = [("specs/recon/check.py", "checks every spec file"), ("specs/recon/mutate_check.py", "proves the check catches"),
+             ("specs/recon/build_issues.py", "renders the issues"), ("specs/recon/build_page.py", "renders this page")]
+    y, h = ROW["tool"]
+    for i, (p, sub) in enumerate(tools):
+        files.append((p, os.path.basename(p), sub, 20 + i * (tw + tgap), y, tw, h, "tool"))
+    return files
+
+
+def map_svg():
+    files = map_files()
+    at = {f[0]: f for f in files}
+    def mid_x(p):
+        f = at[p]
+        return f[3] + f[5] / 2
+    root, rules = at["specs/recon/root.xml"], at["specs/recon/rules.xml"]
+    structure = next(f for f in files if f[7] == "structure")
+    tasks = [f for f in files if f[7] in ("task", "missing")]
+    auth = [f for f in files if f[7] == "authority"]
+    edges, labels = [], []
+    frame_bottom = max(f[4] + f[6] for f in auth) + 8
+    frame = f'<rect x="8" y="4" width="984" height="{frame_bottom - 4}" rx="12" class="frame"/>'
+    edges.append((f"M{mid_x(rules[0]):.0f},{frame_bottom} V{rules[4] - 3}", True))
+    edges.append((f"M{mid_x(root[0]):.0f},{frame_bottom} V{root[4] - 3}", True))
+    labels.append((mid_x(root[0]) + 10, frame_bottom + 20, "quoted word for word by the root and the rules; check.py proves every quote", "start"))
+    edges.append((f"M{root[3]},{root[4] + 29} H{rules[3] + rules[5] + 3}", True))
+    labels.append(((root[3] + rules[3] + rules[5]) / 2, root[4] + 22, "read next: the rules", "middle"))
+    edges.append((f"M{root[3] + root[5]},{root[4] + 29} H{structure[3] - 3}", True))
+    labels.append(((root[3] + root[5] + structure[3]) / 2, root[4] + 22, "its authority", "middle"))
+    tbus = (root[4] + root[6] + tasks[0][4]) // 2 + 8
+    edges.append((f"M{mid_x(root[0]):.0f},{root[4] + root[6]} V{tbus}", False))
+    edges.append((f"M{mid_x(rules[0]):.0f},{rules[4] + rules[6]} V{tbus}", False))
+    edges.append((f"M{tasks[0][3] + tasks[0][5] / 2:.0f},{tbus} H{tasks[-1][3] + tasks[-1][5] / 2:.0f}", False))
+    for t in tasks:
+        edges.append((f"M{t[3] + t[5] / 2:.0f},{tbus} V{t[4] - 3}", True))
+    labels.append((mid_x(root[0]) + 8, root[4] + root[6] + 20, "its sequence names each task file", "start"))
+    labels.append((mid_x(rules[0]) + 8, rules[4] + rules[6] + 20, "every rule binds every task", "start"))
+    edges.append((f"M{tasks[-1][3] + tasks[-1][5] - 30:.0f},{tasks[-1][4]} V{structure[4] + structure[6] + 3}", True))
+    labels.append((tasks[-1][3] + tasks[-1][5] - 36, structure[4] + structure[6] + 20, "each task reflects it", "end"))
+    for a, b in zip(tasks, tasks[1:]):
+        edges.append((f"M{a[3] + a[5]},{a[4] + 29} H{b[3] - 3}", True))
+    tools = [f for f in files if f[7] == "tool"]
+    labels.append((20, tools[0][4] - 10, "the pack's tools: the check and its mutation test, and the renderers of the issues and this page", "start"))
+    height = tools[0][4] + tools[0][6] + 12
+    out = [f'<svg class="map" viewBox="0 0 1000 {height}" role="group" aria-label="The spec pack: every file of the repository it is made of, and how each names the others. Each box opens the file as the repository holds it.">',
+           '<defs><marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="mk"/></marker></defs>',
+           frame]
+    out += [f'<path d="{d}" class="edge"{" marker-end=\"url(#arrow)\"" if arrow else ""}/>' for d, arrow in edges]
+    out += [f'<text x="{x:.0f}" y="{y:.0f}" text-anchor="{anchor}" class="lbl">{esc(t)}</text>' for x, y, t, anchor in labels]
+    for path, l1, l2, x, y, w, h, kind in files:
+        exists = os.path.exists(os.path.join(REPO, path))
+        box = (f'<rect x="{x:.0f}" y="{y}" width="{w}" height="{h}" rx="9" class="box {kind}"/>'
+               f'<text x="{x + w / 2:.0f}" y="{y + (22 if h > 52 else 21)}" text-anchor="middle" class="l1">{esc(l1)}</text>'
+               f'<text x="{x + w / 2:.0f}" y="{y + (42 if h > 52 else 39)}" text-anchor="middle" class="l2">{esc(l2)}</text>')
+        if exists:
+            out.append(f'<a href="#{slug(path)}" data-src="{slug(path)}"><title>{esc(path)}: open the file as the repository holds it</title>{box}</a>')
+        else:
+            out.append(f'<g><title>{esc(path)}: not written yet</title>{box}</g>')
     out.append("</svg>")
     return "".join(out)
+
+
+def sources_html():
+    """Every file the map draws that exists, whole, as the repository holds it: what each box opens."""
+    out = []
+    for path, l1, l2, *_ in map_files():
+        full = os.path.join(REPO, path)
+        if not os.path.exists(full):
+            continue
+        body = open(full, encoding="utf-8").read()
+        meta = f"{len(body.splitlines())} lines · {l2}"
+        out.append(f'<details class="src" id="{slug(path)}" data-path="{esc(path)}" data-meta="{esc(meta)}">'
+                   f'<summary><code>{esc(path)}</code> <span class="sub">{esc(meta)}</span></summary><pre>{esc(body)}</pre></details>')
+    return "".join(out)
+
+
+VIEWER = ('<div id="viewer" class="viewer" hidden><div class="vhead"><code class="vpath"></code><span class="vmeta sub"></span>'
+          '<button type="button" class="vclose" aria-label="Close the file">Close</button></div><pre class="vbody"></pre></div>')
+SCRIPT = """<script>
+(function(){
+  var viewer = document.getElementById('viewer');
+  function show(id){
+    var src = document.getElementById(id); if(!src) return false;
+    viewer.querySelector('.vpath').textContent = src.getAttribute('data-path');
+    viewer.querySelector('.vmeta').textContent = src.getAttribute('data-meta');
+    viewer.querySelector('.vbody').textContent = src.querySelector('pre').textContent;
+    viewer.hidden = false; viewer.scrollIntoView({block: 'start'});
+    return true;
+  }
+  document.querySelectorAll('svg.map a[data-src]').forEach(function(a){
+    a.addEventListener('click', function(e){ if(show(a.getAttribute('data-src'))) e.preventDefault(); });
+  });
+  viewer.querySelector('.vclose').addEventListener('click', function(){ viewer.hidden = true; });
+})();
+</script>"""
 
 
 # ---------------------------------------------------------------- generic XML rendering
@@ -186,10 +286,18 @@ dl.attrs{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px;margin:
 .el{margin:8px 0 8px 10px;padding-left:10px;border-left:1px solid var(--line)}
 .task{margin-top:24px;padding:12px 16px;background:var(--panel);border-radius:10px}
 details.raw{margin-top:14px}details.raw summary{cursor:pointer;color:var(--accent)}
-.mapw{overflow-x:auto;background:var(--panel);border-radius:10px;padding:8px}svg.map{width:100%;min-width:640px;height:auto;display:block}
+.mapw{overflow-x:auto;background:var(--panel);border-radius:10px;padding:8px}svg.map{width:100%;min-width:860px;height:auto;display:block}
 svg.map .box{fill:var(--box);stroke:var(--edge);stroke-width:1.2}svg.map .box.root{stroke:var(--accent);stroke-width:1.8}
-svg.map .l1{fill:var(--ink);font-size:17px;font-weight:600}svg.map .l2{fill:var(--mute);font-size:12.5px}
-svg.map .edge{fill:none;stroke:var(--edge);stroke-width:1.6}svg.map .mk{fill:var(--edge)}svg.map a:hover .box{stroke:var(--accent)}
+svg.map .box.structure{stroke:var(--ok);stroke-width:1.6}svg.map .box.authority,svg.map .box.tool{fill:var(--bg)}
+svg.map .box.missing{fill:none;stroke-dasharray:5 4}
+svg.map .l1{fill:var(--ink);font-size:15px;font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}svg.map .l2{fill:var(--mute);font-size:11.5px}
+svg.map .lbl{fill:var(--mute);font-size:11px;font-style:italic}svg.map .frame{fill:none;stroke:var(--line);stroke-width:1.2;stroke-dasharray:3 4}
+svg.map .edge{fill:none;stroke:var(--edge);stroke-width:1.4}svg.map .mk{fill:var(--edge)}svg.map a:hover .box,svg.map a:focus .box{stroke:var(--accent);stroke-width:2.2}
+svg.map a{cursor:pointer}
+.viewer{margin-top:12px;border:1px solid var(--accent);border-radius:10px;background:var(--panel);padding:10px 12px}
+.vhead{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 12px}.vhead .vclose{margin-left:auto;font:inherit;color:var(--accent);background:none;border:1px solid var(--line);border-radius:6px;padding:2px 10px;cursor:pointer}
+.viewer pre{max-height:70vh;margin:10px 0 0;white-space:pre;overflow:auto}
+details.src{margin:6px 0;padding:6px 10px;background:var(--panel);border-radius:8px}details.src summary{cursor:pointer}details.src pre{white-space:pre;max-height:70vh}
 .foot{color:var(--mute);font-size:.88em;margin-top:40px}
 """
 
@@ -199,7 +307,9 @@ def page():
     body = [f'<h1>Recon Build Spec</h1><p class="sub">Version {esc(ROOT.get("version"))} · epic #{esc(ROOT.get("epic"))} · {esc(ROOT.get("date"))} · rendered from specs/recon/ at {esc(sha())}. '
             "An agent reads the rules, the root, its one task file and the code merged on main, and nothing else.</p>",
             f'<p>{esc(text(ROOT.find("identity/product")))}</p>',
-            '<h2 id="s-map">The build</h2><div class="mapw">' + map_svg() + "</div>",
+            '<h2 id="s-map">The spec pack</h2><p class="sub">Every box is a file of the repository; open one to read it as the '
+            "repository holds it. The arrows are how the files name each other. A build starts at its task file, reads the root, "
+            "then the rules, then its task file whole.</p><div class=\"mapw\">" + map_svg() + "</div>" + VIEWER,
             '<h2 id="s-sequence">The sequence</h2><p class="note">' + esc(text(ROOT.find("sequence/note"))) + "</p>" + sequence_html(),
             '<h2 id="s-decisions">The decisions</h2><p class="note">' + esc(text(ROOT.find("decisions/note"))) + "</p>" + decisions_html(),
             '<h2 id="s-the-rules">The rules · specs/recon/rules.xml</h2>' + rules_html() + raw(files[0]),
@@ -209,11 +319,13 @@ def page():
             body.append(render(part, 3))
     body.append(raw(files[1]))
     body.append('<h2 id="s-the-tasks">The task files · specs/recon/tasks/</h2>' + tasks_html())
+    body.append('<h2 id="s-files">The files, whole</h2><p class="sub">What each box of the map opens: the file as the repository '
+                "holds it at this commit.</p>" + sources_html())
     body.append(f'<p class="foot">Rendered by specs/recon/build_page.py from {", ".join(esc(os.path.relpath(f, REPO)) for f in files)}; '
                 "the spec check (specs/recon/check.py) passes on them.</p>")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             '<title>Recon Build Spec</title><meta name="description" content="The build spec of SuperX Recon: the sequence, the decisions, the rules, the root and every task file, rendered from the repository.">'
-            f"<style>{CSS}</style></head><body><div class=\"wrap\">" + "".join(body) + "</div></body></html>")
+            f"<style>{CSS}</style></head><body><div class=\"wrap\">" + "".join(body) + "</div>" + SCRIPT + "</body></html>")
 
 
 def main(argv):
