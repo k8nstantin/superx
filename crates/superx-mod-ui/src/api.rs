@@ -20,24 +20,13 @@ pub struct StatusResponse {
     pub default_range: String,
 }
 
-/// Is capture keeping up (#452)? `/api/capture`.
+/// Is every transcript line captured (#489)? `/api/capture`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct CaptureView {
-    /// RFC3339: when the OS last recorded anything.
-    pub last_written: Option<String>,
-    /// RFC3339: when a session's transcript last changed.
-    pub transcripts_changed: Option<String>,
-    /// That session, as `<agent>/<session key>`.
-    pub transcript: Option<String>,
-    /// RFC3339: since when a change has been waiting to be taken in, as
-    /// far as this server has seen; absent while capture keeps up.
-    pub waiting_since: Option<String>,
-    /// How long transcripts may change past the newest record before
-    /// this says stalled (`attr_ui_capture_stall_secs`).
+    /// How long a complete line may wait unread before the page calls
+    /// capture behind (`attr_ui_capture_stall_secs`).
     pub stall_secs: i64,
-    /// A change has waited longer than that.
-    pub stalled: bool,
     /// Every transcript line captured, whole (#489), for each Claude Code
     /// transcript changed lately; `None` when the check got no answer.
     pub files: Option<Vec<CaptureFile>>,

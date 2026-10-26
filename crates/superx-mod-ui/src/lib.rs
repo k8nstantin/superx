@@ -24,7 +24,6 @@ pub mod checkout;
 pub mod compare;
 pub mod completeness;
 pub mod export;
-pub mod health;
 pub mod api;
 pub mod insights;
 pub mod landed;
@@ -151,11 +150,10 @@ pub async fn resolved_default_range(kernel: &Kernel) -> String {
     }
 }
 
-/// Resolve how long an answer may be reused, in seconds.
-/// How long transcripts may change past the OS's newest record before the
-/// page says capture is stalled (#452).
+/// How long a complete transcript line may wait unread before the page
+/// calls capture behind (#489).
 pub async fn resolved_stall_secs(kernel: &Kernel) -> u64 {
-    resolved_secs(kernel, health::STALL_SECS_PARAM, health::DEFAULT_STALL_SECS).await
+    resolved_secs(kernel, completeness::STALL_SECS_PARAM, completeness::DEFAULT_STALL_SECS).await
 }
 
 /// How recently a transcript must have changed for the completeness check
@@ -164,6 +162,7 @@ pub async fn resolved_watch_secs(kernel: &Kernel) -> u64 {
     resolved_secs(kernel, completeness::WATCH_SECS_PARAM, completeness::DEFAULT_WATCH_SECS).await
 }
 
+/// Resolve how long an answer may be reused, in seconds.
 pub async fn resolved_cache_secs(kernel: &Kernel) -> u64 {
     resolved_secs(kernel, CACHE_SECS_PARAM, DEFAULT_CACHE_SECS).await
 }

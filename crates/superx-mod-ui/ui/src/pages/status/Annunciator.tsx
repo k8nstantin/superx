@@ -60,8 +60,7 @@ export function Annunciator({
   const quiet = !down && !anythingLive && lag != null && lag >= BANDS.lagWarn
 
   // Every transcript line captured, whole (#489): checked by the server,
-  // transcript by transcript, from when it began watching each. The same
-  // query as the capture banner, so one request serves both.
+  // transcript by transcript, from when it began watching each.
   const capture = useQuery({ queryKey: ['capture'], queryFn: fetchCapture, refetchInterval: 30000, retry: 1 })
   const files = capture.data?.files
   const lost = (files ?? []).filter((f) => n(f.rows) < n(f.lines))

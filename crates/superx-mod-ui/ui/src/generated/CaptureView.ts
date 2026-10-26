@@ -2,35 +2,14 @@
 import type { CaptureFile } from "./CaptureFile";
 
 /**
- * Is capture keeping up (#452)? `/api/capture`.
+ * Is every transcript line captured (#489)? `/api/capture`.
  */
 export type CaptureView = { 
 /**
- * RFC3339: when the OS last recorded anything.
- */
-last_written: string | null, 
-/**
- * RFC3339: when a session's transcript last changed.
- */
-transcripts_changed: string | null, 
-/**
- * That session, as `<agent>/<session key>`.
- */
-transcript: string | null, 
-/**
- * RFC3339: since when a change has been waiting to be taken in, as
- * far as this server has seen; absent while capture keeps up.
- */
-waiting_since: string | null, 
-/**
- * How long transcripts may change past the newest record before
- * this says stalled (`attr_ui_capture_stall_secs`).
+ * How long a complete line may wait unread before the page calls
+ * capture behind (`attr_ui_capture_stall_secs`).
  */
 stall_secs: bigint, 
-/**
- * A change has waited longer than that.
- */
-stalled: boolean, 
 /**
  * Every transcript line captured, whole (#489), for each Claude Code
  * transcript changed lately; `None` when the check got no answer.
