@@ -1,9 +1,11 @@
 //! Message verbs — conversations, first-class (schema v2.1 §3.8).
 //!
 //! One `message` row per conversation event captured from an agent
-//! session. `content` carries the extracted readable text; `raw`
-//! preserves the full original source event (capture is very detailed
-//! by design — operator directive 2026-08-07). Reading a conversation
+//! session. `content` carries the extracted readable text; `raw_text`
+//! keeps the source event exactly as written (capture is very detailed
+//! by design — operator directive 2026-08-07). Capture writes no parsed
+//! copy: `raw` is NONE, since one nested as deep as the agent's JSON made
+//! capture depend on what the agents write (#541). Reading a conversation
 //! is one indexed query per session; per-agent reads use the
 //! `(agent, valid_from)` index.
 
@@ -23,7 +25,8 @@ pub struct MessageRecord {
     pub role: String,
     /// Extracted readable text; empty when the event carries none.
     pub content: String,
-    /// The full original source event.
+    /// A parsed copy of the source event, on rows written before #541;
+    /// capture writes NONE and keeps the event as `raw_text`.
     pub raw: Option<Object>,
     /// Source ordering (e.g. JSONL line number within the transcript).
     pub seq: Option<i64>,
@@ -59,7 +62,7 @@ impl Kernel {
 
     /// Append one row to `message` as [`Kernel::log_message`] does, with
     /// the event exactly as the agent wrote it (`raw_text`, its line's
-    /// text, #528) beside its parsed copy `raw`.
+    /// text, #528).
     ///
     /// # Errors
     ///

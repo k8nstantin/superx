@@ -20,7 +20,7 @@
 //!   human prompts.
 //! - Every other line (`attachment`, `system`, `api-request*`,
 //!   `ai-title`, `mode`, `file-history-*`, …) is not conversation and is
-//!   captured as telemetry, the whole line under `line` (#471).
+//!   captured as telemetry, the whole line as its text, `raw_text` (#471, #541).
 //! - Unparseable lines are captured raw (`transcript_raw`), the whole
 //!   text under `text`, never dropped, never a crash.
 //! - Beside the transcripts Claude Code writes other files: saved tool
@@ -45,7 +45,7 @@ use surrealdb::types::{Object, RecordId, Value};
 
 use crate::capture::{AgentAdapter, DiscoveredSource, SourceRef, ADAPTERS};
 use crate::error::{KernelError, Result};
-use crate::message::{line_to_object, NewMessage};
+use crate::message::NewMessage;
 use crate::registry::{KernelModule, KernelModuleDescriptor, NodeKind, KERNEL_MODULES};
 use crate::substrate::Kernel;
 
@@ -315,7 +315,9 @@ impl ClaudeCodeAdapter {
                         agent: source.agent_id.clone(),
                         role: role.to_string(),
                         content: content.clone(),
-                        raw: Some(line_to_object(&json)),
+                        // The line's text alone (`raw_text`, below): a parsed copy
+                        // made capture depend on how deep a line nests (#541).
+                        raw: None,
                         seq: None,
                         emitted_at,
                     }, Some(line.to_string()))
@@ -347,10 +349,9 @@ impl ClaudeCodeAdapter {
                     "file".to_string(),
                     Value::String(file.to_string_lossy().to_string()),
                 );
-                // The whole line (#471): the system prompt and the context
-                // sent with each request, attachments, turn durations, away
-                // summaries. These were kept as their kind alone.
-                payload.insert("line".to_string(), Value::Object(line_to_object(&json)));
+                // The whole line (#471), as its text (#541): the system prompt
+                // and the context sent with each request, attachments, turn
+                // durations, away summaries. These were kept as their kind alone.
                 payload.insert("raw_text".to_string(), Value::String(line.to_string()));
                 kernel
                     .log_telemetry_for_agent(
