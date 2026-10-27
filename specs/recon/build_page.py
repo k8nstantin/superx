@@ -1,8 +1,12 @@
-"""The Build Spec page, rendered from the spec files: python3 specs/recon/build_page.py [out.html]
+"""The Build Spec page, rendered from the spec files: python3 specs/recon/build_page.py [--whole] [out.html]
 
 One page: the map of the build (the root and every task of the sequence, numbered, in their order), the decisions,
 the rules whole, the root whole, every task file whole, and each file's XML as written. Nothing here is written by
 hand: every word comes from specs/recon/rules.xml, specs/recon/root.xml and specs/recon/tasks/*.xml.
+
+The page kept in the repository, build_spec.html, holds every file of the map whole but the structure: its DDL lives in
+its own file alone, since tools/skill_audit.py (X1) refuses DDL in any other file of the repository. With --whole the
+page holds the structure too; that is the page published for review, and it is written outside the repository.
 """
 import html
 import os
@@ -150,8 +154,9 @@ def map_svg():
     return "".join(out)
 
 
-def sources_html():
-    """Every file the map draws that exists, whole, as the repository holds it: what each box opens."""
+def sources_html(whole):
+    """Every file the map draws that exists, whole, as the repository holds it: what each box opens. The structure's
+    text only when whole: in the repository its DDL lives in its own file alone (tools/skill_audit.py, X1)."""
     out = []
     for path, l1, l2, *_ in map_files():
         full = os.path.join(REPO, path)
@@ -159,6 +164,10 @@ def sources_html():
             continue
         body = open(full, encoding="utf-8").read()
         meta = f"{len(body.splitlines())} lines · {l2}"
+        if path.endswith(".surql") and not whole:
+            body = (f"{path} is not copied into this page: the structure's DDL lives in its own file alone, since "
+                    "tools/skill_audit.py (X1) refuses DDL in any other file of the repository. Open the file itself, "
+                    "or the page python3 specs/recon/build_page.py --whole renders outside the repository, which holds it whole.")
         out.append(f'<details class="src" id="{slug(path)}" data-path="{esc(path)}" data-meta="{esc(meta)}">'
                    f'<summary><code>{esc(path)}</code> <span class="sub">{esc(meta)}</span></summary><pre>{esc(body)}</pre></details>')
     return "".join(out)
@@ -302,7 +311,7 @@ details.src{margin:6px 0;padding:6px 10px;background:var(--panel);border-radius:
 """
 
 
-def page():
+def page(whole):
     files = [os.path.join(HERE, "rules.xml"), os.path.join(HERE, "root.xml")] + [f for f in (task_file(t) for t in TASKS) if f]
     body = [f'<h1>Recon Build Spec</h1><p class="sub">Version {esc(ROOT.get("version"))} · epic #{esc(ROOT.get("epic"))} · {esc(ROOT.get("date"))} · rendered from specs/recon/ at {esc(sha())}. '
             "An agent reads the rules, the root, its one task file and the code merged on main, and nothing else.</p>",
@@ -320,7 +329,7 @@ def page():
     body.append(raw(files[1]))
     body.append('<h2 id="s-the-tasks">The task files · specs/recon/tasks/</h2>' + tasks_html())
     body.append('<h2 id="s-files">The files, whole</h2><p class="sub">What each box of the map opens: the file as the repository '
-                "holds it at this commit.</p>" + sources_html())
+                "holds it at this commit.</p>" + sources_html(whole))
     body.append(f'<p class="foot">Rendered by specs/recon/build_page.py from {", ".join(esc(os.path.relpath(f, REPO)) for f in files)}; '
                 "the spec check (specs/recon/check.py) passes on them.</p>")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -329,9 +338,15 @@ def page():
 
 
 def main(argv):
-    out = argv[0] if argv else os.path.join(HERE, "build_spec.html")
-    open(out, "w", encoding="utf-8").write(page())
-    print(f"wrote {os.path.relpath(out, REPO)}")
+    whole = "--whole" in argv
+    rest = [a for a in argv if a != "--whole"]
+    out = os.path.abspath(rest[0]) if rest else os.path.join(HERE, "build_spec.html")
+    if whole and os.path.commonpath([out, REPO]) == REPO:
+        print("build_page.py --whole copies the structure's DDL into the page: write it outside the repository "
+              "(tools/skill_audit.py, X1)", file=sys.stderr)
+        return 2
+    open(out, "w", encoding="utf-8").write(page(whole))
+    print(f"wrote {out if whole else os.path.relpath(out, REPO)}")
     return 0
 
 
