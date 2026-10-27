@@ -10,7 +10,8 @@
 //! summary: right for a feed, wrong for a record. On one session it left
 //! out 2.6 MB of tool input, 100 K characters of thinking and every tool
 //! output that came as a block array (#460). This one reads the captured
-//! event (`raw`) whole.
+//! event (`raw`) whole: since #541 capture keeps its text alone, which is
+//! parsed here (`parsed`, #543).
 //!
 //! Every other line of the transcript, which the capture keeps whole since
 //! #471 (the system prompt and tools, each message sent with a request,
@@ -76,9 +77,11 @@ const LINE_BOOKKEEPING: &[&str] = &[
 const REQUEST_SENT: &[&str] = &["api-request-shape", "api-request-blob", "api-request"];
 
 /// The action events that are transcript lines kept whole (#471): written
-/// in place, not in the appendix. A line kept by its kind alone, before
-/// #471, has no `line` and stays in the appendix.
-const WHOLE_LINE: &str = "(lifecycle_event = 'transcript_event' AND payload.line != NONE)";
+/// in place, not in the appendix; parsed from `line`, or since #541 from
+/// their text, `raw_text`. A line kept by its kind alone, before #471, has
+/// neither and stays in the appendix.
+const WHOLE_LINE: &str =
+    "(lifecycle_event = 'transcript_event' AND (payload.line != NONE OR payload.raw_text != NONE))";
 
 /// The marker that opens the file's last line. The page checks for it
 /// before it keeps the file.
@@ -464,7 +467,7 @@ async fn message_page(
         keyword.map(|_| crate::activity::MSG_MATCH),
         whole,
     );
-    crate::answered("export messages", || {
+    let rows = crate::answered("export messages", || {
         let (sql, session) = (sql.clone(), session.clone());
         let keyword = keyword.map(str::to_lowercase);
         async move {
@@ -483,7 +486,8 @@ async fn message_page(
             Ok(q.await?.take(0)?)
         }
     })
-    .await
+    .await?;
+    crate::parsed::messages(kernel, rows).await
 }
 
 /// The next page of the session's action events, matched as the session
@@ -1592,13 +1596,13 @@ impl Writer {
             // The line as captured; of a line kept by kind alone (#471),
             // what was kept.
             let payload = a.payload.clone().into_json_value();
-            let row = payload.get("line").filter(|l| !l.is_null()).cloned().unwrap_or(payload);
+            let row = crate::parsed::line(&payload).unwrap_or(payload);
             self.json_line(&row);
             return;
         }
         let payload = a.payload.clone().into_json_value();
         let kind = payload.get("kind").and_then(Json::as_str).unwrap_or("line").to_string();
-        let line = payload.get("line").cloned().unwrap_or(Json::Null);
+        let line = crate::parsed::line(&payload).unwrap_or(Json::Null);
         if REQUEST_SENT.contains(&kind.as_str()) {
             self.close_request();
         }
@@ -2113,14 +2117,14 @@ pub(crate) fn line_body(a: &TelemetryRecord) -> Option<(String, String, String)>
         return None;
     }
     let payload = a.payload.clone().into_json_value();
-    let line = payload.get("line")?;
+    let line = crate::parsed::line(&payload)?;
     let kind = payload.get("kind").and_then(Json::as_str).unwrap_or("line");
     let mut w = feed_writer(a.valid_from);
-    let (heading, pieces) = line_pieces(kind, line, &mut w.calls);
+    let (heading, pieces) = line_pieces(kind, &line, &mut w.calls);
     for p in &pieces {
         w.txt_piece(p);
     }
-    let said = beyond(line, LINE_BOOKKEEPING).unwrap_or(Json::Null).to_string();
+    let said = beyond(&line, LINE_BOOKKEEPING).unwrap_or(Json::Null).to_string();
     let mut digest = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&said, &mut digest);
     Some((heading, w.out.trim_end().to_string(), format!("{:016x}", std::hash::Hasher::finish(&digest))))
