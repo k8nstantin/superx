@@ -14,7 +14,7 @@ use superx_kernel::adapters::claude_code::{
 };
 use superx_kernel::capture::{capture_tick, discover_paired};
 use superx_kernel::registry::{KernelModule as _, NodeKind};
-use superx_kernel::types::Value;
+use superx_kernel::types::{Decimal, Number, Value};
 use superx_kernel::Kernel;
 
 /// Only this adapter's sources — the other adapters linked into this
@@ -88,7 +88,7 @@ async fn history_backfill_extracts_conversation() -> Result<(), Box<dyn Error>> 
     assert_eq!(messages[1].content, "hi there");
     assert_eq!(messages[2].role, "tool");
     assert!(messages[2].content.contains("file_a"));
-    assert!(messages[0].raw.is_none(), "no parsed copy: the line is kept as its text (#541)");
+    assert!(messages[0].raw.is_some(), "full raw event preserved");
     assert!(messages[0].emitted_at.is_some(), "source timestamp parsed");
 
     // Per-agent query path: agent_id finds the same messages.
@@ -266,8 +266,7 @@ async fn every_listed_root_is_captured_under_its_own_source() -> Result<(), Box<
 }
 
 /// Nothing is dropped (#471): a line that is not conversation keeps its
-/// whole text under `raw_text`, with no parsed copy (#541), and an
-/// unparseable line its whole text.
+/// whole content under `line`, and an unparseable line its whole text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_line_is_kept_whole() -> Result<(), Box<dyn Error>> {
     let kernel = common::fresh_seeded_kernel().await?;
@@ -284,12 +283,11 @@ async fn every_line_is_kept_whole() -> Result<(), Box<dyn Error>> {
             _ => None,
         })
     };
-    assert_eq!(
-        field("transcript_event", "raw_text"),
-        Some(Value::String(r#"{"type":"ai-title","aiTitle":"Test session","sessionId":"sess-1"}"#.into())),
-        "the ai-title line, whole, as its text"
-    );
-    assert_eq!(field("transcript_event", "line"), None, "no parsed copy (#541)");
+    let line = match field("transcript_event", "line") {
+        Some(Value::Object(line)) => line,
+        other => return Err(format!("the ai-title line is kept whole, not {other:?}").into()),
+    };
+    assert_eq!(line.get("aiTitle"), Some(&Value::String("Test session".into())));
     assert_eq!(
         field("transcript_raw", "text"),
         Some(Value::String("this is {{{ not json".into())),
@@ -298,20 +296,24 @@ async fn every_line_is_kept_whole() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// A line is kept exactly as written (#516), as its text (#541): a key
-/// holding `null`, a float's every digit and an integer beyond `i64` are
-/// there character for character, and no parsed copy is written.
+/// A line is kept exactly as written (#516): a key holding `null` is still
+/// there when read back from the engine, a float keeps its last bit, and an
+/// integer beyond `i64` stays exact as a decimal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nulls_and_numbers_are_kept_exactly() -> Result<(), Box<dyn Error>> {
     let kernel = common::fresh_seeded_kernel().await?;
     let tmp = tempfile::tempdir()?;
     arrange(&kernel, tmp.path()).await?;
-    let reply = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"exact"}],"stop_sequence":null,"usage":{"fallback_credit":null,"iterations":[null]}},"big":18446744073709551615,"sessionId":"sess-n","timestamp":"2026-08-07T11:00:00.000Z"}"#;
-    let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok","tool_use_id":"t1"}]},"toolUseResult":{"durationSeconds":9.577058125019073,"returnCodeInterpretation":null},"sessionId":"sess-n","timestamp":"2026-08-07T11:00:01.000Z"}"#;
-    let mode = r#"{"type":"mode","mode":null,"ratio":0.1,"sessionId":"sess-n"}"#;
     fs::write(
         tmp.path().join("projects").join("-tmp-proj").join("sess-n.jsonl"),
-        format!("{reply}\n{result}\n{mode}\n"),
+        concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"exact"}],"stop_sequence":null,"usage":{"fallback_credit":null,"iterations":[null]}},"big":18446744073709551615,"sessionId":"sess-n","timestamp":"2026-08-07T11:00:00.000Z"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok","tool_use_id":"t1"}]},"toolUseResult":{"durationSeconds":9.577058125019073,"returnCodeInterpretation":null},"sessionId":"sess-n","timestamp":"2026-08-07T11:00:01.000Z"}"#,
+            "\n",
+            r#"{"type":"mode","mode":null,"ratio":0.1,"sessionId":"sess-n"}"#,
+            "\n"
+        ),
     )?;
     let sources = cc_sources(&kernel).await?;
     let report = capture_tick(&kernel, &sources, None).await?;
@@ -321,76 +323,43 @@ async fn nulls_and_numbers_are_kept_exactly() -> Result<(), Box<dyn Error>> {
         .find_entity_by_name("node_session", "attr_session_descriptor", "claude_code/sess-n")
         .await?
         .expect("session captured");
-    let messages = kernel.session_messages(session.clone(), 10).await?;
-    assert_eq!(messages.len(), 2, "two conversation lines");
-    assert!(messages.iter().all(|m| m.raw.is_none()), "no parsed copy (#541)");
-    let rows: Vec<Value> = kernel
-        .db()
-        .query("SELECT raw_text, valid_from FROM message WHERE session = $sess ORDER BY valid_from")
-        .bind(("sess", session))
-        .await?
-        .take(0)?;
-    let texts: Vec<Option<&Value>> = rows.iter().map(|r| at(r, &["raw_text"])).collect();
-    assert_eq!(
-        texts,
-        vec![Some(&Value::String(reply.into())), Some(&Value::String(result.into()))],
-        "each line, nulls and numbers as written"
+    let raws: Vec<Value> =
+        kernel.session_messages(session, 10).await?.into_iter().filter_map(|m| m.raw.map(Value::Object)).collect();
+    let [reply, result] = raws.as_slice() else {
+        return Err(format!("two conversation lines, not {}", raws.len()).into());
+    };
+    assert!(matches!(at(reply, &["message", "stop_sequence"]), Some(Value::Null)), "{reply:?}");
+    assert!(matches!(at(reply, &["message", "usage", "fallback_credit"]), Some(Value::Null)), "{reply:?}");
+    assert!(
+        matches!(at(reply, &["message", "usage", "iterations"]), Some(Value::Array(a)) if matches!(a.as_slice(), [Value::Null])),
+        "{reply:?}"
     );
+    assert!(
+        matches!(at(reply, &["big"]), Some(Value::Number(Number::Decimal(d))) if *d == Decimal::from(u64::MAX)),
+        "an integer beyond i64 stays exact: {:?}",
+        at(reply, &["big"])
+    );
+    let duration: f64 = "9.577058125019073".parse()?;
+    assert!(
+        matches!(at(result, &["toolUseResult", "durationSeconds"]), Some(Value::Number(Number::Float(f))) if f.to_bits() == duration.to_bits()),
+        "a float keeps its last bit: {:?}",
+        at(result, &["toolUseResult", "durationSeconds"])
+    );
+    assert!(matches!(at(result, &["toolUseResult", "returnCodeInterpretation"]), Some(Value::Null)), "{result:?}");
 
     let recent = kernel.recent_telemetry(50).await?;
-    let mode_kept = recent.iter().any(|e| {
-        matches!(at(&e.payload, &["raw_text"]), Some(Value::String(t)) if t == mode) && at(&e.payload, &["line"]).is_none()
-    });
-    assert!(mode_kept, "the mode line, as written, with no parsed copy");
-    Ok(())
-}
-
-/// A line nested as deep as an agent writes it is kept as its text (#541):
-/// capture writes no parsed copy, so how deep a line nests is never its
-/// concern. A Jira tool result nested 23 levels deep, its comments in
-/// Atlassian Document Format, was waiting when capture stopped for 25 hours.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_deeply_nested_line_is_kept_as_its_text() -> Result<(), Box<dyn Error>> {
-    let kernel = common::fresh_seeded_kernel().await?;
-    let tmp = tempfile::tempdir()?;
-    arrange(&kernel, tmp.path()).await?;
-    // Eighty levels: deeper than that line, within what serde_json parses.
-    let deep = format!("{}{}", r#"{"content":["#.repeat(40), "]}".repeat(40));
-    let user = format!(
-        r#"{{"type":"user","message":{{"role":"user","content":"deep"}},"mcpMeta":{deep},"sessionId":"sess-d","timestamp":"2026-08-07T13:00:00.000Z"}}"#
+    let mode = recent
+        .iter()
+        .find_map(|e| match at(&e.payload, &["line", "type"]) {
+            Some(Value::String(t)) if t == "mode" => at(&e.payload, &["line"]).cloned(),
+            _ => None,
+        })
+        .ok_or("the mode line is captured")?;
+    assert!(matches!(at(&mode, &["mode"]), Some(Value::Null)), "{mode:?}");
+    assert!(
+        matches!(at(&mode, &["ratio"]), Some(Value::Number(Number::Float(f))) if f.to_bits() == 0.1_f64.to_bits()),
+        "{mode:?}"
     );
-    let attachment = format!(r#"{{"type":"attachment","attachment":{deep},"sessionId":"sess-d"}}"#);
-    fs::write(
-        tmp.path().join("projects").join("-tmp-proj").join("sess-d.jsonl"),
-        format!("{user}\n{attachment}\n"),
-    )?;
-    let sources = cc_sources(&kernel).await?;
-    let report = capture_tick(&kernel, &sources, None).await?;
-    assert!(report.errors.is_empty(), "{:?}", report.errors);
-
-    let session = kernel
-        .find_entity_by_name("node_session", "attr_session_descriptor", "claude_code/sess-d")
-        .await?
-        .expect("session captured");
-    let messages = kernel.session_messages(session.clone(), 10).await?;
-    assert_eq!(messages.len(), 1, "the user line is a message");
-    assert_eq!(messages[0].content, "deep");
-    assert!(messages[0].raw.is_none(), "no parsed copy (#541)");
-    let rows: Vec<Value> = kernel
-        .db()
-        .query("SELECT raw_text FROM message WHERE session = $sess")
-        .bind(("sess", session))
-        .await?
-        .take(0)?;
-    assert_eq!(rows.first().and_then(|r| at(r, &["raw_text"])), Some(&Value::String(user.clone())), "as written");
-
-    let recent = kernel.recent_telemetry(100).await?;
-    let kept = recent.iter().any(|e| {
-        e.lifecycle_event == "transcript_event"
-            && matches!(at(&e.payload, &["raw_text"]), Some(Value::String(t)) if *t == attachment)
-            && at(&e.payload, &["line"]).is_none()
-    });
-    assert!(kept, "the attachment line, as written, with no parsed copy");
     Ok(())
 }
 
@@ -471,8 +440,8 @@ async fn file_events(kernel: &Kernel) -> Result<Vec<(String, Option<String>, Str
         .collect())
 }
 
-/// Every line keeps its exact text (#528): a key's order, a number's
-/// spelling and the spacing a parser does not keep. A
+/// Every line keeps its exact text (#528) beside its parsed copy: a key's
+/// order, a number's spelling and the spacing a parser does not keep. A
 /// message holds it in `raw_text`; any other line in its payload's
 /// `raw_text`; an unparseable line too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

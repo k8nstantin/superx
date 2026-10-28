@@ -69,7 +69,7 @@ async fn every_write_is_kept_and_the_last_is_the_message() -> Result<(), Box<dyn
         .find_entity_by_name("node_session", "attr_session_descriptor", "gemini_cli/g-sess-1")
         .await?
         .expect("session entity from header line");
-    let messages = kernel.session_messages(session.clone(), 10).await?;
+    let messages = kernel.session_messages(session, 10).await?;
     assert_eq!(
         messages.len(),
         2,
@@ -80,17 +80,14 @@ async fn every_write_is_kept_and_the_last_is_the_message() -> Result<(), Box<dyn
     assert_eq!(messages[0].content, "hello gemini\nsecond part", "parts joined");
     assert_eq!(messages[1].role, "assistant");
     assert_eq!(messages[1].content, "here you go", "last re-emission wins");
-    assert!(messages.iter().all(|m| m.raw.is_none()), "no parsed copy (#541)");
-    let rows: Vec<Value> = kernel
-        .db()
-        .query("SELECT raw_text, valid_from FROM message WHERE session = $sess ORDER BY valid_from")
-        .bind(("sess", session))
-        .await?
-        .take(0)?;
+    let raw = Value::Object(messages[1].raw.clone().expect("raw preserved"));
     assert_eq!(
-        rows.last().and_then(|r| at(r, &["raw_text"])),
-        Some(&Value::String(GEMINI_FULL.into())),
-        "the last write as written, its call's resultDisplay with it"
+        at(&raw, &["toolCalls"]).and_then(|c| match c {
+            Value::Array(calls) => calls.first().and_then(|call| at(call, &["resultDisplay"])).cloned(),
+            _ => None,
+        }),
+        Some(Value::Array(vec![Value::Array(vec![Value::String("junk".into())].into())].into())),
+        "the call's resultDisplay is kept as written"
     );
 
     let recent = kernel.recent_telemetry(50).await?;
@@ -99,12 +96,13 @@ async fn every_write_is_kept_and_the_last_is_the_message() -> Result<(), Box<dyn
     let earlier = recent
         .iter()
         .find_map(|e| match at(&e.payload, &["kind"]) {
-            Some(Value::String(kind)) if kind == "superseded" => Some(&e.payload),
+            Some(Value::String(kind)) if kind == "superseded" => at(&e.payload, &["line"]).cloned(),
             _ => None,
         })
         .ok_or("the record's earlier write is kept whole")?;
-    assert_eq!(at(earlier, &["raw_text"]), Some(&Value::String(GEMINI_PARTIAL.into())), "{earlier:?}");
-    assert_eq!(at(earlier, &["line"]), None, "no parsed copy (#541)");
+    assert_eq!(at(&earlier, &["id"]), Some(&Value::String("g-1".into())));
+    assert_eq!(at(&earlier, &["content"]), Some(&Value::String(String::new())), "{earlier:?}");
+    assert!(matches!(at(&earlier, &["thoughts"]), Some(Value::Array(_))), "{earlier:?}");
     assert!(count("transcript_event") >= 2, "info line and the earlier write captured");
     Ok(())
 }
@@ -184,7 +182,7 @@ async fn a_later_read_captures_into_the_headers_session() -> Result<(), Box<dyn 
 }
 
 /// An attachment is kept as written (#518): its whole `inlineData`, never
-/// cut to a few hundred characters, in the line's text (#541).
+/// cut to a few hundred characters.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_attachment_is_kept_whole() -> Result<(), Box<dyn Error>> {
     let kernel = common::fresh_seeded_kernel().await?;
@@ -193,10 +191,10 @@ async fn an_attachment_is_kept_whole() -> Result<(), Box<dyn Error>> {
     let data = "A".repeat(1000);
     let chats = tmp.path().join("tmp").join("proj-slug").join("chats");
     let mut f = fs::OpenOptions::new().append(true).open(chats.join("session-2026-08-07T09-00-gsess1.jsonl"))?;
-    let line = format!(
+    writeln!(
+        f,
         r#"{{"id":"u-3","type":"user","content":[{{"text":"see this"}},{{"inlineData":{{"mimeType":"image/png","data":"{data}"}}}}]}}"#
-    );
-    writeln!(f, "{line}")?;
+    )?;
     let sources = gemini_sources(&kernel).await?;
     let report = capture_tick(&kernel, &sources, None).await?;
     assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -205,19 +203,19 @@ async fn an_attachment_is_kept_whole() -> Result<(), Box<dyn Error>> {
         .find_entity_by_name("node_session", "attr_session_descriptor", "gemini_cli/g-sess-1")
         .await?
         .expect("session entity from header line");
-    let rows: Vec<Value> = kernel
-        .db()
-        .query("SELECT raw_text FROM message WHERE session = $sess AND content = 'see this'")
-        .bind(("sess", session))
-        .await?
-        .take(0)?;
-    assert_eq!(rows.first().and_then(|r| at(r, &["raw_text"])), Some(&Value::String(line)), "the whole attachment, as written");
+    let messages = kernel.session_messages(session, 20).await?;
+    let raw = messages.iter().find(|m| m.content == "see this").and_then(|m| m.raw.clone()).ok_or("the record is captured")?;
+    let raw = Value::Object(raw);
+    let kept = at(&raw, &["content"]).and_then(|c| match c {
+        Value::Array(parts) => parts.get(1).and_then(|part| at(part, &["inlineData", "data"])).cloned(),
+        _ => None,
+    });
+    assert_eq!(kept, Some(Value::String(data)), "the whole attachment");
     Ok(())
 }
 
-/// The header, every `$set` and every info line are kept whole (#471), as
-/// their text with no parsed copy (#541): the header and `$set` lines were
-/// folded away unseen.
+/// The header, every `$set` and every info line are kept whole (#471):
+/// the header and `$set` lines were folded away unseen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn header_set_and_info_lines_are_kept_whole() -> Result<(), Box<dyn Error>> {
     let kernel = common::fresh_seeded_kernel().await?;
@@ -232,8 +230,8 @@ async fn header_set_and_info_lines_are_kept_whole() -> Result<(), Box<dyn Error>
         .iter()
         .filter(|e| e.lifecycle_event == "transcript_event")
         .filter_map(|e| match &e.payload {
-            Value::Object(o) => match (o.get("kind"), o.get("raw_text"), o.get("line")) {
-                (Some(Value::String(kind)), Some(Value::String(_)), None) => Some(kind.clone()),
+            Value::Object(o) => match (o.get("kind"), o.get("line")) {
+                (Some(Value::String(kind)), Some(Value::Object(_))) => Some(kind.clone()),
                 _ => None,
             },
             _ => None,
@@ -245,17 +243,20 @@ async fn header_set_and_info_lines_are_kept_whole() -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-/// A record and a header keep their nulls (#516), as their text (#541):
-/// read back from the engine, each line is there exactly as written.
+/// A record and a header keep their nulls (#516): read back from the
+/// engine, a key holding `null` is still there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_keeps_its_nulls() -> Result<(), Box<dyn Error>> {
     let kernel = common::fresh_seeded_kernel().await?;
     let tmp = tempfile::tempdir()?;
     arrange(&kernel, tmp.path()).await?;
     let chats = tmp.path().join("tmp").join("proj-slug").join("chats");
-    let header = r#"{"sessionId":"g-sess-n","projectHash":"abc","startTime":"2026-08-07T10:00:00.000Z","lastUpdated":"2026-08-07T10:00:00.000Z","kind":"main","summary":null}"#;
-    let user = r#"{"id":"u-n","type":"user","timestamp":"2026-08-07T10:00:01.000Z","content":[{"text":"hi"}],"displayContent":null}"#;
-    fs::write(chats.join("session-2026-08-07T10-00-gsessn.jsonl"), format!("{header}\n{user}\n"))?;
+    let body = [
+        r#"{"sessionId":"g-sess-n","projectHash":"abc","startTime":"2026-08-07T10:00:00.000Z","lastUpdated":"2026-08-07T10:00:00.000Z","kind":"main","summary":null}"#,
+        r#"{"id":"u-n","type":"user","timestamp":"2026-08-07T10:00:01.000Z","content":[{"text":"hi"}],"displayContent":null}"#,
+    ]
+    .join("\n");
+    fs::write(chats.join("session-2026-08-07T10-00-gsessn.jsonl"), body + "\n")?;
     let sources = gemini_sources(&kernel).await?;
     let report = capture_tick(&kernel, &sources, None).await?;
     assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -264,19 +265,23 @@ async fn a_record_keeps_its_nulls() -> Result<(), Box<dyn Error>> {
         .find_entity_by_name("node_session", "attr_session_descriptor", "gemini_cli/g-sess-n")
         .await?
         .expect("session entity from header line");
-    let rows: Vec<Value> = kernel
-        .db()
-        .query("SELECT raw_text FROM message WHERE session = $sess")
-        .bind(("sess", session))
-        .await?
-        .take(0)?;
-    assert_eq!(rows.first().and_then(|r| at(r, &["raw_text"])), Some(&Value::String(user.into())), "the record, its null as written");
+    let messages = kernel.session_messages(session, 10).await?;
+    let raw = messages.first().and_then(|m| m.raw.as_ref()).ok_or("the user record is captured")?;
+    assert!(matches!(raw.get("displayContent"), Some(Value::Null)), "{raw:?}");
 
     let recent = kernel.recent_telemetry(50).await?;
-    assert!(
-        recent.iter().any(|e| matches!(at(&e.payload, &["raw_text"]), Some(Value::String(t)) if t == header)),
-        "the header, its null as written"
-    );
+    let header = recent
+        .iter()
+        .find_map(|e| match &e.payload {
+            Value::Object(o) if matches!(o.get("session"), Some(Value::String(s)) if s == "g-sess-n")
+                && matches!(o.get("kind"), Some(Value::String(k)) if k == "header") =>
+            {
+                o.get("line").cloned()
+            }
+            _ => None,
+        })
+        .ok_or("the header is kept whole")?;
+    assert!(matches!(&header, Value::Object(o) if matches!(o.get("summary"), Some(Value::Null))), "{header:?}");
     Ok(())
 }
 

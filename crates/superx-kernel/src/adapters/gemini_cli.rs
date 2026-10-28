@@ -10,7 +10,7 @@
 //!   subdirectories are post-FVP).
 //! - Line 1 of each file is a session header (`sessionId`, `kind`).
 //! - `{"$set": …}` lines are header mutations, not messages: the header
-//!   and every `$set` are kept whole as `transcript_event`s, as their text (#471, #541).
+//!   and every `$set` are kept whole as `transcript_event`s (#471).
 //! - `type:"user"` — `content` is an ARRAY of parts (`{text}` /
 //!   `inlineData`); `type:"gemini"` — `content` is a plain string,
 //!   plus `thoughts`, `tokens`, `model`, optional `toolCalls`.
@@ -35,7 +35,7 @@ use surrealdb::types::{Object, RecordId, Value};
 
 use crate::capture::{AgentAdapter, DiscoveredSource, SourceRef, ADAPTERS};
 use crate::error::{KernelError, Result};
-use crate::message::NewMessage;
+use crate::message::{line_to_object, NewMessage};
 use crate::registry::{KernelModule, KernelModuleDescriptor, NodeKind, KERNEL_MODULES};
 use crate::substrate::Kernel;
 
@@ -234,6 +234,7 @@ impl GeminiCliAdapter {
             payload.insert("kind".to_string(), Value::String(kind.to_string()));
             payload.insert("session".to_string(), Value::String(session_key));
             payload.insert("file".to_string(), Value::String(file_key));
+            payload.insert("line".to_string(), Value::Object(line_to_object(json)));
             payload.insert("raw_text".to_string(), Value::String(text.to_string()));
             kernel
                 .log_telemetry_for_agent(
@@ -277,9 +278,7 @@ impl GeminiCliAdapter {
                         agent: source.agent_id.clone(),
                         role: role.to_string(),
                         content: content.clone(),
-                        // The line's text alone (`raw_text`, below): a parsed copy
-                        // made capture depend on how deep a line nests (#541).
-                        raw: None,
+                        raw: Some(line_to_object(json)),
                         seq: None,
                         emitted_at,
                     }, Some(text.to_string()))
@@ -335,6 +334,7 @@ impl GeminiCliAdapter {
                 if let Some(c) = json.get("content").and_then(|v| v.as_str()) {
                     payload.insert("content".to_string(), Value::String(c.to_string()));
                 }
+                payload.insert("line".to_string(), Value::Object(line_to_object(json)));
                 payload.insert("raw_text".to_string(), Value::String(text.to_string()));
                 kernel
                     .log_telemetry_for_agent(
@@ -354,6 +354,7 @@ impl GeminiCliAdapter {
                 payload.insert("session".to_string(), Value::String(session_key));
                 let snippet: String = json.to_string().chars().take(500).collect();
                 payload.insert("snippet".to_string(), Value::String(snippet));
+                payload.insert("line".to_string(), Value::Object(line_to_object(json)));
                 payload.insert("raw_text".to_string(), Value::String(text.to_string()));
                 kernel
                     .log_telemetry_for_agent(
@@ -384,6 +385,7 @@ impl GeminiCliAdapter {
         payload.insert("kind".to_string(), Value::String("superseded".to_string()));
         payload.insert("session".to_string(), Value::String(session_of(file_sessions, file, json)));
         payload.insert("file".to_string(), Value::String(file.to_string_lossy().to_string()));
+        payload.insert("line".to_string(), Value::Object(line_to_object(json)));
         payload.insert("raw_text".to_string(), Value::String(text.to_string()));
         kernel
             .log_telemetry_for_agent(
