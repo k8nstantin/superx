@@ -5063,6 +5063,69 @@ async fn the_export_writes_every_transcript_line_in_place_and_whole() {
     assert!(text.ends_with("end of export · 6 rows · 2 messages (2 user) · 4 transcript lines\n"), "{text}");
 }
 
+/// A row kept as its text alone (#541) reads whole (#543): the session view,
+/// the export and the jsonl file parse a message's `raw_text` where it has
+/// no `raw`, and a line's where its payload has no `line`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rows_kept_as_their_text_read_whole() {
+    use superx_mod_ui::export::{session_export, ExportOptions, Pages};
+
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "src-t").await;
+    let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"listing"},{"type":"tool_use","id":"t9","name":"Bash","input":{"command":"ls -la /deep"}}]},"sessionId":"src-t"}"#;
+    kernel
+        .db()
+        .query("CREATE $id SET session = $sess, agent = $agent, role = 'assistant', content = 'listing', raw_text = $text, valid_from = $at")
+        .bind(("id", export_id("message", 1)))
+        .bind(("sess", session.clone()))
+        .bind(("agent", agent.clone()))
+        .bind(("text", call.to_string()))
+        .bind(("at", export_at(1)))
+        .await
+        .expect("create")
+        .check()
+        .expect("message row");
+    let mode = r#"{"type":"mode","mode":"plan","sessionId":"src-t"}"#;
+    let payload = superx_kernel::message::json_to_object(
+        &serde_json::json!({ "kind": "mode", "session": "src-t", "file": "/p/t.jsonl", "raw_text": mode }),
+    );
+    kernel
+        .db()
+        .query("CREATE $id SET lifecycle_event = 'transcript_event', payload = $payload, subject = $agent, agent = $agent, valid_from = $at")
+        .bind(("id", export_id("telemetry_stream", 2)))
+        .bind(("payload", superx_kernel::types::Value::Object(payload)))
+        .bind(("agent", agent.clone()))
+        .bind(("at", export_at(2)))
+        .await
+        .expect("create")
+        .check()
+        .expect("line row");
+
+    // The session view: the call from the message's text, the line in place.
+    let rows = superx_mod_ui::activity::session_activity(&kernel, session.clone(), 50, None, None)
+        .await
+        .expect("activity");
+    assert!(
+        rows.iter().any(|r| r.rendered.contains("tool call Bash (t9)") && r.rendered.contains("ls -la /deep")),
+        "{:?}",
+        rows.iter().map(|r| &r.rendered).collect::<Vec<_>>()
+    );
+    assert!(rows.iter().any(|r| r.heading.as_deref() == Some("mode")), "the line, whole");
+
+    // The export: the same, in place, and no line counted as kept by kind only.
+    let pages = Pages { messages: 10, lines: 10, actions: 10 };
+    let everything = ExportOptions::parse(Some("everything"), Some("full"), Some("txt"), None, None).expect("options");
+    let text = exported(session_export(kernel.clone(), session.clone(), everything, export_at(5), pages)).await;
+    assert!(text.contains("tool call Bash (t9):") && text.contains("ls -la /deep"), "{text}");
+    assert!(text.contains("[mode]") && !text.contains("kept by kind only"), "{text}");
+
+    // The jsonl file: each row parsed from its text.
+    let jsonl = ExportOptions::parse(Some("everything"), Some("full"), Some("jsonl"), None, None).expect("options");
+    let text = exported(session_export(kernel.clone(), session, jsonl, export_at(5), pages)).await;
+    assert!(text.contains("\"command\":\"ls -la /deep\""), "{text}");
+    assert!(text.contains("\"mode\":\"plan\""), "{text}");
+}
+
 /// The feed's search reads every payload field that holds a string, and
 /// passes over one that holds anything else: a whole transcript line is an
 /// object, which `string::lowercase` refuses, and failed the search (#477).
@@ -5358,9 +5421,20 @@ async fn the_completeness_check_finds_a_lost_line_a_kind_only_line_and_an_unread
     read_all().await;
     assert_eq!(counted(&kernel, &mut watch).await, (4, 3, 1, false), "a line kept by kind only");
 
+    // A line kept as its text alone, as capture keeps every line since #541: whole (#543).
+    append("{\"type\":\"mode\",\"mode\":\"plan\"}\n");
+    let mut payload = line_row("mode", false);
+    payload.insert("raw_text".to_string(), text("{\"type\":\"mode\",\"mode\":\"plan\"}"));
+    kernel
+        .log_telemetry_for_agent("transcript_event", Value::Object(payload), Some(source.clone()), Some(agent.clone()))
+        .await
+        .expect("row");
+    read_all().await;
+    assert_eq!(counted(&kernel, &mut watch).await, (5, 4, 1, false), "a line kept as its text is whole");
+
     // A complete line capture has not read.
     append("{\"type\":\"mode\"}\n");
-    assert_eq!(counted(&kernel, &mut watch).await, (4, 3, 1, true), "a line waiting unread");
+    assert_eq!(counted(&kernel, &mut watch).await, (5, 4, 1, true), "a line waiting unread");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

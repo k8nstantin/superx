@@ -11,7 +11,8 @@
 //!   the lines capture read from it against the rows it wrote for them.
 //!   The adapter writes a line's row before it moves its cursor past the
 //!   line, so a line read without a row is a line lost;
-//! - **whole**: no line kept by its kind alone, as lines were before #471.
+//! - **whole**: no line kept by its kind alone, as lines were before #471:
+//!   each has its parsed copy (#471) or, since #541, its text alone.
 //!
 //! Read-only: a transcript is read as bytes from where the last count
 //! stopped, nothing in it is parsed, and the substrate is read through its
@@ -241,7 +242,8 @@ async fn count_rows(kernel: &Kernel, t: &Transcript, agent: &RecordId, counted: 
             Ok(kernel
                 .db()
                 .query(
-                    "SELECT id, valid_from, lifecycle_event, payload.line != NONE AS whole FROM telemetry_stream \
+                    "SELECT id, valid_from, lifecycle_event, (payload.line != NONE OR payload.raw_text != NONE) AS whole \
+                     FROM telemetry_stream \
                      WHERE agent = $agent AND valid_from >= $from \
                      AND (lifecycle_event = 'transcript_event' OR lifecycle_event = 'transcript_raw') \
                      AND payload.file = $file",

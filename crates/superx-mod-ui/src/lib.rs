@@ -28,6 +28,7 @@ pub mod api;
 pub mod insights;
 pub mod landed;
 pub mod models;
+mod parsed;
 mod server;
 pub mod stats;
 pub mod tasks;
