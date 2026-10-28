@@ -126,9 +126,11 @@ fn action_row(a: &TelemetryRecord) -> (String, Option<(String, String)>) {
 /// `raw.toolUseResult`, Claude Code's structured copy of a tool's output.
 /// The row already carries that output, and the feed never renders the
 /// copy, which was a fifth of every byte a session's messages read (#461).
+/// Nor its text, `raw_text`: a row with no parsed copy has it read and
+/// parsed on its own (`parsed::messages`, #543).
 pub(crate) fn projection(table: &str) -> &'static str {
     if table == "message" {
-        "* OMIT raw.toolUseResult"
+        "* OMIT raw.toolUseResult, raw_text"
     } else {
         "*"
     }
@@ -173,6 +175,11 @@ pub trait LiveRow: superx_kernel::types::SurrealValue + Send {
     fn key(&self) -> (&RecordId, chrono::DateTime<chrono::Utc>);
     /// The feed event it renders as.
     fn event(&self) -> SseEvent;
+    /// The rows as the feed renders them: a message with its parsed form,
+    /// from its text where capture kept the text alone (#543).
+    fn readable(kernel: &Kernel, rows: Vec<Self>) -> impl std::future::Future<Output = Result<Vec<Self>>> + Send + '_
+    where
+        Self: Sized;
 }
 
 impl LiveRow for TelemetryRecord {
@@ -182,6 +189,9 @@ impl LiveRow for TelemetryRecord {
     fn event(&self) -> SseEvent {
         action_event(self)
     }
+    fn readable(_kernel: &Kernel, rows: Vec<Self>) -> impl std::future::Future<Output = Result<Vec<Self>>> + Send + '_ {
+        std::future::ready(Ok(rows))
+    }
 }
 
 impl LiveRow for MessageRecord {
@@ -190,6 +200,9 @@ impl LiveRow for MessageRecord {
     }
     fn event(&self) -> SseEvent {
         message_event(self)
+    }
+    fn readable(kernel: &Kernel, rows: Vec<Self>) -> impl std::future::Future<Output = Result<Vec<Self>>> + Send + '_ {
+        crate::parsed::messages(kernel, rows)
     }
 }
 
@@ -258,6 +271,7 @@ impl LiveCursor {
                 }
             })
             .await?;
+            let rows = T::readable(kernel, rows).await?;
             for r in &rows {
                 let (id, t) = r.key();
                 self.at = t;
@@ -310,6 +324,7 @@ impl LiveCursor {
             }
         })
         .await?;
+        let rows = T::readable(kernel, rows).await?;
         for r in &rows {
             let (id, t) = r.key();
             if self.sent.insert(id.clone(), t).is_none() {
@@ -570,7 +585,7 @@ async fn recent_messages(
     q: Query<'_>,
 ) -> Result<Vec<MessageRecord>> {
     if before.is_none() && q.is_none() {
-        return whole_seconds(limit, None, |ask| async move {
+        let rows = whole_seconds(limit, None, |ask| async move {
             crate::answered("recent messages", || async {
                 Ok(kernel
                     .db()
@@ -581,7 +596,8 @@ async fn recent_messages(
             })
             .await
         })
-        .await;
+        .await?;
+        return crate::parsed::messages(kernel, rows).await;
     }
     let sql = page_query("message", None, before, q, MSG_MATCH);
     let rows: Vec<MessageRecord> = whole_seconds(limit, before, |ask| {
@@ -589,7 +605,7 @@ async fn recent_messages(
         async move { Ok(page!(kernel, "message", sql, ask, before, q)) }
     })
     .await?;
-    Ok(rows)
+    crate::parsed::messages(kernel, rows).await
 }
 
 /// The NEWEST `limit` telemetry events, optionally older than a cursor
@@ -660,6 +676,7 @@ pub async fn session_activity(
         async move { Ok(page!(kernel, "message", sql, ask, before, q, ("sess", session.clone()))) }
     })
     .await?;
+    let messages = crate::parsed::messages(kernel, messages).await?;
 
     // Two ways an action belongs to a session (see the module doc);
     // without a resolved scope only the subject arm can match — it must
