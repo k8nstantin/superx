@@ -1,0 +1,30 @@
+[package]
+name = "superx-mod-recon"
+description = "Recon: the models, the agents, thinking effort and the operator, measured from every line the kernel captured and every repository the agents worked in, kept in the module's own database — its own executable, superx-recon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Its own executable (operator, 2026-10-24): its own process, database and
+# URL, never linked into `superx`, so nothing it does can reach capture.
+[[bin]]
+name = "superx-recon"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+chrono.workspace = true
+clap.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+superx-kernel = { path = "../superx-kernel" }
+tokio = { workspace = true, features = ["signal", "net", "process", "time", "sync"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+surrealdb.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
