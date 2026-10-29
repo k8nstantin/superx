@@ -45,7 +45,7 @@
 
   <rule id="crawl-not-skim">
     <from>The operator, 2026-10-25: "crawler means slow diligent methodical"; "we crawl not skim". 2026-10-26: the crawler finds the details that are not readily apparent, and is counted on to deliver critical data no one was aware of</from>
-    <text>The crawler crawls. Every field a source carries gets a column or a table, or a line_field row that says no column holds it. Every line read is a line row that names the tables it fed, none when it fed none. Every repository is read whole: all of its history, every ref, every reflog, every blame. Every pass checks what it read against what its source holds, the kernel's lines in the range read, git's own counts, a host's totals, and records any difference; a pass that finds one is partial, the difference in its note. Speed is no goal; pacing is, and capture comes first.</text>
+    <text>The crawler crawls. Every field a source carries gets a column or a table, or a line_field row that says no column holds it. Every line read is counted in its pass, and so is every line that fed no table. Every repository is read whole: all of its history, every ref, every reflog, every blame. Every pass checks what it read against what its source holds, the kernel's lines in the range read, git's own counts, a host's totals, and records any difference; a pass that finds one is partial, the difference in its note. Speed is no goal; pacing is, and capture comes first.</text>
     <breach>the tests of t02 and t03; their live gates (passes complete, the lines read equal to the lines held); review</breach>
   </rule>
 
