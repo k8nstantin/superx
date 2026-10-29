@@ -13,8 +13,9 @@
 # Run it in a terminal of your own, never through an agent: --initialize
 # asks for the root password at that terminal, and nothing else sees it.
 #
-# Every build it installs is kept as <home>/backup/superx-recon-<commit>,
-# so the build a deploy replaces is already there under its own commit.
+# Every build it installs is kept in the module's own folder, as
+# <home>/modules/recon/backup/superx-recon-<commit>, so the build a deploy
+# replaces is already there under its own commit.
 #
 # Usage:
 #   tools/deploy_recon.sh [--initialize] [checkout]
@@ -44,6 +45,7 @@ done
 : "${SUPERX_BIN:=$HOME/.local/bin}"
 RECON="$SUPERX_BIN/superx-recon"
 PERFORMANCE="$SUPERX_BIN/superx-performance"
+BACKUP="$SUPERX_HOME/modules/recon/backup"
 
 if [ "$INITIALIZE" = yes ] && [ ! -t 0 ]; then
     echo "ERROR: --initialize asks for the root password at a terminal: run this in a terminal of your own." >&2
@@ -58,9 +60,9 @@ COMMIT="$( git -C "$CHECKOUT" rev-parse --short HEAD )"
 echo "→ build superx-recon at $COMMIT, in $CHECKOUT"
 ( cd "$CHECKOUT" && cargo build --release -p superx-mod-recon )
 
-echo "→ install it in $SUPERX_BIN, kept as $SUPERX_HOME/backup/superx-recon-$COMMIT"
-mkdir -p "$SUPERX_HOME/backup"
-cp -p "$CHECKOUT/target/release/superx-recon" "$SUPERX_HOME/backup/superx-recon-$COMMIT"
+echo "→ install it in $SUPERX_BIN, kept as $BACKUP/superx-recon-$COMMIT"
+mkdir -p "$BACKUP"
+cp -p "$CHECKOUT/target/release/superx-recon" "$BACKUP/superx-recon-$COMMIT"
 cp "$CHECKOUT/target/release/superx-recon" "$RECON.new" && mv -f "$RECON.new" "$RECON"
 
 echo "→ stop what runs"

@@ -106,7 +106,7 @@
         <result>target/release/superx-recon, built from that commit</result>
       </step>
       <step n="2" name="install">
-        <cmd>cp -p &lt;bin&gt;/superx-recon &lt;home&gt;/backup/superx-recon-&lt;the running build's commit&gt;</cmd>
+        <cmd>mkdir -p &lt;home&gt;/modules/recon/backup &amp;&amp; cp -p &lt;bin&gt;/superx-recon &lt;home&gt;/modules/recon/backup/superx-recon-&lt;the running build's commit&gt;</cmd>
         <cmd>cp target/release/superx-recon &lt;bin&gt;/superx-recon.new &amp;&amp; mv -f &lt;bin&gt;/superx-recon.new &lt;bin&gt;/superx-recon</cmd>
       </step>
       <step n="3" name="provision">
