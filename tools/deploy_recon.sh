@@ -10,8 +10,10 @@
 # retire-performance), so superx-performance is stopped too while it is
 # installed; a stop of one that does not run says so and does nothing.
 #
-# Run it in a terminal of your own, never through an agent: --initialize
-# asks for the root password at that terminal, and nothing else sees it.
+# --initialize takes the root password from a terminal, or from the
+# instance's credentials file given as the script's input, which nothing
+# prints; with the file it runs from anywhere, `!` included:
+#   tools/deploy_recon.sh --initialize <checkout> < ~/.superx/db/superx-credentials
 #
 # Every build it installs is kept in the module's own folder, as
 # <home>/modules/recon/backup/superx-recon-<commit>, so the build a deploy
@@ -47,8 +49,8 @@ RECON="$SUPERX_BIN/superx-recon"
 PERFORMANCE="$SUPERX_BIN/superx-performance"
 BACKUP="$SUPERX_HOME/modules/recon/backup"
 
-if [ "$INITIALIZE" = yes ] && [ ! -t 0 ]; then
-    echo "ERROR: --initialize asks for the root password at a terminal: run this in a terminal of your own." >&2
+if [ "$INITIALIZE" = yes ] && [ ! -t 0 ] && [ ! -s /dev/stdin ]; then
+    echo "ERROR: --initialize takes the root password from a terminal, or from $SUPERX_HOME/db/superx-credentials given as input (< file)." >&2
     exit 2
 fi
 if ! git -C "$CHECKOUT" diff --quiet HEAD --; then
