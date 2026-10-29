@@ -10,8 +10,8 @@ What it proves, and nothing more:
     a mandate's §, a table's number, a gate's id or a fallback attribute), a credential (a token's shape), a path of the
     operator's own home, or the word reader;
   - every file a spec names in a reference attribute (path, file, from, reflects, builds, where) exists, unless a task
-    of the sequence builds it, and none is a prose document (a README, CLAUDE.md, a page, docs/), the authority files
-    BLUEPRINT.md, SUPERX_SCHEMA.md and the skill's SKILL.md apart;
+    of the sequence builds or removes it, and none is a prose document (a README, CLAUDE.md, a page, docs/), the
+    authority files BLUEPRINT.md, SUPERX_SCHEMA.md and the skill's SKILL.md apart;
   - no spec carries its history: no changelog, no version-by-version header; a task file's header, branch and PR title
     carry its version attribute;
   - every rule has its from, text and breach; every decision is confirmed, with its date and where, or open, with the
@@ -114,10 +114,10 @@ def tracked(prefix):
 
 
 def built(root, task_roots):
-    """What the tasks build: paths that may be absent until their task is merged."""
+    """What the tasks build or remove: paths that may be absent, before their task is merged or after it."""
     out = set()
     for t in (list(root.iter("task")) if root is not None else []) + task_roots:
-        for p in (t.get("builds") or "").split():
+        for p in (t.get("builds") or "").split() + (t.get("removes") or "").split():
             out.add(p)
         if t.get("file"):
             out.add(t.get("file"))
@@ -132,7 +132,7 @@ def exists(token):
 
 
 def references(rel, root, built_paths, problems):
-    """Every file a spec names in a reference attribute exists, unless a task builds it, and none is prose."""
+    """Every file a spec names in a reference attribute exists, unless a task builds or removes it, and none is prose."""
     for el in root.iter():
         for attr in REF_ATTRS:
             for token in PATH_TOKEN.findall(el.get(attr) or ""):
