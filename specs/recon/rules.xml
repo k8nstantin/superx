@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SuperX Recon: the build rules. Version 0.
+
+  One file, no generator. Every rule has three parts:
+    from    - where the rule comes from: a sentence of an authority file (quoted, checked verbatim by
+              specs/recon/check.py), the merged code, or the operator's ruling with its date
+    text    - the rule, as it binds every task and every agent
+    breach  - what catches a breach, each a guard that exists or that a task of the sequence builds:
+              specs/recon/check.py over the specs, the lints (clippy, tools/skill_audit.py) over the code,
+              a test, a gate of a task, or the operator's review
+  Nothing here writes a count of the captured lines, the sessions, the repositories or the hosts.
+-->
+<rules product="SuperX Recon" epic="466" version="0" date="2026-10-26">
+
+  <rule id="one-module-its-own-process">
+    <from>BLUEPRINT.md: "It is never linked into `superx`, so nothing it does can reach capture."; "own db `superx/&lt;name&gt;` + service account". The operator, 2026-10-24 and 2026-10-25: its own executable, schema and URL; one module, one port, one schema</from>
+    <text>Recon is one module: its own executable, superx-recon; its own process, with its pid file and its logs in its module folder; its own database, superx/recon, applied by superx-recon --initialize; its own port and tab; its own parameters on its registry entity. It depends on superx-kernel alone, and no crate of the workspace depends on it. The kernel never waits on it: a recon that is stopped, slow or broken leaves capture untouched.</text>
+    <breach>a test of t01 that reads the workspace's dependency graph (no crate depends on superx-mod-recon, and it depends on no module); review</breach>
+  </rule>
+
+  <rule id="kernel-read-only">
+    <from>BLUEPRINT.md: "The kernel has zero knowledge of any module's domain."; "SELECT + CREATE only, no verb ever issues UPDATE / DELETE / DDL." The operator: the kernel is off limits to a module's work</from>
+    <text>The crawler reads the kernel's database with SELECT and nothing else, a bounded page at a time, in the order of its rows' ids, as the service account the instance names; it never writes it and never reads it through another client. No task changes superx-kernel, superx or superx-ops; what the module needs from the kernel it reads as the kernel writes it.</text>
+    <breach>review of every query the module issues; tools/skill_audit.py (§10)</breach>
+  </rule>
+
+  <rule id="append-only">
+    <from>SUPERX_SCHEMA.md: "No kernel verb ever emits UPDATE, DELETE, UPSERT, DEFINE, REMOVE, or ALTER." crates/superx-mod-recon/schema/recon.surql: "Nothing is overwritten and nothing is removed (§10)."</from>
+    <text>The module's own database takes CREATE only: a fact is a row for good, what changes about it appends a row, and the newest valid_from is the fact. The crawler never issues UPDATE, UPSERT, DELETE, REMOVE, DEFINE or ALTER; row ids are UUIDv7, set by the module's code. The structure is applied by superx-recon --initialize alone, by the operator, under root.</text>
+    <breach>tools/skill_audit.py (§10); review</breach>
+  </rule>
+
+  <rule id="the-structure-decides">
+    <from>crates/superx-mod-recon/schema/recon.surql: "Nothing here is judged." The operator, 2026-10-26: first build the structure, then the crawler that fills it</from>
+    <text>The structure, the module's one schema file, says every table, field, link, index and vocabulary the crawler writes, and a test reads the schema back out of the engine and diffs it against the file. Nothing the crawler writes is outside it. A task changes it only as its file says; any other change is designed with the operator and approved per change (§7, §11), and a task that needs one stops.</text>
+    <breach>the schema test of the module; CI's Operator-approved marker on a schema file; review</breach>
+  </rule>
+
+  <rule id="crawler-is-the-reader">
+    <from>The operator, 2026-10-26: the crawler is the reader; there are no readers beside it</from>
+    <text>One crawler reads everything the module holds: the lines, the repositories, the hosts. Nothing else in the module reads a source. A source is a part of the crawler, named for what it crawls, never a component beside it; nothing in the module, its code, its tests, its specs or its PRs is called a reader.</text>
+    <breach>specs/recon/check.py (the word in a spec); review</breach>
+  </rule>
+
+  <rule id="crawl-not-skim">
+    <from>The operator, 2026-10-25: "crawler means slow diligent methodical"; "we crawl not skim". 2026-10-26: the crawler finds the details that are not readily apparent, and is counted on to deliver critical data no one was aware of</from>
+    <text>The crawler crawls. Every field a source carries gets a column or a table, or a line_field row that says no column holds it. Every line read is a line row that names the tables it fed, none when it fed none. Every repository is read whole: all of its history, every ref, every reflog, every blame. Every pass checks what it read against what its source holds, the kernel's lines in the range read, git's own counts, a host's totals, and records any difference; a pass that finds one is partial, the difference in its note. Speed is no goal; pacing is, and capture comes first.</text>
+    <breach>the tests of t02 and t03; their live gates (passes complete, the lines read equal to the lines held); review</breach>
+  </rule>
+
+  <rule id="nothing-dropped">
+    <from>crates/superx-kernel/src/adapters/claude_code.rs: "The whole line, whatever its length: nothing is dropped (#471)." The operator, 2026-10-24: design to the requirement, never to the disk</from>
+    <text>No sampling, no cap, no truncation, no summary: a limit's fallback is no limit; a value is kept as the source wrote it, in the column the structure gives it; a line, a field or a value the crawler cannot place is counted and named, never dropped and never guessed at.</text>
+    <breach>the tests of every task; review</breach>
+  </rule>
+
+  <rule id="derived-and-rebuilt">
+    <from>crates/superx-mod-recon/schema/recon.surql: "EVERY ROW IS DERIVED, from the kernel's captured lines and from git,". The operator, 2026-10-25: the lines captured before today are read as they are, never fixed</from>
+    <text>Every row is derived from the kernel's lines, git and the hosts, and a provision rebuilds the whole database from them; the one exception is what git or a host has since expired or pruned and the crawler had kept, which the structure names. A line captured before a capture fix is read as it is: the crawler never recaptures, repairs or fills in a kernel line.</text>
+    <breach>review; the live gates after a provision</breach>
+  </rule>
+
+  <rule id="repos-from-the-logs">
+    <from>The operator, 2026-10-25: the crawler builds its list from the logs, which are the first to report a change. 2026-10-26: the crawler discovers the repositories from the session logs, then goes from the sessions into them</from>
+    <text>The repositories come from the logs: every working directory a session's lines name is followed to the checkout and the repository that hold it, and so is every root the operator names in attr_recon_include; a commit or a push a session printed sends the crawler to its repository in the same pass. A repository no session and no root leads to is never crawled, and one the operator excludes in attr_recon_exclude never is. A checkout whose folder is gone is recorded gone and keeps its history.</text>
+    <breach>the tests of t03; review</breach>
+  </rule>
+
+  <rule id="never-write-a-measured-repository">
+    <from>The operator, 2026-10-13 (#446): the product never writes to a repository it measures, or runs code in one. 2026-10-26: a dedicated folder for the repositories, under the module, into which the crawler fetches freely: the more it holds, the better</from>
+    <text>The operator's repositories are read with git, read-only: never a write, a fetch, a checkout, a lock, or a program a repository names (no diff driver, no external diff, no signature check, no fsmonitor, optional locks off). Fetching happens only into the crawler's own mirror clones, in its repos folder, which nothing else writes: a fetch takes every ref the remote advertises, nothing a mirror has fetched is ever pruned or collected, and a mirror's hooks never run.</text>
+    <breach>the tests of the module's git calls, which read every call's arguments and environment; review</breach>
+  </rule>
+
+  <rule id="hosts-read-only-with-credentials">
+    <from>The operator, 2026-10-25: the crawler gets a credentials file for the hosts. 2026-10-26: the credentials serve the hosts and the mirror clones both</from>
+    <text>The hosts are read with GET only, with the operator's read-only credentials from the credentials file. The file is mode 600 and read by the crawler alone, and the crawler refuses a file others can read. A credential is never stored, logged, printed, shown on the tab, written into a URL, a command line, the environment, git's configuration or a mirror, and never sent to a host other than the one it is for; git asks superx-recon for it when it fetches.</text>
+    <breach>the tests of t01 and t03; specs/recon/check.py (no credential written in a spec); review</breach>
+  </rule>
+
+  <rule id="parallel-by-repository">
+    <from>The operator, 2026-10-26: the crawler scales by crawling more repositories, more of them at once, the number set by a parameter</from>
+    <text>The crawler crawls one repository per worker, as many at once as attr_recon_repos_at_once allows, each worker making its own git and host calls; within a repository its steps run in their order, and a repository's facts are written by its own worker alone. The lines are crawled as one stream, in the order the kernel captured them. The pass waits for every worker before it records itself.</text>
+    <breach>the tests of t03; review</breach>
+  </rule>
+
+  <rule id="capture-first">
+    <from>BLUEPRINT.md: "It is never linked into `superx`, so nothing it does can reach capture." The operator, 2026-10-25: capturing correct, whole data is the kernel's purpose</from>
+    <text>Nothing the crawler does slows or stops capture: it reads the kernel's database a bounded page at a time, holds nothing open between pages, and reads nothing while attr_recon_read_secs is 0; a pass that cannot read waits for the next.</text>
+    <breach>the live gates, read beside capture's own ticks; review</breach>
+  </rule>
+
+  <rule id="no-hardcoded-policy">
+    <from>.claude/skills/zero-trust-execution/SKILL.md: "Facts go in columns; judgments do not."</from>
+    <text>Every tunable is a parameter attr_recon_*, with its fallback in the module's params.rs, reported by name when it is set to a value of the wrong shape; a constant that is no policy carries an audited skill-allow marker. Judgments, such as which work the operator directed, what is rework and how work is split into sittings, are parameters applied when a chart is drawn, never columns and never constants.</text>
+    <breach>tools/skill_audit.py (§9); review</breach>
+  </rule>
+
+  <rule id="types-flow">
+    <from>.claude/skills/zero-trust-execution/SKILL.md: "A `record&lt;table&gt;` is a `Thing` everywhere."</from>
+    <text>Types flow end to end: a link is a record id, a kernel line's id a Uuid, a time a DateTime&lt;Utc&gt;, from the line to the column; nothing is cast to text to pass the engine, and a refusal of the engine is fixed in the code, never by loosening the structure (§12, §14).</text>
+    <breach>tools/skill_audit.py (§14); the structure's own asserts; review</breach>
+  </rule>
+
+  <rule id="gates-are-the-truth">
+    <from>.claude/skills/zero-trust-execution/SKILL.md: "Code does not exist until `cargo test --workspace` passes."</from>
+    <text>A task is done when cargo test --workspace, cargo clippy --workspace --all-targets --all-features -- -D warnings and python3 tools/skill_audit.py pass and every gate of its file is green; nothing is called done, ready or complete before, and a gate that cannot fail is no gate.</text>
+    <breach>CI's required checks; the PR's gate table</breach>
+  </rule>
+
+  <rule id="trunk">
+    <from>.claude/skills/zero-trust-execution/SKILL.md: "Every change ties to a GitHub issue"</from>
+    <text>Each task is one issue, one branch cut from the head of main and one PR into main, merged by the operator; one open branch and one open PR at a time; a merged branch is deleted.</text>
+    <breach>review</breach>
+  </rule>
+
+  <rule id="specs-are-the-truth">
+    <from>The operator, 2026-10-26: "xmls are the source of truth"</from>
+    <text>The XML files under specs/recon/ are the source: the issues and the Build Spec page are rendered from them (build_issues.py, build_page.py) and nothing flows back but an issue's number. A spec file is committed only when specs/recon/check.py passes on it, and the check's mutation test proves the check catches what it guards.</text>
+    <breach>specs/recon/check.py; specs/recon/mutate_check.py</breach>
+  </rule>
+
+  <rule id="one-agent">
+    <from>The operator, 2026-10-26: the data lake's pack, whose rule this is, the operator's ruling of 2026-10-03 for every build from a spec</from>
+    <text>One session, one agent, sequential: the agent that holds a task does every step itself: reading, writing, testing, running the gates, writing the PR. It never spawns, delegates to, forks or messages another agent, subagent, worker, team or background session, and never asks another model to build or verify a part. A PR whose history shows another agent's hand is closed. This rule is a constraint of every task.</text>
+    <breach>review of the PR's history</breach>
+  </rule>
+
+  <rule id="one-build-per-task">
+    <from>The operator, 2026-10-26: the data lake's pack, whose rule this is, the operator's rulings of 2026-10-01 and 2026-10-05 for every build from a spec</from>
+    <text>Each version of a task file is built once: one agent, one branch, one PR; the operator reviews and merges before the next task starts. The next task's agent reads what the root's method read lists and nothing of an unmerged branch. The model is the operator's choice per task and the label records it. Only when the task file's comparison attribute is yes is it built by several agents, one per model, each from the same file version on its own branch; none is merged until the operator chooses one.</text>
+    <breach>review</breach>
+  </rule>
+
+  <rule id="agent-decides-only-what-is-listed">
+    <from>The operator, 2026-10-26: the data lake's pack, whose rule this is; the operator, 2026-10-08: "what is left to the agent's determination? not much: we are building the defined product"</from>
+    <text>Every task file lists under agent-decides the only things its agent decides: the names and the decomposition inside its own modules and tests, the means of a step within the standard library and the workspace's dependencies, the contents of its fixtures within the cases listed, its commit granularity. Everything else a build needs is written in the task file, the root, the rules, the authority files or the merged code; a build that decides anything else, or decides it differently from the file, is closed, and the step it departed from is named in the review. Every gate names the steps it proves, so a failed gate points at the step to look at.</text>
+    <breach>review of the PR against the task file's agent-decides list and its steps; the gates, each naming the steps it proves</breach>
+  </rule>
+
+  <rule id="kickoff">
+    <from>The operator, 2026-10-26: a branch and a PR are built from the task's XML file; the operator may name the session that builds a task, the spec's own included</from>
+    <text>A build starts with a model pointed at one task file in the repository, specs/recon/tasks/&lt;issue&gt;.xml. Nothing else is said at kickoff. The kickoff line is the first message of a session opened for that build, in a new session, on a checkout of the head of main updated from origin: not the session that wrote the spec, not a session that built or reviewed another build, not one that holds a conversation. There, before the branch is cut, python3 tools/skill_audit.py run on the head of main names what CI's Bright-line skill rules check names on that head, no more and no fewer: it reads no file on a path through a folder named worktrees, and every file elsewhere in the folder, whether git holds it or not; a folder where it names fewer or more is not a build folder, and the build stops there. A model whose session holds anything before the kickoff line beyond what the harness gives every session (its own text, the repository's CLAUDE.md, its settings, a command that set the model or the effort, with its output) stops at that line, says so, and builds nothing. The model writes its own label, &lt;model&gt;-&lt;effort&gt;, as the root's method model gives it. The operator may instead name a session to build a task, the spec's own included: that session builds when the operator says so, from the task file as written, reads the files in the order the root's method read gives from that word on, and its PR says it was the session the operator named. The file's start element names the branch, the PR title and the first word of every commit; a build started any other way, or on a branch or PR named any other way, does not count.</text>
+    <breach>review of the branch name and the PR title against the task file's start element; the PR body stating that the kickoff line was the session's first message, and on which checkout</breach>
+  </rule>
+
+  <rule id="every-rule-binds">
+    <from>These rules</from>
+    <text>Every rule here binds every task. Every gate of a task names in its proves attribute what it proves; a rule that no gate of a task names binds the task all the same.</text>
+    <breach>specs/recon/check.py</breach>
+  </rule>
+
+</rules>

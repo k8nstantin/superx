@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SuperX Recon, build spec version 0: task t01, the structure. File version 1 (2026-10-26).
+  An agent reads this file in the order the root's method read gives.
+  Its GitHub issue is #536, rendered from this file by specs/recon/build_issues.py.
+  The history of this file is its git log.
+-->
+<task id="t01" name="structure" issue="536" version="1" date="2026-10-26"
+      reflects="crates/superx-mod-recon/schema/recon.surql BLUEPRINT.md"
+      command="superx-recon --initialize; superx-recon start; superx-recon stop; superx-recon status; superx-recon run"
+      builds="crates/superx-mod-recon/Cargo.toml crates/superx-mod-recon/src/ crates/superx-mod-recon/tests/">
+
+  <start>Pointed at this file, you are told nothing else. This line must be the first message of a session opened for this build, in a new session, on a checkout of the head of main updated from origin, with no other branch checked out and no worktree of an earlier build checked out in the build folder; if your session holds anything before it beyond what rules.xml kickoff allows the harness (its own text, the repository's CLAUDE.md, its settings, a command that set your model or effort, with its output), such as a conversation, the writing of this spec or another build, stop here, say so, and build nothing, unless the operator named this session to build this task (rules.xml kickoff), and then build on the operator's word. Your label is your own, &lt;model&gt;-&lt;effort&gt;: your model's name and the effort you run at, as your session reports them, lowercase, dots and spaces as hyphens; when your session does not report your effort, ask the operator for it before you cut the branch. Read whole, in the order the root's method read gives. Then run python3 tools/skill_audit.py on the head of main and compare what it names with what CI's Bright-line skill rules check names on that head: one fewer is a file the audit did not read, since it reads none on a path through a folder named worktrees, and one more is a file git does not hold; either is a stop: say so and build nothing (gate G3). Cut the branch feat/536-structure-v1-&lt;model&gt;-&lt;effort&gt; from the head of main. Every commit message starts with #536 and carries no attribution trailer. Build what this file says and run its local gates; ask the operator for the deploy its live gates need (root method deploy, this file's gates note) and run them on the operator's word; push the branch and open the PR into main with gh: the title "#536 structure v1 · &lt;model&gt;-&lt;effort&gt;", the body the root's method pr step lists, naming the root's version and this file's version attribute, and, since the PR removes the schema files of two crates, this line, which CI looks for: "Operator-approved: 2026-10-26 — the recon structure and the removal of superx-mod-performance and superx-mod-repos with their schemas (specs/recon/root.xml, decisions structure and retire-performance)". What this file, the root, the rules and the merged code do not say is a stop, not a guess.</start>
+
+  <piece>The structure task. superx-mod-performance becomes superx-mod-recon around the approved structure, which is already in place, crates/superx-mod-recon/schema/recon.surql, and which this task never writes. The crate's code moves into that folder and takes the recon names: the executable superx-recon, the module recon, the database superx/recon, the parameters attr_recon_*, the module folder &lt;home&gt;/modules/recon/ with its repos folder and its credentials file. The crawler does what it does today, on the new structure, which only adds to what it may write. Status lists every table of the structure, and says what the credentials file holds by host, never a token. superx-mod-performance and superx-mod-repos leave the workspace, and the core UI links to no module's own UI (#534). Nothing is crawled that is not crawled today: the lines in depth are t02, the repositories, their mirrors and their hosts t03.</piece>
+
+  <before>Merged on main when this task starts: superx-mod-performance (#507, #509, #511, #513): its executable superx-performance, its database superx/performance from its schema/performance.surql, the deep crawl's tables, and its crawler, which reads the captured lines into the first tables and lists the repositories the sessions worked in. superx-mod-repos (#500 to #505), retired on 2026-10-25: its process stopped, its crate still a member of the workspace. superx-mod-ui, whose nav lists the module UIs the registry names and whose Status page links each one. This spec, and the structure, crates/superx-mod-recon/schema/recon.surql, the one file in that folder. On the operator's instance superx-performance runs, and superx-recon does not exist.</before>
+
+  <after>Who uses what this task builds: t02 (#537), which crawls the captured lines in depth into the lines' tables; t03 (#538), which crawls the repositories, their mirrors in the repos folder and their hosts with the credentials file; t04 (#539), the tab, on the module's own port. Nothing else of the workspace reads the module.</after>
+
+  <reflects>
+    <file path="crates/superx-mod-recon/schema/recon.surql" keys="the header; every table, field and index">
+      <quote>THIS FILE IS THE STRUCTURE (§11): the model changes here first, with the</quote>
+      <quote>Nothing is overwritten and nothing is removed (§10).</quote>
+    </file>
+    <file path="BLUEPRINT.md" keys="the phase plan's measurement row; decision D17">
+      <quote>It is never linked into `superx`, so nothing it does can reach capture.</quote>
+      <quote>A module is a self-contained mini-app: own db `superx/&lt;name&gt;` + service account (via `modules provision`), own dir, own log target, own CLI namespace, own parameters; kernel is the hub — modules depend on the kernel only, never on each other</quote>
+    </file>
+  </reflects>
+
+  <reads>
+    <code path="crates/superx-mod-performance/">Every file, whole: what moves.</code>
+    <code path="crates/superx-kernel/src/substrate.rs">module_db: a module's database is superx/&lt;name&gt; and its account superx_mod_&lt;name&gt;.</code>
+    <code path="crates/superx-kernel/src/provision.rs">provision_module_schema, which --initialize calls.</code>
+    <code path="crates/superx-mod-ui/src/api.rs">ModuleView.</code>
+    <code path="crates/superx-mod-ui/src/server.rs">api_status.</code>
+    <code path="crates/superx-mod-ui/ui/src/App.tsx">The shell and its nav.</code>
+    <code path="crates/superx-mod-ui/ui/src/pages/status/SystemsSection.tsx">The module table.</code>
+    <code path="crates/superx-mod-ui/tests/ui.rs">How the core UI's routes are tested.</code>
+    <code path="Cargo.toml">The workspace's members.</code>
+  </reads>
+
+  <command>
+    <form>superx-recon [--home &lt;home&gt;] --initialize | start | stop | status | run, the commands superx-performance takes today, under the new name: --initialize provisions superx/recon from the structure, asking for the root password once; start runs the module in the background; stop stops it; status says whether it runs, its URL, what its database holds, the credentials file by host, and its parameters; run is the process itself, which start runs.</form>
+    <runs>Its own process, as today: never linked into superx (rules one-module-its-own-process).</runs>
+  </command>
+
+  <build>
+    <module path="crates/superx-mod-recon/" name="the recon module">
+      <step n="1" name="the move">Every file of crates/superx-mod-performance moves to crates/superx-mod-recon with git mv, keeping its history, except schema/performance.surql, which is removed with git rm: the structure that replaces it is crates/superx-mod-recon/schema/recon.surql, already there. Cargo.toml: the package superx-mod-recon, its description naming the recon module and what it measures, its one binary superx-recon from src/main.rs, its dependencies unchanged.</step>
+      <step n="2" name="the structure">lib.rs: SCHEMA_DDL is include_str!("../schema/recon.surql") and MODULE_NAME is "recon", so the module's database is superx/recon and its account superx_mod_recon (crates/superx-kernel/src/substrate.rs module_db), its registry entry recon, its folder &lt;home&gt;/modules/recon/. The structure only adds to the tables the crawler writes and to the words they take, so the crawler's code writes what it writes today, unchanged.</step>
+      <step n="3" name="the names">Every name the module shows takes recon: the executable superx-recon in its command line, its help, its messages and its errors; its pid file superx-recon.pid and its output log superx-recon.out in the module folder; daemon.rs's executable name superx-recon, a running process told by its name as ps prints it, so names_this_executable accepts superx-recon alone, the Linux cut of a long name keeping the rule it has today for any name it would cut; the Host guard's refusal, status's first line and own_hint's provisioning command name superx-recon; every tracing target "performance" becomes "recon". The doc comments say recon. None says the core UI links to the module: the module publishes its URL in the registry (attr_module_ui_url, unchanged), and the core UI does not read it after step 11.</step>
+      <step n="4" name="the parameters">Every attr_performance_&lt;name&gt; becomes attr_recon_&lt;name&gt;: the same names after the prefix, in the same order, with the same fallbacks, the same shapes and the same reports. No parameter is added or removed. The struct params.rs reads the set values with takes a name other than `reader`.</step>
+      <step n="5" name="the module folder">At run, after the module is registered as starting and before it says it is active: the module folder holds repos/, made with mode 700 when it is absent and left as it is, mode included, when it is present; and credentials.json, written when it is absent, with mode 600, holding the template, and never written when it is present, whatever it holds. The template is this JSON object, written by serde_json::to_string_pretty with a newline after it: "_doc" with the text "Read-only tokens, one per host. github.com: a fine-grained personal access token with read access to metadata, contents, pull requests, issues, actions, commit statuses, deployments and administration. bitbucket.org: an API token with the read scopes. Keep this file mode 600. superx-recon reads it, never writes it once it exists, and never shows a token."; "github.com" with the object holding "token": ""; "bitbucket.org" with the object holding "token": "". Instance gains the two paths, &lt;home&gt;/modules/recon/repos and &lt;home&gt;/modules/recon/credentials.json, beside the pid file and the logs.</step>
+      <step n="6" name="the credentials">A module of the crate reads credentials.json, when status renders and when a part of the crawler asks for a host's token (t03). Its answer is one of: none, the file is absent; refused, the file's mode lets anyone but its owner read or write it (its mode and 0o077 is not 0), and nothing of it is read; unreadable, the file is not a JSON object whose every key that does not start with "_" names an object with a string "token", with serde_json's reason or the key that broke it; or the hosts, each github.com or bitbucket.org, with its token or no token when the string is empty, and every other key that does not start with "_" named as an unknown host. A key that starts with "_" is a note and is skipped. A token is held in a type whose Debug and Display print &lt;token&gt; and nothing of the token, and no log line, status text, error or test output ever holds one.</step>
+      <step n="7" name="the status">status lists every table of the structure but pass and pass_source, each once, in groups, each table with the name its rows are called: sessions, context, models and tools as today; repos as today, and after its tables merge_resolution "merge resolutions", tag "tags" and commit_trailer "trailers"; then hosts: host_repository "repositories on hosts", host_repository_state "host settings", host_user "host accounts", host_crawl "host crawls", host_call "host calls", host_object "host objects", mirror "mirrors", pull_request "pull requests", pull_request_state "pull request states", pull_request_commit "pull request commits", pull_request_file "pull request files", pull_request_review "reviews", pull_request_event "pull request events", issue "issues", issue_state "issue states", host_comment "comments", ci_run "CI runs", ci_run_state "CI run states", ci_log "CI logs", release "releases", host_rule "host rules", deployment "deployments", deployment_state "deployment states"; then census as today. After the groups and before the last pass, two lines: `credentials &lt;path&gt;: ` and then, when the answer of step 6 is the hosts, github.com then bitbucket.org, each `&lt;host&gt; token set` or `&lt;host&gt; no token`, then each unknown host as `&lt;host&gt; unknown`, joined by ` · `; when it is none, `none`; refused, `refused, mode &lt;its mode in octal&gt;; chmod 600 &lt;path&gt;`; unreadable, `unreadable: &lt;the reason&gt;`. Then `repos       &lt;path&gt;`, the repos folder.</step>
+      <step n="8" name="the words">No file of the crate calls anything a `reader`: the doc comments that do, in crawler/value.rs, crawler/lines/mod.rs, crawler/lines/facts.rs, crawler/lines/kernel.rs, crawler/lines/state.rs, crawler/lines/formats/mod.rs and crawler/lines/formats/claude_code.rs, say the crawler or what it does, their meaning unchanged.</step>
+      <step n="9" name="the tests">The crate's tests move with it and take the new names. tests/schema.rs's contract becomes the structure's: every table the structure defines, with its fields and indexes, written out in the test as today, and the account superx_mod_recon. Every refusal it holds today stands but one: the step fetch, which the structure makes valid; that case takes the step push. The new rules are proven as the tests element lists them.</step>
+    </module>
+
+    <module path="crates/superx-mod-repos/" name="the retired crate">
+      <step n="10" name="leaving the workspace">git rm -r crates/superx-mod-repos. The workspace's members name crates/superx-mod-recon in place of crates/superx-mod-performance, and no longer name crates/superx-mod-repos; Cargo.lock follows. Its database, superx/repos, is the operator's to drop (decision retire-performance); nothing here touches it.</step>
+    </module>
+
+    <module path="crates/superx-mod-ui/" name="the core UI">
+      <step n="11" name="no module links">App.tsx: the nav lists the pages and nothing else; the Module UIs section, the status query that fed it and the imports only it used are removed. SystemsSection.tsx: the module table has no UI column, its header and its cell removed, and Anchor is no longer imported. api.rs: ModuleView has no ui_url. server.rs: api_status reads no attr_module_ui_url. The generated ModuleView.ts follows from cargo test. The bundle under ui/dist is rebuilt with npm --prefix crates/superx-mod-ui/ui run build: the earlier index-*.js removed, the new one added, index.html updated.</step>
+    </module>
+
+    <tests path="crates/superx-mod-recon/tests/ crates/superx-mod-ui/tests/ui.rs">
+      <how>cargo test, on SurrealDB's in-memory engine, the kernel's schema and the structure applied as the merged tests apply them. The tests the crate has today move with it and take the new names; a test whose item is below is that test, named by its item. A fixture is the test's own: a home in a scratch folder, a token the test makes up and searches every output for, never a real one. The workspace's dependency graph is read with cargo metadata. One test per item below, named by the item it proves; no item without its test; no test outside this list and the moved ones: a rule the list lacks is a stop, not a test.</how>
+      <prove step="2">SCHEMA_DDL is the bytes of crates/superx-mod-recon/schema/recon.surql</prove>
+      <prove step="2">provisioning leaves exactly the tables, fields and indexes the structure defines, each written out in the contract, and the account superx_mod_recon and no other</prove>
+      <prove step="2">nothing that was there survives provisioning</prove>
+      <prove step="2">a host other than github.com and bitbucket.org is refused by host_repository and by host_user, and one repository on a host twice by idx_host_repository</prove>
+      <prove step="2">a host object of a kind the structure does not list, one whose hash is not of the length a SHA-256 has, one whose key is a float, and one from a call that does not exist are each refused by the field they break, and the same content of one object twice by idx_host_object</prove>
+      <prove step="2">a host call that is not a GET, and one with a negative rate limit left, are refused by method and rate_remaining; a host crawl with an outcome outside its words, and one with negative calls, by outcome and calls</prove>
+      <prove step="2">the same account twice is refused by idx_host_user, and a second mirror of one repository on a host by idx_mirror</prove>
+      <prove step="2">a pull request numbered 0, the same pull request twice, and one by an account that does not exist are refused by number, idx_pull_request and author; a state whose head commit is shorter than a hash and one with negative lines added, by head_sha and additions; a pull request's commit shorter than a hash, by hash</prove>
+      <prove step="2">a comment of a kind other than inline or general is refused by kind, and the same comment object twice by idx_host_comment_obj; the same timeline event object twice by idx_pull_request_event_obj; the same issue twice by idx_issue</prove>
+      <prove step="2">a CI run of a kind the structure does not list, the same CI run twice, and one under a parent that does not exist are refused by kind, idx_ci_run and parent; a second log of one run by idx_ci_log; a negative attempt by attempt</prove>
+      <prove step="2">a host rule of a kind the structure does not list is refused by kind, and the same deployment twice by idx_deployment</prove>
+      <prove step="2">a ref of a mirror that does not exist is refused by mirror, and the same reflog entry of a mirror twice by idx_ref_move_mirror</prove>
+      <prove step="2">a commit tied to a session a way other than printed or pull_request, and through a pull request that does not exist, are refused by via and pull_request; a source other than lines, repos and hosts by source; a crawl step push by step; a git call of the step hosts by step; a main line chosen a way outside its words by mainline_from</prove>
+      <prove step="2">the words the structure adds are taken: a crawl step fetch, hosts, tags, merges and patches, a git call fetch, tags, merges and patches, a source hosts, a main line host_default, a commit tied through a pull request, a ref and a reflog entry of a mirror, a file copied, and each operation a checkout can be in the middle of</prove>
+      <prove step="2">a file a commit moved or copied of another kind is refused by kind; a commit with no author or committer offset, and a patch id shorter than a hash, by author_offset, committer_offset and patch_id; a negative count of lines changed ignoring space by added_ignoring_space and removed_ignoring_space</prove>
+      <prove step="2">an operation git does not have, an operation's commit or a rebase's onto that is not a hash, and a negative count of rebase commands are refused by operations, operation_commits, rebase_onto, rebase_done and rebase_left; a branch ahead or behind its upstream or the main line by a negative count by upstream_ahead, upstream_behind, mainline_ahead and mainline_behind</prove>
+      <prove step="2">the same file of a merge resolved twice, the same tag object twice and the same place among a commit's trailers twice are refused by idx_merge_resolution, idx_tag and idx_commit_trailer; a tag of an object type git does not have by target_type, and a tag object or target that is not a hash by object and target</prove>
+      <prove step="2">a checkout state written without the operations columns, as the crawler writes it today, is taken</prove>
+      <prove step="3">the executable names itself superx-recon in its help, and an unknown command is refused naming it</prove>
+      <prove step="3">names_this_executable accepts superx-recon and refuses superx-performance, superx-repos, a name cut short of superx-recon, superx-recon with a character more, superx and the empty name</prove>
+      <prove step="3">the module registers as recon: the registry says starting, then active with its URL in attr_module_ui_url, then stopped</prove>
+      <prove step="3">a request addressed to another name is refused HTTP 403, the refusal naming superx-recon</prove>
+      <prove step="3">status's first line names superx-recon, and an unprovisioned database's hint names superx-recon --initialize</prove>
+      <prove step="3">the pid file is the module folder's superx-recon.pid and the logs are its logs folder, the module folder being &lt;home&gt;/modules/recon</prove>
+      <prove step="3">stop ends superx-recon even while it starts, and never signals another process</prove>
+      <prove step="4">every parameter's name starts with attr_recon_, and the names after the prefix, their order and their fallbacks are today's</prove>
+      <prove step="5">run makes the repos folder with mode 700 when it is absent, and leaves one that is present as it is, its mode included</prove>
+      <prove step="5">run writes credentials.json with mode 600 holding the template when it is absent, and never writes it when it is present, however it differs from the template</prove>
+      <prove step="6">a credentials file that anyone but its owner may read or write is refused, nothing of it read, the answer naming its mode</prove>
+      <prove step="6">a missing file is none; a file that is not an object of hosts with string tokens is unreadable, naming why; a key starting with an underscore is skipped; a host other than github.com and bitbucket.org is unknown; an empty token is no token</prove>
+      <prove step="6">a token never shows: not in Debug, Display, status text, an error or a log line, the test's own token searched for in each</prove>
+      <prove step="7">status counts every table the provisioned database has but pass and pass_source, each once</prove>
+      <prove step="7">the repos group ends with merge_resolution, tag and commit_trailer, and the hosts group lists its tables in the order step 7 gives, each with the name step 7 gives it</prove>
+      <prove step="7">status's credentials line says each host in the order step 7 gives, an unknown host after them, and none, refused and unreadable as step 7 words them; and its repos line names the repos folder</prove>
+      <prove step="8">no file under crates/superx-mod-recon/src or crates/superx-mod-recon/tests holds the word `reader`</prove>
+      <prove step="10">no crate of the workspace depends on superx-mod-recon, it depends on no other module's crate, and neither superx-mod-performance nor superx-mod-repos is a member of the workspace</prove>
+      <prove step="11">the core UI's status answer names no module UI: no module it lists carries a ui_url</prove>
+    </tests>
+  </build>
+
+  <agent-decides>The names and the decomposition of the private functions and types inside the crate and its tests, the credentials module's name included; the means of each step within the standard library and the workspace's dependencies; the contents of the test fixtures within the items the tests element lists; the granularity of the commits within the root's commits step. Nothing else: no name of a command, file, path, table, parameter, line or status word other than this file's; no change to the crawler's behaviour; no new dependency; no number; no default; no test the list lacks. What is not here and not in the root, the rules, the authority files or the merged code is a stop (root method silence).</agent-decides>
+
+  <gates>
+    <note>Local gates run in the checkout, from the repository root. The live gates run after the operator has deployed the branch's head (root method deploy) with these steps of this task's own: the release built with cargo build --release -p superx-mod-recon; superx-recon installed in &lt;bin&gt;, where none was before, so nothing is backed up; superx-performance --home &lt;home&gt; stop; superx-recon --home &lt;home&gt; --initialize, the root password typed by the operator in a terminal; superx-recon --home &lt;home&gt; start. superx-performance stays installed and stopped until the operator drops its database (decision retire-performance). The agent asks for these with every value filled, waits for the operator's word, and runs the live gates' commands only. &lt;port&gt; is the port status prints in its url line.</note>
+    <gate id="G1" kind="local" proves="every step: the code compiles clean">
+      <cmd>cargo clippy --workspace --all-targets --all-features -- -D warnings</cmd>
+      <expect>exit 0</expect>
+    </gate>
+    <gate id="G2" kind="local" proves="steps 1 to 11, each rule by its test">
+      <cmd>cargo test --workspace</cmd>
+      <expect>every `test result:` line says ok with 0 failed; the tests of this file's list are among them, each named by its item; none is ignored that is not ignored on main</expect>
+    </gate>
+    <gate id="G3" kind="local" proves="the mandates the audit reads, over every file the task owns">
+      <cmd>python3 tools/skill_audit.py</cmd>
+      <expect>no violation in a file this task owns; outside them, what CI's Bright-line skill rules check names on the head of main the branch was cut from, no more and no fewer, which stands as main's (root method lint; start)</expect>
+    </gate>
+    <gate id="G4" kind="local" proves="step 11: the bundle the core UI serves holds no module link">
+      <cmd>npm --prefix crates/superx-mod-ui/ui run build</cmd>
+      <cmd>grep -c 'Module UIs' crates/superx-mod-ui/ui/dist/assets/index-*.js</cmd>
+      <expect>the build exits 0, and grep prints 0</expect>
+    </gate>
+    <gate id="G5" kind="local" proves="step 2: the structure untouched; the spec intact">
+      <cmd>git diff --exit-code origin/main -- crates/superx-mod-recon/schema/recon.surql</cmd>
+      <cmd>python3 specs/recon/check.py</cmd>
+      <expect>git exits 0 and prints nothing; the check's last line begins `check ok`</expect>
+    </gate>
+    <gate id="G6" kind="live" proves="steps 2, 3, 5, 6 and 7 on the operator's instance: the module runs as recon on the structure, and its first pass completes">
+      <cmd>superx-recon --home &lt;home&gt; status</cmd>
+      <expect>a `running     pid` line; a `database    superx/recon` line followed by one line per group, hosts among them, every count 0 in the hosts group; the line `credentials &lt;home&gt;/modules/recon/credentials.json: github.com no token · bitbucket.org no token`; and, run again until it shows one, a `last pass` line ending `(complete)` with the rows it wrote</expect>
+    </gate>
+    <gate id="G7" kind="live" proves="step 3: the module's URL answers its own name and refuses any other">
+      <cmd>curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:&lt;port&gt;/status</cmd>
+      <cmd>curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: evil.example' http://127.0.0.1:&lt;port&gt;/status</cmd>
+      <expect>the first prints the code of HTTP 200, the second the code of HTTP 403</expect>
+    </gate>
+    <gate id="G8" kind="live" proves="step 5: the repos folder and the credentials file, as made">
+      <cmd>ls -ld &lt;home&gt;/modules/recon/repos &lt;home&gt;/modules/recon/credentials.json</cmd>
+      <expect>the folder's mode `drwx------` and the file's `-rw-------`</expect>
+    </gate>
+  </gates>
+
+  <owns>crates/superx-mod-recon/Cargo.toml, crates/superx-mod-recon/src/**, crates/superx-mod-recon/tests/**, moved from crates/superx-mod-performance with git mv and changed as the steps say; the removal of crates/superx-mod-performance/** and crates/superx-mod-repos/**; Cargo.toml's members and Cargo.lock; crates/superx-mod-ui/ui/src/App.tsx, crates/superx-mod-ui/ui/src/pages/status/SystemsSection.tsx, crates/superx-mod-ui/src/api.rs, crates/superx-mod-ui/src/server.rs and crates/superx-mod-ui/ui/src/generated/ModuleView.ts, the changes of step 11 and nothing else in them; the test step 11 adds to crates/superx-mod-ui/tests/ui.rs; crates/superx-mod-ui/ui/dist/**, as the build of step 11 writes it.</owns>
+  <forbid>crates/superx-mod-recon/schema/recon.surql, the structure, which no task writes; crates/superx-kernel/**; crates/superx/**; crates/superx-ops/**; crates/superx-mod-entities/**; crates/superx-mod-specs/**; crates/superx-mod-hello/**; schema/**; SUPERX_SCHEMA.md; BLUEPRINT.md; specs/**; tools/**; .github/**; .claude/**; every other file of crates/superx-mod-ui/**. Nothing on the operator's instance is touched by the agent: the deploy is the operator's (root method deploy).</forbid>
+
+  <done>On the branch: crates/superx-mod-recon with its code, its tests and the structure it applies byte for byte; crates/superx-mod-performance and crates/superx-mod-repos gone from the workspace; the core UI without module links. G1 to G8 green, their evidence in the PR as the root method pr lists it, the PR body naming the root's version and this file's version and carrying the operator's approval line the start element gives. After this task the operator's instance runs superx-recon on superx/recon, its first pass complete, its repos folder and its credentials file in place, the credentials file waiting for the operator's tokens.</done>
+</task>
