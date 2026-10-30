@@ -15,6 +15,8 @@ pub struct Read {
     pub header: Header,
     /// Where the session was working, when the line says.
     pub place: Option<Place>,
+    /// The prompt whose turn the line is in (Claude Code's `promptId`).
+    pub prompt_id: Option<String>,
     pub facts: Vec<Fact>,
 }
 
@@ -52,8 +54,9 @@ pub struct Place {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fact {
     Prompt(Prompt),
+    Trigger(Trigger),
     Reply(Box<ReplyLine>),
-    Result(ToolResult),
+    Result(Box<ToolResult>),
     Turn(Turn),
     Compaction(Compaction),
     Away(Away),
@@ -98,6 +101,32 @@ pub struct Prompt {
     /// An interrupt that stopped tool calls under way: every call of the
     /// session's newest reply that has no result yet ends `interrupted`.
     pub stops_tools: bool,
+    /// Where the line says it came from, all as written.
+    pub turn: TurnPosition,
+}
+
+/// What a line says of the turn it starts (Claude Code): its prompt's id,
+/// how it came in, how tool calls were being approved, and its place in the
+/// session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnPosition {
+    pub prompt_id: Option<String>,
+    pub source: Option<String>,
+    pub permission_mode: Option<String>,
+    pub turn_index: Option<i64>,
+    pub prompt_index: Option<i64>,
+}
+
+/// A line that set an agent working without the operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trigger {
+    /// The agent's own word for it.
+    pub kind: String,
+    /// Who sent it, as the line names it.
+    pub source: Option<String>,
+    pub prompt_id: Option<String>,
+    /// What it said, whole.
+    pub text: String,
 }
 
 /// One line of a model's reply: for Claude Code, one content block; for
@@ -115,6 +144,19 @@ pub struct ReplyLine {
     pub turn_effort: Option<String>,
     pub stop_reason: Option<String>,
     pub subagent: bool,
+    /// The agent's version on the line.
+    pub client_version: Option<String>,
+    /// What steered it, as Claude Code names it.
+    pub skill: Option<String>,
+    pub plugin: Option<String>,
+    pub mcp_server: Option<String>,
+    pub mcp_tool: Option<String>,
+    /// A refusal's category and explanation.
+    pub refusal: Option<String>,
+    pub refusal_text: Option<String>,
+    /// Why the prompt cache was missed, and the input tokens that missed it.
+    pub cache_miss: Option<String>,
+    pub cache_missed: Option<i64>,
     /// The reply's counts as this line has them.
     pub counts: Option<Counts>,
     pub text: Text,
@@ -145,6 +187,9 @@ pub struct Counts {
     pub web_searches: Option<i64>,
     pub web_fetches: Option<i64>,
     pub service_tier: Option<String>,
+    /// The cache writes by how long they are kept (Claude).
+    pub cache_write_1h_tokens: Option<i64>,
+    pub cache_write_5m_tokens: Option<i64>,
     /// The whole usage object, as captured.
     pub usage: Object,
 }
@@ -195,6 +240,12 @@ pub struct Call {
     pub input_bytes: i64,
     /// The call asked to run outside the sandbox.
     pub sandbox_off: bool,
+    /// The skill a skill call loads.
+    pub skill: Option<String>,
+    /// The model a subagent call asks for.
+    pub model: Option<String>,
+    /// The time limit the call set.
+    pub timeout_ms: Option<i64>,
     /// Where a shell command ran, when the call says (Gemini); otherwise
     /// the session's working directory at the call.
     pub dir: Option<String>,
@@ -244,8 +295,29 @@ pub struct ToolResult {
     pub edits: Vec<Edit>,
     /// What a shell command printed, for the commands it ran.
     pub output: Option<String>,
+    /// What the tool returned, as text, when it did not end `ok`.
+    pub text: Option<String>,
     /// The git or GitHub actions the agent itself noted on the result.
     pub noted: Vec<GitEvent>,
+    /// What the line carrying it alone says of it (Claude Code).
+    pub line: ResultLine,
+    /// What the tool reported beside it (Claude Code's `toolUseResult`).
+    pub persisted_bytes: Option<i64>,
+    pub return_note: Option<String>,
+    pub background_task: Option<String>,
+}
+
+/// What a line that carries one result alone says of it: who let the call
+/// run, how a refused call was refused, and the sandbox.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResultLine {
+    pub decision: Option<String>,
+    pub decided_by: Option<String>,
+    pub decision_source: Option<String>,
+    pub decision_reason: Option<String>,
+    pub denial: Option<String>,
+    pub operator_feedback: Option<String>,
+    pub sandboxed: Option<bool>,
     /// The hosts the sandbox stopped the command reaching.
     pub sandbox_hosts: Vec<String>,
 }
@@ -255,6 +327,7 @@ pub struct ToolResult {
 pub enum EditKind {
     Created,
     Modified,
+    Deleted,
 }
 
 impl EditKind {
@@ -263,6 +336,7 @@ impl EditKind {
         match self {
             Self::Created => "created",
             Self::Modified => "modified",
+            Self::Deleted => "deleted",
         }
     }
 }
@@ -276,6 +350,8 @@ pub enum CountedFrom {
     Strings,
     /// The whole content it wrote.
     Content,
+    /// The files Claude Code saw a shell command change, with their hunks.
+    Shell,
 }
 
 impl CountedFrom {
@@ -285,11 +361,12 @@ impl CountedFrom {
             Self::Patch => "patch",
             Self::Strings => "strings",
             Self::Content => "content",
+            Self::Shell => "shell",
         }
     }
 }
 
-/// A file a file tool changed.
+/// A file a tool changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
     pub path: String,

@@ -17,25 +17,30 @@
 //!   limit, an API error), not a model's reply.
 //! - A user line is the operator's only when `origin.kind` is `human`;
 //!   task notifications, peers, coordinators and reminders arrive on the
-//!   same kind of line. A `!` command (`<bash-input>`), a slash command
-//!   (`<command-name>`) and an interrupt (`[Request interrupted by user…`)
-//!   carry no origin. Tool results come back on user lines, one
-//!   `tool_result` block each, with what the tool reported in
+//!   same kind of line, and are triggers. A `!` command (`<bash-input>`), a
+//!   slash command (`<command-name>`) and an interrupt (`[Request
+//!   interrupted by user…`) carry no origin. Tool results come back on user
+//!   lines, one `tool_result` block each, with what the tool reported in
 //!   `toolUseResult`.
 //! - `system` lines: `turn_duration` (`durationMs`, `messageCount`),
 //!   `compact_boundary` (`compactMetadata`), `away_summary` (`content`).
 //! - An `attachment` line of type `queued_command` is a prompt typed while
 //!   the agent worked; `origin.kind` is `human` when it is the operator's.
 //! - Every line carries `cwd`, `gitBranch`, `entrypoint` and `version`.
+//! - Every other kind of line it writes ([`NO_TABLE`]), its other system
+//!   lines and attachments, and the files beside its transcripts feed no
+//!   table: they are read, counted, and their fields listed.
 
 use chrono::{DateTime, Utc};
 use superx_kernel::types::Value;
 
+use crate::crawler::lines::census::Shapes;
 use crate::crawler::lines::facts::{
     Away, Call, Compaction, Counts, CountedFrom, Edit, EditKind, Fact, GitAction, GitEvent, Header, Outcome, Place,
-    Prompt, PromptKind, Read, ReplyLine, Text, Thinking, ToolResult, Turn,
+    Prompt, PromptKind, Read, ReplyLine, ResultLine, Text, Thinking, ToolResult, Trigger, Turn, TurnPosition,
 };
-use crate::crawler::value::{at, chars, flag, float, int, json_len, lines, list, object, some_text, text};
+use crate::crawler::lines::kernel::Body;
+use crate::crawler::value::{at, chars, flag, float, int, json_len, lines, list, object, some_text, text, Columns};
 
 /// The agent, as the kernel names it.
 pub const AGENT: &str = superx_kernel::adapters::claude_code::AGENT_NAME;
@@ -43,11 +48,176 @@ pub const AGENT: &str = superx_kernel::adapters::claude_code::AGENT_NAME;
 /// The tool that runs shell commands.
 pub const SHELL_TOOL: &str = "Bash";
 
-/// The `system` lines the crawler reads.
-pub const SYSTEM_SUBTYPES: [&str; 3] = ["turn_duration", "compact_boundary", "away_summary"];
+/// A file beside the transcripts, as the kernel keeps it (#520).
+pub const SIDE_FILE: &str = "file";
 
-/// The `attachment` lines the crawler reads.
-pub const ATTACHMENT_TYPES: [&str; 1] = ["queued_command"];
+/// The kinds of line Claude Code writes that feed no table, beside its
+/// other system lines and attachments.
+pub const NO_TABLE: [&str; 23] = [
+    "file-history-snapshot",
+    "file-history-delta",
+    "last-prompt",
+    "atis-latch",
+    "agent-name",
+    "fork-context-ref",
+    "started",
+    "launched",
+    "result",
+    "failed",
+    "artifact-autoreact-ledger",
+    "artifact-comment-monitor",
+    "api-request",
+    "api-request-blob",
+    "api-request-shape",
+    "ai-title",
+    "permission-mode",
+    "mode",
+    "cost-state",
+    "pr-link",
+    "frame-link",
+    "queue-operation",
+    SIDE_FILE,
+];
+
+/// How Claude Code's lines name their fields: the blocks of a message's
+/// content by their type, and the maps it keys by data.
+pub const SHAPES: Shapes = Shapes {
+    content: Some("message.content"),
+    result: Some("toolUseResult"),
+    keyed_by_data: &[
+        "modelUsage",
+        "snapshot.trackedFileBackups",
+        "artifacts",
+        "wireToolInputs",
+        "wireIngestContext",
+        "toolUseResult[AskUserQuestion].answers",
+        "toolUseResult[AskUserQuestion].annotations",
+        "message.content[tool_use:Artifact].input.files",
+    ],
+};
+
+/// What the reading takes from every line, whatever its kind: where the
+/// session works, how the agent was started and its version, and when the
+/// line was written.
+pub const STORED_ON_EVERY_LINE: &[&str] = &["cwd", "gitBranch", "entrypoint", "version", "timestamp"];
+
+/// What the reading puts in a column, by kind of line; a path ending in
+/// `.**` is held whole, and `*` stands for any tool.
+pub const STORED: &[(&str, &[&str])] = &[
+    (
+        "user",
+        &[
+            "message.content",
+            "message.content[text].text",
+            "promptId",
+            "promptSource",
+            "permissionMode",
+            "turnPosition.turnIndex",
+            "turnPosition.promptIndex",
+            "origin.kind",
+            "origin.from",
+            "origin.producer",
+            "origin.name",
+            "message.content[tool_result:*].content",
+            "message.content[tool_result:*].content[].text",
+            "toolUseResult[*].durationMs",
+            "toolUseResult[*].durationSeconds",
+            "toolUseResult[*].filePath",
+            "toolUseResult[*].userModified",
+            "toolUseResult[*].gitOperation.pr.number",
+            "toolUseResult[*].gitOperation.pr.url",
+            "toolUseResult[*].gitOperation.push.branch",
+            "toolUseResult[*].gitOperation.branch.ref",
+            "toolUseResult[*].gitOperation.commit.sha",
+            "toolUseResult[*].gitOperation.commit.hash",
+            "toolUseResult[*].persistedOutputSize",
+            "toolUseResult[*].returnCodeInterpretation",
+            "toolUseResult[*].backgroundTaskId",
+            "toolUseResult[*].bashEditDiff.files[].filePath",
+            "permissionDecision.decision",
+            "permissionDecision.reasonType",
+            "permissionDecision.source",
+            "permissionDecision.reasonCode",
+            "toolDenialKind",
+            "userFeedback",
+            "sandboxed",
+            "sandboxViolations[].host",
+        ],
+    ),
+    (
+        "assistant",
+        &[
+            "message.id",
+            "requestId",
+            "message.model",
+            "requestedModel",
+            "message.content[fallback].from.model",
+            "advisorModel",
+            "effort",
+            "perTurnEffort",
+            "message.stop_reason",
+            "isSidechain",
+            "message.usage.**",
+            "attributionSkill",
+            "attributionPlugin",
+            "attributionMcpServer",
+            "attributionMcpTool",
+            "message.stop_details.category",
+            "message.stop_details.explanation",
+            "message.diagnostics.cache_miss_reason.type",
+            "message.diagnostics.cache_miss_reason.cache_missed_input_tokens",
+            "apiBlockIndex",
+            "thinkingDurationMs",
+            "thinkingDisplay",
+            "message.content[thinking].thinking",
+            "message.content[tool_use:*].id",
+            "message.content[tool_use:*].name",
+            "message.content[tool_use:*].input.file_path",
+            "message.content[tool_use:*].input.notebook_path",
+            "message.content[tool_use:*].input.path",
+            "message.content[tool_use:*].input.command",
+            "message.content[tool_use:*].input.description",
+            "message.content[tool_use:*].input.pattern",
+            "message.content[tool_use:*].input.url",
+            "message.content[tool_use:*].input.query",
+            "message.content[tool_use:*].input.subagent_type",
+            "message.content[tool_use:*].input.run_in_background",
+            "message.content[tool_use:*].input.dangerouslyDisableSandbox",
+            "message.content[tool_use:*].input.timeout",
+            "message.content[tool_use:Skill].input.skill",
+            "message.content[tool_use:Agent].input.model",
+        ],
+    ),
+    ("system/turn_duration", &["durationMs", "messageCount"]),
+    (
+        "system/compact_boundary",
+        &[
+            "compactMetadata.trigger",
+            "compactMetadata.preTokens",
+            "compactMetadata.postTokens",
+            "compactMetadata.cumulativeDroppedTokens",
+            "compactMetadata.durationMs",
+        ],
+    ),
+    ("system/away_summary", &["content"]),
+    (
+        "attachment/queued_command",
+        &[
+            "attachment.prompt",
+            "attachment.prompt[].text",
+            "attachment.origin.kind",
+            "attachment.origin.from",
+            "attachment.origin.producer",
+            "attachment.origin.name",
+            "attachment.commandMode",
+            "promptId",
+            "promptSource",
+            "permissionMode",
+            "turnPosition.turnIndex",
+            "turnPosition.promptIndex",
+        ],
+    ),
+];
 
 /// The model Claude Code names on a notice it wrote itself.
 const SYNTHETIC_MODEL: &str = "<synthetic>";
@@ -59,6 +229,39 @@ const REFUSALS: [&str; 2] = ["The user doesn't want to proceed with this tool us
 const INTERRUPT: &str = "[Request interrupted by user";
 const INTERRUPT_FOR_TOOLS: &str = "[Request interrupted by user for tool use";
 
+/// The tool that loads a skill, and the one that starts a subagent.
+const SKILL_TOOL: &str = "Skill";
+const AGENT_TOOL: &str = "Agent";
+
+/// A line as the kernel kept it, read.
+#[must_use]
+pub fn read_kept(body: &Body, kernel_kind: Option<&str>, at_time: DateTime<Utc>) -> Read {
+    match body {
+        Body::Json(line) => read(line, at_time),
+        // Kept by its kind alone (before #471): its kind says whether the
+        // format knows it, and nothing of it is left to read.
+        Body::Missing => match kernel_kind {
+            Some(kind) if kind == "system" || kind == "attachment" || NO_TABLE.contains(&kind) => Read::nothing(),
+            _ => Read::unknown(),
+        },
+        Body::Text(_) | Body::NotJson => Read::unknown(),
+    }
+}
+
+/// A line's kind: its type; a system line's type and subtype, and an
+/// attachment's type and its attachment's type, joined by a slash; where
+/// the line holds no type, the kind the kernel gave it.
+#[must_use]
+pub fn kind(line: &Value, kernel_kind: Option<&str>) -> String {
+    let joined = |kind: &str, sub: Option<&str>| sub.map_or_else(|| kind.to_string(), |sub| format!("{kind}/{sub}"));
+    match text(line, &["type"]) {
+        Some("system") => joined("system", text(line, &["subtype"])),
+        Some("attachment") => joined("attachment", text(line, &["attachment", "type"])),
+        Some(kind) => kind.to_string(),
+        None => kernel_kind.unwrap_or_default().to_string(),
+    }
+}
+
 /// One line, read. `at_time` is when the line was written.
 #[must_use]
 pub fn read(line: &Value, at_time: DateTime<Utc>) -> Read {
@@ -67,6 +270,7 @@ pub fn read(line: &Value, at_time: DateTime<Utc>) -> Read {
         Some("user") => user(line, at_time),
         Some("system") => system(line),
         Some("attachment") => attachment(line),
+        Some(kind) if NO_TABLE.contains(&kind) => Read::nothing(),
         _ => Read::unknown(),
     };
     read.header =
@@ -76,6 +280,9 @@ pub fn read(line: &Value, at_time: DateTime<Utc>) -> Read {
         branch: some_text(line, &["gitBranch"]),
         says_branch: at(line, &["gitBranch"]).is_some(),
     });
+    let mut columns = Columns::default();
+    read.prompt_id = columns.text(line, &["promptId"]);
+    read.known &= columns.placed();
     read
 }
 
@@ -88,6 +295,7 @@ fn assistant(line: &Value, at_time: DateTime<Utc>) -> Read {
         return Read::nothing();
     }
     let mut known = model.is_some();
+    let mut columns = Columns::default();
     let first = int(line, &["apiBlockIndex"]);
     let blocks = list(line, &["message", "content"]);
     let mut added = 0;
@@ -112,7 +320,7 @@ fn assistant(line: &Value, at_time: DateTime<Utc>) -> Read {
                     signature_chars: chars(text(block, &["signature"]).unwrap_or_default()),
                 });
             }
-            Some("tool_use") => match call(block, at_time) {
+            Some("tool_use") => match call(block, at_time, &mut columns) {
                 Some(c) => calls.push(c),
                 None => known = false,
             },
@@ -126,29 +334,36 @@ fn assistant(line: &Value, at_time: DateTime<Utc>) -> Read {
     if counts.is_none() {
         known = false;
     }
-    Read {
-        known,
-        facts: vec![Fact::Reply(Box::new(ReplyLine {
-            agent_id,
-            request_id: some_text(line, &["requestId"]),
-            model,
-            requested_model: some_text(line, &["requestedModel"]).or(fell_back_from),
-            advisor_model: some_text(line, &["advisorModel"]),
-            effort: some_text(line, &["effort"]),
-            turn_effort: some_text(line, &["perTurnEffort"]),
-            stop_reason: some_text(line, &["message", "stop_reason"]),
-            subagent: flag(line, &["isSidechain"]).unwrap_or(false),
-            counts,
-            text: Text::Added(added),
-            thinking,
-            calls,
-            results: Vec::new(),
-            blocks: i64::try_from(blocks.len()).unwrap_or(i64::MAX),
-            cumulative: false,
-            thinking_dropped: thinking_dropped(line),
-        }))],
-        ..Read::default()
-    }
+    let refused = text(line, &["message", "stop_details", "type"]) == Some("refusal");
+    let reply = ReplyLine {
+        agent_id,
+        request_id: some_text(line, &["requestId"]),
+        model,
+        requested_model: some_text(line, &["requestedModel"]).or(fell_back_from),
+        advisor_model: some_text(line, &["advisorModel"]),
+        effort: some_text(line, &["effort"]),
+        turn_effort: some_text(line, &["perTurnEffort"]),
+        stop_reason: some_text(line, &["message", "stop_reason"]),
+        subagent: flag(line, &["isSidechain"]).unwrap_or(false),
+        client_version: columns.text(line, &["version"]),
+        skill: columns.text(line, &["attributionSkill"]),
+        plugin: columns.text(line, &["attributionPlugin"]),
+        mcp_server: columns.text(line, &["attributionMcpServer"]),
+        mcp_tool: columns.text(line, &["attributionMcpTool"]),
+        refusal: if refused { columns.text(line, &["message", "stop_details", "category"]) } else { None },
+        refusal_text: if refused { columns.text(line, &["message", "stop_details", "explanation"]) } else { None },
+        cache_miss: columns.text(line, &["message", "diagnostics", "cache_miss_reason", "type"]),
+        cache_missed: columns.count(line, &["message", "diagnostics", "cache_miss_reason", "cache_missed_input_tokens"]),
+        counts,
+        text: Text::Added(added),
+        thinking,
+        calls,
+        results: Vec::new(),
+        blocks: i64::try_from(blocks.len()).unwrap_or(i64::MAX),
+        cumulative: false,
+        thinking_dropped: thinking_dropped(line),
+    };
+    Read { known: known && columns.placed(), facts: vec![Fact::Reply(Box::new(reply))], ..Read::default() }
 }
 
 /// The earlier thinking a request left out: its `input_transformations` of
@@ -180,19 +395,24 @@ fn counts(line: &Value) -> Option<Counts> {
         web_searches: optional(&["server_tool_use", "web_search_requests"]).ok()?,
         web_fetches: optional(&["server_tool_use", "web_fetch_requests"]).ok()?,
         service_tier: some_text(usage, &["service_tier"]),
+        cache_write_1h_tokens: optional(&["cache_creation", "ephemeral_1h_input_tokens"]).ok()?,
+        cache_write_5m_tokens: optional(&["cache_creation", "ephemeral_5m_input_tokens"]).ok()?,
         usage: object(line, &["message", "usage"])?.clone(),
     })
 }
 
 /// A `tool_use` block. Its input is read by what it names, whatever the
-/// tool: a file, a command, a search, a page, a subagent.
-fn call(block: &Value, at_time: DateTime<Utc>) -> Option<Call> {
+/// tool: a file, a command, a search, a page, a subagent, a skill, a time
+/// limit.
+fn call(block: &Value, at_time: DateTime<Utc>, columns: &mut Columns) -> Option<Call> {
     let input = at(block, &["input"]);
     let field = |key: &str| input.and_then(|i| some_text(i, &[key]));
+    let tool = some_text(block, &["name"])?;
+    let none = Value::None;
+    let input_or_none = input.unwrap_or(&none);
     Some(Call {
         call_id: some_text(block, &["id"])?,
         at: at_time,
-        tool: some_text(block, &["name"])?,
         path: field("file_path").or_else(|| field("notebook_path")).or_else(|| field("path")),
         command: field("command"),
         description: field("description"),
@@ -203,17 +423,17 @@ fn call(block: &Value, at_time: DateTime<Utc>) -> Option<Call> {
         background: input.and_then(|i| flag(i, &["run_in_background"])).unwrap_or(false),
         input_bytes: input.map_or(0, json_len),
         sandbox_off: input.and_then(|i| flag(i, &["dangerouslyDisableSandbox"])).unwrap_or(false),
+        skill: if tool == SKILL_TOOL { columns.text(input_or_none, &["skill"]) } else { None },
+        model: if tool == AGENT_TOOL { columns.text(input_or_none, &["model"]) } else { None },
+        timeout_ms: columns.count(input_or_none, &["timeout"]),
+        tool,
         dir: None,
     })
 }
 
 fn user(line: &Value, at_time: DateTime<Utc>) -> Read {
     match at(line, &["message", "content"]) {
-        Some(Value::String(s)) => prompt(line, s.clone(), 0).map_or_else(Read::nothing, |p| Read {
-            known: true,
-            facts: vec![Fact::Prompt(p)],
-            ..Read::default()
-        }),
+        Some(Value::String(s)) => typed(line, s.clone(), 0),
         Some(Value::Array(blocks)) => {
             if blocks.iter().any(|b| text(b, &["type"]) == Some("tool_result")) {
                 return results(line, blocks, at_time);
@@ -229,15 +449,27 @@ fn user(line: &Value, at_time: DateTime<Utc>) -> Read {
                     _ => known = false,
                 }
             }
-            let facts = prompt(line, texts.join("\n"), images).map(Fact::Prompt).into_iter().collect();
-            Read { known, facts, ..Read::default() }
+            let mut read = typed(line, texts.join("\n"), images);
+            read.known &= known;
+            read
         }
         _ => Read::unknown(),
     }
 }
 
+/// A user line that is no tool result: the operator's prompt, a trigger,
+/// or neither, which feeds no table.
+fn typed(line: &Value, message: String, images: i64) -> Read {
+    let mut columns = Columns::default();
+    let fact = match prompt(line, &message, images, &mut columns) {
+        Some(p) => Some(Fact::Prompt(p)),
+        None => trigger(line, line, message, &mut columns).map(Fact::Trigger),
+    };
+    Read { known: columns.placed(), facts: fact.into_iter().collect(), ..Read::default() }
+}
+
 /// Whose a user line is, and what kind of message: the operator's only.
-fn prompt(line: &Value, message: String, images: i64) -> Option<Prompt> {
+fn prompt(line: &Value, message: &str, images: i64, columns: &mut Columns) -> Option<Prompt> {
     if ["isSidechain", "isMeta", "isCompactSummary"].iter().any(|key| flag(line, &[key]) == Some(true)) {
         return None;
     }
@@ -260,16 +492,72 @@ fn prompt(line: &Value, message: String, images: i64) -> Option<Prompt> {
     if kind != PromptKind::Typed && text(line, &["origin", "kind"]).is_some_and(|k| k != "human") {
         return None;
     }
-    Some(Prompt { kind, stops_tools: message.starts_with(INTERRUPT_FOR_TOOLS), images, text: message })
+    Some(Prompt {
+        kind,
+        stops_tools: message.starts_with(INTERRUPT_FOR_TOOLS),
+        images,
+        text: message.to_string(),
+        turn: turn_position(line, columns),
+    })
+}
+
+/// What a line says of the turn it starts.
+fn turn_position(line: &Value, columns: &mut Columns) -> TurnPosition {
+    TurnPosition {
+        prompt_id: columns.text(line, &["promptId"]),
+        source: columns.text(line, &["promptSource"]),
+        permission_mode: columns.text(line, &["permissionMode"]),
+        turn_index: columns.count(line, &["turnPosition", "turnIndex"]),
+        prompt_index: columns.count(line, &["turnPosition", "promptIndex"]),
+    }
+}
+
+/// A user line that is no prompt and set the agent working: marked by who
+/// wrote it (`origin.kind`, any but `human`), a compaction's summary, or
+/// the instruction an agent gave its subagent, its first line. `line` is
+/// the whole line, `marked` the object that carries the marks.
+fn trigger(line: &Value, marked: &Value, message: String, columns: &mut Columns) -> Option<Trigger> {
+    let kind = match text(marked, &["origin", "kind"]) {
+        Some(kind) if kind != "human" => kind.to_string(),
+        _ if flag(marked, &["isCompactSummary"]) == Some(true) => "compact_summary".to_string(),
+        _ if flag(marked, &["isSidechain"]) == Some(true)
+            && absent(marked, &["parentUuid"])
+            && absent(marked, &["origin"]) =>
+        {
+            "subagent".to_string()
+        }
+        _ => return None,
+    };
+    Some(Trigger {
+        kind,
+        source: source(marked, columns),
+        prompt_id: columns.text(line, &["promptId"]),
+        text: message,
+    })
+}
+
+/// Who sent a trigger, as its origin names it: `from`, else `producer`,
+/// else `name`.
+fn source(marked: &Value, columns: &mut Columns) -> Option<String> {
+    ["from", "producer", "name"]
+        .iter()
+        .find(|key| !absent(marked, &["origin", key]))
+        .and_then(|key| columns.text(marked, &["origin", key]))
+}
+
+/// No value at `path`, or a null one.
+fn absent(v: &Value, path: &[&str]) -> bool {
+    matches!(at(v, path), None | Some(Value::None | Value::Null))
 }
 
 /// A user line of tool results: one block each, with what the tool
-/// reported beside it, and the hosts its sandbox stopped, when the line
-/// holds one.
+/// reported beside it, and what the line says of the result when it
+/// carries that result alone.
 fn results(line: &Value, blocks: &[Value], at_time: DateTime<Utc>) -> Read {
-    let reported = at(line, &["toolUseResult"]);
     let only_one = blocks.iter().filter(|b| text(b, &["type"]) == Some("tool_result")).count() == 1;
-    let hosts = if only_one { sandbox_hosts(line) } else { Vec::new() };
+    let reported = if only_one { at(line, &["toolUseResult"]) } else { None };
+    let mut columns = Columns::default();
+    let says = if only_one { result_line(line, &mut columns) } else { ResultLine::default() };
     let mut known = true;
     let mut facts = Vec::new();
     for b in blocks {
@@ -279,17 +567,41 @@ fn results(line: &Value, blocks: &[Value], at_time: DateTime<Utc>) -> Read {
                     known = false;
                     continue;
                 };
-                let r = result(call_id, b, if only_one { reported } else { None }, at_time);
-                facts.push(Fact::Result(ToolResult { sandbox_hosts: hosts.clone(), ..r }));
+                let (r, shape_known) = result(call_id, b, reported, at_time, &mut columns);
+                known &= shape_known;
+                facts.push(Fact::Result(Box::new(ToolResult { line: says.clone(), ..r })));
             }
             Some("text" | "image") => {}
             _ => known = false,
         }
     }
-    Read { known, facts, ..Read::default() }
+    Read { known: known && columns.placed(), facts, ..Read::default() }
 }
 
-fn result(call_id: String, block: &Value, reported: Option<&Value>, at_time: DateTime<Utc>) -> ToolResult {
+/// What a line that carries one result alone says of it: who let the call
+/// run (`permissionDecision`), how a refused call was refused and what the
+/// operator wrote, and the sandbox.
+fn result_line(line: &Value, columns: &mut Columns) -> ResultLine {
+    ResultLine {
+        decision: columns.text(line, &["permissionDecision", "decision"]),
+        decided_by: columns.text(line, &["permissionDecision", "reasonType"]),
+        decision_source: columns.text(line, &["permissionDecision", "source"]),
+        decision_reason: columns.text(line, &["permissionDecision", "reasonCode"]),
+        denial: columns.text(line, &["toolDenialKind"]),
+        operator_feedback: columns.text(line, &["userFeedback"]),
+        sandboxed: columns.flag(line, &["sandboxed"]),
+        sandbox_hosts: sandbox_hosts(line),
+    }
+}
+
+/// One result, and whether its shape was one the format reads.
+fn result(
+    call_id: String,
+    block: &Value,
+    reported: Option<&Value>,
+    at_time: DateTime<Utc>,
+    columns: &mut Columns,
+) -> (ToolResult, bool) {
     let content = at(block, &["content"]);
     let said = content.map(content_text).unwrap_or_default();
     let outcome = if flag(block, &["is_error"]) == Some(true) {
@@ -322,20 +634,34 @@ fn result(call_id: String, block: &Value, reported: Option<&Value>, at_time: Dat
         Some(r) if at(r, &["stdout"]).is_some() || at(r, &["stderr"]).is_some() => {
             Some(format!("{}\n{}", text(r, &["stdout"]).unwrap_or_default(), text(r, &["stderr"]).unwrap_or_default()))
         }
-        _ if !said.is_empty() => Some(said),
+        _ if !said.is_empty() => Some(said.clone()),
         _ => None,
     };
-    ToolResult {
+    let (edits, shape_known) = match (outcome, reported) {
+        (Outcome::Ok, Some(r)) => match at(r, &["bashEditDiff"]) {
+            Some(diff) => shell_edits(diff).map_or((Vec::new(), false), |edits| (edits, true)),
+            None => (edit(r).into_iter().collect(), true),
+        },
+        _ => (Vec::new(), true),
+    };
+    let none = Value::None;
+    let reported_or_none = reported.unwrap_or(&none);
+    let r = ToolResult {
         call_id,
         at: at_time,
         outcome,
         ms,
         bytes,
-        edits: if outcome == Outcome::Ok { reported.and_then(edit).into_iter().collect() } else { Vec::new() },
+        edits,
         output,
+        text: (outcome != Outcome::Ok).then_some(said),
         noted: reported.map(noted).unwrap_or_default(),
-        sandbox_hosts: Vec::new(),
-    }
+        line: ResultLine::default(),
+        persisted_bytes: columns.count(reported_or_none, &["persistedOutputSize"]),
+        return_note: columns.text(reported_or_none, &["returnCodeInterpretation"]),
+        background_task: columns.text(reported_or_none, &["backgroundTaskId"]),
+    };
+    (r, shape_known)
 }
 
 /// The hosts a sandbox stopped a command reaching (`sandboxViolations`),
@@ -401,6 +727,56 @@ fn edit(reported: &Value) -> Option<Edit> {
         counted_from: CountedFrom::Strings,
         operator_changed,
     })
+}
+
+/// The files Claude Code saw a shell command change (`bashEditDiff`): an
+/// edit per entry of its files, counted from its hunks; none when it is
+/// marked shared, since other commands ran meanwhile and the call alone did
+/// not change them. `None` when its shape is not one the format reads.
+fn shell_edits(diff: &Value) -> Option<Vec<Edit>> {
+    if flag(diff, &["shared"]) == Some(true) {
+        return Some(Vec::new());
+    }
+    let Some(Value::Array(files)) = at(diff, &["files"]) else { return None };
+    let mut edits = Vec::new();
+    for file in files.iter() {
+        let path = some_text(file, &["filePath"])?;
+        let kind = if flag(file, &["created"]) == Some(true) {
+            EditKind::Created
+        } else if flag(file, &["deleted"]) == Some(true) {
+            EditKind::Deleted
+        } else {
+            EditKind::Modified
+        };
+        let (mut added, mut removed) = (0, 0);
+        let hunks: &[Value] = match at(file, &["hunks"]) {
+            None | Some(Value::None | Value::Null) => &[],
+            Some(Value::Array(hunks)) => hunks.as_slice(),
+            Some(_) => return None,
+        };
+        for hunk in hunks {
+            let hunk_lines: Vec<&str> = match hunk {
+                Value::String(s) => s.lines().collect(),
+                Value::Object(_) => list(hunk, &["lines"])
+                    .iter()
+                    .map(|l| match l {
+                        Value::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                _ => return None,
+            };
+            for l in hunk_lines {
+                if l.starts_with('+') {
+                    added += 1;
+                } else if l.starts_with('-') {
+                    removed += 1;
+                }
+            }
+        }
+        edits.push(Edit { path, kind, added, removed, counted_from: CountedFrom::Shell, operator_changed: false });
+    }
+    Some(edits)
 }
 
 /// The git and GitHub actions Claude Code noted on a result
@@ -476,6 +852,9 @@ fn system(line: &Value) -> Read {
     Read { known: true, facts: vec![fact], ..Read::default() }
 }
 
+/// A queued command: the operator's prompt typed while the agent worked, a
+/// trigger marked by its origin or, with none, by its command mode, or
+/// neither.
 fn attachment(line: &Value) -> Read {
     if text(line, &["attachment", "type"]) != Some("queued_command") {
         return Read::nothing();
@@ -491,19 +870,40 @@ fn attachment(line: &Value) -> Read {
         ),
         _ => return Read::unknown(),
     };
+    let mut columns = Columns::default();
     let kind = match text(a, &["origin", "kind"]) {
-        Some("human") if message.starts_with("<bash-input>") => PromptKind::Shell,
-        Some("human") if message.starts_with("<command-name>") => PromptKind::Command,
-        Some("human") => PromptKind::Queued,
+        Some("human") if message.starts_with("<bash-input>") => Some(PromptKind::Shell),
+        Some("human") if message.starts_with("<command-name>") => Some(PromptKind::Command),
+        Some("human") => Some(PromptKind::Queued),
         // Claude Code 2.1.295 left a queued `!` command unmarked.
-        None if message.starts_with("<bash-input>") => PromptKind::Shell,
-        _ => return Read::nothing(),
+        None if message.starts_with("<bash-input>") => Some(PromptKind::Shell),
+        _ => None,
     };
-    Read {
-        known: true,
-        facts: vec![Fact::Prompt(Prompt { kind, text: message, images, stops_tools: false })],
-        ..Read::default()
+    let fact = match kind {
+        Some(kind) => Some(Fact::Prompt(Prompt {
+            kind,
+            text: message,
+            images,
+            stops_tools: false,
+            turn: turn_position(line, &mut columns),
+        })),
+        None => queued_trigger(line, a, message, &mut columns).map(Fact::Trigger),
+    };
+    Read { known: columns.placed(), facts: fact.into_iter().collect(), ..Read::default() }
+}
+
+/// A queued command that set the agent working without the operator:
+/// marked by its origin, any but `human`; with no origin, by its command
+/// mode, any but `prompt`.
+fn queued_trigger(line: &Value, a: &Value, message: String, columns: &mut Columns) -> Option<Trigger> {
+    if text(a, &["origin", "kind"]).is_some() {
+        return trigger(line, a, message, columns);
     }
+    if !absent(a, &["origin"]) {
+        return None;
+    }
+    let mode = text(a, &["commandMode"]).filter(|m| *m != "prompt")?;
+    Some(Trigger { kind: mode.to_string(), source: None, prompt_id: columns.text(line, &["promptId"]), text: message })
 }
 
 #[cfg(test)]
@@ -546,7 +946,7 @@ mod tests {
         read.facts
             .iter()
             .find_map(|f| match f {
-                Fact::Result(r) => Some(r),
+                Fact::Result(r) => Some(r.as_ref()),
                 _ => None,
             })
             .expect("a result")
@@ -668,12 +1068,12 @@ mod tests {
             ),
             when(),
         );
-        assert_eq!(only_result(&stopped).sandbox_hosts, vec!["bitbucket.org".to_string(), "github.com".to_string()]);
+        assert_eq!(only_result(&stopped).line.sandbox_hosts, vec!["bitbucket.org".to_string(), "github.com".to_string()]);
         let clean = read(
             &result_line(serde_json::json!({ "type": "tool_result", "tool_use_id": "toolu_8", "content": "a.rs" }), serde_json::json!({ "stdout": "a.rs", "stderr": "" })),
             when(),
         );
-        assert!(only_result(&clean).sandbox_hosts.is_empty());
+        assert!(only_result(&clean).line.sandbox_hosts.is_empty());
     }
 
     #[test]
@@ -753,7 +1153,7 @@ mod tests {
             (serde_json::json!("not the operator"), serde_json::json!({ "origin": null })),
         ] {
             let r = read(&user(content.clone(), extra), when());
-            assert!(r.known && r.facts.is_empty(), "{content} is not the operator's: {r:?}");
+            assert!(r.known && only_prompt(&r).is_none(), "{content} is not the operator's: {r:?}");
         }
     }
 

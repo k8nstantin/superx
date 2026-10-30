@@ -97,6 +97,64 @@ pub fn time(v: &Value, path: &[&str]) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(t).ok().map(|d| d.with_timezone(&Utc))
 }
 
+/// Reads a line's values into columns, and keeps whether every one could be
+/// placed: absent or null is none, and a value of another type than its
+/// column's is one the crawler cannot place, so the line is counted unread
+/// (rules nothing-dropped).
+#[derive(Debug)]
+pub struct Columns {
+    placed: bool,
+}
+
+impl Default for Columns {
+    fn default() -> Self {
+        Self { placed: true }
+    }
+}
+
+impl Columns {
+    /// Every value read so far was placed.
+    #[must_use]
+    pub fn placed(&self) -> bool {
+        self.placed
+    }
+
+    /// Text at `path`; none when it is empty, as the other text columns.
+    pub fn text(&mut self, v: &Value, path: &[&str]) -> Option<String> {
+        match at(v, path) {
+            None | Some(Value::None | Value::Null) => None,
+            Some(Value::String(s)) => (!s.is_empty()).then(|| s.clone()),
+            Some(_) => self.unplaced(),
+        }
+    }
+
+    /// A count at `path`: a whole number, 0 or more.
+    pub fn count(&mut self, v: &Value, path: &[&str]) -> Option<i64> {
+        match at(v, path) {
+            None | Some(Value::None | Value::Null) => None,
+            Some(Value::Number(n)) => match whole(n) {
+                Some(n) if n >= 0 => Some(n),
+                _ => self.unplaced(),
+            },
+            Some(_) => self.unplaced(),
+        }
+    }
+
+    /// A flag at `path`.
+    pub fn flag(&mut self, v: &Value, path: &[&str]) -> Option<bool> {
+        match at(v, path) {
+            None | Some(Value::None | Value::Null) => None,
+            Some(Value::Bool(b)) => Some(*b),
+            Some(_) => self.unplaced(),
+        }
+    }
+
+    fn unplaced<T>(&mut self) -> Option<T> {
+        self.placed = false;
+        None
+    }
+}
+
 /// A count of characters, as the database keeps counts.
 #[must_use]
 pub fn chars(s: &str) -> i64 {

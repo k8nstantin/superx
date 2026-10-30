@@ -1,10 +1,10 @@
 //! Every query the `lines` source issues against the module's own
-//! database, in one place: where it last stopped reading, and what a
-//! session and a reply already hold. The rows it writes go through
-//! [`crate::crawler::store`]. Nothing here emits UPDATE or DELETE (§10).
-//! Of several rows for one thing, the newest is picked here by
-//! `valid_from`, never by an index's order: SurrealDB 3.1's index on a
-//! datetime orders rows within a second wrongly (#486).
+//! database, in one place: where it last stopped reading, what a session
+//! and a reply already hold, and every field the census has written. The
+//! rows it writes go through [`crate::crawler::store`]. Nothing here emits
+//! UPDATE or DELETE (§10). Of several rows for one thing, the newest is
+//! picked here by `valid_from`, never by an index's order: SurrealDB 3.1's
+//! index on a datetime orders rows within a second wrongly (#486).
 
 use std::collections::HashSet;
 
@@ -12,8 +12,9 @@ use chrono::{DateTime, Utc};
 use superx_kernel::types::{RecordId, Uuid, Value};
 use superx_kernel::{Db, Result};
 
+use crate::crawler::lines::census::{Field, Fields};
 use crate::crawler::lines::facts::Counts;
-use crate::crawler::value::{at, int, text};
+use crate::crawler::value::{at, flag, int, text};
 
 /// The last line the `lines` source read in the newest pass that read
 /// one: where it starts next. Passes are seconds apart, so the index's
@@ -57,8 +58,12 @@ pub struct SessionHolds {
     /// The session's newest place.
     pub place: Option<(String, Option<String>, DateTime<Utc>)>,
     pub replies: Vec<HeldReply>,
-    /// Lines already written as a prompt, a turn, a compaction or a recap.
+    /// Lines already written as a prompt, a trigger, a turn, a compaction
+    /// or a recap.
     pub lines: HashSet<Uuid>,
+    /// The `promptId` of the newest of its prompts and triggers that has
+    /// one, by the order the kernel captured their lines.
+    pub prompt_id: Option<String>,
     pub calls: Vec<HeldCall>,
     /// Calls that have a result, an edit (by file), git events, a test run
     /// or a build run, by the call row's UUID: a set keyed by a record id is
@@ -90,7 +95,8 @@ pub struct HeldCall {
 const SESSION_HOLDS: &str = "
     SELECT cwd, branch, at, valid_from FROM session_place WHERE session = $sess;
     SELECT id, agent_id, kernel_message, at FROM reply WHERE session = $sess;
-    SELECT VALUE kernel_message FROM prompt WHERE session = $sess;
+    SELECT kernel_message, prompt_id FROM prompt WHERE session = $sess;
+    SELECT kernel_message, prompt_id FROM trigger WHERE session = $sess;
     SELECT VALUE kernel_message FROM turn WHERE session = $sess;
     SELECT VALUE kernel_message FROM compaction WHERE session = $sess;
     SELECT VALUE kernel_message FROM away WHERE session = $sess;
@@ -114,16 +120,31 @@ pub async fn session_holds(db: &Db, session: &RecordId) -> Result<SessionHolds> 
     let places: Vec<Value> = res.take(0)?;
     let replies: Vec<Value> = res.take(1)?;
     let mut lines = HashSet::new();
-    for i in 2..=5 {
+    // The newest prompt or trigger with a `promptId`, by its line's id: the
+    // order the kernel captured the lines in.
+    let mut newest: Option<(Uuid, String)> = None;
+    for i in 2..=3 {
+        let held: Vec<Value> = res.take(i)?;
+        for row in &held {
+            let Some(line) = at(row, &["kernel_message"]).and_then(uuid) else { continue };
+            lines.insert(line);
+            if let Some(id) = text(row, &["prompt_id"]) {
+                if newest.as_ref().is_none_or(|(seen, _)| line > *seen) {
+                    newest = Some((line, id.to_string()));
+                }
+            }
+        }
+    }
+    for i in 4..=6 {
         let held: Vec<Value> = res.take(i)?;
         lines.extend(held.iter().filter_map(uuid));
     }
-    let calls: Vec<Value> = res.take(7)?;
-    let results: Vec<Value> = res.take(9)?;
-    let edits: Vec<Value> = res.take(10)?;
-    let git: Vec<Value> = res.take(11)?;
-    let tests: Vec<Value> = res.take(12)?;
-    let builds: Vec<Value> = res.take(13)?;
+    let calls: Vec<Value> = res.take(8)?;
+    let results: Vec<Value> = res.take(10)?;
+    let edits: Vec<Value> = res.take(11)?;
+    let git: Vec<Value> = res.take(12)?;
+    let tests: Vec<Value> = res.take(13)?;
+    let builds: Vec<Value> = res.take(14)?;
     let place = places
         .iter()
         .filter_map(|p| {
@@ -149,6 +170,7 @@ pub async fn session_holds(db: &Db, session: &RecordId) -> Result<SessionHolds> 
             })
             .collect(),
         lines,
+        prompt_id: newest.map(|(_, id)| id),
         calls: calls
             .iter()
             .filter_map(|c| {
@@ -186,6 +208,8 @@ pub struct State {
     pub web_fetches: Option<i64>,
     pub service_tier: Option<String>,
     pub text_chars: i64,
+    pub cache_write_1h_tokens: Option<i64>,
+    pub cache_write_5m_tokens: Option<i64>,
 }
 
 impl State {
@@ -202,6 +226,8 @@ impl State {
             web_fetches: counts.web_fetches,
             service_tier: counts.service_tier.clone(),
             text_chars,
+            cache_write_1h_tokens: counts.cache_write_1h_tokens,
+            cache_write_5m_tokens: counts.cache_write_5m_tokens,
         }
     }
 
@@ -219,6 +245,8 @@ impl State {
             && opt(self.web_searches, other.web_searches)
             && opt(self.web_fetches, other.web_fetches)
             && self.text_chars <= other.text_chars
+            && opt(self.cache_write_1h_tokens, other.cache_write_1h_tokens)
+            && opt(self.cache_write_5m_tokens, other.cache_write_5m_tokens)
     }
 }
 
@@ -256,6 +284,8 @@ pub async fn reply_holds(db: &Db, reply: &RecordId) -> Result<ReplyHolds> {
                 web_fetches: int(s, &["web_fetches"]),
                 service_tier: text(s, &["service_tier"]).map(str::to_string),
                 text_chars: int(s, &["text_chars"])?,
+                cache_write_1h_tokens: int(s, &["cache_write_1h_tokens"]),
+                cache_write_5m_tokens: int(s, &["cache_write_5m_tokens"]),
             })
         },
     );
@@ -269,6 +299,32 @@ pub async fn reply_holds(db: &Db, reply: &RecordId) -> Result<ReplyHolds> {
             })
             .collect(),
     })
+}
+
+/// Every field the census has written, each one's newest row.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError`] when the database cannot answer.
+pub async fn fields(db: &Db) -> Result<Fields> {
+    let rows: Vec<Value> = db
+        .query("SELECT agent, kind, path, stored, first_at, first_line, valid_from FROM line_field")
+        .await?
+        .take(0)?;
+    Ok(Fields::from_rows(rows.iter().filter_map(|r| {
+        let field = Field {
+            stored: flag(r, &["stored"])?,
+            first_at: time_at(r, "first_at")?,
+            first_line: at(r, &["first_line"]).and_then(uuid)?,
+        };
+        Some((
+            text(r, &["agent"])?.to_string(),
+            text(r, &["kind"])?.to_string(),
+            text(r, &["path"])?.to_string(),
+            field,
+            time_at(r, "valid_from")?,
+        ))
+    })))
 }
 
 fn uuid(v: &Value) -> Option<Uuid> {

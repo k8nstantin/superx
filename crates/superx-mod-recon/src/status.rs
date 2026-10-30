@@ -3,6 +3,7 @@
 //! host and where the repos folder is, the crawler's newest pass and what
 //! each of its sources did in it, and the parameters it runs on.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -10,6 +11,7 @@ use chrono::{DateTime, Utc};
 use superx_kernel::types::Value;
 use superx_kernel::{Db, Kernel, Result};
 
+use crate::crawler::lines;
 use crate::credentials::{self, Credentials, BITBUCKET, GITHUB};
 use crate::instance::Instance;
 use crate::params::{self, Resolved};
@@ -116,6 +118,8 @@ pub struct LastSource {
     pub failed: i64,
     pub timed_out: i64,
     pub rows_written: i64,
+    /// What else it counted, by name.
+    pub counts: BTreeMap<String, i64>,
     pub outcome: String,
     pub note: Option<String>,
 }
@@ -131,7 +135,7 @@ fn holdings_query() -> String {
         "LET $last = (SELECT id, finished_at, outcome, rows_written, valid_from FROM pass \
          ORDER BY valid_from DESC LIMIT 1)[0];\
          RETURN $last;\
-         SELECT source, items, unread, calls, failed, timed_out, rows, outcome, note FROM pass_source \
+         SELECT source, items, unread, calls, failed, timed_out, rows, counts, outcome, note FROM pass_source \
          WHERE pass = $last.id ORDER BY source;",
     );
     sql
@@ -177,6 +181,16 @@ fn last_pass(row: &Value, sources: &[Value]) -> Option<LastPass> {
                             o.values().filter_map(|v| if let Value::Number(n) = v { n.to_int() } else { None }).sum()
                         }
                         _ => 0,
+                    },
+                    counts: match field(s, "counts") {
+                        Some(Value::Object(o)) => o
+                            .iter()
+                            .filter_map(|(name, v)| match v {
+                                Value::Number(n) => n.to_int().map(|n| (name.clone(), n)),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => BTreeMap::new(),
                     },
                     outcome: text(s, "outcome")?,
                     note: text(s, "note"),
@@ -338,14 +352,31 @@ fn folder_lines(out: &mut String, folder: &Folder) {
 
 /// What one source did, in a line: what it worked through, its outside
 /// calls when it made any, the rows it added, and how it ended when it did
-/// not end well.
+/// not end well. The lines source says too what the kernel held over the
+/// lines it read, the lines that fed no table, and the fields its lines
+/// showed (#537).
 fn source_line(s: &LastSource) -> String {
-    let mut parts = vec![format!("{} read, {} in a shape it does not know", s.items, s.unread)];
-    if s.calls > 0 {
-        parts.push(format!("{} calls, {} failed, {} cut off", s.calls, s.failed, s.timed_out));
-    }
-    parts.push(format!("{} rows", s.rows_written));
-    let mut line = parts.join(" · ");
+    let n = |name: &str| s.counts.get(name).copied().unwrap_or(0);
+    let mut line = if s.source == lines::SOURCE {
+        format!(
+            "{} read of {} held, {} fed no table, {} in a shape it does not know · {} fields, {} new, {} not stored · {} rows",
+            s.items,
+            n("lines_held"),
+            n("lines_unused"),
+            s.unread,
+            n("fields_seen"),
+            n("fields_new"),
+            n("fields_not_stored"),
+            s.rows_written
+        )
+    } else {
+        let mut parts = vec![format!("{} read, {} in a shape it does not know", s.items, s.unread)];
+        if s.calls > 0 {
+            parts.push(format!("{} calls, {} failed, {} cut off", s.calls, s.failed, s.timed_out));
+        }
+        parts.push(format!("{} rows", s.rows_written));
+        parts.join(" · ")
+    };
     if s.outcome != "complete" {
         let _ = write!(line, " ({}{})", s.outcome, s.note.as_ref().map_or(String::new(), |n| format!(": {n}")));
     }
@@ -509,6 +540,7 @@ mod tests {
             failed,
             timed_out: 0,
             rows_written: rows,
+            counts: BTreeMap::new(),
             outcome: outcome.to_string(),
             note: note.map(str::to_string),
         };
@@ -526,7 +558,13 @@ mod tests {
         };
         let t = text_of(&Database::Ready(h), &folder(), &from_values(&BTreeMap::new()));
         assert!(t.contains("last pass   2026-10-25T15:00:00+00:00 (partial): 1204 rows written\n"), "{t}");
-        assert!(t.contains("  lines     500 read, 3 in a shape it does not know · 1190 rows\n"), "{t}");
+        assert!(
+            t.contains(
+                "  lines     500 read of 0 held, 0 fed no table, 3 in a shape it does not know · 0 fields, 0 new, \
+                 0 not stored · 1190 rows\n"
+            ),
+            "{t}"
+        );
         assert!(
             t.contains(
                 "  repos     125 read, 0 in a shape it does not know · 149 calls, 1 failed, 0 cut off · 14 rows \
