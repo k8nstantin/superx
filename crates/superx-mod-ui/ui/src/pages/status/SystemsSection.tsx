@@ -1,4 +1,4 @@
-import { Anchor, Badge, Grid, SimpleGrid, Table, Text, Tooltip } from '@mantine/core'
+import { Badge, Grid, SimpleGrid, Table, Text, Tooltip } from '@mantine/core'
 import type { InsightsSummary } from '../../generated/InsightsSummary'
 import type { StatsSummary } from '../../generated/StatsSummary'
 import type { StatusResponse } from '../../generated/StatusResponse'
@@ -79,7 +79,6 @@ export function SystemsSection({
                 <Table.Th ta="right">Startup</Table.Th>
                 <Table.Th>Version</Table.Th>
                 <Table.Th>Provisioned</Table.Th>
-                <Table.Th>UI</Table.Th>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
@@ -155,17 +154,6 @@ export function SystemsSection({
                       <Text size="xs" c="dimmed">
                         {m.provisioned == null ? '—' : m.provisioned ? 'yes' : 'no'}
                       </Text>
-                    </Table.Td>
-                    <Table.Td>
-                      {m.ui_url ? (
-                        <Anchor href={m.ui_url} target="_blank" rel="noopener" size="xs">
-                          open ↗
-                        </Anchor>
-                      ) : (
-                        <Text size="xs" c="dimmed">
-                          —
-                        </Text>
-                      )}
                     </Table.Td>
                   </Table.Tr>
                 )

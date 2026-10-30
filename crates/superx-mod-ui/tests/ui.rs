@@ -5518,3 +5518,64 @@ async fn a_session_is_found_by_its_id_without_listing_every_session() {
         "nor is an id nothing carries"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// No module links (#536): the status answer names no module's own UI
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_core_uis_status_answer_names_no_module_ui() {
+    let kernel = fresh_kernel().await;
+    // A module that publishes its own URL on its registry entity, as
+    // superx-recon does.
+    let module = kernel
+        .register_module(&superx_kernel::KernelModuleDescriptor {
+            name: "recon",
+            version: env!("CARGO_PKG_VERSION"),
+            kind: superx_kernel::NodeKind::KernelModule,
+            depends_on: &[],
+            required_metamodel: &[],
+        })
+        .await
+        .expect("register a module");
+    kernel
+        .set_parameter(
+            module,
+            "attr_module_ui_url",
+            superx_kernel::types::Value::String("http://127.0.0.1:5153".to_string()),
+        )
+        .await
+        .expect("its URL");
+    // The core UI, on a port of the test's own.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("a free port")
+        .local_addr()
+        .expect("its address")
+        .port();
+    let ui = kernel.register_module(&UiModule.descriptor()).await.expect("register the ui");
+    kernel
+        .set_parameter(ui, PORT_PARAM, superx_kernel::types::Value::Number(superx_kernel::types::Number::Int(i64::from(port))))
+        .await
+        .expect("its port");
+    UiModule.startup(&kernel).await.expect("the ui serves");
+
+    let answer = tokio::task::spawn_blocking(move || {
+        use std::io::{Read as _, Write as _};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(stream, "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+            .expect("ask");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("the answer");
+        answer
+    })
+    .await
+    .expect("the request ran");
+    let (head, body) = answer.split_once("\r\n\r\n").expect("a head and a body");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let status: serde_json::Value = serde_json::from_str(body).expect("the status, as JSON");
+    let modules = status["modules"].as_array().expect("the modules it lists");
+    assert!(modules.iter().any(|m| m["name"] == "recon"), "the module is listed: {status}");
+    for m in modules {
+        assert!(m.get("ui_url").is_none(), "a module listed with a link to its UI: {m}");
+    }
+}

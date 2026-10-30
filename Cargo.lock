@@ -3843,25 +3843,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "superx-mod-performance"
-version = "1.1.0"
-dependencies = [
- "axum",
- "chrono",
- "clap",
- "rpassword",
- "serde",
- "serde_json",
- "superx-kernel",
- "surrealdb",
- "tokio",
- "tower",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "superx-mod-repos"
+name = "superx-mod-recon"
 version = "1.1.0"
 dependencies = [
  "axum",
