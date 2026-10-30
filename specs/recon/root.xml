@@ -106,11 +106,11 @@
         <result>target/release/superx-recon, built from that commit</result>
       </step>
       <step n="2" name="install">
-        <cmd>cp -p &lt;bin&gt;/superx-recon &lt;home&gt;/backup/superx-recon-&lt;the running build's commit&gt;</cmd>
+        <cmd>mkdir -p &lt;home&gt;/modules/recon/backup &amp;&amp; cp -p &lt;bin&gt;/superx-recon &lt;home&gt;/modules/recon/backup/superx-recon-&lt;the running build's commit&gt;</cmd>
         <cmd>cp target/release/superx-recon &lt;bin&gt;/superx-recon.new &amp;&amp; mv -f &lt;bin&gt;/superx-recon.new &lt;bin&gt;/superx-recon</cmd>
       </step>
       <step n="3" name="provision">
-        <note>Only when the task file says so: when the structure changed, or when the build derives what the rows already written lack, since no row is ever changed. The database is rebuilt from the file, run by the operator in a terminal, the root password typed there; every row is crawled again (rules derived-and-rebuilt).</note>
+        <note>Only when the task file says so: when the structure changed, or when the build derives what the rows already written lack, since no row is ever changed. The database is rebuilt from the file, run by the operator, the root password typed at a terminal or given as input from &lt;home&gt;/db/superx-credentials, which nothing prints; every row is crawled again (rules derived-and-rebuilt).</note>
         <cmd>superx-recon --home &lt;home&gt; --initialize</cmd>
       </step>
       <step n="4" name="restart">
