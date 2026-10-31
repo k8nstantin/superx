@@ -1,6 +1,7 @@
 //! Every read of the kernel, in one place, all of it SELECT (§10): its
-//! captured lines a page at a time by their ids, one session's lines again
-//! from a point, and the names of its agents and sessions.
+//! captured lines a page at a time by their ids, how many lines it holds
+//! over a page's ids, one session's lines again from a point, and the names
+//! of its agents and sessions.
 //!
 //! A line's id is a UUIDv7 the kernel set when it captured the line, so
 //! ids run in the order lines were captured. A page is a seek on a table's
@@ -8,20 +9,33 @@
 //! within a second and drops rows at range bounds (#486), and paging by
 //! one lost 93k of 108k lines where the id walk lost none (#501).
 //!
-//! Lines come from two tables. Conversation lines are `message` rows.
-//! Claude Code's other lines are `transcript_event` rows in
-//! `telemetry_stream`, the line whole under `payload.line` (#471), beside
-//! a firehose of other events. A telemetry page reads a bounded number of
-//! rows, says which are wanted, and fetches only those whole.
+//! Lines come from two tables. Conversation lines are `message` rows: the
+//! line as its agent wrote it (`raw_text`, #529) beside the kernel's parsed
+//! copy (`raw`). Every other line is a row of `telemetry_stream`, beside a
+//! firehose of other events: a `transcript_event` (a Claude Code line that
+//! is not conversation, a file beside its transcripts, a Gemini header,
+//! header change, notice or earlier write of a record), a `transcript_raw`
+//! (a line of a shape its adapter does not know, or that is not JSON) or a
+//! `desktop_event` (a Claude Desktop log record). A telemetry page reads a
+//! bounded number of rows, says which are lines, and fetches only those
+//! whole.
+//!
+//! The kernel kept a line in one of several shapes over time: the parsed
+//! copy alone before #529, both from #529, `raw_text` alone while #542 was
+//! its build, both again from #546, and before #471 a telemetry line by its
+//! kind alone. [`Body`] is the line as the crawler reads it, whichever.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, TimeZone as _, Utc};
+use superx_kernel::message::line_value_from_json;
 use superx_kernel::types::{RecordId, RecordIdKey, Uuid, Value};
 use superx_kernel::{Kernel, Result};
 
-use crate::crawler::lines::formats;
 use crate::crawler::value::{at, text, time};
+
+/// The telemetry rows that are lines, by their `lifecycle_event`.
+pub const LINE_EVENTS: [&str; 3] = ["transcript_event", "transcript_raw", "desktop_event"];
 
 /// Where a page of lines starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +44,23 @@ pub enum Cursor {
     At(Uuid),
     /// After this id.
     After(Uuid),
+}
+
+/// A line, as the crawler reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Body {
+    /// A line the agent wrote as JSON: its `raw_text` parsed, wherever the
+    /// kernel kept one; else the parsed copy it kept, a message row's `raw`
+    /// or a payload's `line`. A file beside Claude Code's transcripts is the
+    /// `line` the kernel made of it.
+    Json(Value),
+    /// A record written as text and read as text: a Claude Desktop log
+    /// record.
+    Text(String),
+    /// A line that is not JSON.
+    NotJson,
+    /// Nothing of the line but its kind: a telemetry line kept before #471.
+    Missing,
 }
 
 /// One captured line, as the crawler reads it.
@@ -43,27 +74,39 @@ pub struct Line {
     pub session: Option<RecordId>,
     /// When the line was written: the agent's own time when it has one.
     pub at: DateTime<Utc>,
-    /// The line, whole.
-    pub raw: Value,
+    pub body: Body,
+    /// The kind the kernel gave a line it kept as telemetry, when it gave
+    /// one (the payload's `kind`).
+    pub kernel_kind: Option<String>,
 }
 
-const MESSAGES_AT: &str =
-    "SELECT id, session, agent, raw, emitted_at, valid_from FROM type::record('message', $from..) LIMIT $limit";
-const MESSAGES_AFTER: &str =
-    "SELECT id, session, agent, raw, emitted_at, valid_from FROM type::record('message', $from>..) LIMIT $limit";
-const SESSION_MESSAGES_AT: &str = "SELECT id, session, agent, raw, emitted_at, valid_from \
+impl Line {
+    /// The line, when it is JSON.
+    #[must_use]
+    pub fn json(&self) -> Option<&Value> {
+        match &self.body {
+            Body::Json(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+const MESSAGES_AT: &str = "SELECT id, session, agent, raw, raw_text, emitted_at, valid_from \
+     FROM type::record('message', $from..) LIMIT $limit";
+const MESSAGES_AFTER: &str = "SELECT id, session, agent, raw, raw_text, emitted_at, valid_from \
+     FROM type::record('message', $from>..) LIMIT $limit";
+const SESSION_MESSAGES_AT: &str = "SELECT id, session, agent, raw, raw_text, emitted_at, valid_from \
      FROM type::record('message', $from..) WHERE session = $sess LIMIT $limit";
-const SESSION_MESSAGES_AFTER: &str = "SELECT id, session, agent, raw, emitted_at, valid_from \
+const SESSION_MESSAGES_AFTER: &str = "SELECT id, session, agent, raw, raw_text, emitted_at, valid_from \
      FROM type::record('message', $from>..) WHERE session = $sess LIMIT $limit";
-const EVENTS_AT: &str = "SELECT id, lifecycle_event = 'transcript_event' AND \
-     ((payload.line.type = 'system' AND payload.line.subtype INSIDE $subtypes) OR \
-     (payload.line.type = 'attachment' AND payload.line.attachment.type INSIDE $attachments)) AS wanted \
+const EVENTS_AT: &str = "SELECT id, lifecycle_event INSIDE $lines AS wanted \
      FROM type::record('telemetry_stream', $from..) LIMIT $limit";
-const EVENTS_AFTER: &str = "SELECT id, lifecycle_event = 'transcript_event' AND \
-     ((payload.line.type = 'system' AND payload.line.subtype INSIDE $subtypes) OR \
-     (payload.line.type = 'attachment' AND payload.line.attachment.type INSIDE $attachments)) AS wanted \
+const EVENTS_AFTER: &str = "SELECT id, lifecycle_event INSIDE $lines AS wanted \
      FROM type::record('telemetry_stream', $from>..) LIMIT $limit";
-const EVENT_LINES: &str = "SELECT id, agent, valid_from, payload.session AS session, payload.line AS line FROM $ids";
+const EVENT_LINES: &str = "SELECT id, agent, lifecycle_event, valid_from, payload FROM $ids";
+const MESSAGES_HELD: &str = "SELECT count() AS n FROM type::record('message', $first..=$last) GROUP ALL";
+const EVENTS_HELD: &str = "SELECT count() AS n FROM type::record('telemetry_stream', $first..=$last) \
+     WHERE lifecycle_event INSIDE $lines GROUP ALL";
 
 /// A page of conversation lines, from `cursor` on.
 ///
@@ -108,19 +151,28 @@ pub async fn session_messages(
 }
 
 /// One page: the lines read, how many rows were scanned for them, and the
-/// last id scanned, where the next page starts.
+/// first and last ids scanned: where the page began, and where the next one
+/// starts.
 #[derive(Debug, Default)]
 pub struct Page {
     pub lines: Vec<Line>,
     pub scanned: usize,
+    pub first: Option<Uuid>,
     pub last: Option<Uuid>,
+}
+
+impl Page {
+    fn scanned_id(&mut self, id: Uuid) {
+        self.first.get_or_insert(id);
+        self.last = Some(id);
+    }
 }
 
 async fn message_page(kernel: &Kernel, names: &mut Names, rows: &[Value]) -> Result<Page> {
     let mut page = Page { scanned: rows.len(), ..Page::default() };
     for r in rows {
         let Some(id) = at(r, &["id"]).and_then(record_uuid) else { continue };
-        page.last = Some(id);
+        page.scanned_id(id);
         let agent = match at(r, &["agent"]) {
             Some(Value::RecordId(a)) => names.agent(kernel, a).await?,
             _ => None,
@@ -129,18 +181,25 @@ async fn message_page(kernel: &Kernel, names: &mut Names, rows: &[Value]) -> Res
             Some(Value::RecordId(s)) => Some(s.clone()),
             _ => None,
         };
-        let line_time = match at(r, &["emitted_at"]).or_else(|| at(r, &["valid_from"])) {
-            Some(Value::Datetime(d)) => DateTime::<Utc>::from(*d),
-            _ => uuid_time(id).unwrap_or_default(),
+        let body = match at(r, &["raw_text"]) {
+            Some(Value::String(t)) => parse(t),
+            _ => match at(r, &["raw"]) {
+                Some(raw @ Value::Object(_)) => Body::Json(raw.clone()),
+                _ => Body::Missing,
+            },
         };
-        page.lines.push(Line { id, agent, session, at: line_time, raw: at(r, &["raw"]).cloned().unwrap_or_default() });
+        let line_time = written_at(&body)
+            .or_else(|| datetime(at(r, &["emitted_at"])))
+            .or_else(|| datetime(at(r, &["valid_from"])))
+            .unwrap_or_else(|| uuid_time(id).unwrap_or_default());
+        page.lines.push(Line { id, agent, session, at: line_time, body, kernel_kind: None });
     }
     Ok(page)
 }
 
-/// A page of the lines kept as telemetry that the crawler reads, from
-/// `cursor` on: `limit` rows of the stream scanned, the wanted ones read
-/// whole.
+/// A page of the telemetry rows that are lines, from `cursor` on: `limit`
+/// rows of the stream scanned, the lines among them read whole, payload and
+/// all; every other row is no line and is skipped.
 ///
 /// # Errors
 ///
@@ -155,8 +214,7 @@ pub async fn events(kernel: &Kernel, names: &mut Names, cursor: Cursor, limit: u
         .query(sql)
         .bind(("from", from))
         .bind(("limit", limit))
-        .bind(("subtypes", formats::system_subtypes()))
-        .bind(("attachments", formats::attachment_types()))
+        .bind(("lines", LINE_EVENTS.to_vec()))
         .await?
         .take(0)?;
     let mut page = Page { scanned: rows.len(), ..Page::default() };
@@ -164,7 +222,7 @@ pub async fn events(kernel: &Kernel, names: &mut Names, cursor: Cursor, limit: u
     for r in &rows {
         let Some(Value::RecordId(id)) = at(r, &["id"]) else { continue };
         let Some(u) = record_uuid_of(id) else { continue };
-        page.last = Some(u);
+        page.scanned_id(u);
         if matches!(at(r, &["wanted"]), Some(Value::Bool(true))) {
             wanted.push(Value::RecordId(id.clone()));
         }
@@ -179,21 +237,93 @@ pub async fn events(kernel: &Kernel, names: &mut Names, cursor: Cursor, limit: u
             Some(Value::RecordId(a)) => names.agent(kernel, a).await?,
             _ => None,
         };
-        let session = match (&agent, text(r, &["session"])) {
+        let payload = at(r, &["payload"]);
+        let session = match (&agent, payload.and_then(|p| text(p, &["session"]))) {
             (Some(agent), Some(key)) => names.session(kernel, agent, key).await?,
             _ => None,
         };
-        let raw = at(r, &["line"]).cloned().unwrap_or_default();
-        let line_time = time(&raw, &["timestamp"])
-            .or_else(|| match at(r, &["valid_from"]) {
-                Some(Value::Datetime(d)) => Some(DateTime::<Utc>::from(*d)),
-                _ => None,
-            })
+        let body = event_body(text(r, &["lifecycle_event"]), payload);
+        let line_time = written_at(&body)
+            .or_else(|| datetime(at(r, &["valid_from"])))
             .unwrap_or_else(|| uuid_time(id).unwrap_or_default());
-        page.lines.push(Line { id, agent, session, at: line_time, raw });
+        let kernel_kind = payload.and_then(|p| text(p, &["kind"])).map(str::to_string);
+        page.lines.push(Line { id, agent, session, at: line_time, body, kernel_kind });
     }
     page.lines.sort_by_key(|l| l.id);
     Ok(page)
+}
+
+/// How many message rows the kernel holds over the ids `first` to `last`.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError`] when the kernel's database cannot answer.
+pub async fn messages_held(kernel: &Kernel, first: Uuid, last: Uuid) -> Result<i64> {
+    let rows: Vec<Value> =
+        kernel.db().query(MESSAGES_HELD).bind(("first", first)).bind(("last", last)).await?.take(0)?;
+    Ok(held(&rows))
+}
+
+/// How many telemetry rows that are lines the kernel holds over the ids
+/// `first` to `last`.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError`] when the kernel's database cannot answer.
+pub async fn events_held(kernel: &Kernel, first: Uuid, last: Uuid) -> Result<i64> {
+    let rows: Vec<Value> = kernel
+        .db()
+        .query(EVENTS_HELD)
+        .bind(("first", first))
+        .bind(("last", last))
+        .bind(("lines", LINE_EVENTS.to_vec()))
+        .await?
+        .take(0)?;
+    Ok(held(&rows))
+}
+
+/// A `count()` grouped over everything: one row, or none over no rows.
+fn held(rows: &[Value]) -> i64 {
+    rows.first().and_then(|r| crate::crawler::value::int(r, &["n"])).unwrap_or(0)
+}
+
+/// A line kept as text, parsed as JSON exactly as the kernel parses it.
+fn parse(raw_text: &str) -> Body {
+    match serde_json::from_str::<serde_json::Value>(raw_text) {
+        Ok(json) => Body::Json(line_value_from_json(&json)),
+        Err(_) => Body::NotJson,
+    }
+}
+
+/// A telemetry line: its `raw_text` wherever the kernel kept one, else the
+/// `line` of its payload; a line of a shape its adapter did not know and
+/// kept without either is not JSON, and any other is kept by its kind alone.
+fn event_body(lifecycle: Option<&str>, payload: Option<&Value>) -> Body {
+    let Some(p) = payload else { return Body::Missing };
+    if let Some(Value::String(t)) = at(p, &["raw_text"]) {
+        return parse(t);
+    }
+    match at(p, &["line"]) {
+        Some(line @ Value::Object(_)) => Body::Json(line.clone()),
+        Some(Value::String(record)) => Body::Text(record.clone()),
+        _ if lifecycle == Some("transcript_raw") => Body::NotJson,
+        _ => Body::Missing,
+    }
+}
+
+/// When a line says it was written.
+fn written_at(body: &Body) -> Option<DateTime<Utc>> {
+    match body {
+        Body::Json(v) => time(v, &["timestamp"]),
+        _ => None,
+    }
+}
+
+fn datetime(v: Option<&Value>) -> Option<DateTime<Utc>> {
+    match v {
+        Some(Value::Datetime(d)) => Some(DateTime::<Utc>::from(*d)),
+        _ => None,
+    }
 }
 
 /// The names of the kernel's agents and sessions, read when one is not yet

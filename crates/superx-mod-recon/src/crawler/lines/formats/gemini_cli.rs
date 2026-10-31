@@ -1,6 +1,9 @@
 //! Gemini CLI's chat lines. The kernel keeps its `user` and `gemini`
-//! records as `message` rows, each the record as it stood when captured;
-//! headers and `info` lines go to telemetry and say nothing measured here.
+//! records as `message` rows, each the record as it stood when captured, and
+//! every earlier write of a record within one read as a `transcript_event`
+//! of kind `superseded` (#518), read as the record is; headers, header
+//! changes and `info`, `error` and `warning` lines are `transcript_event`s
+//! too, and feed no table.
 //!
 //! Shapes, mapped from the 26 chats on this machine (2026-10-25):
 //!
@@ -15,16 +18,19 @@
 //!   of `functionResponse`s.
 //! - `user`: `content` is a list of parts; text parts are the operator's
 //!   message, `functionResponse` parts hand results back.
+//! - A header (`sessionId`, no `type`) and a header change (`$set`) carry
+//!   no type: their kind is the one the kernel gave them.
 //! - Lines carry no working directory, branch or version.
 
 use chrono::{DateTime, Utc};
 use superx_kernel::types::Value;
 
 use crate::crawler::lines::facts::{
-    Call, Counts, CountedFrom, Edit, EditKind, Fact, Outcome, Prompt, PromptKind, Read, ReplyLine, Text, Thinking,
-    ToolResult,
+    Call, Counts, CountedFrom, Edit, EditKind, Fact, Outcome, Prompt, PromptKind, Read, ReplyLine, ResultLine, Text,
+    Thinking, ToolResult, TurnPosition,
 };
-use crate::crawler::value::{at, chars, flag, int, json_len, lines, list, object, some_text, text, time};
+use crate::crawler::lines::kernel::Body;
+use crate::crawler::value::{at, chars, flag, int, json_len, lines, list, object, some_text, text, time, Columns};
 
 /// The agent, as the kernel names it.
 pub const AGENT: &str = superx_kernel::adapters::gemini_cli::AGENT_NAME;
@@ -32,11 +38,65 @@ pub const AGENT: &str = superx_kernel::adapters::gemini_cli::AGENT_NAME;
 /// The tool that runs shell commands.
 pub const SHELL_TOOL: &str = "run_shell_command";
 
+/// The tool that loads a skill.
+const SKILL_TOOL: &str = "activate_skill";
+
+/// The kinds of line Gemini CLI writes that feed no table.
+pub const NO_TABLE: [&str; 5] = ["header", "$set", "info", "error", "warning"];
+
+/// What the reading takes from every line, whatever its kind.
+pub const STORED_ON_EVERY_LINE: &[&str] = &["timestamp"];
+
+/// What the reading puts in a column, by kind of line; a path ending in
+/// `.**` is held whole.
+pub const STORED: &[(&str, &[&str])] = &[
+    ("user", &["content", "content[].text"]),
+    (
+        "gemini",
+        &[
+            "id",
+            "model",
+            "tokens.**",
+            "thoughts[].description",
+            "thoughts[].subject",
+            "thoughts[].timestamp",
+            "toolCalls[].id",
+            "toolCalls[].name",
+            "toolCalls[].timestamp",
+            "toolCalls[].args.file_path",
+            "toolCalls[].args.path",
+            "toolCalls[].args.dir_path",
+            "toolCalls[].args.command",
+            "toolCalls[].args.description",
+            "toolCalls[].args.pattern",
+            "toolCalls[].args.url",
+            "toolCalls[].args.query",
+            "toolCalls[].args.agent_name",
+            "toolCalls[].args.is_background",
+            "toolCalls[].args.name",
+            "toolCalls[].result[].functionResponse.response.output",
+            "toolCalls[].result[].functionResponse.response.error",
+        ],
+    ),
+];
+
 /// What `write_file` says when the file did not exist.
 const CREATED: &str = "Successfully created";
 
 /// How a shell command's output names its exit code.
 const EXIT_CODE: &str = "Exit Code:";
+
+/// A line as the kernel kept it, read: a line with no type by the kind the
+/// kernel gave it.
+#[must_use]
+pub fn read_kept(body: &Body, kernel_kind: Option<&str>, at_time: DateTime<Utc>) -> Read {
+    let known_kind = kernel_kind.is_some_and(|kind| NO_TABLE.contains(&kind));
+    match body {
+        Body::Json(line) if text(line, &["type"]).is_some() => read(line, at_time),
+        Body::Json(_) | Body::Missing if known_kind => Read::nothing(),
+        Body::Json(_) | Body::Missing | Body::Text(_) | Body::NotJson => Read::unknown(),
+    }
+}
 
 /// One line, read. `at` is when the line was written.
 #[must_use]
@@ -44,6 +104,7 @@ pub fn read(line: &Value, at_time: DateTime<Utc>) -> Read {
     match text(line, &["type"]) {
         Some("user") => user(line),
         Some("gemini") => gemini(line, at_time),
+        Some(kind) if NO_TABLE.contains(&kind) => Read::nothing(),
         _ => Read::unknown(),
     }
 }
@@ -80,7 +141,13 @@ fn user(line: &Value) -> Read {
 fn typed(message: String, images: i64) -> Read {
     Read {
         known: true,
-        facts: vec![Fact::Prompt(Prompt { kind: PromptKind::Typed, text: message, images, stops_tools: false })],
+        facts: vec![Fact::Prompt(Prompt {
+            kind: PromptKind::Typed,
+            text: message,
+            images,
+            stops_tools: false,
+            turn: TurnPosition::default(),
+        })],
         ..Read::default()
     }
 }
@@ -90,6 +157,7 @@ fn gemini(line: &Value, at_time: DateTime<Utc>) -> Read {
         return Read::unknown();
     };
     let mut known = true;
+    let mut columns = Columns::default();
     let counts = match at(line, &["tokens"]) {
         Some(_) => {
             let c = counts(line);
@@ -121,7 +189,7 @@ fn gemini(line: &Value, at_time: DateTime<Utc>) -> Read {
     let mut calls = Vec::new();
     let mut results = Vec::new();
     for c in list(line, &["toolCalls"]) {
-        let Some(call) = call(c, at_time) else {
+        let Some(call) = call(c, at_time, &mut columns) else {
             known = false;
             continue;
         };
@@ -130,29 +198,35 @@ fn gemini(line: &Value, at_time: DateTime<Utc>) -> Read {
         }
         calls.push(call);
     }
-    Read {
-        known,
-        facts: vec![Fact::Reply(Box::new(ReplyLine {
-            agent_id,
-            request_id: None,
-            model: some_text(line, &["model"]),
-            requested_model: None,
-            advisor_model: None,
-            effort: None,
-            turn_effort: None,
-            stop_reason: None,
-            subagent: false,
-            counts,
-            text: Text::Total(chars(text(line, &["content"]).unwrap_or_default())),
-            thinking,
-            calls,
-            results,
-            blocks: 0,
-            cumulative: true,
-            thinking_dropped: 0,
-        }))],
-        ..Read::default()
-    }
+    let reply = ReplyLine {
+        agent_id,
+        request_id: None,
+        model: some_text(line, &["model"]),
+        requested_model: None,
+        advisor_model: None,
+        effort: None,
+        turn_effort: None,
+        stop_reason: None,
+        subagent: false,
+        client_version: None,
+        skill: None,
+        plugin: None,
+        mcp_server: None,
+        mcp_tool: None,
+        refusal: None,
+        refusal_text: None,
+        cache_miss: None,
+        cache_missed: None,
+        counts,
+        text: Text::Total(chars(text(line, &["content"]).unwrap_or_default())),
+        thinking,
+        calls,
+        results,
+        blocks: 0,
+        cumulative: true,
+        thinking_dropped: 0,
+    };
+    Read { known: known && columns.placed(), facts: vec![Fact::Reply(Box::new(reply))], ..Read::default() }
 }
 
 /// The reply's counts, from its `tokens`: the input not served from cache,
@@ -171,21 +245,23 @@ fn counts(line: &Value) -> Option<Counts> {
         web_searches: None,
         web_fetches: None,
         service_tier: None,
+        cache_write_1h_tokens: None,
+        cache_write_5m_tokens: None,
         usage: object(line, &["tokens"])?.clone(),
     })
 }
 
-fn call(c: &Value, at_time: DateTime<Utc>) -> Option<Call> {
+fn call(c: &Value, at_time: DateTime<Utc>, columns: &mut Columns) -> Option<Call> {
     let args = at(c, &["args"]);
     let field = |key: &str| args.and_then(|a| some_text(a, &[key]));
     let tool = some_text(c, &["name"])?;
     let shell = tool == SHELL_TOOL;
+    let none = Value::None;
     Some(Call {
         call_id: some_text(c, &["id"])?,
         at: time(c, &["timestamp"]).unwrap_or(at_time),
         path: field("file_path").or_else(|| field("path")).or_else(|| if shell { None } else { field("dir_path") }),
         dir: if shell { field("dir_path") } else { None },
-        tool,
         command: field("command"),
         description: field("description"),
         pattern: field("pattern"),
@@ -195,6 +271,10 @@ fn call(c: &Value, at_time: DateTime<Utc>) -> Option<Call> {
         background: args.and_then(|a| flag(a, &["is_background"])).unwrap_or(false),
         input_bytes: args.map_or(0, json_len),
         sandbox_off: false,
+        skill: if tool == SKILL_TOOL { columns.text(args.unwrap_or(&none), &["name"]) } else { None },
+        model: None,
+        timeout_ms: None,
+        tool,
     })
 }
 
@@ -251,9 +331,13 @@ fn result(c: &Value, call: &Call, at_time: DateTime<Utc>) -> Option<ToolResult> 
         ms: None,
         bytes: at(c, &["result"]).map_or(0, json_len),
         edits: edit.into_iter().collect(),
-        output: (!said.is_empty()).then_some(said),
+        output: (!said.is_empty()).then(|| said.clone()),
+        text: (outcome != Outcome::Ok).then_some(said),
         noted: Vec::new(),
-        sandbox_hosts: Vec::new(),
+        line: ResultLine::default(),
+        persisted_bytes: None,
+        return_note: None,
+        background_task: None,
     })
 }
 
@@ -294,7 +378,7 @@ mod tests {
         let typed = read(&line(serde_json::json!({ "id": "u1", "type": "user", "content": [{ "text": "fix it" }, { "inlineData": {} }] })), when());
         assert_eq!(
             typed.facts,
-            vec![Fact::Prompt(Prompt { kind: PromptKind::Typed, text: "fix it".into(), images: 1, stops_tools: false })]
+            vec![Fact::Prompt(Prompt { kind: PromptKind::Typed, text: "fix it".into(), images: 1, stops_tools: false, turn: TurnPosition::default() })]
         );
         let handed = read(&line(serde_json::json!({ "id": "u2", "type": "user", "content": [{ "functionResponse": { "id": "c1" } }] })), when());
         assert!(handed.known && handed.facts.is_empty());

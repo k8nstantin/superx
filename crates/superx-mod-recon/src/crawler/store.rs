@@ -111,6 +111,14 @@ impl Row {
     }
 
     #[must_use]
+    pub fn some_flag(self, key: &str, v: Option<bool>) -> Self {
+        match v {
+            Some(v) => self.flag(key, v),
+            None => self,
+        }
+    }
+
+    #[must_use]
     pub fn time(mut self, key: &str, v: DateTime<Utc>) -> Self {
         self.0.insert(key, Value::Datetime(Datetime::from(v)));
         self

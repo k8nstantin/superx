@@ -17,11 +17,14 @@ use superx_kernel::types::{RecordId, Uuid};
 use superx_kernel::{Db, Kernel, Result};
 
 use crate::crawler::lines::commands;
-use crate::crawler::lines::facts::{Call, Fact, GitEvent, Outcome, Prompt, Read, ReplyLine, ToolResult};
+use crate::crawler::lines::facts::{
+    Call, CountedFrom, Fact, GitEvent, Outcome, Prompt, Read, ReplyLine, Text, ToolResult, Trigger,
+};
 use crate::crawler::lines::formats;
 use crate::crawler::lines::kernel::{self as kernel_lines, Cursor, Line, Names};
 use crate::crawler::lines::store::{self, State as Counted};
 use crate::crawler::store::{Batch, Row};
+use crate::crawler::value::chars;
 
 /// Lines read per page when a reply is read again.
 const REPLY_PAGE: u32 = 200; // skill-allow: §9-const — read-path bound, not a policy tunable
@@ -41,6 +44,9 @@ struct Session {
     kernel: RecordId,
     agent: String,
     place: Option<(String, Option<String>, DateTime<Utc>)>,
+    /// The newest `promptId` of the session's lines read so far: the turn a
+    /// reply begun now is in.
+    prompt_id: Option<String>,
     replies: HashMap<String, Reply>,
     /// The reply last begun: the one an interrupt stops.
     newest: Option<String>,
@@ -105,7 +111,8 @@ struct CallState {
 pub enum Applied {
     /// Its facts are written, or were already.
     Read,
-    /// It belongs to no session the kernel names, or is in a shape the
+    /// The kernel names no agent for it, it has something to place but
+    /// belongs to no session the kernel names, or it is in a shape the
     /// crawler does not know: counted as not read.
     Unread,
 }
@@ -125,18 +132,28 @@ impl State {
         self.sessions.retain(|_, s| s.last >= before);
     }
 
+    /// The tool of a call of `session` the crawler holds, by the call's id.
+    #[must_use]
+    pub fn call_tool(&self, session: Option<&RecordId>, call_id: &str) -> Option<String> {
+        let key = session.and_then(kernel_lines::record_uuid_of)?;
+        self.sessions.get(&key)?.calls.get(call_id).map(|c| c.tool.clone())
+    }
+
     /// Turn one line's facts into rows.
     ///
     /// # Errors
     ///
     /// [`superx_kernel::KernelError`] when a database cannot answer.
     pub async fn apply(&mut self, src: &mut Sources<'_>, line: &Line, read: Read, batch: &mut Batch) -> Result<Applied> {
-        let Some(key) = line.session.as_ref().and_then(kernel_lines::record_uuid_of) else {
-            return Ok(Applied::Unread);
-        };
         if line.agent.is_none() {
             return Ok(Applied::Unread);
         }
+        let Some(key) = line.session.as_ref().and_then(kernel_lines::record_uuid_of) else {
+            // A line with nothing to place needs no session: a Claude
+            // Desktop record, a file beside the transcripts of no session.
+            let nothing_to_place = read.facts.is_empty() && read.place.is_none();
+            return Ok(if read.known && nothing_to_place { Applied::Read } else { Applied::Unread });
+        };
         if !self.sessions.contains_key(&key) {
             let session = self.open(src, line, &read, batch).await?;
             self.sessions.insert(key, session);
@@ -170,6 +187,7 @@ impl State {
         for fact in read.facts {
             match fact {
                 Fact::Prompt(p) => session.prompt(line, &p, batch),
+                Fact::Trigger(t) => session.trigger(line, &t, batch),
                 Fact::Reply(r) => session.reply(src, line, *r, batch).await?,
                 Fact::Result(r) => session.result(line.id, &r, batch),
                 Fact::Turn(t) => {
@@ -201,6 +219,10 @@ impl State {
                 }
             }
         }
+        // A reply begun after this line is in the turn this line names.
+        if read.prompt_id.is_some() {
+            session.prompt_id = read.prompt_id;
+        }
         Ok(if known { Applied::Read } else { Applied::Unread })
     }
 
@@ -222,6 +244,7 @@ impl State {
             kernel: kernel_session.clone(),
             agent: agent.to_string(),
             place: None,
+            prompt_id: None,
             replies: HashMap::new(),
             newest: None,
             calls: HashMap::new(),
@@ -247,6 +270,7 @@ impl State {
         let held = store::session_holds(src.db, &session.row).await?;
         session.place = held.place;
         session.lines = held.lines;
+        session.prompt_id = held.prompt_id;
         // By the reply row's UUID: a map keyed by a record id is one clippy
         // refuses (`mutable_key_type`).
         let mut by_row: HashMap<Uuid, String> = HashMap::new();
@@ -308,8 +332,13 @@ impl Session {
             self.keyed(line)
                 .text("kind", p.kind.as_str())
                 .text("text", p.text.clone())
-                .int("chars", crate::crawler::value::chars(&p.text))
-                .int("images", p.images),
+                .int("chars", chars(&p.text))
+                .int("images", p.images)
+                .some_text("prompt_id", p.turn.prompt_id.clone())
+                .some_text("source", p.turn.source.clone())
+                .some_text("permission_mode", p.turn.permission_mode.clone())
+                .some_int("turn_index", p.turn.turn_index)
+                .some_int("prompt_index", p.turn.prompt_index),
         );
         if p.stops_tools {
             let open: Vec<String> = self
@@ -338,6 +367,21 @@ impl Session {
         }
     }
 
+    fn trigger(&mut self, line: &Line, t: &Trigger, batch: &mut Batch) {
+        if !self.lines.insert(line.id) {
+            return;
+        }
+        batch.create(
+            "trigger",
+            self.keyed(line)
+                .text("kind", t.kind.clone())
+                .some_text("source", t.source.clone())
+                .some_text("prompt_id", t.prompt_id.clone())
+                .text("text", t.text.clone())
+                .int("chars", chars(&t.text)),
+        );
+    }
+
     async fn reply(&mut self, src: &mut Sources<'_>, line: &Line, r: ReplyLine, batch: &mut Batch) -> Result<()> {
         if !self.replies.contains_key(&r.agent_id) {
             self.replies.insert(r.agent_id.clone(), Reply::new(None, (line.id, line.at), true));
@@ -363,6 +407,16 @@ impl Session {
                     .some_text("turn_effort", r.turn_effort.clone())
                     .some_text("stop_reason", r.stop_reason.clone())
                     .flag("subagent", r.subagent)
+                    .some_text("prompt_id", self.prompt_id.clone())
+                    .some_text("client_version", r.client_version.clone())
+                    .some_text("skill", r.skill.clone())
+                    .some_text("plugin", r.plugin.clone())
+                    .some_text("mcp_server", r.mcp_server.clone())
+                    .some_text("mcp_tool", r.mcp_tool.clone())
+                    .some_text("refusal", r.refusal.clone())
+                    .some_text("refusal_text", r.refusal_text.clone())
+                    .some_text("cache_miss", r.cache_miss.clone())
+                    .some_int("cache_missed", r.cache_missed)
                     .int("thinking_dropped", r.thinking_dropped),
             );
             if let Some(reply) = self.replies.get_mut(&r.agent_id) {
@@ -372,7 +426,7 @@ impl Session {
         }
         let held = self.replies.get(&r.agent_id).is_some_and(|reply| reply.held);
         if !held {
-            self.hold(src, &r.agent_id, r.cumulative).await?;
+            self.hold(src, &r.agent_id, r.cumulative, line.id).await?;
         }
         self.reply_line(line, &r, batch);
         Ok(())
@@ -380,8 +434,10 @@ impl Session {
 
     /// What the database holds of a reply written before this state began,
     /// and, for a reply that adds a block per line, every line of it read
-    /// again, so what this line adds is counted once.
-    async fn hold(&mut self, src: &mut Sources<'_>, agent_id: &str, cumulative: bool) -> Result<()> {
+    /// again, from its first line to `upto`, the line being read, so what
+    /// this line adds is counted once. The session's other lines between
+    /// them, a subagent's among them, are stepped over.
+    async fn hold(&mut self, src: &mut Sources<'_>, agent_id: &str, cumulative: bool, upto: Uuid) -> Result<()> {
         let Some(reply) = self.replies.get_mut(agent_id) else { return Ok(()) };
         reply.held = true;
         let Some(row) = reply.row.clone() else { return Ok(()) };
@@ -396,16 +452,16 @@ impl Session {
         'pages: loop {
             let page = kernel_lines::session_messages(src.kernel, src.names, &self.kernel, cursor, REPLY_PAGE).await?;
             for l in &page.lines {
-                let read = formats::read(&self.agent, &l.raw, l.at);
+                if l.id > upto {
+                    break 'pages;
+                }
+                let read = formats::read(&self.agent, l);
                 let mine = read.facts.into_iter().find_map(|f| match f {
                     Fact::Reply(r) if r.agent_id == agent_id => Some(*r),
                     _ => None,
                 });
-                match mine {
-                    Some(r) => again.push((l.clone(), r)),
-                    // A reply's lines follow one another; the first line of
-                    // the session that is not one of them ends it.
-                    None => break 'pages,
+                if let Some(r) = mine {
+                    again.push((l.clone(), r));
                 }
             }
             match page.last {
@@ -419,7 +475,7 @@ impl Session {
         let Some(reply) = self.replies.get_mut(agent_id) else { return Ok(()) };
         for (l, r) in again {
             if reply.lines.insert(l.id) {
-                if let crate::crawler::lines::facts::Text::Added(n) = r.text {
+                if let Text::Added(n) = r.text {
                     reply.text.insert(l.id, n);
                 }
                 reply.offsets.insert(l.id, reply.blocks);
@@ -440,7 +496,7 @@ impl Session {
         let Some(row) = reply.row.clone() else { return };
         let first_time = reply.lines.insert(line.id);
         if first_time && !r.cumulative {
-            if let crate::crawler::lines::facts::Text::Added(n) = r.text {
+            if let Text::Added(n) = r.text {
                 reply.text.insert(line.id, n);
             }
             reply.offsets.insert(line.id, reply.blocks);
@@ -495,17 +551,16 @@ impl Session {
                 reply.counts = Some(c.clone());
             }
         }
-        if let crate::crawler::lines::facts::Text::Total(n) = r.text {
+        if let Text::Total(n) = r.text {
             reply.total = reply.total.max(n);
         }
         if let Some(counts) = reply.counts.clone() {
             let text_chars = if r.cumulative { reply.total } else { reply.text.values().sum() };
             let state = Counted::of(&counts, text_chars);
-            let changed = match &reply.newest {
-                None => true,
-                Some(newest) if r.cumulative => state != *newest && !state.within(newest),
-                Some(newest) => state != *newest,
-            };
+            // A state no higher than the newest is an earlier one, read
+            // again: a Gemini reply's older emission, or a Claude reply read
+            // again from its middle up to the line being read.
+            let changed = reply.newest.as_ref().is_none_or(|newest| state != *newest && !state.within(newest));
             if changed {
                 batch.create(
                     "reply_state",
@@ -521,6 +576,8 @@ impl Session {
                         .some_int("web_fetches", state.web_fetches)
                         .some_text("service_tier", state.service_tier.clone())
                         .int("text_chars", state.text_chars)
+                        .some_int("cache_write_1h_tokens", state.cache_write_1h_tokens)
+                        .some_int("cache_write_5m_tokens", state.cache_write_5m_tokens)
                         .object("usage", counts.usage.clone()),
                 );
                 reply.newest = Some(state);
@@ -546,10 +603,26 @@ impl Session {
                     .text("outcome", r.outcome.as_str())
                     .some_int("ms", r.ms)
                     .int("bytes", r.bytes)
-                    .texts("sandbox_hosts", &r.sandbox_hosts),
+                    .some_text("decision", r.line.decision.clone())
+                    .some_text("decided_by", r.line.decided_by.clone())
+                    .some_text("decision_source", r.line.decision_source.clone())
+                    .some_text("decision_reason", r.line.decision_reason.clone())
+                    .some_text("denial", r.line.denial.clone())
+                    .some_text("operator_feedback", r.line.operator_feedback.clone())
+                    .some_flag("sandboxed", r.line.sandboxed)
+                    .texts("sandbox_hosts", &r.line.sandbox_hosts)
+                    .some_int("persisted_bytes", r.persisted_bytes)
+                    .some_text("return_note", r.return_note.clone())
+                    .some_text("background_task", r.background_task.clone())
+                    .some_text("text", r.text.clone()),
             );
         }
+        let shell = formats::is_shell(&call.tool);
         for e in &r.edits {
+            // What a shell command changed is the shell's to say.
+            if e.counted_from == CountedFrom::Shell && !shell {
+                continue;
+            }
             if call.edits.insert(e.path.clone()) {
                 batch.create(
                     "edit",
@@ -565,7 +638,7 @@ impl Session {
             }
         }
         let finished = matches!(r.outcome, Outcome::Ok | Outcome::Error);
-        let ran = match (&call.command, finished && formats::is_shell(&call.tool)) {
+        let ran = match (&call.command, finished && shell) {
             (Some(command), true) => {
                 commands::read(command, r.output.as_deref().unwrap_or_default(), r.outcome == Outcome::Ok, call.dir.as_deref())
             }
@@ -639,7 +712,10 @@ fn create_call(batch: &mut Batch, reply: &RecordId, line_id: Uuid, c: &Call) -> 
             .some_text("subagent_type", c.subagent_type.clone())
             .flag("background", c.background)
             .int("input_bytes", c.input_bytes)
-            .flag("sandbox_off", c.sandbox_off),
+            .some_text("skill", c.skill.clone())
+            .some_text("model", c.model.clone())
+            .flag("sandbox_off", c.sandbox_off)
+            .some_int("timeout_ms", c.timeout_ms),
     )
 }
 
