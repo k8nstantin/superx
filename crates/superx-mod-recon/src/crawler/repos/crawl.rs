@@ -308,6 +308,17 @@ pub fn mirror_with(places: &Places, host: Host) -> With<'static> {
     With { config, env, input: None, unbounded: false }
 }
 
+/// How every diff a crawl reads is printed, whatever the operator's
+/// configuration says: a root commit against the empty tree
+/// (`log.showRoot`), no color (`color.ui`), git's default algorithm
+/// (`diff.algorithm`); so the files, the counts and the patch ids are git's
+/// own in every repository.
+const DIFF: [&str; 3] = ["--root", "--no-color", "--diff-algorithm=myers"];
+
+/// And a patch, which patch-id reads, with git's default prefixes and
+/// context (`diff.noprefix`, `diff.context`).
+const PATCH: [&str; 2] = ["--default-prefix", "-U3"];
+
 impl Worker<'_> {
     fn count(&mut self, name: &'static str, n: i64) {
         *self.counts.entry(name).or_default() += n;
@@ -369,15 +380,17 @@ impl Worker<'_> {
         let Some(config) = self.git("setup", &common, &["config", "--null", "--list"], &plain).await else {
             return Ok(self.stopped(memory));
         };
-        if config.failed() {
+        // git lists a configuration outside a repository too: whether git
+        // reads the repository is what rev-parse says.
+        let Some(shallow) = self.git("setup", &common, &["rev-parse", "--is-shallow-repository"], &plain).await else {
+            return Ok(self.stopped(memory));
+        };
+        if config.failed() || shallow.failed() {
             // Its git directory is there and git cannot read it.
             self.fill_crawl("unreadable", "HEAD", "head", None, 0, &BTreeMap::new());
             return Ok(Ran { outcome: "unreadable", memory, hosts: Vec::new(), commits_held: 0, commits_read: 0, kept: Vec::new() });
         }
         let config = remotes::config(&config.stdout);
-        let Some(shallow) = self.git("setup", &common, &["rev-parse", "--is-shallow-repository"], &plain).await else {
-            return Ok(self.stopped(memory));
-        };
         if shallow.ok().map(str::trim) == Some("true") {
             self.notes.push("shallow: its commits are those git holds".to_string());
         }
@@ -889,7 +902,7 @@ impl Worker<'_> {
                 .git(
                     "log",
                     &dir.path,
-                    &["log", "--stdin", "--no-walk=unsorted", "--diff-merges=first-parent", "--no-renames", "--raw", "--numstat", "--no-abbrev", "-z", "--format=commit %H"],
+                    &[&["log", "--stdin", "--no-walk=unsorted", "--diff-merges=first-parent", "--no-renames", "--raw", "--numstat", "--no-abbrev", "-z", "--format=commit %H"][..], &DIFF].concat(),
                     &with,
                 )
                 .await?;
@@ -898,12 +911,14 @@ impl Worker<'_> {
                 .git(
                     "log",
                     &dir.path,
-                    &["log", "--stdin", "--no-walk=unsorted", "--diff-merges=first-parent", "--no-renames", "--numstat", "--ignore-all-space", "-z", "--format=commit %H"],
+                    &[&["log", "--stdin", "--no-walk=unsorted", "--diff-merges=first-parent", "--no-renames", "--numstat", "--ignore-all-space", "-z", "--format=commit %H"][..], &DIFF].concat(),
                     &with,
                 )
                 .await?;
             let blind = commits::numstat(blind.ok_raw().unwrap_or_default());
-            let patches = self.git("patches", &dir.path, &["log", "--stdin", "--no-walk=unsorted", "--no-renames", "-p", "--format=commit %H"], &with).await?;
+            // A merge has no patch, so no patch id.
+            let args = [&["log", "--stdin", "--no-walk=unsorted", "--diff-merges=off", "--no-renames", "-p", "--format=commit %H"][..], &DIFF, &PATCH].concat();
+            let patches = self.git("patches", &dir.path, &args, &with).await?;
             let patch_input = patches.ok_raw().unwrap_or_default().to_vec();
             let ids = self.git("patches", &dir.path, &["patch-id", "--stable"], &With { input: Some(&patch_input), ..base.clone() }).await?;
             let ids = commits::patch_ids(ids.ok().unwrap_or_default());
@@ -1184,7 +1199,7 @@ impl Worker<'_> {
     ) -> Result<bool> {
         let Some(tip) = tip else { return Ok(true) };
         let with = self.with_of(tip_dir);
-        let args = ["log", "--first-parent", "--diff-merges=first-parent", "--no-renames", "--raw", "--no-abbrev", "-z", "--format=commit %H", tip];
+        let args = [&["log", "--first-parent", "--diff-merges=first-parent", "--no-renames", "--raw", "--no-abbrev", "-z", "--format=commit %H"][..], &DIFF, &[tip]].concat();
         let Some(call) = self.git("landed", &tip_dir.path, &args, &with).await else { return Ok(false) };
         // Each (path, blob) the first-parent history wrote, by its oldest
         // commit: the log lists the newest first.
@@ -1224,7 +1239,7 @@ impl Worker<'_> {
             here.sort();
             let input: Vec<u8> = here.iter().flat_map(|h| format!("{h}\n").into_bytes()).collect();
             let with = With { input: Some(&input), ..self.with_of(dir) };
-            let args = ["log", "--stdin", "--no-walk=unsorted", "--diff-merges=first-parent", "--no-renames", "--raw", "--no-abbrev", "-z", "--format=commit %H"];
+            let args = [&["log", "--stdin", "--no-walk=unsorted", "--diff-merges=first-parent", "--no-renames", "--raw", "--no-abbrev", "-z", "--format=commit %H"][..], &DIFF].concat();
             let Some(call) = self.git("landed", &dir.path, &args, &with).await else { return Ok(false) };
             let files = commits::files(call.ok_raw().unwrap_or_default());
             for hash in here {
@@ -1268,7 +1283,8 @@ impl Worker<'_> {
                 (meta.split(' ').nth(1) == Some("blob")).then(|| path.to_string())
             })
             .collect();
-        let Some(history) = self.git("tip", &tip_dir.path, &["log", "--diff-merges=first-parent", "--no-renames", "--numstat", "-z", "--format=commit %H", tip], &with).await
+        let args = [&["log", "--diff-merges=first-parent", "--no-renames", "--numstat", "-z", "--format=commit %H"][..], &DIFF, &[tip]].concat();
+        let Some(history) = self.git("tip", &tip_dir.path, &args, &with).await
         else {
             return Ok(false);
         };
@@ -1303,7 +1319,10 @@ impl Worker<'_> {
             set.spawn(async move {
                 let _permit = semaphore.acquire_owned().await;
                 let mut git = Git::new(timeout);
-                let call = git.run_with(&dir, &["blame", "--porcelain", &tip, "--", &path], &with).await;
+                // No revision the operator's blame.ignoreRevsFile names is
+                // passed over: blame credits each line to the commit that
+                // wrote it.
+                let call = git.run_with(&dir, &["blame", "--porcelain", "--ignore-revs-file=", &tip, "--", &path], &with).await;
                 (git.tally(), call)
             });
         }
