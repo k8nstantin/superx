@@ -5520,33 +5520,41 @@ async fn a_session_is_found_by_its_id_without_listing_every_session() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// No module links (#536): the status answer names no module's own UI
+// Module links (#553): the status answer names a module's own UI only
+// while the module is active, and never the core UI's own
 // ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_core_uis_status_answer_names_no_module_ui() {
+async fn the_core_uis_status_answer_links_only_active_modules() {
     let kernel = fresh_kernel().await;
-    // A module that publishes its own URL on its registry entity, as
-    // superx-recon does.
-    let module = kernel
-        .register_module(&superx_kernel::KernelModuleDescriptor {
-            name: "recon",
-            version: env!("CARGO_PKG_VERSION"),
-            kind: superx_kernel::NodeKind::KernelModule,
-            depends_on: &[],
-            required_metamodel: &[],
-        })
-        .await
-        .expect("register a module");
-    kernel
-        .set_parameter(
-            module,
-            "attr_module_ui_url",
-            superx_kernel::types::Value::String("http://127.0.0.1:5153".to_string()),
-        )
-        .await
-        .expect("its URL");
-    // The core UI, on a port of the test's own.
+    // Modules that publish their own URL on their registry entity, as
+    // superx-recon does: one running, one that ran and stopped, one
+    // never started.
+    for (name, url) in [
+        ("recon", "http://127.0.0.1:5153"),
+        ("repos", "http://127.0.0.1:5154"),
+        ("specs", "http://127.0.0.1:5152"),
+    ] {
+        let module = kernel
+            .register_module(&superx_kernel::KernelModuleDescriptor {
+                name,
+                version: env!("CARGO_PKG_VERSION"),
+                kind: superx_kernel::NodeKind::KernelModule,
+                depends_on: &[],
+                required_metamodel: &[],
+            })
+            .await
+            .expect("register a module");
+        kernel
+            .set_parameter(module, "attr_module_ui_url", superx_kernel::types::Value::String(url.to_string()))
+            .await
+            .expect("its URL");
+    }
+    kernel.mark_active(superx_kernel::NodeKind::KernelModule, "recon", 1).await.expect("recon runs");
+    kernel.mark_active(superx_kernel::NodeKind::KernelModule, "repos", 1).await.expect("repos ran");
+    kernel.mark_disabled(superx_kernel::NodeKind::KernelModule, "repos").await.expect("and stopped");
+    // The core UI, on a port of the test's own, active and with a URL of
+    // its own: it never links to itself.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("a free port")
         .local_addr()
@@ -5554,9 +5562,14 @@ async fn the_core_uis_status_answer_names_no_module_ui() {
         .port();
     let ui = kernel.register_module(&UiModule.descriptor()).await.expect("register the ui");
     kernel
-        .set_parameter(ui, PORT_PARAM, superx_kernel::types::Value::Number(superx_kernel::types::Number::Int(i64::from(port))))
+        .set_parameter(ui.clone(), PORT_PARAM, superx_kernel::types::Value::Number(superx_kernel::types::Number::Int(i64::from(port))))
         .await
         .expect("its port");
+    kernel
+        .set_parameter(ui, "attr_module_ui_url", superx_kernel::types::Value::String(format!("http://127.0.0.1:{port}")))
+        .await
+        .expect("its URL");
+    kernel.mark_active(superx_kernel::NodeKind::KernelModule, "ui", 1).await.expect("the ui runs");
     UiModule.startup(&kernel).await.expect("the ui serves");
 
     let answer = tokio::task::spawn_blocking(move || {
@@ -5574,8 +5587,14 @@ async fn the_core_uis_status_answer_names_no_module_ui() {
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     let status: serde_json::Value = serde_json::from_str(body).expect("the status, as JSON");
     let modules = status["modules"].as_array().expect("the modules it lists");
-    assert!(modules.iter().any(|m| m["name"] == "recon"), "the module is listed: {status}");
-    for m in modules {
-        assert!(m.get("ui_url").is_none(), "a module listed with a link to its UI: {m}");
+    let named = |name: &str| {
+        modules
+            .iter()
+            .find(|m| m["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is listed: {status}"))
+    };
+    assert_eq!(named("recon")["ui_url"], "http://127.0.0.1:5153", "the running module is linked");
+    for name in ["repos", "specs", "ui"] {
+        assert!(named(name)["ui_url"].is_null(), "{name} is listed without a link: {}", named(name));
     }
 }
