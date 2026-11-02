@@ -372,7 +372,7 @@ async fn a_pass_reads_every_line_into_its_facts_and_a_second_pass_writes_nothing
     assert_eq!(third.rows_written, 0, "{third:?}");
     assert_eq!(every_count(&db).await, counts, "nothing written twice after a restart");
     assert_eq!(count(&db, "pass").await, 3, "one row per pass");
-    assert_eq!(count(&db, "pass_source").await, 6, "and one per source in it");
+    assert_eq!(count(&db, "pass_source").await, 9, "and one per source in it: lines, repos and hosts");
 }
 
 #[tokio::test]
@@ -746,7 +746,7 @@ async fn the_crawler_ends_when_asked_even_while_it_waits() {
     // finds nothing to pass over and waits a minute before it looks again.
     let kernel = booted_kernel().await;
     let (asked, watched) = watch::channel(false);
-    let crawler = tokio::spawn(superx_mod_recon::crawler::run(kernel, Stop::new(watched)));
+    let crawler = tokio::spawn(superx_mod_recon::crawler::run(kernel, superx_mod_recon::crawler::Places::default(), Stop::new(watched)));
     tokio::time::sleep(SETTLE).await;
     asked.send_replace(true);
     let ended = tokio::time::timeout(LIMIT, crawler).await;

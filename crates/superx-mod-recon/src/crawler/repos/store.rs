@@ -1,6 +1,7 @@
 //! Every query the `repos` source issues against the module's own
-//! database, in one place: the list as it stands, and the working
-//! directories the sessions worked in. The rows it writes go through
+//! database for its list, in one place: the list as it stands, the working
+//! directories the sessions worked in, and the git events the lines showed
+//! (#538); a crawl reads what it needs itself. The rows it writes go through
 //! [`crate::crawler::store`]. Of several rows for one thing, the newest is
 //! picked here by `valid_from`, never by an index's order (#486).
 
@@ -11,8 +12,10 @@ use superx_kernel::types::{RecordId, Uuid, Value};
 use superx_kernel::{Db, Result};
 
 use crate::crawler::lines::kernel::record_uuid_of;
+use crate::crawler::repos::crawl::Event;
+use crate::crawler::repos::operations::Operations;
 use crate::crawler::store::Row;
-use crate::crawler::value::{at, flag, text};
+use crate::crawler::value::{at, flag, list, text};
 
 /// A checkout's state, as a `checkout_state` row says it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +23,9 @@ pub struct CheckoutState {
     pub branch: Option<String>,
     pub first_branch: Option<String>,
     pub present: bool,
+    /// What git is in the middle of there (#538, step 12); none when not
+    /// read, as for a checkout that is gone.
+    pub operations: Option<Operations>,
 }
 
 /// A directory, as a `directory` row says it.
@@ -57,7 +63,8 @@ pub struct Held {
 
 const HELD: &str = "SELECT id, common_dir FROM repository;\
      SELECT id, repository, repository.common_dir AS common, toplevel FROM checkout;\
-     SELECT checkout, branch, first_branch, present, valid_from FROM checkout_state;\
+     SELECT checkout, branch, first_branch, present, operations, operation_commits, rebase_branch, rebase_onto, rebase_done, \
+     rebase_left, bisect_start, valid_from FROM checkout_state;\
      SELECT path, source, checkout, exact, valid_from FROM directory;";
 
 /// Read the list as it stands.
@@ -94,6 +101,7 @@ pub async fn held(db: &Db) -> Result<Held> {
                 branch: text(r, &["branch"]).map(str::to_string),
                 first_branch: text(r, &["first_branch"]).map(str::to_string),
                 present: flag(r, &["present"])?,
+                operations: operations_of(r),
             },
             time(r, "valid_from")?,
         ))
@@ -162,11 +170,93 @@ pub fn checkout(repository: &RecordId, toplevel: &str, at_time: DateTime<Utc>) -
 /// A checkout's state, when it changed.
 #[must_use]
 pub fn checkout_state(checkout: &RecordId, state: &CheckoutState) -> Row {
-    Row::new()
+    let row = Row::new()
         .link("checkout", checkout)
         .some_text("branch", state.branch.clone())
         .some_text("first_branch", state.first_branch.clone())
-        .flag("present", state.present)
+        .flag("present", state.present);
+    match &state.operations {
+        None => row,
+        Some(o) => {
+            let row = row.texts("operations", &o.operations);
+            let row = match &o.operation_commits {
+                Some(c) => row.texts("operation_commits", c),
+                None => row,
+            };
+            row.some_text("rebase_branch", o.rebase_branch.clone())
+                .some_text("rebase_onto", o.rebase_onto.clone())
+                .some_int("rebase_done", o.rebase_done)
+                .some_int("rebase_left", o.rebase_left)
+                .some_text("bisect_start", o.bisect_start.clone())
+        }
+    }
+}
+
+/// The operations a checkout_state row holds; none when it holds none.
+fn operations_of(r: &Value) -> Option<Operations> {
+    let strings = |key: &str| -> Vec<String> {
+        list(r, &[key]).iter().filter_map(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        }).collect()
+    };
+    let number = |key: &str| match at(r, &[key]) {
+        Some(Value::Number(n)) => n.to_int(),
+        _ => None,
+    };
+    match at(r, &["operations"]) {
+        Some(Value::Array(_)) => Some(Operations {
+            operations: strings("operations"),
+            operation_commits: matches!(at(r, &["operation_commits"]), Some(Value::Array(_))).then(|| strings("operation_commits")),
+            rebase_branch: text(r, &["rebase_branch"]).map(str::to_string),
+            rebase_onto: text(r, &["rebase_onto"]).map(str::to_string),
+            rebase_done: number("rebase_done"),
+            rebase_left: number("rebase_left"),
+            bisect_start: text(r, &["bisect_start"]).map(str::to_string),
+        }),
+        _ => None,
+    }
+}
+
+/// The git actions that send the crawler to a repository (step 1), which
+/// hold the ones that tie a commit to a session (step 13).
+pub const ACTIONS: [&str; 10] =
+    ["commit", "push", "merge", "rebase", "revert", "cherry_pick", "reset", "branch_deleted", "pr_created", "pr_merged"];
+
+/// Every git event the lines source wrote of those actions, with the
+/// session of its tool call's reply.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError`] when the module's database cannot answer.
+pub async fn events(db: &Db) -> Result<Vec<Event>> {
+    let rows: Vec<Value> = db
+        .query(
+            "SELECT action, hash, dir, url, pr_number, at, tool_call, tool_call.reply.session AS session, valid_from \
+             FROM git_event WHERE action INSIDE $actions",
+        )
+        .bind(("actions", ACTIONS.to_vec()))
+        .await?
+        .take(0)?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            Some(Event {
+                action: text(r, &["action"])?.to_string(),
+                hash: text(r, &["hash"]).map(str::to_string),
+                dir: text(r, &["dir"]).map(str::to_string),
+                url: text(r, &["url"]).map(str::to_string),
+                pr_number: match at(r, &["pr_number"]) {
+                    Some(Value::Number(n)) => n.to_int(),
+                    _ => None,
+                },
+                at: time(r, "at")?,
+                tool_call: record(r, "tool_call")?,
+                session: record(r, "session"),
+                valid_from: time(r, "valid_from")?,
+            })
+        })
+        .collect())
 }
 
 /// A directory's row, when it changed.

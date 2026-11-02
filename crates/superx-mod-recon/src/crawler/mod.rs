@@ -2,13 +2,14 @@
 //! after pass while `superx-recon` runs, through its sources.
 //!
 //! A source reads one kind of thing: [`lines`], the lines the kernel
-//! captured; [`repos`], the git repositories those lines lead to. Sources
-//! share facts, not messages: a source reads what the others wrote to the
+//! captured; [`repos`], the git repositories those lines lead to;
+//! [`hosts`], the hosts those repositories live on (#538). Sources share
+//! facts, not messages: a source reads what the others wrote to the
 //! database. A pass runs them in the order their facts need: `lines`
 //! first, then `repos`, which follows the working directories `lines` has
-//! just written. Each source spreads its own work as far as its parameters
-//! allow. A source added later (the GitHub and Bitbucket hosts, and
-//! others) is one more module here, with its own tables of facts.
+//! just written, its workers crawling beside each repository the host
+//! repositories its remotes name. Each source spreads its own work as far
+//! as its parameters allow.
 //!
 //! A pass ends with its own row and one row per source (`pass`,
 //! `pass_source`): what each source worked through, what it could not
@@ -17,9 +18,11 @@
 //! even that record cannot be written, the pass is not recorded and the
 //! crawler starts over from its database.
 //!
-//! The crawler only reads the kernel (SELECT) and the repositories (git,
-//! read-only), and only writes its own database (CREATE).
+//! The crawler only reads the kernel (SELECT), the repositories (git,
+//! read-only) and the hosts (GET), and only writes its own database
+//! (CREATE) and its own mirrors.
 
+pub mod hosts;
 pub mod lines;
 pub mod repos;
 pub mod store;
@@ -27,6 +30,7 @@ pub mod value;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use superx_kernel::types::{RecordId, Uuid};
@@ -176,21 +180,59 @@ impl Pass {
     }
 }
 
+/// Where the crawler keeps and finds what is its own (#538): the instance's
+/// home, the repos folder its mirrors live in, the credentials file, itself
+/// as git's askpass, and the hosts' addresses. A test gives its own,
+/// through these arguments.
+#[derive(Debug, Clone, Default)]
+pub struct Places {
+    pub home: Option<PathBuf>,
+    pub repos: Option<PathBuf>,
+    pub credentials: Option<PathBuf>,
+    pub askpass: Option<PathBuf>,
+    pub hosts: hosts::Endpoints,
+}
+
+impl Places {
+    /// The instance's own places, with this executable as git's askpass.
+    #[must_use]
+    pub fn of(instance: &crate::instance::Instance, askpass: Option<PathBuf>) -> Self {
+        Self {
+            home: Some(instance.home.clone()),
+            repos: Some(instance.repos_dir()),
+            credentials: Some(instance.credentials_path()),
+            askpass,
+            hosts: hosts::Endpoints::default(),
+        }
+    }
+}
+
 /// What the crawler keeps from one pass to the next: its connection to its
-/// own database, and each source's memory.
+/// own database, its places, and each source's memory.
 #[derive(Default)]
 pub struct Crawler {
     db: Option<Db>,
+    places: Places,
     lines: lines::Memory,
     repos: repos::Memory,
+    hosts: hosts::Memory,
+}
+
+impl Crawler {
+    /// A crawler that keeps what it fetches, and finds the hosts, at
+    /// `places`.
+    #[must_use]
+    pub fn new(places: Places) -> Self {
+        Self { places, ..Self::default() }
+    }
 }
 
 /// Pass after pass, until asked to stop: one right away, then one every
 /// `attr_recon_read_secs`, the parameters read afresh before each.
 /// Nothing is read while it is 0, or while the module's database is not
 /// provisioned; both are looked at again a minute later.
-pub async fn run(kernel: Kernel, mut stop: Stop) {
-    let mut crawler = Crawler::default();
+pub async fn run(kernel: Kernel, places: Places, mut stop: Stop) {
+    let mut crawler = Crawler::new(places);
     loop {
         let wait_secs = match params::resolve(&kernel).await {
             Err(e) => {
@@ -228,6 +270,7 @@ fn log(pass: superx_kernel::Result<Pass>) {
         Ok(p) if p.rows_written > 0 || p.outcome != "complete" => {
             let lines = p.source(lines::SOURCE);
             let repos = p.source(repos::SOURCE);
+            let hosts = p.source(hosts::SOURCE);
             tracing::info!(
                 target: "recon",
                 outcome = p.outcome,
@@ -235,6 +278,8 @@ fn log(pass: superx_kernel::Result<Pass>) {
                 lines_unread = lines.map_or(0, |s| s.unread),
                 repos_items = repos.map_or(0, |s| s.items),
                 git_calls = repos.map_or(0, |s| s.calls),
+                hosts_items = hosts.map_or(0, |s| s.items),
+                host_calls = hosts.map_or(0, |s| s.calls),
                 rows_written = p.rows_written,
                 "pass"
             );
@@ -301,14 +346,20 @@ async fn passes(
     let stopped = lines.outcome == Outcome::Stopped;
     sources.push(lines);
     if !stopped {
-        let repos = match repos::crawl(db, params, &mut crawler.repos, &worked_in, stop).await {
-            Ok(run) => run,
+        // `repos` next, its workers crawling the hosts beside it.
+        let crawled =
+            repos::crawl(db, params, &crawler.places, &mut crawler.repos, &crawler.hosts, &worked_in, started_at, stop).await;
+        match crawled {
+            Ok(c) => {
+                sources.push(c.repos);
+                sources.push(c.hosts);
+            }
             Err(e) => {
                 crawler.repos = repos::Memory::default();
-                failed(repos::SOURCE, &e)
+                sources.push(failed(repos::SOURCE, &e));
+                sources.push(failed(hosts::SOURCE, &e));
             }
-        };
-        sources.push(repos);
+        }
     }
     let outcome = if sources.iter().any(|s| s.outcome == Outcome::Stopped) {
         "stopped"

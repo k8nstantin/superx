@@ -72,6 +72,16 @@ const DEFAULT_SURVIVAL_SKIP: &[&str] =
 /// rule in code can know it.
 pub const MAINLINE_REFS_PARAM: &str = "attr_recon_mainline_refs";
 
+/// Repositories crawled in depth at once, each by a worker of its own
+/// (#538, decision repos-at-once): no limit until the operator sets one.
+pub const REPOS_AT_ONCE_PARAM: &str = "attr_recon_repos_at_once";
+const DEFAULT_REPOS_AT_ONCE: u64 = ALL;
+
+/// Milliseconds a call to a host may take before it is cut off (#538); its
+/// fallback is attr_recon_git_timeout_ms's.
+pub const HOST_TIMEOUT_MS_PARAM: &str = "attr_recon_host_timeout_ms";
+const DEFAULT_HOST_TIMEOUT_MS: u64 = DEFAULT_GIT_TIMEOUT_MS;
+
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -87,6 +97,8 @@ pub struct Params {
     pub unreachable_commits: u64,
     pub survival_skip: Vec<String>,
     pub mainline_refs: BTreeMap<String, String>,
+    pub repos_at_once: u64,
+    pub host_timeout_ms: u64,
 }
 
 impl Params {
@@ -139,7 +151,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 12] = [
+pub const NAMES: [&str; 14] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -152,6 +164,8 @@ pub const NAMES: [&str; 12] = [
     UNREACHABLE_COMMITS_PARAM,
     SURVIVAL_SKIP_PARAM,
     MAINLINE_REFS_PARAM,
+    REPOS_AT_ONCE_PARAM,
+    HOST_TIMEOUT_MS_PARAM,
 ];
 
 /// Read every parameter from this module's registry entity. Before the
@@ -198,6 +212,8 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         unreachable_commits: r.limit(UNREACHABLE_COMMITS_PARAM, DEFAULT_UNREACHABLE_COMMITS),
         survival_skip: r.strings(SURVIVAL_SKIP_PARAM, DEFAULT_SURVIVAL_SKIP),
         mainline_refs: r.refs(MAINLINE_REFS_PARAM),
+        repos_at_once: r.at_least_one(REPOS_AT_ONCE_PARAM, DEFAULT_REPOS_AT_ONCE),
+        host_timeout_ms: r.count(HOST_TIMEOUT_MS_PARAM, 1, DEFAULT_HOST_TIMEOUT_MS),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -259,6 +275,20 @@ impl Resolver<'_> {
             fallback,
             |v| match v {
                 Value::Number(n) => n.to_int().and_then(|i| u64::try_from(i).ok()),
+                _ => None,
+            },
+            |&v| if v == ALL { "all".to_string() } else { v.to_string() },
+        )
+    }
+
+    /// A whole number, 1 or more, shown as `all` when there is no limit.
+    fn at_least_one(&mut self, name: &'static str, fallback: u64) -> u64 {
+        self.read(
+            name,
+            "a whole number, 1 or more",
+            fallback,
+            |v| match v {
+                Value::Number(n) => n.to_int().and_then(|i| u64::try_from(i).ok()).filter(|&i| i >= 1),
                 _ => None,
             },
             |&v| if v == ALL { "all".to_string() } else { v.to_string() },
@@ -345,8 +375,9 @@ mod tests {
     }
 
     /// The parameters before the rename, as `superx-performance` named them,
-    /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 12] = [
+    /// in their order, with the fallback each ran on, and the two #538
+    /// adds after them (step 24).
+    const TODAY: [(&str, &str); 14] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -359,6 +390,8 @@ mod tests {
         ("unreachable_commits", "all"),
         ("survival_skip", "/dist/, .lock, .tsbuildinfo, .png, .jpg, .jpeg, .ico, .woff, .woff2, .svg, .pdf"),
         ("mainline_refs", "none"),
+        ("repos_at_once", "all"),
+        ("host_timeout_ms", "120000"),
     ];
 
     #[test]

@@ -10,6 +10,9 @@
 //! - `superx-recon run`: the process itself, in the foreground;
 //!   `start` runs it in the background. It serves its URL and reads every
 //!   captured line into its database, pass after pass.
+//! - `superx-recon <prompt>` with `SUPERX_RECON_ASKPASS` in its environment:
+//!   git's askpass for a mirror's fetch (#538), answering with the token the
+//!   credentials file gives that host, and nothing else.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -20,8 +23,9 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use superx_kernel::Kernel;
+use superx_mod_recon::crawler::hosts::{Host, ASKPASS_ENV, HOME_ENV};
 use superx_mod_recon::instance::{Instance, PASSWORD_ENV};
-use superx_mod_recon::{crawler, daemon, folder, params, registry, server, status, MODULE_NAME, SCHEMA_DDL};
+use superx_mod_recon::{credentials, crawler, daemon, folder, params, registry, server, status, MODULE_NAME, SCHEMA_DDL};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::watch;
@@ -58,6 +62,14 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // git's askpass: one argument, the prompt; nothing read, started or
+    // logged.
+    if let Ok(host) = std::env::var(ASKPASS_ENV) {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if let [prompt] = args.as_slice() {
+            return askpass(&host, prompt);
+        }
+    }
     let cli = Cli::parse();
     let instance = match Instance::read(&cli.home) {
         Ok(i) => i,
@@ -87,6 +99,45 @@ async fn main() -> ExitCode {
 fn fail(e: &str) -> ExitCode {
     eprintln!("superx-recon: {e}");
     ExitCode::FAILURE
+}
+
+/// Answer git's prompt for a mirror's fetch (step 23): the password of
+/// `https://<host>` or `https://<user>@<host>`, `host` the one the
+/// environment names and one the crawler reads, from the credentials file
+/// of the home the environment names. Any other prompt, or no token, is no
+/// answer: nothing printed, why said without a token, exit 1.
+fn askpass(host: &str, prompt: &str) -> ExitCode {
+    let refuse = |why: &str| {
+        eprintln!("superx-recon: as git's askpass: {why}");
+        ExitCode::FAILURE
+    };
+    let Some(url) = prompt.strip_prefix("Password for '").and_then(|p| p.trim_end().strip_suffix("':")) else {
+        return refuse("not a password prompt");
+    };
+    let Some(authority) = url.strip_prefix("https://") else {
+        return refuse("not a prompt for https");
+    };
+    let asked = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if asked != host || asked.contains(['/', ':', '?', '#']) {
+        return refuse("the prompt is not for the host it was started for");
+    }
+    let Some(which) = Host::of(host) else {
+        return refuse("not a host the crawler reads");
+    };
+    let Ok(home) = std::env::var(HOME_ENV) else {
+        return refuse("no home named");
+    };
+    let path = Instance::read(std::path::Path::new(&home)).map(|i| i.credentials_path());
+    let Ok(path) = path else {
+        return refuse("the home's params cannot be read");
+    };
+    match which.token(&credentials::read(&path)) {
+        Some(token) => {
+            println!("{}", token.secret());
+            ExitCode::SUCCESS
+        }
+        None => refuse("the credentials file gives the host no token"),
+    }
 }
 
 /// Connect to the instance's substrate as its service account.
@@ -211,7 +262,8 @@ async fn run(instance: &Instance) -> Result<(), String> {
     // it was in is recorded as stopped.
     let (asked, watched) = watch::channel(false);
     let asked = Arc::new(asked);
-    let crawling = tokio::spawn(crawler::run(kernel.clone(), crawler::Stop::new(watched)));
+    let places = crawler::Places::of(instance, std::env::current_exe().ok());
+    let crawling = tokio::spawn(crawler::run(kernel.clone(), places, crawler::Stop::new(watched)));
     let on_stop = {
         let asked = Arc::clone(&asked);
         async move {

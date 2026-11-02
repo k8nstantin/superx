@@ -23,8 +23,14 @@ pub struct Batch {
 
 impl Batch {
     /// A row of `table`, its id set here, its `valid_from` now.
-    pub fn create(&mut self, table: &'static str, mut content: Row) -> RecordId {
-        let id = RecordId::new(table, Uuid::new_v7());
+    pub fn create(&mut self, table: &'static str, content: Row) -> RecordId {
+        self.create_as(table, RecordId::new(table, Uuid::new_v7()), content)
+    }
+
+    /// A row of `table` under an id set before (§11, [`new_id`]): a row the
+    /// crawl finishes last and the database must hold first, before the
+    /// rows that link to it (#538).
+    pub fn create_as(&mut self, table: &'static str, id: RecordId, mut content: Row) -> RecordId {
         content.0.insert("valid_from", Value::Datetime(Datetime::from(Utc::now())));
         self.rows.push((id.clone(), content.0));
         *self.added.entry(table).or_default() += 1;
@@ -41,6 +47,79 @@ impl Batch {
     #[must_use]
     pub fn total(&self) -> i64 {
         self.added.values().sum()
+    }
+}
+
+/// A new row id of `table`: a UUIDv7, set here (§11).
+#[must_use]
+pub fn new_id(table: &str) -> RecordId {
+    RecordId::new(table, Uuid::new_v7())
+}
+
+/// The rows one worker makes (#538), held until it is done, in the order
+/// the database must take them: each after every row it links. A row the
+/// worker finishes last and the database must hold first (a crawl, a host
+/// crawl, a repository on a host) holds its place from the start
+/// ([`Rows::hold`]) and is filled in when it is known.
+#[derive(Debug, Default)]
+pub struct Rows {
+    list: Vec<(&'static str, RecordId, Option<Row>)>,
+}
+
+/// A place held for a row filled in later, and the id it will have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    index: usize,
+    pub id: RecordId,
+}
+
+impl Rows {
+    /// A row, after every row made before it.
+    pub fn push(&mut self, table: &'static str, row: Row) -> RecordId {
+        let id = new_id(table);
+        self.list.push((table, id.clone(), Some(row)));
+        id
+    }
+
+    /// A row under an id set before, after every row made before it: an
+    /// account several workers name, under the one id the pass gives it.
+    pub fn push_as(&mut self, table: &'static str, id: RecordId, row: Row) {
+        self.list.push((table, id, Some(row)));
+    }
+
+    /// A place for a row of `table`, here in the order, filled in later.
+    pub fn hold(&mut self, table: &'static str) -> Place {
+        let id = new_id(table);
+        self.list.push((table, id.clone(), None));
+        Place { index: self.list.len() - 1, id }
+    }
+
+    /// The row of a place held.
+    pub fn fill(&mut self, place: &Place, row: Row) {
+        if let Some(slot) = self.list.get_mut(place.index) {
+            slot.2 = Some(row);
+        }
+    }
+
+    /// The rows made so far of `table`.
+    #[must_use]
+    pub fn count(&self, table: &str) -> i64 {
+        i64::try_from(self.list.iter().filter(|(t, _, row)| *t == table && row.is_some()).count()).unwrap_or(i64::MAX)
+    }
+
+    /// Every row made, in order, but those `skip` names; a place never
+    /// filled is left out.
+    #[must_use]
+    pub fn into_batch(self, skip: &dyn Fn(&RecordId) -> bool) -> Batch {
+        let mut batch = Batch::default();
+        for (table, id, row) in self.list {
+            if let Some(row) = row {
+                if !skip(&id) {
+                    batch.create_as(table, id, row);
+                }
+            }
+        }
+        batch
     }
 }
 
@@ -148,6 +227,38 @@ impl Row {
     pub fn object(mut self, key: &str, v: Object) -> Self {
         self.0.insert(key, Value::Object(v));
         self
+    }
+
+    /// Any value, as it is: a host object's key, which is a number or a
+    /// text (#538).
+    #[must_use]
+    pub fn value(mut self, key: &str, v: Value) -> Self {
+        self.0.insert(key, v);
+        self
+    }
+
+    #[must_use]
+    pub fn some_value(self, key: &str, v: Option<Value>) -> Self {
+        match v {
+            Some(v) => self.value(key, v),
+            None => self,
+        }
+    }
+
+    #[must_use]
+    pub fn some_link(self, key: &str, v: Option<&RecordId>) -> Self {
+        match v {
+            Some(v) => self.link(key, v),
+            None => self,
+        }
+    }
+
+    #[must_use]
+    pub fn some_time(self, key: &str, v: Option<DateTime<Utc>>) -> Self {
+        match v {
+            Some(v) => self.time(key, v),
+            None => self,
+        }
     }
 }
 

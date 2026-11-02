@@ -16,9 +16,14 @@ path = "src/main.rs"
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
+# The hosts' read APIs (#538, decision http-client): one HTTP client for
+# both hosts, over rustls.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The SHA-256 a host object's content is kept by (#538).
+sha2 = "0.10"
 superx-kernel = { path = "../superx-kernel" }
 tokio = { workspace = true, features = ["signal", "net", "process", "time", "sync"] }
 tracing.workspace = true

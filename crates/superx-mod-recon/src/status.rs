@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use superx_kernel::types::Value;
 use superx_kernel::{Db, Kernel, Result};
 
-use crate::crawler::lines;
+use crate::crawler::{hosts, lines, repos};
 use crate::credentials::{self, Credentials, BITBUCKET, GITHUB};
 use crate::instance::Instance;
 use crate::params::{self, Resolved};
@@ -354,10 +354,37 @@ fn folder_lines(out: &mut String, folder: &Folder) {
 /// calls when it made any, the rows it added, and how it ended when it did
 /// not end well. The lines source says too what the kernel held over the
 /// lines it read, the lines that fed no table, and the fields its lines
-/// showed (#537).
+/// showed (#537); the repos source the commits it read of those git holds,
+/// and the hosts source the objects it read of those the hosts stated
+/// (#538).
 fn source_line(s: &LastSource) -> String {
     let n = |name: &str| s.counts.get(name).copied().unwrap_or(0);
-    let mut line = if s.source == lines::SOURCE {
+    let mut line = if s.source == repos::SOURCE {
+        format!(
+            "{} read, {} in a shape it does not know · {} commits read of {} held · {} calls, {} failed, {} cut off · {} rows",
+            s.items,
+            s.unread,
+            n("commits_read"),
+            n("commits_held"),
+            s.calls,
+            s.failed,
+            s.timed_out,
+            s.rows_written
+        )
+    } else if s.source == hosts::SOURCE {
+        format!(
+            "{} read, {} in a shape it does not know · {} objects read of {} stated · {} calls, {} failed, {} cut off, {} waits · {} rows",
+            s.items,
+            s.unread,
+            n("totals_read"),
+            n("totals_stated"),
+            s.calls,
+            s.failed,
+            s.timed_out,
+            n("rate_waits"),
+            s.rows_written
+        )
+    } else if s.source == lines::SOURCE {
         format!(
             "{} read of {} held, {} fed no table, {} in a shape it does not know · {} fields, {} new, {} not stored · {} rows",
             s.items,
@@ -567,8 +594,8 @@ mod tests {
         );
         assert!(
             t.contains(
-                "  repos     125 read, 0 in a shape it does not know · 149 calls, 1 failed, 0 cut off · 14 rows \
-                 (partial: 1 git calls cut off)\n"
+                "  repos     125 read, 0 in a shape it does not know · 0 commits read of 0 held · 149 calls, 1 failed, \
+                 0 cut off · 14 rows (partial: 1 git calls cut off)\n"
             ),
             "{t}"
         );

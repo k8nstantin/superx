@@ -7,6 +7,11 @@
 //! refresh is written back (git(1), `GIT_OPTIONAL_LOCKS`). A call that
 //! outlasts `attr_recon_git_timeout_ms` is killed, never left behind.
 //!
+//! A call on one of the crawler's own mirrors (#538) carries more: the
+//! mirror's settings on its command line and its environment, which
+//! [`With`] gives. A fetch is not bound by the timeout: only a stop ends
+//! it, and git ends one that stalls.
+//!
 //! What each call did is kept: when it started, how long it took, its exit
 //! code, what it printed and what it wrote to its error output. The crawler
 //! counts every call, and records it where its schema has a place for it.
@@ -16,6 +21,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
 /// Configuration under which a read would run a program the repository
@@ -36,6 +42,22 @@ fn no_diff_drivers(subcommand: &str) -> &'static [&'static str] {
     }
 }
 
+/// What a call takes beyond t01's overrides: settings on its command line
+/// and variables in its environment (a mirror's, step 4), what it is given
+/// to read, and whether the runner's bound applies.
+#[derive(Debug, Default, Clone)]
+pub struct With<'a> {
+    /// `key=value` settings, each given to git as `-c key=value`, after
+    /// the overrides and before the subcommand.
+    pub config: Vec<String>,
+    /// Variables set in the call's environment, beside `GIT_OPTIONAL_LOCKS`.
+    pub env: Vec<(String, String)>,
+    /// What git reads on its standard input; none when absent.
+    pub input: Option<&'a [u8]>,
+    /// Not cut off at the runner's bound: only a stop ends it (a fetch).
+    pub unbounded: bool,
+}
+
 /// One git call, as it ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {
@@ -44,6 +66,8 @@ pub struct Call {
     /// Every argument after `git -C <dir>`, exactly as run: the overrides,
     /// the subcommand and its flags.
     pub args: Vec<String>,
+    /// Every variable the runner set in its environment.
+    pub env: Vec<(String, String)>,
     pub started_at: DateTime<Utc>,
     pub ms: u64,
     /// Its exit code; `None` when it was cut off, could not start, or was
@@ -52,6 +76,8 @@ pub struct Call {
     /// Cut off at its bound and killed.
     pub timed_out: bool,
     pub stdout: String,
+    /// What it printed, byte for byte.
+    pub raw: Vec<u8>,
     /// What git wrote to its error output, whole; when git could not
     /// start, why.
     pub stderr: String,
@@ -64,11 +90,24 @@ impl Call {
         (self.exit == Some(0)).then_some(self.stdout.as_str())
     }
 
+    /// What it printed, byte for byte, when it succeeded.
+    #[must_use]
+    pub fn ok_raw(&self) -> Option<&[u8]> {
+        (self.exit == Some(0)).then_some(self.raw.as_slice())
+    }
+
     /// It did not succeed: an exit code other than 0, a cut-off, or a git
     /// that could not start.
     #[must_use]
     pub fn failed(&self) -> bool {
         self.exit != Some(0)
+    }
+
+    /// The lines it printed.
+    #[must_use]
+    pub fn lines_out(&self) -> u64 {
+        u64::try_from(self.raw.iter().filter(|b| **b == b'\n').count()).unwrap_or(u64::MAX)
+            + u64::from(self.raw.last().is_some_and(|b| *b != b'\n'))
     }
 }
 
@@ -80,6 +119,17 @@ pub struct Tally {
     pub timeouts: u64,
     pub ms: u64,
     pub bytes_out: u64,
+}
+
+impl Tally {
+    /// Another tally's calls added to this one's.
+    pub fn add(&mut self, other: Tally) {
+        self.calls += other.calls;
+        self.failed += other.failed;
+        self.timeouts += other.timeouts;
+        self.ms = self.ms.saturating_add(other.ms);
+        self.bytes_out = self.bytes_out.saturating_add(other.bytes_out);
+    }
 }
 
 /// Runs git under one bound, and counts every call.
@@ -102,49 +152,84 @@ impl Git {
         self.tally
     }
 
+    /// Calls another runner made for this one's work: blames run at once,
+    /// each on its own runner.
+    pub fn add(&mut self, other: Tally) {
+        self.tally.add(other);
+    }
+
     /// Run `git -C dir args…`.
     pub async fn run(&mut self, dir: &Path, args: &[&str]) -> Call {
+        self.run_with(dir, args, &With::default()).await
+    }
+
+    /// Run `git -C dir args…` with what `with` adds.
+    pub async fn run_with(&mut self, dir: &Path, args: &[&str], with: &With<'_>) -> Call {
         let started_at = Utc::now();
         let clock = Instant::now();
         let mut argv: Vec<String> = NO_REPOSITORY_PROGRAMS.iter().map(|a| (*a).to_string()).collect();
+        for setting in &with.config {
+            argv.push("-c".to_string());
+            argv.push(setting.clone());
+        }
         if let Some((subcommand, rest)) = args.split_first() {
             argv.push((*subcommand).to_string());
             argv.extend(no_diff_drivers(subcommand).iter().map(|a| (*a).to_string()));
             argv.extend(rest.iter().map(|a| (*a).to_string()));
         }
-        let run = Command::new("git")
+        let mut env = vec![("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string())];
+        env.extend(with.env.iter().cloned());
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(dir)
             .args(&argv)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output();
-        let (exit, timed_out, stdout, stderr) = match tokio::time::timeout(self.timeout, run).await {
-            Ok(Ok(out)) => (
-                out.status.code(),
-                false,
-                String::from_utf8_lossy(&out.stdout).into_owned(),
-                String::from_utf8_lossy(&out.stderr).into_owned(),
-            ),
-            Ok(Err(e)) => (None, false, String::new(), format!("git could not run: {e}")),
-            Err(_) => (None, true, String::new(), String::new()),
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(if with.input.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let input = with.input.map(<[u8]>::to_vec);
+        let run = async move {
+            let mut command = command;
+            let mut child = command.spawn()?;
+            let writer = match (child.stdin.take(), input) {
+                (Some(mut stdin), Some(input)) => Some(tokio::spawn(async move {
+                    // A git that stops reading early closes the pipe: what
+                    // it printed says what it did with what it read.
+                    let _written = stdin.write_all(&input).await;
+                })),
+                _ => None,
+            };
+            let out = child.wait_with_output().await;
+            if let Some(writer) = writer {
+                let _ended = writer.await;
+            }
+            out
+        };
+        let ran = if with.unbounded { Ok(run.await) } else { tokio::time::timeout(self.timeout, run).await };
+        let (exit, timed_out, raw, stderr) = match ran {
+            Ok(Ok(out)) => (out.status.code(), false, out.stdout, String::from_utf8_lossy(&out.stderr).into_owned()),
+            Ok(Err(e)) => (None, false, Vec::new(), format!("git could not run: {e}")),
+            Err(_) => (None, true, Vec::new(), String::new()),
         };
         let call = Call {
             dir: dir.to_path_buf(),
             args: argv,
+            env,
             started_at,
             ms: u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX),
             exit,
             timed_out,
-            stdout,
+            stdout: String::from_utf8_lossy(&raw).into_owned(),
+            raw,
             stderr,
         };
         self.tally.calls += 1;
         self.tally.failed += u64::from(call.failed());
         self.tally.timeouts += u64::from(call.timed_out);
         self.tally.ms = self.tally.ms.saturating_add(call.ms);
-        self.tally.bytes_out = self.tally.bytes_out.saturating_add(call.stdout.len() as u64);
+        self.tally.bytes_out = self.tally.bytes_out.saturating_add(call.raw.len() as u64);
         call
     }
 }
