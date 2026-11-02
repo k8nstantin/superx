@@ -273,7 +273,8 @@ impl<'p> HostCrawl<'p> {
                 .int("waited_ms", counts.waited_ms)
                 .int("objects_new", self.objects_new)
                 .int("objects_changed", self.objects_changed)
-                .int("rows_written", self.made_rows + counts.calls + i64::from(self.made.is_some()))
+                // Its rows, the host repository's when it made it, and itself.
+                .int("rows_written", self.made_rows + counts.calls + i64::from(self.made.is_some()) + 1)
                 .text("outcome", outcome)
                 .some_text("note", note.clone()),
         );

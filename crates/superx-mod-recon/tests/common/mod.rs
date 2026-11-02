@@ -294,15 +294,23 @@ pub struct Answer {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// How long the host takes to answer.
+    pub after: std::time::Duration,
 }
 
 impl Answer {
     pub fn json(body: serde_json::Value) -> Self {
-        Self { status: 200, headers: Vec::new(), body: body.to_string() }
+        Self { status: 200, headers: Vec::new(), body: body.to_string(), after: std::time::Duration::ZERO }
     }
 
     pub fn status(status: u16, body: &str) -> Self {
-        Self { status, headers: Vec::new(), body: body.to_string() }
+        Self { status, headers: Vec::new(), body: body.to_string(), after: std::time::Duration::ZERO }
+    }
+
+    /// Answered only after `after`.
+    pub fn late(mut self, after: std::time::Duration) -> Self {
+        self.after = after;
+        self
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Self {
@@ -394,6 +402,7 @@ async fn answer(axum::extract::State(server): axum::extract::State<Server>, requ
     let Some(given) = given else {
         return (axum::http::StatusCode::NOT_FOUND, "{\"message\":\"Not Found\"}").into_response();
     };
+    tokio::time::sleep(given.after).await;
     let etag = given.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("etag")).map(|(_, v)| v.clone());
     let unchanged = etag.is_some() && etag == if_none_match;
     let status = if unchanged { 304 } else { given.status };
@@ -489,6 +498,20 @@ pub fn hosted(from: &Path, git_base: &Path, host: &str, path: &str) -> PathBuf {
 /// Every event logged while it is the default subscriber, as text.
 #[derive(Debug, Clone, Default)]
 pub struct Logged(pub Arc<Mutex<Vec<String>>>);
+
+/// Every event logged on any thread of this test binary from its first call
+/// on: the process's one subscriber, set once. A subscriber set for one
+/// thread misses what tests running beside it leave the callsites caching.
+pub fn logged() -> Logged {
+    static LOGGED: std::sync::OnceLock<Logged> = std::sync::OnceLock::new();
+    LOGGED
+        .get_or_init(|| {
+            let logged = Logged::default();
+            tracing::subscriber::set_global_default(logged.clone()).expect("the one subscriber of this test binary");
+            logged
+        })
+        .clone()
+}
 
 struct Fields(String);
 
@@ -607,6 +630,12 @@ impl<'k> Lines<'k> {
             "toolUseResult": { "stdout": printed, "stderr": "", "interrupted": false }
         }))
         .await;
+    }
+
+    /// The agent pushing a new branch from `dir`: the crawler goes back to
+    /// its repository, and no commit is printed.
+    pub async fn pushed(&mut self, dir: &Path) {
+        self.ran(dir, "git push origin topic", "To github.com:acme/widgets.git\n * [new branch]      topic -> topic\n").await;
     }
 
     /// The agent committing in `dir`: git printed the commit's short hash.

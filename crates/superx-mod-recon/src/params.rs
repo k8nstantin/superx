@@ -407,6 +407,32 @@ mod tests {
     }
 
     #[test]
+    fn attr_recon_repos_at_once_and_attr_recon_host_timeout_ms_follow_todays_parameters_in_that_order_with_their_fallbacks_and_a_value_of_the_wrong_shape_is_reported_by_name() {
+        assert_eq!(NAMES[12..], [REPOS_AT_ONCE_PARAM, HOST_TIMEOUT_MS_PARAM], "after today's twelve, in that order");
+        let r = from_values(&BTreeMap::new());
+        assert_eq!((r.params.repos_at_once, r.params.host_timeout_ms), (ALL, DEFAULT_GIT_TIMEOUT_MS), "no limit; the git calls' own fallback");
+        let shown: Vec<(&str, &str)> = r.settings[12..].iter().map(|s| (s.name, s.value.as_str())).collect();
+        assert_eq!(shown, [(REPOS_AT_ONCE_PARAM, "all"), (HOST_TIMEOUT_MS_PARAM, "120000")]);
+
+        let mut values = BTreeMap::new();
+        values.insert(REPOS_AT_ONCE_PARAM, number(1));
+        values.insert(HOST_TIMEOUT_MS_PARAM, number(5_000));
+        let r = from_values(&values);
+        assert!(r.problems.is_empty(), "{:?}", r.problems);
+        assert_eq!((r.params.repos_at_once, r.params.host_timeout_ms), (1, 5_000));
+
+        for (repos, timeout) in [(number(0), number(0)), (Value::String("two".to_string()), number(-5)), (number(-1), Value::String("1s".to_string()))] {
+            let mut values = BTreeMap::new();
+            values.insert(REPOS_AT_ONCE_PARAM, repos);
+            values.insert(HOST_TIMEOUT_MS_PARAM, timeout);
+            let r = from_values(&values);
+            let named: Vec<&str> = r.problems.iter().map(|p| p.name).collect();
+            assert_eq!(named, [REPOS_AT_ONCE_PARAM, HOST_TIMEOUT_MS_PARAM], "each reported by name");
+            assert_eq!((r.params.repos_at_once, r.params.host_timeout_ms), (ALL, DEFAULT_GIT_TIMEOUT_MS), "the fallbacks stand in");
+        }
+    }
+
+    #[test]
     fn nothing_set_is_every_fallback() {
         let r = from_values(&BTreeMap::new());
         assert!(r.problems.is_empty());

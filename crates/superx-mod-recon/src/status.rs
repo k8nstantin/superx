@@ -602,6 +602,52 @@ mod tests {
     }
 
     #[test]
+    fn status_prints_the_repos_and_hosts_sources_lines_as_step_25_words_them() {
+        let counted = |pairs: &[(&str, i64)]| pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect::<BTreeMap<String, i64>>();
+        let source = |name: &str, items, unread, calls, failed, timed_out, rows, counts, outcome: &str, note: Option<&str>| LastSource {
+            source: name.to_string(),
+            items,
+            unread,
+            calls,
+            failed,
+            timed_out,
+            rows_written: rows,
+            counts,
+            outcome: outcome.to_string(),
+            note: note.map(str::to_string),
+        };
+        let h = Holdings {
+            last_pass: Some(LastPass {
+                finished_at: DateTime::parse_from_rfc3339("2026-11-02T15:00:00Z").expect("time").to_utc(),
+                outcome: "partial".to_string(),
+                rows_written: 2_000,
+                sources: vec![
+                    source("lines", 500, 3, 0, 0, 0, 1_190, counted(&[("lines_held", 510)]), "complete", None),
+                    source("repos", 12, 0, 149, 1, 2, 14, counted(&[("commits_read", 98), ("commits_held", 100)]), "partial", Some("x: 98 commits read of 100 held")),
+                    source("hosts", 3, 1, 75, 1, 0, 300, counted(&[("totals_read", 40), ("totals_stated", 42), ("rate_waits", 2)]), "complete", None),
+                ],
+            }),
+            ..Holdings::default()
+        };
+        let t = text_of(&Database::Ready(h), &folder(), &from_values(&BTreeMap::new()));
+        assert!(
+            t.contains(
+                "  repos     12 read, 0 in a shape it does not know · 98 commits read of 100 held · 149 calls, 1 failed, 2 cut off · 14 rows \
+                 (partial: x: 98 commits read of 100 held)\n"
+            ),
+            "{t}"
+        );
+        assert!(
+            t.contains("  hosts     3 read, 1 in a shape it does not know · 40 objects read of 42 stated · 75 calls, 1 failed, 0 cut off, 2 waits · 300 rows\n"),
+            "{t}"
+        );
+        assert!(
+            t.contains("  lines     500 read of 510 held, 0 fed no table, 3 in a shape it does not know · 0 fields, 0 new, 0 not stored · 1190 rows\n"),
+            "the lines source's line as t02 left it: {t}"
+        );
+    }
+
+    #[test]
     fn an_unprovisioned_database_names_this_modules_own_command() {
         let kernel = "configuration error: module 'recon' db signin refused (There was a problem with \
                       authentication) — run `superx modules provision recon` first";

@@ -153,12 +153,12 @@ impl<'p> Caller<'p> {
     /// [`superx_kernel::KernelError`] when the database cannot answer.
     pub async fn get(&mut self, db: &Db, rows: &mut Rows, url: &str, shape: Shape, stop: &mut Stop) -> Result<Option<Got>> {
         let Ok(parsed) = Url::parse(url) else {
-            return Ok(Some(self.record(rows, Answered::refused(url, format!("not a url: {url}")), shape)));
+            return Ok(Some(self.record(rows, Answered::refused(url, format!("not a url: {url}")), shape, false)));
         };
         let base = Url::parse(self.pass.endpoints.api(self.host)).ok();
         if base.as_ref().is_none_or(|b| b.origin() != parsed.origin()) {
             // A token goes to its own host's address alone.
-            return Ok(Some(self.record(rows, Answered::refused(url, format!("not the host's address: {url}")), shape)));
+            return Ok(Some(self.record(rows, Answered::refused(url, format!("not the host's address: {url}")), shape, false)));
         }
         let path = path_of(&parsed);
         let before = earlier(db, &path).await?;
@@ -168,7 +168,7 @@ impl<'p> Caller<'p> {
             };
             let Some(answered) = answered else { return Ok(None) };
             let wait = refused_for_rate(&answered).then(|| rate_wait(&answered, Utc::now()));
-            let mut got = self.record(rows, answered, shape);
+            let mut got = self.record(rows, answered, shape, wait.is_some());
             if got.not_modified {
                 got.next = before.as_ref().and_then(|b| b.next.as_ref()).map(|p| self.origin_url(p));
             }
@@ -247,7 +247,9 @@ impl<'p> Caller<'p> {
 
     /// The call's row, and its objects as `shape` reads them; an answer
     /// that is not JSON, or not of the shape, is unread and its call failed.
-    fn record(&mut self, rows: &mut Rows, answered: Answered, shape: Shape) -> Got {
+    /// A refusal for the rate is waited and asked again: a wait, counted as
+    /// one, and no failed call.
+    fn record(&mut self, rows: &mut Rows, answered: Answered, shape: Shape, refused_for_rate: bool) -> Got {
         let ok = answered.status == Some(StatusCode::OK.as_u16());
         let not_modified = answered.status == Some(StatusCode::NOT_MODIFIED.as_u16());
         let mut error = answered.error.clone();
@@ -269,7 +271,7 @@ impl<'p> Caller<'p> {
         }
         let failed = error.is_some();
         self.counts.calls += 1;
-        self.counts.failed += i64::from(failed);
+        self.counts.failed += i64::from(failed && !refused_for_rate);
         self.counts.timed_out += i64::from(answered.timed_out);
         self.counts.not_modified += i64::from(not_modified);
         let call = rows.push(
