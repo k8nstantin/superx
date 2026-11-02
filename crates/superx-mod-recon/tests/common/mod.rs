@@ -226,12 +226,14 @@ pub fn repos_count(p: &Pass, name: &str) -> i64 {
 pub async fn session(db: &superx_kernel::Db, key: &str) -> RecordId {
     let id: Vec<Value> = db
         .query(
-            "LET $s = (CREATE session CONTENT { kernel_session: rand::uuid::v7(), agent: 'claude_code', agent_id: $key, \
+            "LET $s = (CREATE $sid CONTENT { kernel_session: rand::uuid::v7(), agent: 'claude_code', agent_id: $key, \
              first_at: time::now(), valid_from: time::now() }).id; \
-             CREATE reply CONTENT { session: $s[0], agent_id: $key, kernel_message: rand::uuid::v7(), at: time::now(), \
+             CREATE $rid CONTENT { session: $s[0], agent_id: $key, kernel_message: rand::uuid::v7(), at: time::now(), \
              model: 'claude-opus-5-5', subagent: false, thinking_dropped: 0, valid_from: time::now() }; \
              RETURN $s[0];",
         )
+        .bind(("sid", RecordId::new("session", superx_kernel::types::Uuid::new_v7())))
+        .bind(("rid", RecordId::new("reply", superx_kernel::types::Uuid::new_v7())))
         .bind(("key", key.to_string()))
         .await
         .expect("session")
@@ -252,6 +254,7 @@ pub async fn git_event(db: &superx_kernel::Db, session: &RecordId, action: &str,
     let call = RecordId::new("tool_call", call);
     let mut vars = superx_kernel::types::Object::new();
     vars.insert("call", Value::RecordId(call.clone()));
+    vars.insert("call_id", Value::String(format!("toolu_{}", superx_kernel::types::Uuid::new_v7())));
     vars.insert("reply", Value::RecordId(reply.clone()));
     vars.insert("action", Value::String(action.to_string()));
     vars.insert("dir", dir.map_or(Value::None, |d| Value::String(d.to_string_lossy().into_owned())));
@@ -259,7 +262,7 @@ pub async fn git_event(db: &superx_kernel::Db, session: &RecordId, action: &str,
     vars.insert("url", url.map_or(Value::None, |u| Value::String(u.to_string())));
     vars.insert("pr", pr_number.map_or(Value::None, number));
     db.query(
-        "CREATE $call CONTENT { reply: $reply, call_id: rand::uuid::v7(), kernel_message: rand::uuid::v7(), at: time::now(), \
+        "CREATE $call CONTENT { reply: $reply, call_id: $call_id, kernel_message: rand::uuid::v7(), at: time::now(), \
          tool: 'Bash', command: 'git', background: false, input_bytes: 3, sandbox_off: false, valid_from: time::now() }; \
          CREATE git_event CONTENT { tool_call: $call, at: time::now(), action: $action, dir: $dir, hash: $hash, \
          branch: NONE, subject: NONE, pr_number: $pr, url: $url, valid_from: time::now() };",
@@ -308,6 +311,9 @@ impl Answer {
     }
 }
 
+/// A prefix of paths and its answers.
+pub type Prefixed = (String, VecDeque<Answer>);
+
 /// A request the host was sent.
 #[derive(Debug, Clone)]
 pub struct Asked {
@@ -324,12 +330,14 @@ impl Asked {
 }
 
 /// A host of the test's own: each path's answers, given in turn, the last
-/// given again; every request it is sent, recorded. An answer with an etag
-/// is HTTP 304 to a request that sends that etag back. A path it holds no
-/// answer for is HTTP 404.
+/// given again; a path with none of its own takes the answers of the
+/// longest prefix it begins with; every request it is sent, recorded. An
+/// answer with an etag is HTTP 304 to a request that sends that etag back.
+/// A path it holds no answer for is HTTP 404.
 #[derive(Debug, Clone, Default)]
 pub struct Server {
     pub answers: Arc<Mutex<HashMap<String, VecDeque<Answer>>>>,
+    pub prefixes: Arc<Mutex<Vec<Prefixed>>>,
     pub asked: Arc<Mutex<Vec<Asked>>>,
     pub base: String,
 }
@@ -352,6 +360,12 @@ impl Server {
         self.answers.lock().expect("answers").insert(path.to_string(), answers.into());
     }
 
+    /// Answer every path that begins with `prefix` and has no answers of
+    /// its own with `answers`, in turn.
+    pub fn on_prefix(&self, prefix: &str, answers: Vec<Answer>) {
+        self.prefixes.lock().expect("prefixes").push((prefix.to_string(), answers.into()));
+    }
+
     pub fn asked(&self) -> Vec<Asked> {
         self.asked.lock().expect("asked").clone()
     }
@@ -368,10 +382,15 @@ async fn answer(axum::extract::State(server): axum::extract::State<Server>, requ
         request.headers().iter().map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or_default().to_string())).collect();
     let if_none_match = request.headers().get("if-none-match").and_then(|v| v.to_str().ok()).map(str::to_string);
     server.asked.lock().expect("asked").push(Asked { method: request.method().to_string(), path: path.clone(), headers });
+    let take = |queue: &mut VecDeque<Answer>| if queue.len() > 1 { queue.pop_front() } else { queue.front().cloned() };
     let given = {
         let mut answers = server.answers.lock().expect("answers");
-        answers.get_mut(&path).and_then(|queue| if queue.len() > 1 { queue.pop_front() } else { queue.front().cloned() })
+        answers.get_mut(&path).and_then(take)
     };
+    let given = given.or_else(|| {
+        let mut prefixes = server.prefixes.lock().expect("prefixes");
+        prefixes.iter_mut().filter(|(p, _)| path.starts_with(p.as_str())).max_by_key(|(p, _)| p.len()).and_then(|(_, queue)| take(queue))
+    });
     let Some(given) = given else {
         return (axum::http::StatusCode::NOT_FOUND, "{\"message\":\"Not Found\"}").into_response();
     };
@@ -418,6 +437,51 @@ pub fn endpoints(server: &Server, git_base: &Path) -> Endpoints {
         bitbucket_api: format!("{}/2.0", server.base),
         bitbucket_git: git_base.join("bitbucket.org").to_string_lossy().into_owned(),
     }
+}
+
+/// A Bitbucket page of `values`, as its lists answer.
+pub fn page(values: serde_json::Value) -> Answer {
+    let size = values.as_array().map_or(0, Vec::len);
+    Answer::json(serde_json::json!({ "values": values, "pagelen": 50, "size": size, "page": 1 }))
+}
+
+/// GitHub answering every path step 17 names for `path` with nothing but
+/// `repository`, its default branch unprotected.
+pub fn github_quiet(server: &Server, path: &str, repository: serde_json::Value) {
+    let base = format!("/repos/{path}");
+    let default = repository["default_branch"].as_str().unwrap_or("main").to_string();
+    server.on(&base, vec![Answer::json(repository)]);
+    for list in ["pulls?state=all&sort=created&direction=asc", "issues?state=all&sort=created&direction=asc", "issues/comments?sort=created&direction=asc", "pulls/comments?sort=created&direction=asc"] {
+        server.on(&format!("{base}/{list}&per_page=100"), vec![Answer::json(serde_json::json!([]))]);
+    }
+    for list in ["issues/events", "deployments", "releases", "rulesets"] {
+        server.on(&format!("{base}/{list}?per_page=100"), vec![Answer::json(serde_json::json!([]))]);
+    }
+    server.on(&format!("{base}/actions/runs?per_page=100"), vec![Answer::json(serde_json::json!({ "total_count": 0, "workflow_runs": [] }))]);
+    server.on(&format!("{base}/environments?per_page=100"), vec![Answer::json(serde_json::json!({ "total_count": 0, "environments": [] }))]);
+    server.on(&format!("{base}/branches/{default}/protection"), vec![Answer::status(404, "{\"message\":\"Branch not protected\"}")]);
+    server.on_prefix(&format!("{base}/commits/"), vec![Answer::json(serde_json::json!([]))]);
+}
+
+/// Bitbucket answering every path step 18 names for `path` with nothing but
+/// `repository`.
+pub fn bitbucket_quiet(server: &Server, path: &str, repository: serde_json::Value) {
+    let base = format!("/2.0/repositories/{path}");
+    server.on(&base, vec![Answer::json(repository)]);
+    server.on(&format!("{base}/pullrequests?state=OPEN&state=MERGED&state=DECLINED&state=SUPERSEDED&sort=created_on&pagelen=50"), vec![page(serde_json::json!([]))]);
+    server.on(&format!("{base}/pipelines?sort=-created_on&pagelen=50"), vec![page(serde_json::json!([]))]);
+    for list in ["deployments", "environments", "branch-restrictions", "default-reviewers"] {
+        server.on(&format!("{base}/{list}?pagelen=50"), vec![page(serde_json::json!([]))]);
+    }
+    server.on_prefix(&format!("{base}/commit/"), vec![page(serde_json::json!([]))]);
+}
+
+/// The host's own copy of `from`, a bare repository at `<git_base>/<host>/<path>.git`.
+pub fn hosted(from: &Path, git_base: &Path, host: &str, path: &str) -> PathBuf {
+    let to = git_base.join(host).join(format!("{path}.git"));
+    std::fs::create_dir_all(to.parent().expect("a parent")).expect("host folder");
+    git(from, &["clone", "-q", "--bare", &from.to_string_lossy(), &to.to_string_lossy()]);
+    to
 }
 
 // ── every log line ─────────────────────────────────────────────────────────

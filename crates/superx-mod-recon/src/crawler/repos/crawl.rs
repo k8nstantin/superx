@@ -270,6 +270,44 @@ pub async fn crawl(shared: Arc<Shared>, job: Job, memory: Remembered, stop: Stop
     }
 }
 
+/// What every git call on a mirror carries (step 4): its settings, and its
+/// environment, where git finds superx-recon as its askpass and nothing of
+/// the operator's configuration.
+#[must_use]
+pub fn mirror_with(places: &Places, host: Host) -> With<'static> {
+    let mut env: Vec<(String, String)> = vec![
+        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+    ];
+    if let Some(askpass) = &places.askpass {
+        env.push(("GIT_ASKPASS".to_string(), askpass.to_string_lossy().into_owned()));
+    }
+    env.push((hosts::ASKPASS_ENV.to_string(), host.name().to_string()));
+    if let Some(home) = &places.home {
+        env.push((hosts::HOME_ENV.to_string(), home.to_string_lossy().into_owned()));
+    }
+    let config = [
+        "fetch.prune=false",
+        "fetch.pruneTags=false",
+        "gc.auto=0",
+        "maintenance.auto=false",
+        "core.logAllRefUpdates=always",
+        "gc.reflogExpire=never",
+        "gc.reflogExpireUnreachable=never",
+        "core.hooksPath=/dev/null",
+        "http.followRedirects=false",
+        "credential.helper=",
+        "http.lowSpeedLimit=1",
+        "http.lowSpeedTime=60",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .chain(std::iter::once(format!("credential.username={}", host.git_user())))
+    .collect();
+    With { config, env, input: None, unbounded: false }
+}
+
 impl Worker<'_> {
     fn count(&mut self, name: &'static str, n: i64) {
         *self.counts.entry(name).or_default() += n;
@@ -280,44 +318,8 @@ impl Worker<'_> {
         Ran { outcome: "stopped", memory, hosts: Vec::new(), commits_held: 0, commits_read: 0, kept: Vec::new() }
     }
 
-    /// What every git call on a mirror carries (step 4).
-    fn mirror_with(&self, host: Host) -> With<'static> {
-        let places = &self.shared.places;
-        let mut env: Vec<(String, String)> = vec![
-            ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
-            ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
-            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-        ];
-        if let Some(askpass) = &places.askpass {
-            env.push(("GIT_ASKPASS".to_string(), askpass.to_string_lossy().into_owned()));
-        }
-        env.push((hosts::ASKPASS_ENV.to_string(), host.name().to_string()));
-        if let Some(home) = &places.home {
-            env.push((hosts::HOME_ENV.to_string(), home.to_string_lossy().into_owned()));
-        }
-        let config = [
-            "fetch.prune=false",
-            "fetch.pruneTags=false",
-            "gc.auto=0",
-            "maintenance.auto=false",
-            "core.logAllRefUpdates=always",
-            "gc.reflogExpire=never",
-            "gc.reflogExpireUnreachable=never",
-            "core.hooksPath=/dev/null",
-            "http.followRedirects=false",
-            "credential.helper=",
-            "http.lowSpeedLimit=1",
-            "http.lowSpeedTime=60",
-        ]
-        .iter()
-        .map(|s| (*s).to_string())
-        .chain(std::iter::once(format!("credential.username={}", host.git_user())))
-        .collect();
-        With { config, env, input: None, unbounded: false }
-    }
-
     fn with_of(&self, dir: &Dir) -> With<'static> {
-        dir.mirror.as_ref().map_or_else(With::default, |m| self.mirror_with(m.host))
+        dir.mirror.as_ref().map_or_else(With::default, |m| mirror_with(&self.shared.places, m.host))
     }
 
     /// One git call of a step, a git_call row; `None` when a stop came
@@ -515,7 +517,7 @@ impl Worker<'_> {
         }
 
         // Step 9: the placements.
-        let Some(placed) = self.placements(&db, &held, &dirs, tip.as_deref(), &tip_dir).await? else {
+        let Some(placed) = self.placements(&db, &held, &dirs, &by_dir[0].1, tip.as_deref(), &tip_dir).await? else {
             return Ok(self.stopped(memory));
         };
 
@@ -674,7 +676,7 @@ impl Worker<'_> {
     /// A mirror: made bare with no template when its folder is absent, its
     /// row written when the database holds none, then fetched.
     async fn mirror(&mut self, host: Host, path: &str, folder: &str, at_path: &Path, hr: &RecordId, row: Option<RecordId>) -> Option<RecordId> {
-        let with = self.mirror_with(host);
+        let with = mirror_with(&self.shared.places, host);
         let url = self.shared.hosts.endpoints.git_url(host, path);
         if !at_path.is_dir() {
             let parent = at_path.parent()?;
@@ -693,7 +695,11 @@ impl Worker<'_> {
             None => {
                 let id = self.rows.push(
                     "mirror",
-                    Row::new().link("host_repository", hr).text("url", url.clone()).text("folder", folder).time("created_at", Utc::now()),
+                    Row::new()
+                        .link("host_repository", hr)
+                        .text("url", format!("https://{}/{path}.git", host.name()))
+                        .text("folder", folder)
+                        .time("created_at", Utc::now()),
                 );
                 self.shared.hosts.mirror_made(hr, Mirror { id: id.clone(), folder: folder.to_string() });
                 id
@@ -721,12 +727,21 @@ impl Worker<'_> {
         let commit_of = |refs: &[refs::Ref], name: &str| refs.iter().find(|r| r.name == name).map(|r| r.commit.clone());
 
         if let Some(wanted) = self.shared.params.mainline_refs.get(&self.job.name).cloned() {
-            let target = format!("{wanted}^{{commit}}");
-            let plain = With::default();
-            let Some(resolved) = self.git("refs", &common.path, &["rev-parse", "--verify", "--quiet", &target], &plain).await else {
+            // As git resolves a name there, a tag peeled to its commit; a
+            // name that does not resolve is "missing", no failed call.
+            let target = format!("{wanted}^{{commit}}\n");
+            let ask = With { input: Some(target.as_bytes()), ..With::default() };
+            let Some(resolved) = self.git("refs", &common.path, &["cat-file", "--batch-check"], &ask).await else {
                 return Ok(("HEAD".to_string(), "head", None, None));
             };
-            if let Some(tip) = resolved.ok().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string) {
+            let tip = resolved
+                .ok()
+                .and_then(|out| out.lines().next())
+                .and_then(|line| line.split_once(' '))
+                .filter(|(hash, rest)| is_full_hash(hash) && rest.starts_with("commit "))
+                .map(|(hash, _)| hash.to_string());
+            let plain = With::default();
+            if let Some(tip) = tip {
                 let Some(full) = self.git("refs", &common.path, &["rev-parse", "--symbolic-full-name", &wanted], &plain).await else {
                     return Ok(("HEAD".to_string(), "head", None, None));
                 };
@@ -1072,8 +1087,17 @@ impl Worker<'_> {
 
     // ── step 9 ──────────────────────────────────────────────────────────
 
-    /// Where each commit sits. `None` when a stop came first.
-    async fn placements(&mut self, db: &Db, held: &HashMap<String, Held>, dirs: &[Dir], tip: Option<&str>, tip_dir: &Dir) -> Result<Option<Placed>> {
+    /// Where each commit sits; `refs`, the repository's own. `None` when a
+    /// stop came first.
+    async fn placements(
+        &mut self,
+        db: &Db,
+        held: &HashMap<String, Held>,
+        dirs: &[Dir],
+        refs: &[refs::Ref],
+        tip: Option<&str>,
+        tip_dir: &Dir,
+    ) -> Result<Option<Placed>> {
         let mut mainline: HashSet<String> = HashSet::new();
         let mut first_parent: Vec<String> = Vec::new();
         if let Some(tip) = tip {
@@ -1085,9 +1109,13 @@ impl Worker<'_> {
         }
         let first: HashSet<&String> = first_parent.iter().collect();
         let mut in_flight: HashSet<String> = HashSet::new();
+        // A branch checked out and not yet born reaches nothing.
         let branches: Vec<String> = self.job.checkouts.iter().filter(|c| c.present).filter_map(|c| c.branch.clone()).collect();
         for branch in branches {
             let name = format!("refs/heads/{branch}");
+            if !refs.iter().any(|r| r.name == name) {
+                continue;
+            }
             let Some(call) = self.git("placement", &dirs[0].path, &["rev-list", &name], &With::default()).await else { return Ok(None) };
             in_flight.extend(lines_of(&call));
         }
