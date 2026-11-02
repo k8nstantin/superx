@@ -63,6 +63,11 @@ pub struct ModuleView {
     pub version: String,
     pub module_id: String,
     pub provisioned: Option<bool>,
+    /// The module's OWN page, from the `attr_module_ui_url` parameter on
+    /// its registry entity (D-UI2), and only while its registry says
+    /// active (#553): a module that stopped, was retired or was disabled
+    /// keeps its last URL there, and the nav links nothing that is gone.
+    pub ui_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, TS)]
