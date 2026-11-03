@@ -33,7 +33,7 @@ export function practicesAnswer(s: Scoped, pal: Palette): string {
     })
     .filter((e) => e.yes.commits > 0 && e.no.commits > 0)
   const said = effects
-    .map((e) => `${cap(e.m)} ${pct(e.yes.alive, e.yes.committed)}% (${e.yes.commits} commits) against ${pct(e.no.alive, e.no.committed)}% (${e.no.commits})`)
+    .map((e) => `${cap(e.m)} ${pct(e.yes.alive, e.yes.decided)}% (${e.yes.commits} commits) against ${pct(e.no.alive, e.no.decided)}% (${e.no.commits})`)
     .join('; ')
   return `${n(tested)} of ${n(printed.length)} printed commits (${pct(tested, printed.length)}%) came after their session ran tests.${
     said ? ` Lines still alive, tested first against not: ${said}.` : ''
@@ -55,15 +55,15 @@ export function Practices({ s, pal, open }: { s: Scoped; pal: Palette; open: (b:
           formatter: (ps: { dataIndex: number; marker: string; seriesName: string; value: number }[]) => {
             const b = buckets[ps[0].dataIndex]
             const o = outcome(b.commits)
-            return `<b>${b.label.replace('\n', ' ')}</b> · ${n(o.commits)} commits, ${n(o.committed)} lines<br/>${ps.map((p) => `${p.marker}${p.seriesName}: ${p.value}%`).join('<br/>')}`
+            return `<b>${b.label.replace('\n', ' ')}</b> · ${n(o.commits)} commits, ${n(o.decided)} decided lines (${n(o.flight)} in flight)<br/>${ps.map((p) => `${p.marker}${p.seriesName}: ${p.value}%`).join('<br/>')}`
           },
         },
         xAxis: category(buckets.map((b) => b.label), { axisLabel: { color: '#CFC2DB', fontSize: 10, interval: 0 } }),
         yAxis: percent(),
         series: [
-          grouped('landed', buckets.map((b) => { const o = outcome(b.commits); return pct(o.landed, o.committed) }), '#3987e5'),
-          grouped('still alive', buckets.map((b) => { const o = outcome(b.commits); return pct(o.alive, o.committed) }), PART_COLOUR.alive),
-          grouped('never landed', buckets.map((b) => { const o = outcome(b.commits); return pct(o.never, o.committed) }), PART_COLOUR.never),
+          grouped('landed', buckets.map((b) => { const o = outcome(b.commits); return pct(o.landed, o.decided) }), '#3987e5'),
+          grouped('still alive', buckets.map((b) => { const o = outcome(b.commits); return pct(o.alive, o.decided) }), PART_COLOUR.alive),
+          grouped('never landed', buckets.map((b) => { const o = outcome(b.commits); return pct(o.never, o.decided) }), PART_COLOUR.never),
         ],
       }}
     />
@@ -92,7 +92,7 @@ export function Practices({ s, pal, open }: { s: Scoped; pal: Palette; open: (b:
   const wk = group(s.weeks, (w) => w.week)
   const testedWeeks = [...new Set(printed.map((c) => weekOf(c.at)))].sort()
   const cards: Card[] = [
-    { i: 'tested', title: 'Commits made after the session ran tests, and without', note: 'tests run since the session\'s previous commit · click a group for its commits', w: 12, h: 11, render: rates(tested, 'Tested first') },
+    { i: 'tested', title: 'Commits made after the session ran tests, and without', note: 'tests run since the session\'s previous commit · shares of decided lines (in flight left out) · click a group for its commits', w: 12, h: 11, render: rates(tested, 'Tested first') },
     { i: 'effort', title: 'By the thinking effort of the reply that committed', w: 6, h: 10, render: rates(effort, 'Effort') },
     { i: 'context', title: 'By the context the committing reply carried', note: 'fifths of the commits by tokens sent', w: 6, h: 10, render: rates(context, 'Context') },
     { i: 'subagent', title: 'Main session or subagent', w: 6, h: 10, render: rates(subagent, 'Who committed') },

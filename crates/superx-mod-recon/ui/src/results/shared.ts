@@ -49,10 +49,12 @@ export function palette(weeks: Week[]): Palette {
 /// those, `alive` is what blame credits today and `replaced` the rest;
 /// `flight` what may still land (a checked-out branch or an open pull
 /// request); `never` the lines of files that never reached the main line.
-export type Outcome = { commits: number; committed: number; landed: number; alive: number; replaced: number; flight: number; never: number }
+/// `decided` is committed less what is in flight: the rates divide by it,
+/// so open work counts neither for a model nor against it.
+export type Outcome = { commits: number; committed: number; decided: number; landed: number; alive: number; replaced: number; flight: number; never: number }
 
 export function outcome(cs: FoundCommit[]): Outcome {
-  const o: Outcome = { commits: 0, committed: 0, landed: 0, alive: 0, replaced: 0, flight: 0, never: 0 }
+  const o: Outcome = { commits: 0, committed: 0, decided: 0, landed: 0, alive: 0, replaced: 0, flight: 0, never: 0 }
   for (const c of cs) {
     o.commits += 1
     o.committed += c.added
@@ -63,6 +65,7 @@ export function outcome(cs: FoundCommit[]): Outcome {
     if (c.in_flight) o.flight += Math.max(0, c.added - c.landed)
     else if (c.place !== 'mainline') o.never += c.never_landed
   }
+  o.decided = Math.max(0, o.committed - o.flight)
   return o
 }
 

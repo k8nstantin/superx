@@ -16,12 +16,14 @@ export function landedAnswer(s: Scoped): string {
   const ranked = enough(by)
   const rows = [...by.entries()].filter(([m]) => ranked.has(m)).map(([m, cs]) => [m, outcome(cs)] as [string, Outcome]).filter(([, o]) => o.committed > 0)
   if (!rows.length) return 'No credited commits in this view.'
-  rows.sort((a, b) => b[1].landed / b[1].committed - a[1].landed / a[1].committed)
+  const rate = (o: Outcome, k: 'landed' | 'alive') => (o.decided ? o[k] / o.decided : 0)
+  rows.sort((a, b) => rate(b[1], 'landed') - rate(a[1], 'landed'))
   const top = rows.slice(0, 5)
-  const alive = [...top].sort((a, b) => b[1].alive / b[1].committed - a[1].alive / a[1].committed)
-  return `Landed: ${top.map(([m, o]) => `${cap(m)} ${pct(o.landed, o.committed)}%`).join(', ')} of the lines each committed. Still alive: ${alive
-    .map(([m, o]) => `${cap(m)} ${pct(o.alive, o.committed)}%`)
-    .join(', ')}.`
+  const alive = [...top].sort((a, b) => rate(b[1], 'alive') - rate(a[1], 'alive'))
+  const open = top.filter(([, o]) => o.flight > 0)
+  return `Of the lines each committed whose fate is decided, landed: ${top.map(([m, o]) => `${cap(m)} ${pct(o.landed, o.decided)}%`).join(', ')}. Still alive: ${alive
+    .map(([m, o]) => `${cap(m)} ${pct(o.alive, o.decided)}%`)
+    .join(', ')}.${open.length ? ` In flight, not yet counted: ${open.map(([m, o]) => `${cap(m)} ${n(o.flight)} lines`).join(', ')}.` : ''}`
 }
 
 export function Landed({ s, pal, open }: { s: Scoped; pal: Palette; open: (b: Behind) => void }) {
@@ -117,7 +119,7 @@ export function Landed({ s, pal, open }: { s: Scoped; pal: Palette; open: (b: Be
             itemStyle: { color: pal.colour(m) },
             data: weeks.map((w) => {
               const o = outcome(per.get(w) ?? [])
-              return o.committed ? pct(o[part], o.committed) : null
+              return o.decided ? pct(o[part], o.decided) : null
             }),
           }
         }),
@@ -128,8 +130,8 @@ export function Landed({ s, pal, open }: { s: Scoped; pal: Palette; open: (b: Be
     { i: 'share', title: 'Of every line each model committed', note: 'click a segment for its commits', w: 6, h: 10, render: (h) => shares(h, false) },
     { i: 'lines', title: 'The same, in lines', note: 'volume as well as share', w: 6, h: 10, render: (h) => shares(h, true) },
     { i: 'weekly', title: `Week by week, the lines ${model} committed`, note: 'pick a model; zoom with the slider; click a bar for its commits', w: 12, h: 11, render: weekly },
-    { i: 'alive', title: 'Still alive, by the week the lines were committed', note: 'share of committed lines blame credits today · dot size = lines committed', w: 6, h: 10, render: (h) => trend(h, 'alive') },
-    { i: 'never', title: 'Never landed, by the week the lines were committed', note: 'share of committed lines whose files never reached the main line', w: 6, h: 10, render: (h) => trend(h, 'never') },
+    { i: 'alive', title: 'Still alive, by the week the lines were committed', note: 'share of decided lines (in flight left out) blame credits today · dot size = lines committed', w: 6, h: 10, render: (h) => trend(h, 'alive') },
+    { i: 'never', title: 'Never landed, by the week the lines were committed', note: 'share of decided lines whose files never reached the main line', w: 6, h: 10, render: (h) => trend(h, 'never') },
     { i: 'commits', title: `Every credited commit in view (${n(s.commits.length)})`, note: 'click a row for the whole commit', w: 12, h: 12, scroll: true, render: () => <CommitRows commits={s.commits} pal={pal} /> },
   ]
   return <Board name="results.landed" cards={cards} />

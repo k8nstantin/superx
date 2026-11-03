@@ -26,7 +26,7 @@ function weekRows(s: Scoped): WeekRow[] {
       corrections: sum(ws, (w) => w.corrections),
       escalations: sum(ws, (w) => w.escalations),
       interrupts: sum(ws, (w) => w.interrupts),
-      committed: o.committed,
+      committed: o.decided,
       never: o.never,
       alive: o.alive,
     }

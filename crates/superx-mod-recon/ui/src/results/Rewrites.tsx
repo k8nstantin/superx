@@ -25,7 +25,7 @@ export function rewritesAnswer(s: Scoped): string {
   const kinds = KINDS.map(([k]) => [k, sum(top.ws, (w) => w.moves[k] ?? 0)] as [string, number]).filter(([, v]) => v > 0)
   const o = outcome(s.commits.filter((c) => weekOf(c.at) === top.week))
   return `The most rewriting was the week of ${weekLabel(top.week)}: ${kinds.map(([k, v]) => `${n(v)} ${k}${v === 1 ? '' : 's'}`).join(', ')}${
-    o.committed ? `; ${pct(o.never, o.committed)}% of the ${n(o.committed)} lines committed that week never landed` : ''
+    o.decided ? `; ${pct(o.never, o.decided)}% of the ${n(o.decided)} decided lines committed that week never landed` : ''
   }.`
 }
 

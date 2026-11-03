@@ -59,9 +59,9 @@ function scorecard(s: Scoped, pal: Palette): Row[] {
         model: m,
         commits: o.commits,
         committed: o.committed,
-        landed: pct(o.landed, o.committed),
-        alive: pct(o.alive, o.committed),
-        never: pct(o.never, o.committed),
+        landed: pct(o.landed, o.decided),
+        alive: pct(o.alive, o.decided),
+        never: pct(o.never, o.decided),
         flight: o.flight,
         testedShare: printed.length ? pct(printed.filter((c) => c.tested).length, printed.length) : null,
         tokensPerAlive: o.alive ? tokens / o.alive : null,
@@ -116,7 +116,7 @@ export function headToHead(s: Scoped, a: string, b: string): string {
   const oa = outcome(sh.a)
   const ob = outcome(sh.b)
   const cells = sh.cells.length === 1 ? 'one repository-week' : `${sh.cells.length} repository-weeks`
-  return `Where both worked (${cells}): ${a} landed ${pct(oa.landed, oa.committed)}% and kept ${pct(oa.alive, oa.committed)}% of ${n(oa.committed)} lines; ${b} landed ${pct(ob.landed, ob.committed)}% and kept ${pct(ob.alive, ob.committed)}% of ${n(ob.committed)}.`
+  return `Where both worked (${cells}): ${a} landed ${pct(oa.landed, oa.decided)}% and kept ${pct(oa.alive, oa.decided)}% of ${n(oa.decided)} decided lines; ${b} landed ${pct(ob.landed, ob.decided)}% and kept ${pct(ob.alive, ob.decided)}% of ${n(ob.decided)}.`
 }
 
 function effortAnswer(s: Scoped): string | null {
@@ -126,17 +126,17 @@ function effortAnswer(s: Scoped): string | null {
   const best = [...byModel.entries()]
     .filter(([m]) => ranked.has(m))
     .map(([m, cs]) => {
-      const levels = [...group(cs, (c) => c.effort as string).entries()].map(([e, xs]) => ({ e, o: outcome(xs) })).filter((x) => x.o.committed > 0)
+      const levels = [...group(cs, (c) => c.effort as string).entries()].map(([e, xs]) => ({ e, o: outcome(xs) })).filter((x) => x.o.decided > 0)
       if (levels.length < 2) return null
-      levels.sort((x, y) => pct(y.o.alive, y.o.committed) - pct(x.o.alive, x.o.committed))
+      levels.sort((x, y) => pct(y.o.alive, y.o.decided) - pct(x.o.alive, x.o.decided))
       const hi = levels[0]
       const lo = levels[levels.length - 1]
-      return { m, hi, lo, gap: pct(hi.o.alive, hi.o.committed) - pct(lo.o.alive, lo.o.committed) }
+      return { m, hi, lo, gap: pct(hi.o.alive, hi.o.decided) - pct(lo.o.alive, lo.o.decided) }
     })
     .filter((x): x is NonNullable<typeof x> => x != null)
     .sort((x, y) => y.gap - x.gap)[0]
   if (!best) return null
-  return `${cap(best.m)} at ${best.hi.e} effort kept ${pct(best.hi.o.alive, best.hi.o.committed)}% alive (${best.hi.o.commits} commits); at ${best.lo.e}, ${pct(best.lo.o.alive, best.lo.o.committed)}% (${best.lo.o.commits}). The two efforts ran in different weeks, so this is what happened, not yet a cause.`
+  return `${cap(best.m)} at ${best.hi.e} effort kept ${pct(best.hi.o.alive, best.hi.o.decided)}% alive (${best.hi.o.commits} commits); at ${best.lo.e}, ${pct(best.lo.o.alive, best.lo.o.decided)}% (${best.lo.o.commits}). The two efforts ran in different weeks, so this is what happened, not yet a cause.`
 }
 
 function contextAnswer(s: Scoped): string | null {
@@ -147,7 +147,7 @@ function contextAnswer(s: Scoped): string | null {
   const bins = edges.slice(0, 5).map((lo, i) => {
     const hi = edges[i + 1]
     const o = outcome(printed.filter((c) => (c.context as number) >= lo && (i === 4 ? (c.context as number) <= hi : (c.context as number) < hi)))
-    return { lo, hi, o, never: pct(o.never, o.committed) }
+    return { lo, hi, o, never: pct(o.never, o.decided) }
   })
   const worst = [...bins].sort((a, b) => b.never - a.never)[0]
   const best = [...bins].sort((a, b) => a.never - b.never)[0]
@@ -231,7 +231,7 @@ export function Decide({ s, pal, open, go }: { s: Scoped; pal: Palette; open: (b
         }
         const rate = (cs: FoundCommit[] | undefined, part: 'landed' | 'alive') => {
           const o = outcome(cs ?? [])
-          return pct(o[part], o.committed)
+          return pct(o[part], o.decided)
         }
         return (
           <Stack gap={6}>
