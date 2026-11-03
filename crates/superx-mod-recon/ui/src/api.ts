@@ -158,3 +158,25 @@ export type ModelTotal = Measures & { model: string; sessions: number; first_day
 export type Models = { days: ModelDay[]; totals: ModelTotal[] }
 
 export const fetchModels = () => fetch('/api/results/models').then((r) => answer<Models>(r))
+
+/// What is behind one model's bar on one UTC day (src/results.rs `day`).
+export type DayFile = { path: string; change: string; added: number; removed: number }
+export type DayCommit = {
+  hash: string
+  repo: string
+  subject: string
+  committed_at: string | null
+  added: number
+  removed: number
+  place: string | null
+  landed: boolean
+  alive: number | null
+  session: string | null
+  files: DayFile[]
+}
+export type DayEdit = { at: string | null; path: string; kind: string; added: number; removed: number; tool: string; session: string | null; operator_changed: boolean }
+export type DaySession = { session: string; agent: string; replies: number; first: string | null; last: string | null }
+export type ModelDayDetail = { model: string; day: string; commits: DayCommit[]; edits: DayEdit[]; sessions: DaySession[] }
+
+export const fetchDay = (model: string, day: string) =>
+  fetch(`/api/results/day?model=${encodeURIComponent(model)}&day=${encodeURIComponent(day)}`).then((r) => answer<ModelDayDetail>(r))
