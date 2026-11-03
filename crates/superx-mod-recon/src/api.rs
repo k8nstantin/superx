@@ -274,6 +274,23 @@ pub async fn models(State(kernel): State<Kernel>) -> Response {
     }
 }
 
+/// `GET /api/results/compare`: [`crate::results::compare::compare`], from the
+/// module's own database, under the parameters in force.
+pub async fn compare(State(kernel): State<Kernel>) -> Response {
+    let resolved = match params::resolve(&kernel).await {
+        Ok(r) => r,
+        Err(e) => return unavailable(&e),
+    };
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match crate::results::compare::compare(&db, &resolved.params).await {
+        Ok(c) => Json(c).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
 /// What `GET /api/results/day` is asked: a model and a UTC day.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DayQuery {

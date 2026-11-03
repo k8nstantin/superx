@@ -9,6 +9,8 @@
 //! here, since the engine's handling of NONE is not to be trusted in either
 //! (SurrealDB 3.1.4: `!= NONE` filters drop or keep the wrong rows).
 
+pub mod compare;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
@@ -86,7 +88,7 @@ pub struct Models {
 }
 
 /// The model a link chain ends in, `unknown` when it ends in nothing.
-const UNKNOWN: &str = "unknown";
+pub(crate) const UNKNOWN: &str = "unknown";
 
 /// Every model, from the module's own rows.
 ///
@@ -193,7 +195,7 @@ pub async fn models(db: &Db) -> Result<Models> {
 /// the model of its earliest tie that names one, else its earliest tie. The
 /// charts and their drill-downs read commits through this alone, so a day's
 /// commits are the same in both.
-fn owned(mut ties: Vec<Value>) -> Vec<Value> {
+pub(crate) fn owned(mut ties: Vec<Value>) -> Vec<Value> {
     ties.sort_by_key(|t| (model_of(t) == UNKNOWN, time(t, "tied_at")));
     let mut counted: BTreeSet<String> = BTreeSet::new();
     ties.into_iter().filter(|t| record(t, "commit").is_some_and(|c| counted.insert(row_key(&c)))).collect()
@@ -395,7 +397,7 @@ fn slot(days: &mut BTreeMap<(String, String), Measures>, day: String, model: Str
     days.entry((day, model)).or_default()
 }
 
-fn model_of(v: &Value) -> String {
+pub(crate) fn model_of(v: &Value) -> String {
     text(v, "model").filter(|m| !m.is_empty()).unwrap_or_else(|| UNKNOWN.to_string())
 }
 
@@ -403,7 +405,7 @@ fn day_of(v: &Value, key: &str) -> Option<String> {
     time(v, key).map(|t: DateTime<Utc>| t.format("%Y-%m-%d").to_string())
 }
 
-fn text(v: &Value, key: &str) -> Option<String> {
+pub(crate) fn text(v: &Value, key: &str) -> Option<String> {
     match v {
         Value::Object(o) => match o.get(key) {
             Some(Value::String(s)) => Some(s.clone()),
@@ -413,7 +415,7 @@ fn text(v: &Value, key: &str) -> Option<String> {
     }
 }
 
-fn int(v: &Value, key: &str) -> i64 {
+pub(crate) fn int(v: &Value, key: &str) -> i64 {
     match v {
         Value::Object(o) => match o.get(key) {
             Some(Value::Number(n)) => n.to_int().unwrap_or(0),

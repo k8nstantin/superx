@@ -82,6 +82,45 @@ const DEFAULT_REPOS_AT_ONCE: u64 = ALL;
 pub const HOST_TIMEOUT_MS_PARAM: &str = "attr_recon_host_timeout_ms";
 const DEFAULT_HOST_TIMEOUT_MS: u64 = DEFAULT_GIT_TIMEOUT_MS;
 
+/// The longest a gap between two replies counts as work, in seconds: a
+/// model's minutes are the gaps before its replies, each capped here (#539,
+/// as mod-ui's attr_ui_active_session_secs).
+pub const ACTIVE_SECS_PARAM: &str = "attr_recon_active_secs";
+const DEFAULT_ACTIVE_SECS: u64 = 300; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_active_secs
+
+/// How long after a model takes over from another its commits count as
+/// "just after the switch", in seconds (#539).
+pub const TAKEOVER_SECS_PARAM: &str = "attr_recon_takeover_secs";
+const DEFAULT_TAKEOVER_SECS: u64 = 10_800; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_takeover_secs
+
+/// Lines added and removed above which a commit is a bulk drop, a vendored
+/// or generated change, and not a model's authored work (#539).
+pub const BULK_LINES_PARAM: &str = "attr_recon_bulk_lines";
+const DEFAULT_BULK_LINES: u64 = 5_000; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_bulk_lines
+
+/// Commits by one model to one file at which the file counts as returned to
+/// rather than written: thrash (#539).
+pub const THRASH_TOUCHES_PARAM: &str = "attr_recon_thrash_touches";
+const DEFAULT_THRASH_TOUCHES: u64 = 3; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_thrash_touches
+
+/// The words a commit's subject starts with, or has after a space, when the
+/// work is being done again: rework (#539).
+pub const REWORK_WORDS_PARAM: &str = "attr_recon_rework_words";
+const DEFAULT_REWORK_WORDS: &[&str] = &["fix", "revert", "undo", "redo", "restore", "re-add", "readd", "rework"];
+
+/// The words in an operator's prompt that correct the agent, as whole words
+/// (#539, mod-ui's list).
+pub const CORRECTION_WORDS_PARAM: &str = "attr_recon_correction_words";
+const DEFAULT_CORRECTION_WORDS: &[&str] = &[
+    "again", "stop", "wrong", "instead", "follow", "missed", "broke", "redo", "throw", "i said", "i told you", "deviate", "deviated",
+    "deviating", "start over", "from scratch", "revert", "undo", "not what", "fix it",
+];
+
+/// The words in an operator's prompt that escalate, as the start of a word
+/// (#539, mod-ui's list).
+pub const ESCALATION_WORDS_PARAM: &str = "attr_recon_escalation_words";
+const DEFAULT_ESCALATION_WORDS: &[&str] = &["fuck", "shit", "wtf", "damn", "useless", "garbage"];
+
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -99,6 +138,13 @@ pub struct Params {
     pub mainline_refs: BTreeMap<String, String>,
     pub repos_at_once: u64,
     pub host_timeout_ms: u64,
+    pub active_secs: u64,
+    pub takeover_secs: u64,
+    pub bulk_lines: u64,
+    pub thrash_touches: u64,
+    pub rework_words: Vec<String>,
+    pub correction_words: Vec<String>,
+    pub escalation_words: Vec<String>,
 }
 
 impl Params {
@@ -152,7 +198,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 14] = [
+pub const NAMES: [&str; 21] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -167,6 +213,13 @@ pub const NAMES: [&str; 14] = [
     MAINLINE_REFS_PARAM,
     REPOS_AT_ONCE_PARAM,
     HOST_TIMEOUT_MS_PARAM,
+    ACTIVE_SECS_PARAM,
+    TAKEOVER_SECS_PARAM,
+    BULK_LINES_PARAM,
+    THRASH_TOUCHES_PARAM,
+    REWORK_WORDS_PARAM,
+    CORRECTION_WORDS_PARAM,
+    ESCALATION_WORDS_PARAM,
 ];
 
 /// What a parameter is for, as the tab shows it (#539): when the crawler
@@ -198,6 +251,13 @@ pub fn about(name: &str) -> Option<About> {
         UNREACHABLE_COMMITS_PARAM => ("how much", "number or all", "Unreachable commits read per repository, at most."),
         GIT_TIMEOUT_MS_PARAM => ("how much", "number", "Milliseconds a git call may take before it is abandoned."),
         HOST_TIMEOUT_MS_PARAM => ("how much", "number", "Milliseconds a call to a host may take before it is cut off."),
+        ACTIVE_SECS_PARAM => ("measures", "number", "The longest gap between two replies that counts as a model's working time, in seconds."),
+        TAKEOVER_SECS_PARAM => ("measures", "number", "How long after a model takes over its commits count as just after the switch, in seconds."),
+        BULK_LINES_PARAM => ("measures", "number", "Lines a commit adds and removes above which it is a bulk drop, not a model's authored work."),
+        THRASH_TOUCHES_PARAM => ("measures", "number", "Commits by one model to one file at which the file is returned to rather than written."),
+        REWORK_WORDS_PARAM => ("measures", "list", "Words a commit's subject starts with, or has after a space, when work is done again."),
+        CORRECTION_WORDS_PARAM => ("measures", "list", "Whole words in your prompt that correct the agent."),
+        ESCALATION_WORDS_PARAM => ("measures", "list", "Words in your prompt, at a word's start, that escalate."),
         _ => return None,
     };
     Some(About { group, decides, input })
@@ -249,6 +309,13 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         mainline_refs: r.refs(MAINLINE_REFS_PARAM),
         repos_at_once: r.at_once(REPOS_AT_ONCE_PARAM, DEFAULT_REPOS_AT_ONCE),
         host_timeout_ms: r.count(HOST_TIMEOUT_MS_PARAM, 1, DEFAULT_HOST_TIMEOUT_MS),
+        active_secs: r.count(ACTIVE_SECS_PARAM, 1, DEFAULT_ACTIVE_SECS),
+        takeover_secs: r.count(TAKEOVER_SECS_PARAM, 1, DEFAULT_TAKEOVER_SECS),
+        bulk_lines: r.count(BULK_LINES_PARAM, 1, DEFAULT_BULK_LINES),
+        thrash_touches: r.count(THRASH_TOUCHES_PARAM, 1, DEFAULT_THRASH_TOUCHES),
+        rework_words: r.strings(REWORK_WORDS_PARAM, DEFAULT_REWORK_WORDS),
+        correction_words: r.strings(CORRECTION_WORDS_PARAM, DEFAULT_CORRECTION_WORDS),
+        escalation_words: r.strings(ESCALATION_WORDS_PARAM, DEFAULT_ESCALATION_WORDS),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -416,7 +483,7 @@ mod tests {
 
     /// The parameters before the rename, as `superx-performance` named them,
     /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 14] = [
+    const TODAY: [(&str, &str); 21] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -431,6 +498,17 @@ mod tests {
         ("mainline_refs", "none"),
         ("repos_at_once", "all"),
         ("host_timeout_ms", "120000"),
+        ("active_secs", "300"),
+        ("takeover_secs", "10800"),
+        ("bulk_lines", "5000"),
+        ("thrash_touches", "3"),
+        ("rework_words", "fix, revert, undo, redo, restore, re-add, readd, rework"),
+        (
+            "correction_words",
+            "again, stop, wrong, instead, follow, missed, broke, redo, throw, i said, i told you, deviate, deviated, deviating, \
+             start over, from scratch, revert, undo, not what, fix it",
+        ),
+        ("escalation_words", "fuck, shit, wtf, damn, useless, garbage"),
     ];
 
     #[test]
@@ -533,14 +611,14 @@ mod tests {
     #[test]
     fn attr_recon_repos_at_once_and_attr_recon_host_timeout_ms_follow_todays_parameters_in_that_order_with_their_fallbacks_and_a_value_of_the_wrong_shape_is_reported_by_name() {
         let names: Vec<&str> = from_values(&BTreeMap::new()).settings.iter().map(|s| s.name).collect();
-        assert_eq!(names[names.len() - 2..], [REPOS_AT_ONCE_PARAM, HOST_TIMEOUT_MS_PARAM], "after today's, in that order");
-        assert_eq!(names[..names.len() - 2], NAMES[..12], "today's stay as they were");
+        assert_eq!(names[12..14], [REPOS_AT_ONCE_PARAM, HOST_TIMEOUT_MS_PARAM], "after today's, in that order");
+        assert_eq!(names[..12], NAMES[..12], "today's stay as they were");
 
         let fallback = from_values(&BTreeMap::new());
         assert_eq!((fallback.params.repos_at_once, fallback.params.host_timeout_ms), (ALL, fallback.params.git_timeout_ms));
-        let shown: Vec<(&str, &str)> = fallback.settings[12..].iter().map(|s| (s.name, s.value.as_str())).collect();
+        let shown: Vec<(&str, &str)> = fallback.settings[12..14].iter().map(|s| (s.name, s.value.as_str())).collect();
         assert_eq!(shown, [(REPOS_AT_ONCE_PARAM, "all"), (HOST_TIMEOUT_MS_PARAM, "120000")], "no limit is shown all");
-        assert!(fallback.settings[12..].iter().all(|s| !s.set));
+        assert!(fallback.settings[12..14].iter().all(|s| !s.set));
 
         let mut values = BTreeMap::new();
         values.insert(REPOS_AT_ONCE_PARAM, number(3));
@@ -581,7 +659,7 @@ mod tests {
     fn every_parameter_says_what_it_is_for() {
         for name in NAMES {
             let about = about(name).expect(name);
-            assert!(["when", "where", "how much", "listens"].contains(&about.group), "{name}: {about:?}");
+            assert!(["when", "where", "how much", "listens", "measures"].contains(&about.group), "{name}: {about:?}");
             assert!(["number", "number or all", "list", "refs"].contains(&about.input), "{name}: {about:?}");
             assert!(!about.decides.is_empty(), "{name}");
         }

@@ -6,6 +6,7 @@ pub mod common;
 use common::*;
 use superx_mod_recon::crawler::Crawler;
 use superx_mod_recon::params::INCLUDE_PARAM;
+use superx_mod_recon::results::compare::compare;
 use superx_mod_recon::results::{day, models, Measures};
 
 /// An assistant line of `model`, one content block of reply `id`.
@@ -45,6 +46,8 @@ async fn each_model_counts_its_replies_newest_tokens_thinking_tool_calls_edited_
         "toolUseResult": { "filePath": "/repo/a.rs", "oldString": "a", "newString": "b", "userModified": false, "structuredPatch": [{ "lines": ["-a", "+b", "+c"] }] }
     }))
     .await;
+    // The operator corrects Opus, before Sonnet takes over.
+    c.message(serde_json::json!({ "type": "user", "cwd": "/repo", "gitBranch": "main", "origin": { "kind": "human" }, "message": { "role": "user", "content": "no, do it again" } })).await;
     c.message(reply("s3", SONNET, serde_json::json!({ "type": "tool_use", "id": "call_ls", "name": "Bash", "input": { "command": "ls" } }), 300, serde_json::json!({}))).await;
     // Opus commits: its Bash call printed the new commit's hash.
     c.bash(&dir, "git commit -m 'second'", &format!("[main {}] second\n 1 file changed, 2 insertions(+)", &second[..7])).await;
@@ -120,5 +123,20 @@ async fn each_model_counts_its_replies_newest_tokens_thinking_tool_calls_edited_
     assert_eq!(behind.sessions.iter().map(|s| s.replies).collect::<Vec<_>>(), [3], "its one session, with its three replies");
     let behind = day(&db, SONNET, on(&worked)).await.expect("sonnet's day");
     assert_eq!((behind.sessions.len(), behind.edits.len(), behind.commits.len()), (2, 0, 0), "{behind:?}");
+
+    // The comparison: the commit Opus's call printed is Opus's by evidence;
+    // its spend counts the replies made in the repository it judged.
+    let compared = compare(&db, &params(&[])).await.expect("the comparison");
+    let opus = compared.deviations.iter().find(|d| d.model == "opus 5.5").unwrap_or_else(|| panic!("{compared:?}"));
+    assert_eq!(
+        (opus.commits, opus.added, opus.removed, opus.alive, opus.survived_pct),
+        (1, 2, 0, 2, 100),
+        "its one landed commit, all of it alive: {opus:?}"
+    );
+    assert_eq!((opus.messages, opus.out_tokens), (1, 1), "the reply that committed, in the repository: {opus:?}");
+    assert_eq!((opus.operator_turns, opus.corrections, opus.corrections_per_100), (2, 1, 50), "its run's two prompts, one correcting");
+    assert_eq!((opus.abandoned_lines, opus.in_flight_lines), (0, 0));
+    assert!(compared.unjudged.is_empty(), "{compared:?}");
+    assert_eq!(compared.repos.iter().map(|r| (r.repo.as_str(), r.model.as_str(), r.commits)).collect::<Vec<_>>(), [("work", "opus 5.5", 1)]);
     std::fs::remove_dir_all(&root).expect("clean up");
 }
