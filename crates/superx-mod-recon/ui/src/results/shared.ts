@@ -30,7 +30,7 @@ export const local = (iso: string | null | undefined) =>
 /// colour whatever a filter leaves.
 export type Palette = { models: string[]; colour: (model: string) => string }
 
-export function palette(weeks: Week[]): Palette {
+export function palette(weeks: Pick<Week, 'model' | 'replies'>[]): Palette {
   const replies = new Map<string, number>()
   for (const w of weeks) replies.set(w.model, (replies.get(w.model) ?? 0) + w.replies)
   const models = [...replies.keys()].filter((m) => m !== '').sort((a, b) => (replies.get(b) ?? 0) - (replies.get(a) ?? 0))

@@ -6,7 +6,7 @@ import { EChart, FAIL, OK } from '../EChart'
 import { fetchWindow, type WinCommit, type WinRepo, type Window } from '../api'
 import { category, grid, grouped, legend, stacked, tip, value, zoom } from './charts'
 import { ModelBadge, Place, PromptRows, Whole } from './Rows'
-import { local, n, type Palette } from './shared'
+import { local, n, palette, type Palette } from './shared'
 
 // What was done in each repository, now: the last hour, today, yesterday,
 // the last 7 or 30 days, in the operator's own time. Who worked there, what
@@ -346,6 +346,9 @@ export function Now({ pal }: { pal: Palette }) {
     refetchInterval: preset.every,
   })
   const w = q.data
+  // Until the findings have loaded, the models take their colours from
+  // this window, in the same order.
+  const shown = pal.models.length || !w ? pal : palette(w.repos.flatMap((r) => r.models))
   return (
     <Stack gap="md">
       <Group justify="space-between" align="center">
@@ -366,7 +369,7 @@ export function Now({ pal }: { pal: Palette }) {
               h: 8,
               render: (h) => {
                 const repos = w.repos.map((r) => r.repo || '(no repository)')
-                const models = [...new Set(w.repos.flatMap((r) => r.models.map((m) => m.model)))].sort((a, b) => pal.models.indexOf(a) - pal.models.indexOf(b))
+                const models = [...new Set(w.repos.flatMap((r) => r.models.map((m) => m.model)))].sort((a, b) => shown.models.indexOf(a) - shown.models.indexOf(b))
                 return (
                   <EChart
                     height={h}
@@ -376,7 +379,7 @@ export function Now({ pal }: { pal: Palette }) {
                       tooltip: tip({ valueFormatter: (v: number) => `${v} h` }),
                       xAxis: value(),
                       yAxis: category([...repos].reverse()),
-                      series: models.map((m) => stacked(m || 'not credited', [...w.repos].reverse().map((r) => Math.round((r.models.find((x) => x.model === m)?.active_secs ?? 0) / 360) / 10), m ? pal.colour(m) : '#5C4470', 'h')),
+                      series: models.map((m) => stacked(m || 'not credited', [...w.repos].reverse().map((r) => Math.round((r.models.find((x) => x.model === m)?.active_secs ?? 0) / 360) / 10), m ? shown.colour(m) : '#5C4470', 'h')),
                     }}
                   />
                 )
@@ -419,9 +422,9 @@ export function Now({ pal }: { pal: Palette }) {
             <Group gap="sm" align="baseline">
               <Title order={3}>{r.repo || 'In no repository'}</Title>
               {Object.entries(r.agents).map(([a, k]) => <Badge key={a} variant="outline" color="gray">{a || 'agent'} · {k} session{k === 1 ? '' : 's'}</Badge>)}
-              {r.models.map((m) => <ModelBadge key={m.model} model={m.model} pal={pal} />)}
+              {r.models.map((m) => <ModelBadge key={m.model} model={m.model} pal={shown} />)}
             </Group>
-            <RepoBoard w={w} r={r} pal={pal} />
+            <RepoBoard w={w} r={r} pal={shown} />
           </Stack>
         </Paper>
       ))}
