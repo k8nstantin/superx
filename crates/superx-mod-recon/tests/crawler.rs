@@ -372,7 +372,7 @@ async fn a_pass_reads_every_line_into_its_facts_and_a_second_pass_writes_nothing
     assert_eq!(third.rows_written, 0, "{third:?}");
     assert_eq!(every_count(&db).await, counts, "nothing written twice after a restart");
     assert_eq!(count(&db, "pass").await, 3, "one row per pass");
-    assert_eq!(count(&db, "pass_source").await, 6, "and one per source in it");
+    assert_eq!(count(&db, "pass_source").await, 9, "and one per source in it");
 }
 
 #[tokio::test]

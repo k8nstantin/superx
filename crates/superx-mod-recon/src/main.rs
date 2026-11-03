@@ -10,9 +10,11 @@
 //! - `superx-recon run`: the process itself, in the foreground;
 //!   `start` runs it in the background. It serves its URL and reads every
 //!   captured line into its database, pass after pass.
+//! - `superx-recon <prompt>` with `SUPERX_RECON_ASKPASS` in its
+//!   environment: git's askpass for the crawler's mirrors (#538, step 23).
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -20,6 +22,8 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use superx_kernel::Kernel;
+use superx_mod_recon::credentials::{self, Credentials, BITBUCKET, GITHUB};
+use superx_mod_recon::crawler::repos::mirror::ASKPASS_ENV;
 use superx_mod_recon::instance::{Instance, PASSWORD_ENV};
 use superx_mod_recon::{crawler, daemon, folder, params, registry, server, status, MODULE_NAME, SCHEMA_DDL};
 use tokio::net::TcpListener;
@@ -58,6 +62,69 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // git's askpass first: it reads no command, starts nothing and logs
+    // nothing.
+    if let Some(answered) = askpass() {
+        return answered;
+    }
+    command().await
+}
+
+/// git's askpass (#538, step 23): superx-recon started with
+/// `SUPERX_RECON_ASKPASS` in its environment and one argument, the prompt
+/// git gives. `None` when it was not started so.
+fn askpass() -> Option<ExitCode> {
+    let host = std::env::var_os(ASKPASS_ENV)?;
+    let mut args = std::env::args_os().skip(1);
+    let (Some(prompt), None) = (args.next(), args.next()) else { return None };
+    Some(answer(&host.to_string_lossy(), &prompt.to_string_lossy()))
+}
+
+/// The password for `prompt`: the token the credentials file of the home
+/// `SUPERX_HOME` names gives the host `SUPERX_RECON_ASKPASS` names, when
+/// the prompt asks for the password of `https://<host>` or
+/// `https://<user>@<host>` and that host is github.com or bitbucket.org;
+/// for any other prompt, or with no token, nothing, and why on the error
+/// output, which never holds a token.
+fn answer(host: &str, prompt: &str) -> ExitCode {
+    let refuse = |why: &str| {
+        eprintln!("superx-recon askpass: {why}");
+        ExitCode::FAILURE
+    };
+    if host != GITHUB && host != BITBUCKET {
+        return refuse(&format!("{ASKPASS_ENV} names no host the crawler reads"));
+    }
+    let Some(url) = prompt.strip_prefix("Password for '").and_then(|rest| rest.strip_suffix("': ")) else {
+        return refuse("not a prompt for a password");
+    };
+    let Some(rest) = url.strip_prefix("https://") else {
+        return refuse("not a prompt for a password over https");
+    };
+    let asked = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    if asked != host {
+        return refuse(&format!("a prompt for another host than {host}"));
+    }
+    let Some(home) = std::env::var_os("SUPERX_HOME") else {
+        return refuse("SUPERX_HOME names no home");
+    };
+    let path = match Instance::read(Path::new(&home)) {
+        Ok(instance) => instance.credentials_path(),
+        Err(e) => return refuse(&e),
+    };
+    let token = match credentials::read(&path) {
+        Credentials::Hosts(hosts) if host == GITHUB => hosts.github,
+        Credentials::Hosts(hosts) => hosts.bitbucket,
+        _ => None,
+    };
+    let Some(token) = token else {
+        return refuse(&format!("the credentials file gives {host} no token"));
+    };
+    println!("{}", token.secret());
+    ExitCode::SUCCESS
+}
+
+/// Every command but the askpass.
+async fn command() -> ExitCode {
     let cli = Cli::parse();
     let instance = match Instance::read(&cli.home) {
         Ok(i) => i,
@@ -211,7 +278,16 @@ async fn run(instance: &Instance) -> Result<(), String> {
     // it was in is recorded as stopped.
     let (asked, watched) = watch::channel(false);
     let asked = Arc::new(asked);
-    let crawling = tokio::spawn(crawler::run(kernel.clone(), crawler::Stop::new(watched)));
+    let places = crawler::Places {
+        repos: Some(instance.repos_dir()),
+        credentials: Some(instance.credentials_path()),
+        // git runs the askpass in a mirror's folder: the home it reads is
+        // named whole.
+        home: Some(std::fs::canonicalize(&instance.home).unwrap_or_else(|_| instance.home.clone())),
+        askpass: std::env::current_exe().ok(),
+        endpoints: crawler::hosts::Endpoints::default(),
+    };
+    let crawling = tokio::spawn(crawler::run_in(kernel.clone(), places, crawler::Stop::new(watched)));
     let on_stop = {
         let asked = Arc::clone(&asked);
         async move {

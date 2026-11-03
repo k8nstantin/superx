@@ -2,13 +2,15 @@
 //! after pass while `superx-recon` runs, through its sources.
 //!
 //! A source reads one kind of thing: [`lines`], the lines the kernel
-//! captured; [`repos`], the git repositories those lines lead to. Sources
-//! share facts, not messages: a source reads what the others wrote to the
-//! database. A pass runs them in the order their facts need: `lines`
-//! first, then `repos`, which follows the working directories `lines` has
-//! just written. Each source spreads its own work as far as its parameters
-//! allow. A source added later (the GitHub and Bitbucket hosts, and
-//! others) is one more module here, with its own tables of facts.
+//! captured; [`repos`], the git repositories those lines lead to; and
+//! [`hosts`], the GitHub and Bitbucket repositories those repositories'
+//! remotes name, crawled beside them. Sources share facts, not messages: a
+//! source reads what the others wrote to the database. A pass runs them in
+//! the order their facts need: `lines` first, then `repos`, which follows
+//! the working directories `lines` has just written, its workers crawling
+//! `hosts` beside it. Each source spreads its own work as far as its
+//! parameters allow. A source added later is one more module here, with
+//! its own tables of facts.
 //!
 //! A pass ends with its own row and one row per source (`pass`,
 //! `pass_source`): what each source worked through, what it could not
@@ -28,6 +30,7 @@ pub mod value;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use superx_kernel::types::{RecordId, Uuid};
@@ -177,21 +180,49 @@ impl Pass {
     }
 }
 
+/// Where the crawler finds what is its own beside its database: the repos
+/// folder its mirrors live in, the credentials file, the instance's home
+/// and superx-recon itself, which git asks for a mirror's password (#538,
+/// steps 4 and 23); and where the hosts are reached. Without them, as the
+/// tests of the lines have it, no mirror is made and no host is asked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Places {
+    pub repos: Option<PathBuf>,
+    pub credentials: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+    pub askpass: Option<PathBuf>,
+    pub endpoints: hosts::Endpoints,
+}
+
 /// What the crawler keeps from one pass to the next: its connection to its
-/// own database, and each source's memory.
+/// own database, where its own things are, and each source's memory.
 #[derive(Default)]
 pub struct Crawler {
     db: Option<Db>,
+    places: Places,
     lines: lines::Memory,
     repos: repos::Memory,
+}
+
+impl Crawler {
+    /// A crawler that finds its own things at `places`.
+    #[must_use]
+    pub fn new(places: Places) -> Self {
+        Self { places, ..Self::default() }
+    }
 }
 
 /// Pass after pass, until asked to stop: one right away, then one every
 /// `attr_recon_read_secs`, the parameters read afresh before each.
 /// Nothing is read while it is 0, or while the module's database is not
 /// provisioned; both are looked at again a minute later.
-pub async fn run(kernel: Kernel, mut stop: Stop) {
-    let mut crawler = Crawler::default();
+pub async fn run(kernel: Kernel, stop: Stop) {
+    run_in(kernel, Places::default(), stop).await;
+}
+
+/// [`run`], the crawler finding its own things at `places`.
+pub async fn run_in(kernel: Kernel, places: Places, mut stop: Stop) {
+    let mut crawler = Crawler::new(places);
     loop {
         let wait_secs = match params::resolve(&kernel).await {
             Err(e) => {
@@ -224,11 +255,14 @@ pub async fn run(kernel: Kernel, mut stop: Stop) {
     }
 }
 
-fn log(pass: superx_kernel::Result<Pass>) {
+/// The pass's log line: what each source read and called, and the rows
+/// written; a pass that wrote nothing and ended complete is a debug line.
+pub fn log(pass: superx_kernel::Result<Pass>) {
     match pass {
         Ok(p) if p.rows_written > 0 || p.outcome != "complete" => {
             let lines = p.source(lines::SOURCE);
             let repos = p.source(repos::SOURCE);
+            let hosts = p.source(hosts::SOURCE);
             tracing::info!(
                 target: "recon",
                 outcome = p.outcome,
@@ -236,6 +270,8 @@ fn log(pass: superx_kernel::Result<Pass>) {
                 lines_unread = lines.map_or(0, |s| s.unread),
                 repos_items = repos.map_or(0, |s| s.items),
                 git_calls = repos.map_or(0, |s| s.calls),
+                hosts_items = hosts.map_or(0, |s| s.items),
+                host_calls = hosts.map_or(0, |s| s.calls),
                 rows_written = p.rows_written,
                 "pass"
             );
@@ -259,7 +295,7 @@ pub async fn pass(kernel: &Kernel, params: &Params, crawler: &mut Crawler, stop:
     };
     let result = passes(kernel, &db, params, crawler, stop).await;
     if result.is_err() {
-        *crawler = Crawler::default();
+        *crawler = Crawler::new(crawler.places.clone());
     }
     result
 }
@@ -302,14 +338,18 @@ async fn passes(
     let stopped = lines.outcome == Outcome::Stopped;
     sources.push(lines);
     if !stopped {
-        let repos = match repos::crawl(db, params, &mut crawler.repos, &worked_in, stop).await {
-            Ok(run) => run,
+        // `repos`, its workers crawling `hosts` beside it.
+        match repos::crawl(db, params, &crawler.places, &mut crawler.repos, &worked_in, started_at, stop).await {
+            Ok(crawled) => {
+                sources.push(crawled.repos);
+                sources.push(crawled.hosts);
+            }
             Err(e) => {
                 crawler.repos = repos::Memory::default();
-                failed(repos::SOURCE, &e)
+                sources.push(failed(repos::SOURCE, &e));
+                sources.push(failed(hosts::SOURCE, &e));
             }
-        };
-        sources.push(repos);
+        }
     }
     let outcome = if sources.iter().any(|s| s.outcome == Outcome::Stopped) {
         "stopped"

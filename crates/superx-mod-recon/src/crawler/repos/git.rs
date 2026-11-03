@@ -9,13 +9,19 @@
 //!
 //! What each call did is kept: when it started, how long it took, its exit
 //! code, what it printed and what it wrote to its error output. The crawler
-//! counts every call, and records it where its schema has a place for it.
+//! counts every call, and records it where its schema has a place for it:
+//! a crawl's calls are `git_call` rows (#538, step 2).
+//!
+//! A call on one of the crawler's own mirrors runs with more than the
+//! overrides ([`With`]): the configuration and environment step 4 names,
+//! and no bound when it fetches.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
 /// Configuration under which a read would run a program the repository
@@ -26,12 +32,13 @@ const NO_REPOSITORY_PROGRAMS: [&str; 4] = ["-c", "log.showSignature=false", "-c"
 
 /// The flags that keep a subcommand off the repository's diff drivers
 /// (#447): `blame` runs a textconv filter by default, `log` and `diff` run
-/// one when they print a patch, and an external diff would run too. Only
-/// these subcommands take the flags; the others refuse them.
+/// one when they print a patch, and an external diff would run too;
+/// `diff-tree` takes the same flags (#538, step 2). Only these subcommands
+/// take the flags; the others refuse them.
 fn no_diff_drivers(subcommand: &str) -> &'static [&'static str] {
     match subcommand {
         "blame" => &["--no-textconv"],
-        "log" | "diff" => &["--no-textconv", "--no-ext-diff"],
+        "log" | "diff" | "diff-tree" => &["--no-textconv", "--no-ext-diff"],
         _ => &[],
     }
 }
@@ -52,9 +59,15 @@ pub struct Call {
     /// Cut off at its bound and killed.
     pub timed_out: bool,
     pub stdout: String,
+    /// What it printed, byte for byte, when the call asked for its bytes
+    /// ([`With::raw`]); `stdout` is then empty.
+    pub raw: Option<Vec<u8>>,
     /// What git wrote to its error output, whole; when git could not
     /// start, why.
     pub stderr: String,
+    /// The bytes and the lines it printed.
+    pub bytes_out: u64,
+    pub lines_out: u64,
 }
 
 impl Call {
@@ -82,6 +95,21 @@ pub struct Tally {
     pub bytes_out: u64,
 }
 
+/// What a call runs with beyond the overrides every call has.
+#[derive(Debug, Clone, Default)]
+pub struct With {
+    /// `-c key=value` pairs, before the subcommand.
+    pub config: Vec<String>,
+    /// Variables set in its environment.
+    pub env: Vec<(String, String)>,
+    /// What it reads on its standard input.
+    pub input: Option<Vec<u8>>,
+    /// Keep what it prints byte for byte ([`Call::raw`]).
+    pub raw: bool,
+    /// Never cut off: a fetch takes what the repository's size makes it.
+    pub unbounded: bool,
+}
+
 /// Runs git under one bound, and counts every call.
 #[derive(Debug)]
 pub struct Git {
@@ -102,50 +130,105 @@ impl Git {
         self.tally
     }
 
+    /// The bound its calls are killed at.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Run `git -C dir args…`.
     pub async fn run(&mut self, dir: &Path, args: &[&str]) -> Call {
-        let started_at = Utc::now();
-        let clock = Instant::now();
-        let mut argv: Vec<String> = NO_REPOSITORY_PROGRAMS.iter().map(|a| (*a).to_string()).collect();
-        if let Some((subcommand, rest)) = args.split_first() {
-            argv.push((*subcommand).to_string());
-            argv.extend(no_diff_drivers(subcommand).iter().map(|a| (*a).to_string()));
-            argv.extend(rest.iter().map(|a| (*a).to_string()));
-        }
-        let run = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(&argv)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output();
-        let (exit, timed_out, stdout, stderr) = match tokio::time::timeout(self.timeout, run).await {
-            Ok(Ok(out)) => (
-                out.status.code(),
-                false,
-                String::from_utf8_lossy(&out.stdout).into_owned(),
-                String::from_utf8_lossy(&out.stderr).into_owned(),
-            ),
-            Ok(Err(e)) => (None, false, String::new(), format!("git could not run: {e}")),
-            Err(_) => (None, true, String::new(), String::new()),
-        };
-        let call = Call {
-            dir: dir.to_path_buf(),
-            args: argv,
-            started_at,
-            ms: u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX),
-            exit,
-            timed_out,
-            stdout,
-            stderr,
-        };
+        self.run_with(dir, args, &With::default()).await
+    }
+
+    /// Run `git -C dir args…` with `with`.
+    pub async fn run_with(&mut self, dir: &Path, args: &[&str], with: &With) -> Call {
+        let call = call(dir, args, with, self.timeout).await;
+        self.count(&call);
+        call
+    }
+
+    /// Count a call made apart from this runner, one of several at once.
+    pub fn count(&mut self, call: &Call) {
         self.tally.calls += 1;
         self.tally.failed += u64::from(call.failed());
         self.tally.timeouts += u64::from(call.timed_out);
         self.tally.ms = self.tally.ms.saturating_add(call.ms);
-        self.tally.bytes_out = self.tally.bytes_out.saturating_add(call.stdout.len() as u64);
-        call
+        self.tally.bytes_out = self.tally.bytes_out.saturating_add(call.bytes_out);
+    }
+}
+
+/// The arguments a call runs with after `git -C <dir>`: the overrides, the
+/// call's own configuration, the subcommand and its flags.
+#[must_use]
+pub fn argv(args: &[&str], with: &With) -> Vec<String> {
+    let mut argv: Vec<String> = NO_REPOSITORY_PROGRAMS.iter().map(|a| (*a).to_string()).collect();
+    for pair in &with.config {
+        argv.push("-c".to_string());
+        argv.push(pair.clone());
+    }
+    if let Some((subcommand, rest)) = args.split_first() {
+        argv.push((*subcommand).to_string());
+        argv.extend(no_diff_drivers(subcommand).iter().map(|a| (*a).to_string()));
+        argv.extend(rest.iter().map(|a| (*a).to_string()));
+    }
+    argv
+}
+
+/// One git call: `git -C dir args…`, killed at `timeout` unless `with`
+/// says it is unbounded, and killed when the call is dropped.
+pub async fn call(dir: &Path, args: &[&str], with: &With, timeout: Duration) -> Call {
+    let started_at = Utc::now();
+    let clock = Instant::now();
+    let argv = argv(args, with);
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(&argv)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .envs(with.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(if with.input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let run = async {
+        let mut child = command.spawn()?;
+        let feeding = match (child.stdin.take(), with.input.clone()) {
+            (Some(mut stdin), Some(input)) => Some(tokio::spawn(async move {
+                // A git that stops reading early closes the pipe: what it did
+                // not read is no error of the call's.
+                let _written = stdin.write_all(&input).await;
+            })),
+            _ => None,
+        };
+        let out = child.wait_with_output().await;
+        if let Some(feeding) = feeding {
+            let _fed = feeding.await;
+        }
+        out
+    };
+    let ended = if with.unbounded { Ok(run.await) } else { tokio::time::timeout(timeout, run).await };
+    let (exit, timed_out, out, stderr) = match ended {
+        Ok(Ok(out)) => (out.status.code(), false, out.stdout, String::from_utf8_lossy(&out.stderr).into_owned()),
+        Ok(Err(e)) => (None, false, Vec::new(), format!("git could not run: {e}")),
+        Err(_) => (None, true, Vec::new(), String::new()),
+    };
+    let bytes_out = out.len() as u64;
+    let lines_out = out.iter().filter(|b| **b == b'\n').count() as u64 + u64::from(out.last().is_some_and(|b| *b != b'\n'));
+    let (stdout, raw) = if with.raw { (String::new(), Some(out)) } else { (String::from_utf8_lossy(&out).into_owned(), None) };
+    Call {
+        dir: dir.to_path_buf(),
+        args: argv,
+        started_at,
+        ms: u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX),
+        exit,
+        timed_out,
+        stdout,
+        raw,
+        stderr,
+        bytes_out,
+        lines_out,
     }
 }
 
