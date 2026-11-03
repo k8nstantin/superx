@@ -31,6 +31,31 @@ impl Batch {
         id
     }
 
+    /// A row of `table` under an id taken before its content was known,
+    /// put before every row waiting: the rows after it link it (#538).
+    pub fn create_first(&mut self, id: RecordId, mut content: Row) {
+        let table = static_table(&id);
+        content.0.insert("valid_from", Value::Datetime(Datetime::from(Utc::now())));
+        self.rows.insert(0, (id, content.0));
+        *self.added.entry(table).or_default() += 1;
+    }
+
+    /// Every row of `other`, after this batch's.
+    pub fn append(&mut self, other: Batch) {
+        self.rows.extend(other.rows);
+        for (table, n) in other.added {
+            *self.added.entry(table).or_default() += n;
+        }
+    }
+
+    /// Every waiting row valid from `at`: rows held while a crawl reads
+    /// become valid together, when they are written (#538, step 1).
+    pub fn stamp(&mut self, at: DateTime<Utc>) {
+        for (_, content) in &mut self.rows {
+            content.insert("valid_from", Value::Datetime(Datetime::from(at)));
+        }
+    }
+
     /// Rows waiting to be written.
     #[must_use]
     pub fn waiting(&self) -> usize {
@@ -43,6 +68,21 @@ impl Batch {
         self.added.values().sum()
     }
 }
+
+/// An id for a row of `table` whose content comes later
+/// ([`Batch::create_first`]).
+#[must_use]
+pub fn reserve(table: &'static str) -> RecordId {
+    RecordId::new(table, Uuid::new_v7())
+}
+
+/// The table a reserved id names, as the counts of rows name it.
+fn static_table(id: &RecordId) -> &'static str {
+    TABLES.iter().copied().find(|t| *t == id.table.as_str()).unwrap_or("unknown")
+}
+
+/// The tables a reserved id may name.
+const TABLES: [&str; 3] = ["crawl", "host_crawl", "host_repository"];
 
 /// Write every waiting row, in order.
 ///
@@ -148,6 +188,45 @@ impl Row {
     pub fn object(mut self, key: &str, v: Object) -> Self {
         self.0.insert(key, Value::Object(v));
         self
+    }
+
+    /// Any value, as it is: a field the structure types `int | string`.
+    #[must_use]
+    pub fn value(mut self, key: &str, v: Value) -> Self {
+        self.0.insert(key, v);
+        self
+    }
+
+    #[must_use]
+    pub fn some_value(self, key: &str, v: Option<Value>) -> Self {
+        match v {
+            Some(v) => self.value(key, v),
+            None => self,
+        }
+    }
+
+    #[must_use]
+    pub fn some_time(self, key: &str, v: Option<DateTime<Utc>>) -> Self {
+        match v {
+            Some(v) => self.time(key, v),
+            None => self,
+        }
+    }
+
+    #[must_use]
+    pub fn some_link(self, key: &str, v: Option<&RecordId>) -> Self {
+        match v {
+            Some(v) => self.link(key, v),
+            None => self,
+        }
+    }
+
+    #[must_use]
+    pub fn some_texts(self, key: &str, v: Option<&[String]>) -> Self {
+        match v {
+            Some(v) => self.texts(key, v),
+            None => self,
+        }
     }
 }
 

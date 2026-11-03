@@ -20,6 +20,7 @@
 //! The crawler only reads the kernel (SELECT) and the repositories (git,
 //! read-only), and only writes its own database (CREATE).
 
+pub mod hosts;
 pub mod lines;
 pub mod repos;
 pub mod store;
