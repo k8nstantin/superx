@@ -34,6 +34,7 @@ pub mod folder;
 pub mod instance;
 pub mod params;
 pub mod registry;
+pub mod results;
 pub mod server;
 pub mod status;
 pub mod ui;

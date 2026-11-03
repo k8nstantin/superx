@@ -261,6 +261,19 @@ pub async fn repos(State(kernel): State<Kernel>) -> Response {
     }
 }
 
+/// `GET /api/results/models`: [`crate::results::models`], from the module's
+/// own database.
+pub async fn models(State(kernel): State<Kernel>) -> Response {
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match crate::results::models(&db).await {
+        Ok(models) => Json(models).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
 /// One parameter as the tab shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Shown {

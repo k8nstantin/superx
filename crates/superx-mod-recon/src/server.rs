@@ -53,6 +53,7 @@ pub fn app(kernel: Kernel, instance: Instance, port: u16, progress: Progress) ->
         .route("/status", get(status))
         .route("/api/now", get(api::now))
         .route("/api/repos", get(api::repos))
+        .route("/api/results/models", get(api::models))
         .route("/api/stats", get(api::stats))
         .route("/api/params", get(api::params))
         .route("/api/params/{name}", put(api::set))
