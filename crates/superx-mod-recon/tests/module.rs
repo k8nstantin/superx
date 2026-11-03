@@ -162,7 +162,7 @@ async fn its_url_answers_with_the_status() {
     let home = scratch_home("ws://127.0.0.1:1");
     let instance = Instance::read(&home).expect("instance");
     for host in ["127.0.0.1:5153", "localhost:5153"] {
-        for path in ["/", "/status"] {
+        for path in ["/status"] {
             let (status, text) = get(&kernel, &instance, path, Some(host)).await;
             assert_eq!(status, 200, "{host}{path}: {text}");
             assert!(text.contains("superx/recon: not available."), "{path}: {text}");
@@ -176,7 +176,12 @@ async fn its_url_answers_with_the_status() {
             );
         }
     }
-    assert_eq!(get(&kernel, &instance, "/nothing", Some("127.0.0.1:5153")).await.0, 404);
+    // `/` and every other path are the tab (#539, tests/tab.rs).
+    for path in ["/", "/nothing"] {
+        let (status, page) = get(&kernel, &instance, path, Some("127.0.0.1:5153")).await;
+        assert_eq!(status, 200, "{path}: {page}");
+        assert!(page.contains("<div id=\"root\"></div>"), "{path} is the tab: {page}");
+    }
     std::fs::remove_dir_all(&home).expect("clean up");
 }
 

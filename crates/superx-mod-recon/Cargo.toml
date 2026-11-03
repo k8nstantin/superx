@@ -19,6 +19,9 @@ clap.workspace = true
 # The hosts' read APIs, GET only, over rustls (#538, decision http-client).
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rpassword.workspace = true
+# The tab, built from ui/ and embedded, as the entities module embeds its own (#539).
+rust-embed = "8"
+mime_guess = "2"
 serde.workspace = true
 serde_json.workspace = true
 # A host object's content hash (#538, step 16), the version the lock holds.
