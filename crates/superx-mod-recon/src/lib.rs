@@ -26,6 +26,7 @@
 //! (#446), and writes nothing outside its own database, except its own
 //! registry entry.
 
+pub mod api;
 pub mod crawler;
 pub mod credentials;
 pub mod daemon;
@@ -35,6 +36,7 @@ pub mod params;
 pub mod registry;
 pub mod server;
 pub mod status;
+pub mod ui;
 
 use superx_kernel::{KernelModuleDescriptor, NodeKind};
 

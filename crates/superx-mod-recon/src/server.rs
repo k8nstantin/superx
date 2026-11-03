@@ -1,7 +1,8 @@
 //! The module's own URL (operator, 2026-10-24): `http://127.0.0.1:<port>/`,
-//! on the port `attr_recon_port` names, answering what
-//! `superx-recon status` says. It is this process's alone: the core
-//! UI on :5150 never serves it.
+//! on the port `attr_recon_port` names. It serves the tab (#539) at `/`,
+//! the data the tab reads and writes under `/api/` ([`crate::api`]), and
+//! what `superx-recon status` says at `/status`. It is this process's alone:
+//! the core UI on :5150 never serves it.
 //!
 //! It answers only requests addressed to it by name: `127.0.0.1` or
 //! `localhost` at its own port (#466's rules, review finding X1). It will
@@ -9,14 +10,15 @@
 //! could otherwise read them by pointing a name of its own at 127.0.0.1
 //! (DNS rebinding); the browser sends that name as the request's Host.
 
-use axum::extract::{Request, State};
+use axum::extract::{FromRef, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::Router;
 use superx_kernel::Kernel;
 
+use crate::api;
 use crate::instance::Instance;
 
 /// The port HTTP leaves out of a request's Host.
@@ -30,11 +32,20 @@ struct Page {
     instance: Instance,
 }
 
+impl FromRef<Page> for Kernel {
+    fn from_ref(page: &Page) -> Self {
+        page.kernel.clone()
+    }
+}
+
 /// The module's routes, for the server listening on `port`.
 pub fn app(kernel: Kernel, instance: Instance, port: u16) -> Router {
     Router::new()
-        .route("/", get(status))
         .route("/status", get(status))
+        .route("/api/stats", get(api::stats))
+        .route("/api/params", get(api::params))
+        .route("/api/params/{name}", put(api::set))
+        .fallback(get(crate::ui::asset))
         .with_state(Page { kernel, instance })
         .layer(middleware::from_fn_with_state(port, only_its_own_name))
 }
