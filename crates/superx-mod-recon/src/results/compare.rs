@@ -27,10 +27,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use superx_kernel::types::Value;
 use superx_kernel::{Db, Result};
 
-use super::{int, model_of, owned, text};
+use super::{every, int, model_of, owned, text};
 use crate::crawler::hosts::held::{record, row_key, time};
 use crate::params::Params;
 
@@ -302,38 +301,22 @@ struct HandAcc {
 /// [`superx_kernel::KernelError`] when the database does not answer.
 #[allow(clippy::too_many_lines)] // skill-allow: allow — one walk over every fact, as mod-ui's, so every measure comes from one set of numbers
 pub async fn compare(db: &Db, params: &Params) -> Result<Comparison> {
-    let mut answer = db
-        .query(
-            "SELECT id, session, at, model FROM reply;\n\
-             SELECT reply, valid_from, output_tokens, input_tokens, cache_read_tokens, cache_write_tokens FROM reply_state;\n\
-             SELECT session, at, text FROM prompt;\n\
-             SELECT session, cwd, at FROM session_place;\n\
-             SELECT path, checkout.repository AS repository FROM directory;\n\
-             SELECT toplevel, repository FROM checkout;\n\
-             SELECT id, name FROM repository;\n\
-             SELECT repository, identity, mainline, started_at FROM crawl;\n\
-             SELECT id, repository, author, committed_at, added, removed, subject FROM commit;\n\
-             SELECT commit, place, valid_from FROM placement;\n\
-             SELECT commit, path, via FROM landed_via;\n\
-             SELECT commit, alive, valid_from FROM survival;\n\
-             SELECT commit, path, added, removed FROM commit_file;\n\
-             SELECT commit, commit.committed_at AS at, tool_call.reply.model AS model, at AS tied_at FROM commit_session;",
-        )
-        .await?;
-    let replies: Vec<Value> = answer.take(0)?;
-    let mut states: Vec<Value> = answer.take(1)?;
-    let prompts: Vec<Value> = answer.take(2)?;
-    let places: Vec<Value> = answer.take(3)?;
-    let directories: Vec<Value> = answer.take(4)?;
-    let checkouts: Vec<Value> = answer.take(5)?;
-    let repositories: Vec<Value> = answer.take(6)?;
-    let mut crawls: Vec<Value> = answer.take(7)?;
-    let commit_rows: Vec<Value> = answer.take(8)?;
-    let mut placements: Vec<Value> = answer.take(9)?;
-    let landed_rows: Vec<Value> = answer.take(10)?;
-    let mut survival: Vec<Value> = answer.take(11)?;
-    let file_rows: Vec<Value> = answer.take(12)?;
-    let ties: Vec<Value> = answer.take(13)?;
+    // Every table a page at a time: one answer holding every row of all of
+    // them had the database reset the connection.
+    let replies = every(db, "reply", "session, at, model").await?;
+    let mut states = every(db, "reply_state", "reply, valid_from, output_tokens, input_tokens, cache_read_tokens, cache_write_tokens").await?;
+    let prompts = every(db, "prompt", "session, at, text").await?;
+    let places = every(db, "session_place", "session, cwd, at").await?;
+    let directories = every(db, "directory", "path, checkout.repository AS repository").await?;
+    let checkouts = every(db, "checkout", "toplevel, repository").await?;
+    let repositories = every(db, "repository", "name").await?;
+    let mut crawls = every(db, "crawl", "repository, identity, mainline, started_at").await?;
+    let commit_rows = every(db, "commit", "repository, author, committed_at, added, removed, subject").await?;
+    let mut placements = every(db, "placement", "commit, place, valid_from").await?;
+    let landed_rows = every(db, "landed_via", "commit, path, via").await?;
+    let mut survival = every(db, "survival", "commit, alive, valid_from").await?;
+    let file_rows = every(db, "commit_file", "commit, path, added, removed").await?;
+    let ties = every(db, "commit_session", "commit, commit.committed_at AS at, tool_call.reply.model AS model, at AS tied_at").await?;
 
     // Each reply's newest usage: its output, and the context it carried.
     states.sort_by_key(|s| std::cmp::Reverse(time(s, "valid_from")));

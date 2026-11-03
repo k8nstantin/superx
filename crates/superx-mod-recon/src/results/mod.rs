@@ -19,6 +19,39 @@ use superx_kernel::types::Value;
 use superx_kernel::{Db, Result};
 
 use crate::crawler::hosts::held::{record, row_key, time};
+use crate::crawler::lines::kernel::{first_id, record_uuid_of};
+
+/// Rows read at once from one of the module's tables.
+const PAGE: i64 = 5_000; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// Every row of `table`, its id and `fields`, read a page at a time in the
+/// order of its UUIDv7 ids (as the crawler walks the kernel's lines), so no
+/// answer is one huge message: the comparison's one query of every table
+/// had the database reset the connection.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError`] when the database does not answer.
+pub(crate) async fn every(db: &Db, table: &str, fields: &str) -> Result<Vec<Value>> {
+    let first = format!("SELECT id, {fields} FROM type::record('{table}', $from..) LIMIT $limit");
+    let after = format!("SELECT id, {fields} FROM type::record('{table}', $from>..) LIMIT $limit");
+    let mut out: Vec<Value> = Vec::new();
+    let mut from = first_id();
+    let mut sql = first;
+    loop {
+        let page: Vec<Value> = db.query(sql.as_str()).bind(("from", from)).bind(("limit", PAGE)).await?.take(0)?;
+        let full = i64::try_from(page.len()).unwrap_or(i64::MAX) >= PAGE;
+        let last = page.last().and_then(|r| record(r, "id")).and_then(|id| record_uuid_of(&id));
+        out.extend(page);
+        match last {
+            Some(l) if full => {
+                from = l;
+                sql.clone_from(&after);
+            }
+            _ => return Ok(out),
+        }
+    }
+}
 
 /// One model on one UTC day.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -100,22 +133,26 @@ pub async fn models(db: &Db) -> Result<Models> {
         .query(
             "SELECT time::format(time::floor(at, 1d), '%Y-%m-%d') AS day, model, subagent, count() AS n FROM reply GROUP BY day, model, subagent;\n\
              SELECT model, session FROM reply GROUP BY model, session;\n\
-             SELECT reply, valid_from, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens, \
-             reply.model AS model, reply.at AS at FROM reply_state;\n\
-             SELECT at, ms, reply.model AS model FROM thinking;\n\
-             SELECT time::format(time::floor(at, 1d), '%Y-%m-%d') AS day, reply.model AS model, count() AS n FROM tool_call GROUP BY day, model;\n\
-             SELECT tool_call.at AS at, tool_call.reply.model AS model, added, removed FROM edit;\n\
-             SELECT commit, commit.committed_at AS at, commit.added AS added, commit.removed AS removed, tool_call.reply.model AS model, \
-             at AS tied_at FROM commit_session;",
+             SELECT time::format(time::floor(at, 1d), '%Y-%m-%d') AS day, reply.model AS model, count() AS n FROM tool_call GROUP BY day, model;",
         )
         .await?;
     let replies: Vec<Value> = answer.take(0)?;
     let pairs: Vec<Value> = answer.take(1)?;
-    let mut states: Vec<Value> = answer.take(2)?;
-    let thinking: Vec<Value> = answer.take(3)?;
-    let tool_calls: Vec<Value> = answer.take(4)?;
-    let edits: Vec<Value> = answer.take(5)?;
-    let ties: Vec<Value> = answer.take(6)?;
+    let tool_calls: Vec<Value> = answer.take(2)?;
+    let mut states = every(
+        db,
+        "reply_state",
+        "reply, valid_from, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens, reply.model AS model, reply.at AS at",
+    )
+    .await?;
+    let thinking = every(db, "thinking", "at, ms, reply.model AS model").await?;
+    let edits = every(db, "edit", "tool_call.at AS at, tool_call.reply.model AS model, added, removed").await?;
+    let ties = every(
+        db,
+        "commit_session",
+        "commit, commit.committed_at AS at, commit.added AS added, commit.removed AS removed, tool_call.reply.model AS model, at AS tied_at",
+    )
+    .await?;
 
     let mut days: BTreeMap<(String, String), Measures> = BTreeMap::new();
     for r in &replies {

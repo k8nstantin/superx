@@ -174,7 +174,7 @@ function mini(ranked: Row[], m: Metric) {
 /// line whose length is the gap. The right form when the story is the
 /// DISTANCE between two numbers — typical against peak, the price
 /// before rework against the price after — where two separate bars
-/// make the reader do the subtraction.
+/// make whoever reads the page do the subtraction.
 function dumbbell(
   rows: Row[],
   a: (d: Row) => number,
