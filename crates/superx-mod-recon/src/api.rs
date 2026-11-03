@@ -47,32 +47,26 @@ pub struct Day {
     pub host_failed: i64,
 }
 
-/// The crawler's passes per UTC day, oldest first, from every `pass` row and
-/// every `pass_source` row the module holds.
+/// The crawler's passes per day in `zone` (the operator's own, as the page
+/// reads it), oldest first, from every `pass` row and every `pass_source`
+/// row the module holds, each by the day it finished.
 ///
 /// # Errors
 ///
 /// [`superx_kernel::KernelError`] when the database does not answer.
-pub async fn days(db: &Db) -> superx_kernel::Result<Vec<Day>> {
-    let mut answer = db
-        .query(
-            "SELECT time::format(time::floor(finished_at, 1d), '%Y-%m-%d') AS day, outcome, count() AS passes, \
-             math::sum(rows_written) AS rows FROM pass GROUP BY day, outcome;\n\
-             SELECT time::format(time::floor(finished_at, 1d), '%Y-%m-%d') AS day, source, math::sum(items) AS items, \
-             math::sum(calls) AS calls, math::sum(failed) AS failed FROM pass_source GROUP BY day, source;",
-        )
-        .await?;
-    let passes: Vec<Value> = answer.take(0)?;
-    let sources: Vec<Value> = answer.take(1)?;
+pub async fn days(db: &Db, zone: chrono::FixedOffset) -> superx_kernel::Result<Vec<Day>> {
+    let passes = crate::results::every(db, "pass", "finished_at, outcome, rows_written").await?;
+    let sources = crate::results::every(db, "pass_source", "finished_at, source, items, calls, failed").await?;
+    let day_of = |row: &Value| time(row, "finished_at").map(|t| t.with_timezone(&zone).format("%Y-%m-%d").to_string());
     let mut by_day: BTreeMap<String, Day> = BTreeMap::new();
     for row in &passes {
-        let (Some(day), Some(outcome)) = (text(row, "day"), text(row, "outcome")) else { continue };
+        let (Some(day), Some(outcome)) = (day_of(row), text(row, "outcome")) else { continue };
         let d = by_day.entry(day.clone()).or_insert_with(|| Day { day, ..Day::default() });
-        *d.passes.entry(outcome).or_insert(0) += int(row, "passes");
-        d.rows += int(row, "rows");
+        *d.passes.entry(outcome).or_insert(0) += 1;
+        d.rows += int(row, "rows_written");
     }
     for row in &sources {
-        let (Some(day), Some(source)) = (text(row, "day"), text(row, "source")) else { continue };
+        let (Some(day), Some(source)) = (day_of(row), text(row, "source")) else { continue };
         let d = by_day.entry(day.clone()).or_insert_with(|| Day { day, ..Day::default() });
         match source.as_str() {
             crate::crawler::lines::SOURCE => d.lines += int(row, "items"),
@@ -90,13 +84,25 @@ pub async fn days(db: &Db) -> superx_kernel::Result<Vec<Day>> {
     Ok(by_day.into_values().collect())
 }
 
-/// `GET /api/stats`: [`days`], from the module's own database.
-pub async fn stats(State(kernel): State<Kernel>) -> Response {
+/// What `GET /api/stats` is asked: the operator's time zone, as minutes
+/// east of UTC; none is UTC.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StatsQuery {
+    pub offset: Option<i32>,
+}
+
+/// `GET /api/stats?offset=…`: [`days`], from the module's own database, by
+/// the operator's days.
+pub async fn stats(State(kernel): State<Kernel>, axum::extract::Query(q): axum::extract::Query<StatsQuery>) -> Response {
+    let minutes = q.offset.unwrap_or(0);
+    let Some(zone) = minutes.checked_mul(60).and_then(chrono::FixedOffset::east_opt) else {
+        return refuse(StatusCode::BAD_REQUEST, format!("offset wants minutes east of UTC within a day, not {minutes}"));
+    };
     let db = match kernel.module_db(MODULE_NAME).await {
         Ok(db) => db,
         Err(e) => return unavailable(&e),
     };
-    match days(&db).await {
+    match days(&db, zone).await {
         Ok(days) => Json(serde_json::json!({ "days": days })).into_response(),
         Err(e) => unavailable(&e),
     }

@@ -36,7 +36,9 @@ async function answer<T>(r: Response): Promise<T> {
   return r.json() as Promise<T>
 }
 
-export const fetchStats = () => fetch('/api/stats').then((r) => answer<{ days: Day[] }>(r))
+/// The stats by the operator's own days: the browser's offset, in minutes
+/// east of UTC.
+export const fetchStats = () => fetch(`/api/stats?offset=${-new Date().getTimezoneOffset()}`).then((r) => answer<{ days: Day[] }>(r))
 
 /// A host repository crawled beside a repository in the pass.
 export type HostNow = { name: string; calls: number; failed: number; waits: number; asking: string | null; done: boolean }

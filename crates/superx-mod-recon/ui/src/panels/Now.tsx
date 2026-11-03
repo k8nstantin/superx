@@ -75,7 +75,7 @@ function Header({ p, running }: { p: PassNow; running: boolean }) {
           {running ? 'running' : `last pass: ${p.outcome}`}
         </Badge>
         <Text fz="sm">
-          started {clock(p.started_at)} UTC · {running ? `${since(p.started_at)} so far` : `took ${since(p.started_at, p.finished_at)}, ended ${clock(p.finished_at)}`}
+          started {clock(p.started_at)} · {running ? `${since(p.started_at)} so far` : `took ${since(p.started_at, p.finished_at)}, ended ${clock(p.finished_at)}`}
           {!running && p.rows != null ? ` · ${p.rows.toLocaleString('en-US')} rows written` : ''}
         </Text>
       </Group>

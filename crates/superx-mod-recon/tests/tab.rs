@@ -129,7 +129,7 @@ async fn the_stats_per_day_add_up_every_pass_by_outcome_and_each_sources_lines_g
             other => panic!("a source: {other:?}"),
         }
     }
-    let read = days(&db).await.expect("days");
+    let read = days(&db, chrono::FixedOffset::east_opt(0).expect("UTC")).await.expect("days");
     assert_eq!(read, want.into_values().collect::<Vec<_>>(), "the stats are the rows, day by day");
     assert_eq!(read.len(), 2, "{read:?}");
     assert_eq!(

@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { fetchStats, type Day } from '../api'
 import { AXIS, CANCEL, CHART_COLORS, EChart, FAIL, OK, TOOLTIP, UNKNOWN } from '../EChart'
 
-// The crawler's stats, day by day (UTC), from every pass recon recorded:
+// The crawler's stats, day by day in the operator's own time, from every pass recon recorded:
 // /api/stats reads its own pass and pass_source rows.
 
 const OUTCOMES: [string, string][] = [
@@ -82,7 +82,7 @@ export function Stats() {
     <Stack gap="sm">
       <Group justify="space-between" align="baseline">
         <Title order={3}>Crawler stats</Title>
-        <Text size="xs" c="dimmed">per UTC day, from every pass recon recorded · refreshed every minute</Text>
+        <Text size="xs" c="dimmed">per day, your time, from every pass recon recorded · refreshed every minute</Text>
       </Group>
       {stats.isError && <Alert color="red" title="The stats did not load">{String(stats.error)}</Alert>}
       {stats.isSuccess && days.length === 0 && <Text c="dimmed">No pass recorded yet.</Text>}

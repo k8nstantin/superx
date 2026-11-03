@@ -1,10 +1,21 @@
-// Times as the tab writes them: UTC clock times, and spans in h, m and s.
+// Times as the tab writes them: in the operator's own time zone (operator,
+// 2026-11-03: "speak in time for my time zone"), and spans in h, m and s.
 
-/// `2026-11-03T16:42:56Z` as `16:42:56`.
-export const clock = (iso: string | null | undefined) => (iso ? new Date(iso).toISOString().slice(11, 19) : '—')
+const two = (v: number) => String(v).padStart(2, '0')
 
-/// `2026-11-03T16:42:56Z` as `11-03 16:42`.
-export const day = (iso: string | null | undefined) => (iso ? new Date(iso).toISOString().slice(5, 16).replace('T', ' ') : '—')
+/// `2026-11-03T20:42:56Z` as `16:42:56`, in the operator's own time.
+export const clock = (iso: string | null | undefined) => {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`
+}
+
+/// `2026-11-03T20:42:56Z` as `11-03 16:42`, in the operator's own time.
+export const day = (iso: string | null | undefined) => {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  return `${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`
+}
 
 /// A span in milliseconds as `1h 2m`, `3m 12s` or `41s`.
 export function span(ms: number): string {
