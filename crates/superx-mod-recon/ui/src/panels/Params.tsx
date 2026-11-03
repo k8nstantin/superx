@@ -16,11 +16,13 @@ const GROUPS: [string, string][] = [
 ]
 
 /// The value typed, as the JSON recon is sent: a number, "all", a list of
-/// lines, or an object of repository names to refs, one per line.
+/// lines, or an object of repository names to refs, one per line; `none`
+/// for an empty list or object, so an empty box never sets one.
 function typed(input: Param['input'], text: string): unknown {
   const t = text.trim()
-  if (input === 'list') return text.split('\n').map((l) => l.trim()).filter((l) => l !== '')
+  if (input === 'list') return t === 'none' ? [] : text.split('\n').map((l) => l.trim()).filter((l) => l !== '')
   if (input === 'refs') {
+    if (t === 'none') return {}
     const refs: Record<string, string> = {}
     for (const line of text.split('\n')) {
       const [name, ref] = line.trim().split(/\s+/, 2)
@@ -35,8 +37,8 @@ function typed(input: Param['input'], text: string): unknown {
 const hint: Record<Param['input'], string> = {
   number: 'a whole number',
   'number or all': 'a whole number, or all',
-  list: 'one per line; empty for none',
-  refs: 'repository ref, one pair per line',
+  list: 'one per line, or none',
+  refs: 'repository ref, a pair per line, or none',
 }
 
 function Row({ p }: { p: Param }) {
@@ -64,7 +66,7 @@ function Row({ p }: { p: Param }) {
     <Table.Tr>
       <Table.Td ff="monospace" fz="xs">{p.name}</Table.Td>
       <Table.Td>
-        <Group gap={6} wrap="nowrap">
+        <Group gap={6}>
           <Text ff="monospace" fz="sm" style={{ overflowWrap: 'anywhere' }}>{p.value}</Text>
           <Badge size="xs" variant={p.set ? 'filled' : 'outline'} color={p.set ? 'pelican' : 'gray'}>{p.set ? 'set' : 'fallback'}</Badge>
         </Group>
@@ -76,7 +78,7 @@ function Row({ p }: { p: Param }) {
       <Table.Td miw={260}>
         <Group gap={6} align="flex-start" wrap="nowrap">
           <div style={{ flex: 1 }}>{field}</div>
-          <Button size="xs" disabled={many ? false : text.trim() === ''} loading={change.isPending} onClick={() => change.mutate()}>
+          <Button size="xs" disabled={text.trim() === ''} loading={change.isPending} onClick={() => change.mutate()}>
             Set
           </Button>
         </Group>
