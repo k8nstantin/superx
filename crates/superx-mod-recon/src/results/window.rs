@@ -13,7 +13,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
 
 use super::compare::says_word;
-use super::findings::host_run;
+use super::findings::{host_run, in_flight};
 use super::trail::{rewrites, Trail};
 use super::DayFile;
 use crate::params::Params;
@@ -152,6 +152,7 @@ pub struct Commit {
     pub added: i64,
     pub removed: i64,
     pub place: Option<String>,
+    pub in_flight: bool,
     pub landed: i64,
     pub alive: Option<i64>,
     pub never_landed: i64,
@@ -483,7 +484,7 @@ pub fn window(trail: &Trail, params: &Params, from: DateTime<Utc>, to: DateTime<
         t.commit_removed += c.removed;
         match c.place.as_deref() {
             Some("mainline") => t.commits_mainline += 1,
-            Some("in_flight") => t.commits_in_flight += 1,
+            _ if in_flight(c) => t.commits_in_flight += 1,
             Some("branch") => t.commits_branch += 1,
             Some("recovered") => t.commits_recovered += 1,
             _ => {}
@@ -536,6 +537,7 @@ pub fn window(trail: &Trail, params: &Params, from: DateTime<Utc>, to: DateTime<
                 added: c.added,
                 removed: c.removed,
                 place: c.place.clone(),
+                in_flight: in_flight(c),
                 landed: c.landed,
                 alive: c.alive,
                 never_landed: c.never_landed,

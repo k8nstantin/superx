@@ -371,6 +371,38 @@ pub async fn window(
     }
 }
 
+/// What `GET /api/results/commit` is asked: a repository's name and a
+/// commit's hash.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CommitQuery {
+    pub repo: String,
+    pub hash: String,
+}
+
+/// `GET /api/results/commit?repo=…&hash=…`: [`crate::results::commit::commit`],
+/// one commit whole.
+pub async fn commit(
+    State(kernel): State<Kernel>,
+    State(held): State<Held>,
+    axum::extract::Query(q): axum::extract::Query<CommitQuery>,
+) -> Response {
+    let resolved = match params::resolve(&kernel).await {
+        Ok(r) => r,
+        Err(e) => return unavailable(&e),
+    };
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match held.get(&db, &resolved.params).await {
+        Ok(trail) => match crate::results::commit::commit(&trail, &q.repo, &q.hash) {
+            Some(c) => Json(c).into_response(),
+            None => refuse(StatusCode::NOT_FOUND, format!("no commit {} in {}", q.hash, q.repo)),
+        },
+        Err(e) => unavailable(&e),
+    }
+}
+
 /// One parameter as the tab shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Shown {

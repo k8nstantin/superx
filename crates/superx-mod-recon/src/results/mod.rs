@@ -9,6 +9,7 @@
 //! here, since the engine's handling of NONE is not to be trusted in either
 //! (SurrealDB 3.1.4: `!= NONE` filters drop or keep the wrong rows).
 
+pub mod commit;
 pub mod compare;
 pub mod findings;
 pub mod trail;

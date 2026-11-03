@@ -69,7 +69,7 @@ function drawn(option: unknown): string | null {
 }
 
 /// What a click on a chart names: the series and the category it hit.
-export type Clicked = { seriesName?: string; name?: string; dataIndex?: number; value?: unknown }
+export type Clicked = { seriesName?: string; seriesIndex?: number; name?: string; dataIndex?: number; value?: unknown }
 
 export function EChart({ option, height, onClick }: { option: Record<string, unknown>; height: number; onClick?: (p: Clicked) => void }) {
   const chart = useRef<ReactECharts>(null)

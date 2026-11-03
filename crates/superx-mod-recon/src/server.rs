@@ -67,6 +67,7 @@ pub fn app(kernel: Kernel, instance: Instance, port: u16, progress: Progress) ->
         .route("/api/results/compare", get(api::compare))
         .route("/api/results/findings", get(api::findings))
         .route("/api/results/window", get(api::window))
+        .route("/api/results/commit", get(api::commit))
         .route("/api/stats", get(api::stats))
         .route("/api/params", get(api::params))
         .route("/api/params/{name}", put(api::set))

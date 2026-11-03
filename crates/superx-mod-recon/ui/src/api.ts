@@ -134,96 +134,323 @@ export const setParam = (name: string, value: unknown) =>
     body: JSON.stringify(value),
   }).then((r) => answer<Listing>(r))
 
-/// What a model did, summed (src/results.rs).
-export type Measures = {
-  replies: number
-  subagent_replies: number
-  input_tokens: number
-  output_tokens: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  thinking_tokens: number
-  thinking_spans: number
-  thinking_ms: number
-  tool_calls: number
-  lines_added: number
-  lines_removed: number
-  commits: number
-  commit_lines_added: number
-  commit_lines_removed: number
-}
 
-export type ModelDay = Measures & { day: string; model: string }
-export type ModelTotal = Measures & { model: string; sessions: number; first_day: string; last_day: string }
-export type Models = { days: ModelDay[]; totals: ModelTotal[] }
+// ---- Results (src/results/): the trail's findings, a window on each
+// repository, one commit whole. Times are RFC 3339 in UTC; a model is its
+// family ("opus 5.5"), empty where none is credited; a repository is its
+// name, empty for work in no repository.
 
-export const fetchModels = () => fetch('/api/results/models').then((r) => answer<Models>(r))
-
-/// What is behind one model's bar on one UTC day (src/results.rs `day`).
 export type DayFile = { path: string; change: string; added: number; removed: number }
-export type DayCommit = {
-  hash: string
+
+/// A commit of ours and what became of it.
+export type FoundCommit = {
   repo: string
+  hash: string
   subject: string
-  committed_at: string | null
+  at: string
+  model: string
+  by: 'printed' | 'claim' | null
+  session: string | null
+  agent: string | null
   added: number
   removed: number
   place: string | null
-  landed: boolean
+  in_flight: boolean
+  landed: number
   alive: number | null
-  session: string | null
-  files: DayFile[]
+  never_landed: number
+  files: number
+  bulk: boolean
+  reverted: boolean
+  ci: boolean | null
+  ci_names: { name: string; verdict: boolean | null }[]
+  pulls: number[]
+  tested: boolean | null
+  tests_green: boolean | null
+  built: boolean | null
+  effort: string | null
+  context: number | null
+  subagent: boolean | null
 }
-export type DayEdit = { at: string | null; path: string; kind: string; added: number; removed: number; tool: string; session: string | null; operator_changed: boolean }
-export type DaySession = { session: string; agent: string; replies: number; first: string | null; last: string | null }
-export type ModelDayDetail = { model: string; day: string; commits: DayCommit[]; edits: DayEdit[]; sessions: DaySession[] }
 
-export const fetchDay = (model: string, day: string) =>
-  fetch(`/api/results/day?model=${encodeURIComponent(model)}&day=${encodeURIComponent(day)}`).then((r) => answer<ModelDayDetail>(r))
-
-/// The model comparison (src/results/compare.rs): mod-ui's measures, from
-/// recon's facts.
-export type Deviation = {
-  model: string
+/// A pull request and how it went.
+export type FoundPull = {
+  repo: string
+  host: string
+  path: string
+  number: number
+  title: string
+  url: string
+  created_at: string
+  state: string
+  merged: boolean
+  merged_at: string | null
+  closed_at: string | null
+  minutes_to_merge: number | null
+  additions: number
+  deletions: number
   commits: number
+  model: string | null
+  by: 'opened' | 'commits' | null
+  session: string | null
+  ci_failed: number
+  ci_passed: number
+  ci_first: boolean | null
+}
+
+/// One model's work in one repository in one week (its Monday, UTC).
+export type Week = {
+  week: string
+  model: string
+  repo: string
+  replies: number
+  subagent_replies: number
+  out_tokens: number
+  context_tokens: number
+  thinking_ms: number
+  tool_calls: number
+  active_secs: number
+  edits: number
+  edit_added: number
+  edit_removed: number
+  operator_changed: number
+  tests: number
+  tests_failed: number
+  builds: number
+  builds_failed: number
+  prompts: number
+  corrections: number
+  escalations: number
+  interrupts: number
+}
+
+export type RepoWeek = { week: string; repo: string; moves: Record<string, number>; rewrites: number; ci_passed: number; ci_failed: number; ci_turned: number }
+export type Workflow = { repo: string; name: string; kind: string; runs: number; passed: number; failed: number; turned: number }
+
+export type Findings = {
+  commits: FoundCommit[]
+  pulls: FoundPull[]
+  weeks: Week[]
+  repo_weeks: RepoWeek[]
+  workflows: Workflow[]
+  ci_kinds: Record<string, number>
+  computed_at: string
+}
+
+export const fetchFindings = () => fetch('/api/results/findings').then((r) => answer<Findings>(r))
+
+/// A repository's numbers in a window.
+export type WinTotals = {
+  sessions: number
+  agents: number
+  models: number
+  replies: number
+  subagent_replies: number
+  out_tokens: number
+  context_tokens: number
+  thinking_ms: number
+  tool_calls: number
+  active_secs: number
+  prompts: number
+  corrections: number
+  escalations: number
+  interrupts: number
+  edits: number
+  edit_files: number
+  edit_added: number
+  edit_removed: number
+  commits: number
+  commit_added: number
+  commit_removed: number
+  commits_mainline: number
+  commits_in_flight: number
+  commits_branch: number
+  commits_recovered: number
+  landed: number
+  alive: number
+  reverted: number
+  prs_opened: number
+  prs_merged: number
+  prs_closed: number
+  ci_passed: number
+  ci_failed: number
+  moves: number
+  rewrites: number
+  pushes: number
+  tests: number
+  tests_failed: number
+  builds: number
+  builds_failed: number
+}
+
+export type WinModel = {
+  model: string
+  sessions: number
+  replies: number
+  out_tokens: number
+  context_tokens: number
+  thinking_ms: number
+  tool_calls: number
+  active_secs: number
+  edit_added: number
+  edit_removed: number
+  commits: number
+  commit_added: number
+  commit_removed: number
+  landed: number
+  alive: number
+  prompts: number
+  corrections: number
+  escalations: number
+  tests: number
+  tests_failed: number
+}
+
+export type Step = {
+  start: string
+  model: string
+  replies: number
+  out_tokens: number
+  tool_calls: number
+  edit_added: number
+  edit_removed: number
+  commits: number
+  commit_added: number
+  commit_removed: number
+  prompts: number
+}
+
+export type WinSession = {
+  session: string
+  agent: string
+  models: string[]
+  first: string | null
+  last: string | null
+  replies: number
+  tool_calls: number
+  out_tokens: number
+  active_secs: number
+  edit_added: number
+  edit_removed: number
+  prompts: number
+  commits: number
+  tests: number
+  builds: number
+}
+
+export type WinFile = { path: string; models: string[]; edits: number; edit_added: number; edit_removed: number; commits: number; commit_added: number; commit_removed: number }
+
+export type WinCommit = {
+  hash: string
+  subject: string
+  at: string
+  author_name: string
+  ours: boolean
+  squash: boolean
+  model: string
+  by: 'printed' | 'claim' | null
+  session: string | null
   added: number
   removed: number
-  alive: number
-  survived_pct: number
-  removed_per_100_added: number
-  rework_commits: number
-  rework_pct: number
-  thrash_files: number
-  thrash_per_100_commits: number
-  multi_dir_commits: number
-  multi_dir_pct: number
-  dirs_per_commit_x10: number
-  operator_turns: number
-  corrections: number
-  corrections_per_100: number
-  escalations: number
-  out_tokens: number
-  messages: number
-  runs: number
-  thrown: number
-  tokens_thrown: number
-  tokens_per_line_landed: number
-  tokens_per_line_kept: number
-  median_age_days: number
-  context_avg: number
-  context_peak: number
-  minutes: number
-  minutes_thrown: number
-  alive_per_mtok: number
-  alive_per_hour: number
-  abandoned_commits: number
-  abandoned_lines: number
-  abandoned_pct: number
-  in_flight_lines: number
+  place: string | null
+  in_flight: boolean
+  landed: number
+  alive: number | null
+  never_landed: number
+  reverted: boolean
+  ci: boolean | null
+  pulls: number[]
+  tested: boolean | null
+  files: DayFile[]
 }
-export type Handoff = { from: string; to: string; switches: number; commits: number; added: number; removed: number; alive: number; survived_pct: number }
-export type RepoModel = { repo: string; model: string; commits: number; added: number; alive: number; removed: number; survived_pct: number; rework_commits: number }
-export type UnjudgedRepo = { repo: string; mainline: string; off_mainline_commits: number; unresolved: boolean }
-export type CompareSummary = { handoffs: Handoff[]; deviations: Deviation[]; repos: RepoModel[]; unjudged: UnjudgedRepo[]; computed_at: string }
 
-export const fetchCompare = () => fetch('/api/results/compare').then((r) => answer<CompareSummary>(r))
+export type WinPrompt = { at: string; session: string | null; model: string; kind: string; text: string; correction: boolean; escalation: boolean }
+export type WinPull = {
+  number: number
+  title: string
+  url: string
+  state: string
+  merged: boolean
+  created_at: string
+  merged_at: string | null
+  closed_at: string | null
+  additions: number
+  deletions: number
+  model: string | null
+  ci_failed: number
+  ci_passed: number
+  ci_first: boolean | null
+  happened: string[]
+}
+export type WinRun = {
+  name: string
+  kind: string
+  verdict: boolean | null
+  failed_before: boolean
+  status: string | null
+  conclusion: string | null
+  created_at: string | null
+  completed_at: string | null
+  sha: string | null
+  git_ref: string | null
+  pull: number | null
+  url: string | null
+}
+export type WinMove = { at: string; git_ref: string; kind: string; action: string; identity: string | null; old: string | null; new: string | null; mirror: boolean }
+export type WinCheck = { at: string; test: boolean; what: string; command: string; passed: number; failed: number; ok: boolean; session: string | null; model: string }
+export type WinGit = { at: string; action: string; hash: string | null; branch: string | null; subject: string | null; pr_number: number | null; url: string | null; session: string | null; model: string }
+
+export type WinRepo = {
+  repo: string
+  totals: WinTotals
+  agents: Record<string, number>
+  models: WinModel[]
+  timeline: Step[]
+  sessions: WinSession[]
+  files: WinFile[]
+  commits: WinCommit[]
+  prompts: WinPrompt[]
+  pulls: WinPull[]
+  ci: WinRun[]
+  moves: WinMove[]
+  checks: WinCheck[]
+  git: WinGit[]
+}
+
+export type Window = { from: string; to: string; step_secs: number; repos: WinRepo[]; computed_at: string }
+
+export const fetchWindow = (from: Date, to: Date, step: number) =>
+  fetch(`/api/results/window?${new URLSearchParams({ from: from.toISOString(), to: to.toISOString(), step: String(step) })}`).then((r) =>
+    answer<Window>(r),
+  )
+
+/// One commit, whole.
+export type CommitDetail = {
+  repo: string
+  hash: string
+  subject: string
+  at: string
+  author_name: string
+  model: string
+  by: 'printed' | 'claim' | null
+  session: string | null
+  agent: string | null
+  effort: string | null
+  context: number | null
+  added: number
+  removed: number
+  place: string | null
+  in_flight: boolean
+  squash: boolean
+  landed: number
+  alive: number | null
+  never_landed: number
+  reverted: boolean
+  files: DayFile[]
+  ci: { name: string; kind: string; verdict: boolean | null; failed_before: boolean; status: string | null; conclusion: string | null; created_at: string | null; completed_at: string | null; url: string | null }[]
+  pulls: { number: number; title: string; url: string; state: string; merged: boolean; created_at: string; merged_at: string | null }[]
+  checks: { at: string; test: boolean; what: string; command: string; passed: number; failed: number; ok: boolean }[]
+}
+
+export const fetchCommit = (repo: string, hash: string) =>
+  fetch(`/api/results/commit?${new URLSearchParams({ repo, hash })}`).then((r) => answer<CommitDetail>(r))

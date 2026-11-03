@@ -40,9 +40,14 @@ pub struct FoundCommit {
     pub added: i64,
     pub removed: i64,
     pub place: Option<String>,
+    /// On a checked-out branch, or in an open pull request: it may still
+    /// land, so its lines off the main line are not counted as never landed.
+    pub in_flight: bool,
     pub landed: i64,
     pub alive: Option<i64>,
     pub never_landed: i64,
+    /// Its files.
+    pub files: i64,
     pub bulk: bool,
     pub reverted: bool,
     pub ci: Option<bool>,
@@ -176,6 +181,12 @@ fn slot<'a>(weeks: &'a mut BTreeMap<(String, String, String), Week>, at: DateTim
     })
 }
 
+/// Whether a commit off the main line may still land: it is on a checked-out
+/// branch, or in an open pull request.
+pub(crate) fn in_flight(c: &super::trail::Commit) -> bool {
+    c.place.as_deref() == Some("in_flight") || (c.open_pull && c.place.as_deref() != Some("mainline"))
+}
+
 /// Whether a run is a host's own CI run, not one of its parts or a status.
 pub(crate) fn host_run(kind: &str) -> bool {
     kind == WORKFLOW_RUN || kind == PIPELINE
@@ -246,9 +257,11 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
                 added: c.added,
                 removed: c.removed,
                 place: c.place.clone(),
+                in_flight: in_flight(c),
                 landed: c.landed,
                 alive: c.alive,
                 never_landed: c.never_landed,
+                files: trail.files.get(&c.key).map_or(0, |f| i64::try_from(f.len()).unwrap_or(i64::MAX)),
                 bulk: c.bulk,
                 reverted: c.reverted,
                 ci: c.ci,

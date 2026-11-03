@@ -4,6 +4,7 @@ import { useElementSize } from '@mantine/hooks'
 import GridLayout, { useContainerWidth, type Layout, type LayoutItem } from 'react-grid-layout'
 import 'react-grid-layout/css/styles.css'
 import 'react-resizable/css/styles.css'
+import './board.css'
 
 // A board of cards the operator arranges: each card is dragged by its title
 // and resized from its right edge, its bottom edge or its corner, and what
@@ -93,7 +94,7 @@ export function Board({ name, cards }: { name: string; cards: Card[] }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ids, layout])
   return (
-    <div ref={containerRef}>
+    <div ref={containerRef} className="sx-board">
       <Group justify="flex-end" mb={4}>
         <Text size="xs" c="dimmed">drag a card by its title · resize it from its edge or corner</Text>
         <Button

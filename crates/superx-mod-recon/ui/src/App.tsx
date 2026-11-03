@@ -4,29 +4,31 @@ import { Now } from './panels/Now'
 import { Repos } from './panels/Repos'
 import { Stats } from './panels/Stats'
 import { Params } from './panels/Params'
-import { Models } from './panels/Models'
-import { Comparison } from './panels/Comparison'
+import { Results } from './results/Results'
 
 // The tab, in two: the Crawler (what it does, has and runs on) and the
-// Results (what it gathers them for). One panel per file under panels/, each
-// reading its own route of recon's URL, so a panel is added without touching
-// the others. The open one is kept in the address, #crawler or #results.
+// Results (what it gathers them for, a view per question under results/).
+// The open one is kept in the address: #crawler, or #results/<view>.
 const VIEWS = ['crawler', 'results']
 
-function opened(): string {
-  const view = window.location.hash.slice(1)
-  return VIEWS.includes(view) ? view : 'crawler'
+function opened(): [string, string] {
+  const [view, sub] = window.location.hash.slice(1).split('/')
+  return [VIEWS.includes(view) ? view : 'crawler', sub ?? '']
 }
 
 export default function App() {
-  const [view, setView] = useState(opened)
+  const [[view, sub], setView] = useState(opened)
   useEffect(() => {
     const follow = () => setView(opened())
     window.addEventListener('hashchange', follow)
     return () => window.removeEventListener('hashchange', follow)
   }, [])
+  const go = (v: string, s = '') => {
+    window.location.hash = s ? `${v}/${s}` : v
+    setView([v, s])
+  }
   return (
-    <Container size="xl" py="lg">
+    <Container fluid px="lg" py="lg">
       <Stack gap="lg">
         <Stack gap={2}>
           <Title order={2}>Recon</Title>
@@ -36,12 +38,7 @@ export default function App() {
         </Stack>
         <Tabs
           value={view}
-          onChange={(v) => {
-            if (v) {
-              window.location.hash = v
-              setView(v)
-            }
-          }}
+          onChange={(v) => v && go(v, v === 'results' ? sub : '')}
           keepMounted={false}
         >
           <Tabs.List>
@@ -57,10 +54,7 @@ export default function App() {
             </Stack>
           </Tabs.Panel>
           <Tabs.Panel value="results" pt="lg">
-            <Stack gap="xl">
-              <Comparison />
-              <Models />
-            </Stack>
+            <Results sub={sub} go={(s) => go('results', s)} />
           </Tabs.Panel>
         </Tabs>
       </Stack>

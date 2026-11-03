@@ -264,6 +264,8 @@ pub struct Commit {
     pub ci: Option<bool>,
     pub ci_names: Vec<(String, Option<bool>)>,
     pub pulls: Vec<usize>,
+    /// One of those pull requests is open: work in flight on the host.
+    pub open_pull: bool,
     /// A printed commit's session ran tests since its previous commit.
     pub tested: Option<bool>,
     /// The newest of those tests failed nothing.
@@ -666,6 +668,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
                 ci: None,
                 ci_names: Vec::new(),
                 pulls: Vec::new(),
+                open_pull: false,
                 tested: None,
                 tests_green: None,
                 built: None,
@@ -949,6 +952,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
         for h in &p.hashes {
             if let Some(&c) = p.repo.as_ref().and_then(|r| by_hash.get(&(r.clone(), h.clone()))) {
                 commits[c].pulls.push(i);
+                commits[c].open_pull |= p.state.eq_ignore_ascii_case("open");
             }
         }
     }
@@ -1043,4 +1047,50 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
     commits.sort_by_key(|c| c.at);
 
     Ok(Trail { map, agents, kernel_sessions, replies, edits, checks, git, prompts, commits, pulls, ci, moves, files })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{move_kind, rewrites, verdict};
+
+    #[test]
+    fn a_reflog_entry_is_what_its_message_says_it_did() {
+        for (message, kind) in [
+            ("commit: add a", "commit"),
+            ("commit (initial): first", "commit"),
+            ("commit (amend): add a", "amend"),
+            ("commit (merge): Merge branch 'x'", "merge"),
+            ("merge feat/x: Fast-forward", "merge"),
+            ("reset: moving to HEAD~1", "reset"),
+            ("rebase (finish): returning to refs/heads/x", "rebase"),
+            ("pull --rebase (finish): returning to refs/heads/main", "rebase"),
+            ("pull: Fast-forward", "pull"),
+            ("cherry-pick: add a", "cherry_pick"),
+            ("checkout: moving from main to x", "checkout"),
+            ("fetch: forced-update", "forced"),
+            ("fetch origin: fast-forward", "fetch"),
+            ("update by push", "push"),
+            ("branch: Created from HEAD", "branch"),
+            ("clone: from https://github.com/a/b", "clone"),
+            ("something else", "other"),
+        ] {
+            assert_eq!(move_kind(message), kind, "{message}");
+        }
+        assert!(["amend", "reset", "rebase", "forced"].iter().all(|k| rewrites(k)));
+        assert!(!["commit", "merge", "push", "fetch", "checkout"].iter().any(|k| rewrites(k)));
+    }
+
+    #[test]
+    fn a_ci_run_passes_or_fails_by_its_hosts_own_words() {
+        assert_eq!(verdict("workflow_run", Some("completed"), Some("success")), Some(true));
+        assert_eq!(verdict("workflow_run", Some("completed"), Some("failure")), Some(false));
+        assert_eq!(verdict("workflow_run", Some("completed"), Some("timed_out")), Some(false));
+        assert_eq!(verdict("workflow_run", Some("in_progress"), None), None, "still running");
+        assert_eq!(verdict("check_suite", Some("completed"), Some("cancelled")), None, "cancelled says nothing of the code");
+        assert_eq!(verdict("pipeline", Some("COMPLETED"), Some("SUCCESSFUL")), Some(true));
+        assert_eq!(verdict("pipeline", Some("COMPLETED"), Some("FAILED")), Some(false));
+        assert_eq!(verdict("commit_status", Some("failure"), None), Some(false), "a status's state is its verdict");
+        assert_eq!(verdict("commit_status", Some("SUCCESSFUL"), None), Some(true));
+        assert_eq!(verdict("commit_status", Some("pending"), None), None);
+    }
 }
