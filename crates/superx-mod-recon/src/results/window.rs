@@ -11,14 +11,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
-use superx_kernel::types::{RecordId, Value};
-use superx_kernel::{Db, Result};
 
 use super::compare::says_word;
 use super::findings::host_run;
 use super::trail::{rewrites, Trail};
-use super::{int, text, DayFile, PAGE};
-use crate::crawler::hosts::held::{record, row_key};
+use super::DayFile;
 use crate::params::Params;
 
 /// A repository's numbers in the window.
@@ -321,20 +318,9 @@ impl Acc {
 
 /// What was done in each repository from `from` to `to`, its timeline in
 /// steps of `step_secs`.
-///
-/// # Errors
-///
-/// [`superx_kernel::KernelError`] when the database does not answer the
-/// window's commits' files.
+#[must_use]
 #[allow(clippy::too_many_lines)] // skill-allow: allow — one walk over each kind of fact, each step named
-pub async fn window(
-    db: &Db,
-    trail: &Trail,
-    params: &Params,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-    step_secs: i64,
-) -> Result<Window> {
+pub fn window(trail: &Trail, params: &Params, from: DateTime<Utc>, to: DateTime<Utc>, step_secs: i64) -> Window {
     let step_secs = step_secs.max(1);
     let inside = |at: DateTime<Utc>| from <= at && at < to;
     let start = |at: DateTime<Utc>| from + TimeDelta::seconds((at - from).num_seconds() / step_secs * step_secs);
@@ -488,11 +474,9 @@ pub async fn window(
     }
 
     // The window's commits, and their files.
-    let mut ids: Vec<RecordId> = Vec::new();
     for (i, c) in trail.commits.iter().enumerate().filter(|(_, c)| inside(c.at)) {
         let a = accs.entry(name(Some(&c.repo))).or_default();
         a.commits.push(i);
-        ids.push(c.id.clone());
         let t = &mut a.repo.totals;
         t.commits += 1;
         t.commit_added += c.added;
@@ -526,29 +510,12 @@ pub async fn window(
         p.commit_added += c.added;
         p.commit_removed += c.removed;
     }
-    let mut files: BTreeMap<String, Vec<DayFile>> = BTreeMap::new();
-    for chunk in ids.chunks(usize::try_from(PAGE).unwrap_or(usize::MAX)) {
-        let rows: Vec<Value> = db
-            .query("SELECT commit, path, change, added, removed FROM commit_file WHERE commit INSIDE $ids")
-            .bind(("ids", chunk.to_vec()))
-            .await?
-            .take(0)?;
-        for f in &rows {
-            let Some(c) = record(f, "commit") else { continue };
-            files.entry(row_key(&c)).or_default().push(DayFile {
-                path: text(f, "path").unwrap_or_default(),
-                change: text(f, "change").unwrap_or_default(),
-                added: int(f, "added"),
-                removed: int(f, "removed"),
-            });
-        }
-    }
     for a in accs.values_mut() {
         let mine = std::mem::take(&mut a.commits);
         for i in mine {
             let c = &trail.commits[i];
             let model = c.family.clone().unwrap_or_default();
-            let mut its = files.get(&c.key).cloned().unwrap_or_default();
+            let mut its: Vec<DayFile> = trail.files.get(&c.key).cloned().unwrap_or_default();
             its.sort_by(|x, y| (y.added + y.removed).cmp(&(x.added + x.removed)).then_with(|| x.path.cmp(&y.path)));
             for f in &its {
                 let file = a.file(&f.path, &model);
@@ -697,5 +664,5 @@ pub async fn window(
             .cmp(&(x.totals.replies + x.totals.commits + x.totals.moves))
             .then_with(|| x.repo.cmp(&y.repo))
     });
-    Ok(Window { from, to, step_secs, repos, computed_at: Utc::now().to_rfc3339() })
+    Window { from, to, step_secs, repos, computed_at: Utc::now().to_rfc3339() }
 }

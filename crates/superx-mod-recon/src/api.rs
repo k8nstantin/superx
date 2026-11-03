@@ -22,6 +22,7 @@ use superx_kernel::{Db, Kernel, NodeKind};
 use crate::crawler::hosts::held::{record, row_key, time};
 use crate::crawler::progress::{Now, Progress};
 use crate::params::{self, NAMES};
+use crate::results::trail::Held;
 use crate::MODULE_NAME;
 
 /// The header a write carries.
@@ -317,7 +318,7 @@ pub async fn drill(State(kernel): State<Kernel>, axum::extract::Query(q): axum::
 /// `GET /api/results/findings`: [`crate::results::findings::findings`],
 /// every commit of ours and every pull request with what became of it, and
 /// each model's weeks, from the trail under the parameters in force.
-pub async fn findings(State(kernel): State<Kernel>) -> Response {
+pub async fn findings(State(kernel): State<Kernel>, State(held): State<Held>) -> Response {
     let resolved = match params::resolve(&kernel).await {
         Ok(r) => r,
         Err(e) => return unavailable(&e),
@@ -326,7 +327,7 @@ pub async fn findings(State(kernel): State<Kernel>) -> Response {
         Ok(db) => db,
         Err(e) => return unavailable(&e),
     };
-    match crate::results::trail::load(&db, &resolved.params).await {
+    match held.get(&db, &resolved.params).await {
         Ok(trail) => Json(crate::results::findings::findings(&trail, &resolved.params)).into_response(),
         Err(e) => unavailable(&e),
     }
@@ -344,7 +345,11 @@ pub struct WindowQuery {
 /// `GET /api/results/window?from=…&to=…&step=…`:
 /// [`crate::results::window::window`], what was done in each repository
 /// between the two times.
-pub async fn window(State(kernel): State<Kernel>, axum::extract::Query(q): axum::extract::Query<WindowQuery>) -> Response {
+pub async fn window(
+    State(kernel): State<Kernel>,
+    State(held): State<Held>,
+    axum::extract::Query(q): axum::extract::Query<WindowQuery>,
+) -> Response {
     let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).map(|t| t.with_timezone(&chrono::Utc));
     let (Ok(from), Ok(to)) = (parse(&q.from), parse(&q.to)) else {
         return refuse(StatusCode::BAD_REQUEST, format!("from and to want RFC 3339 times, not {} and {}", q.from, q.to));
@@ -360,12 +365,8 @@ pub async fn window(State(kernel): State<Kernel>, axum::extract::Query(q): axum:
         Ok(db) => db,
         Err(e) => return unavailable(&e),
     };
-    let trail = match crate::results::trail::load(&db, &resolved.params).await {
-        Ok(t) => t,
-        Err(e) => return unavailable(&e),
-    };
-    match crate::results::window::window(&db, &trail, &resolved.params, from, to, q.step).await {
-        Ok(w) => Json(w).into_response(),
+    match held.get(&db, &resolved.params).await {
+        Ok(trail) => Json(crate::results::window::window(&trail, &resolved.params, from, to, q.step)).into_response(),
         Err(e) => unavailable(&e),
     }
 }

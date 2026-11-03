@@ -21,17 +21,20 @@ use superx_kernel::Kernel;
 use crate::api;
 use crate::crawler::progress::Progress;
 use crate::instance::Instance;
+use crate::results::trail::Held;
 
 /// The port HTTP leaves out of a request's Host.
 const HTTP_DEFAULT_PORT: u16 = 80; // skill-allow: §9-const — HTTP's own default port (RFC 9110), not a policy tunable
 
 /// What the module's routes answer from: the kernel, the instance whose
-/// module folder status shows, and what the crawler is doing this second.
+/// module folder status shows, what the crawler is doing this second, and
+/// the trail the results last read.
 #[derive(Clone)]
 struct Page {
     kernel: Kernel,
     instance: Instance,
     progress: Progress,
+    trail: Held,
 }
 
 impl FromRef<Page> for Kernel {
@@ -43,6 +46,12 @@ impl FromRef<Page> for Kernel {
 impl FromRef<Page> for Progress {
     fn from_ref(page: &Page) -> Self {
         page.progress.clone()
+    }
+}
+
+impl FromRef<Page> for Held {
+    fn from_ref(page: &Page) -> Self {
+        page.trail.clone()
     }
 }
 
@@ -62,7 +71,7 @@ pub fn app(kernel: Kernel, instance: Instance, port: u16, progress: Progress) ->
         .route("/api/params", get(api::params))
         .route("/api/params/{name}", put(api::set))
         .fallback(get(crate::ui::asset))
-        .with_state(Page { kernel, instance, progress })
+        .with_state(Page { kernel, instance, progress, trail: Held::default() })
         .layer(middleware::from_fn_with_state(port, only_its_own_name))
 }
 

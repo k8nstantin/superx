@@ -21,13 +21,15 @@
 //! since sums over links and NONE are not trusted to the engine.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use superx_kernel::types::{RecordId, Value};
 use superx_kernel::{Db, Result};
 
 use super::compare::{credit, family, split, Claim};
-use super::{every, flag, int, model_of, owned, text, uuid_text, PAGE};
+use super::{every, flag, int, model_of, owned, text, uuid_text, DayFile};
 use crate::crawler::hosts::ci::{CHECK_SUITE, COMMIT_STATUS, PIPELINE, WORKFLOW_RUN};
 use crate::crawler::hosts::held::{record, row_key, time};
 use crate::params::Params;
@@ -242,7 +244,9 @@ pub struct Commit {
     /// A main-line commit carrying branch work: its lines are the branch
     /// commits'.
     pub squash: bool,
-    /// Lines of it the main line took.
+    /// Lines of it the main line took: all of a main-line commit's; of a
+    /// branch commit's, the lines of each file whose version the main line
+    /// carries.
     pub landed: i64,
     /// Lines of it alive at the newest blame; None where its repository was
     /// never blamed or none of it is on the main line.
@@ -358,6 +362,36 @@ pub struct Trail {
     pub pulls: Vec<Pull>,
     pub ci: Vec<Ci>,
     pub moves: Vec<Move>,
+    /// Every commit's files, by the commit's row.
+    pub files: HashMap<String, Vec<DayFile>>,
+}
+
+/// The trail as last loaded, kept until it is older than the crawler's
+/// reads of the lines (attr_recon_read_secs), since its facts change no
+/// faster. A load holds it, so two pages asking at once load it once.
+#[derive(Clone, Default)]
+pub struct Held(Arc<tokio::sync::Mutex<Option<Loaded>>>);
+
+/// A trail and when it was loaded.
+type Loaded = (Instant, Arc<Trail>);
+
+impl Held {
+    /// The trail; loaded again when older than attr_recon_read_secs.
+    ///
+    /// # Errors
+    ///
+    /// [`superx_kernel::KernelError`] when the database does not answer.
+    pub async fn get(&self, db: &Db, params: &Params) -> Result<Arc<Trail>> {
+        let mut held = self.0.lock().await;
+        if let Some((at, trail)) = held.as_ref() {
+            if at.elapsed() < Duration::from_secs(params.read_secs) {
+                return Ok(Arc::clone(trail));
+            }
+        }
+        let trail = Arc::new(load(db, params).await?);
+        *held = Some((Instant::now(), Arc::clone(&trail)));
+        Ok(trail)
+    }
 }
 
 /// The CI kinds a commit's verdict is read from, in order: a host's own
@@ -664,21 +698,21 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
         }
     }
 
-    // The files of the branch work that is ours, and what landed them.
-    let off = |c: &Commit| matches!(c.place.as_deref(), Some("branch" | "in_flight" | "recovered"));
-    let wanted: Vec<RecordId> =
-        commit_rows.iter().filter_map(|r| record(r, "id")).filter(|id| commit_ix.get(&row_key(id)).is_some_and(|&i| off(&commits[i]) && commits[i].ours)).collect();
-    let mut files: HashMap<String, Vec<(String, i64, i64)>> = HashMap::new();
-    for chunk in wanted.chunks(usize::try_from(PAGE).unwrap_or(usize::MAX)) {
-        let rows: Vec<Value> = db
-            .query("SELECT commit, path, added, removed FROM commit_file WHERE commit INSIDE $ids")
-            .bind(("ids", chunk.to_vec()))
-            .await?
-            .take(0)?;
-        for f in &rows {
-            if let (Some(c), Some(path)) = (record(f, "commit"), text(f, "path")) {
-                files.entry(row_key(&c)).or_default().push((path, int(f, "added"), int(f, "removed")));
-            }
+    // Every commit's files; and what of each commit of ours off the main
+    // line reached it: the lines of its files whose versions the main line
+    // carries, landed by a squash or a replay. The rest never did. A
+    // squash's blame goes to the branch commits it carried, in proportion
+    // to the lines each landed through it and never more than those; the
+    // squash itself is no one's.
+    let mut files: HashMap<String, Vec<DayFile>> = HashMap::new();
+    for f in &every(db, "commit_file", "commit, path, change, added, removed").await? {
+        if let (Some(c), Some(path)) = (record(f, "commit"), text(f, "path")) {
+            files.entry(row_key(&c)).or_default().push(DayFile {
+                path,
+                change: text(f, "change").unwrap_or_default(),
+                added: int(f, "added"),
+                removed: int(f, "removed"),
+            });
         }
     }
     let mut landed_via: HashMap<(String, String), String> = HashMap::new();
@@ -687,66 +721,60 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
             landed_via.insert((row_key(&c), path), row_key(&via));
         }
     }
-    let mut shares: HashMap<String, Vec<(usize, i64)>> = HashMap::new();
+    let off = |c: &Commit| matches!(c.place.as_deref(), Some("branch" | "in_flight" | "recovered"));
+    let mut pieces: HashMap<String, Vec<(usize, i64)>> = HashMap::new();
     let mut bulk_via: HashSet<String> = HashSet::new();
-    for (i, c) in commits.iter().enumerate() {
+    for (i, c) in commits.iter_mut().enumerate() {
+        if c.place.as_deref() == Some("mainline") {
+            c.landed = c.added;
+            continue;
+        }
         if !off(c) || !c.ours {
             continue;
         }
-        for (path, added, removed) in files.get(&c.key).map(Vec::as_slice).unwrap_or_default() {
-            if let Some(via) = landed_via.get(&(c.key.clone(), path.clone())) {
-                if c.bulk {
-                    bulk_via.insert(via.clone());
-                } else {
-                    shares.entry(via.clone()).or_default().push((i, (added + removed).max(1)));
+        let mut through: BTreeMap<String, i64> = BTreeMap::new();
+        for f in files.get(&c.key).map(Vec::as_slice).unwrap_or_default() {
+            match landed_via.get(&(c.key.clone(), f.path.clone())) {
+                Some(via) => {
+                    c.landed += f.added;
+                    *through.entry(via.clone()).or_default() += f.added;
                 }
+                None => c.never_landed += f.added,
+            }
+        }
+        for (via, lines) in through {
+            if c.bulk {
+                bulk_via.insert(via);
+            } else {
+                pieces.entry(via).or_default().push((i, lines));
             }
         }
     }
-    let mut gains: Vec<(usize, i64, Option<i64>)> = Vec::new();
-    for (via, pieces) in &shares {
+    let mut squashes: Vec<usize> = Vec::new();
+    let mut gains: Vec<(usize, i64)> = Vec::new();
+    for (via, list) in &pieces {
         let Some(&m) = commit_ix.get(via) else { continue };
         let squash = &commits[m];
         if squash.place.as_deref() != Some("mainline") || (squash.bulk && bulk_via.contains(via)) {
             continue;
         }
-        let weights: Vec<i64> = pieces.iter().map(|p| p.1).collect();
-        let lines = split(squash.added, &weights);
-        let alive = squash.alive.map(|a| split(a, &weights));
-        for (k, (piece, _)) in pieces.iter().enumerate() {
-            gains.push((*piece, lines[k], alive.as_ref().map(|a| a[k])));
+        if let Some(alive) = squash.alive {
+            let weights: Vec<i64> = list.iter().map(|p| p.1.max(1)).collect();
+            for (k, share) in split(alive, &weights).into_iter().enumerate() {
+                gains.push((list[k].0, share.min(list[k].1)));
+            }
         }
-        gains.push((m, 0, None));
+        squashes.push(m);
     }
-    for (i, lines, alive) in gains {
+    for m in squashes {
+        let c = &mut commits[m];
+        c.squash = true;
+        c.family = None;
+        c.by = None;
+    }
+    for (i, alive) in gains {
         let c = &mut commits[i];
-        if c.place.as_deref() == Some("mainline") {
-            c.squash = true;
-            continue;
-        }
-        c.landed += lines;
-        if let Some(a) = alive {
-            c.alive = Some(c.alive.unwrap_or(0) + a);
-        }
-    }
-    for c in &mut commits {
-        if c.place.as_deref() == Some("mainline") && !c.squash {
-            c.landed = c.added;
-        }
-        if off(c) {
-            c.never_landed = files
-                .get(&c.key)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-                .iter()
-                .filter(|(path, _, _)| !landed_via.contains_key(&(c.key.clone(), path.clone())))
-                .map(|(_, a, _)| a)
-                .sum();
-        }
-        if c.squash {
-            c.family = None;
-            c.by = None;
-        }
+        c.alive = Some(c.alive.unwrap_or(0) + alive);
     }
 
     // What a later commit reverted: git's own `Revert "<subject>"`.
@@ -801,7 +829,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
     // The hosts: which repository each host repository is, its pull
     // requests and their commits, its CI runs.
     let host_rows = every(db, "host_repository", "host, path").await?;
-    let host_crawl_rows = every(db, "host_crawl", "host_repository, crawl.repository AS repository").await?;
+    let remote_rows = every(db, "remote_state", "repository, host, path").await?;
     let pull_rows = every(db, "pull_request", "host_repository, number, created_at, source_branch, target_branch, url").await?;
     let mut pull_states = every(
         db,
@@ -814,15 +842,28 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
     let mut ci_states = every(db, "ci_run_state", "ci_run, status, conclusion, completed_at, valid_from").await?;
     let move_rows = every(db, "ref_move", "repository, mirror, ref, at, old, new, identity, action").await?;
 
-    let hosts: HashMap<String, (String, String)> = host_rows
-        .iter()
-        .filter_map(|h| Some((row_key(&record(h, "id")?), (text(h, "host").unwrap_or_default(), text(h, "path").unwrap_or_default()))))
-        .collect();
-    let mut local: HashMap<String, String> = HashMap::new();
-    for h in &host_crawl_rows {
-        if let (Some(hr), Some(repo)) = (record(h, "host_repository"), record(h, "repository")) {
-            local.entry(row_key(&hr)).or_insert_with(|| row_key(&repo));
+    // Which repository each host repository is: the local repositories
+    // whose remotes name it, the one of its own name first, since a build
+    // folder cloned from it is another repository with the same remote.
+    let mut naming: HashMap<(String, String), BTreeSet<String>> = HashMap::new();
+    for r in &remote_rows {
+        if let (Some(repo), Some(host), Some(path)) = (record(r, "repository"), text(r, "host"), text(r, "path")) {
+            naming.entry((host, path)).or_default().insert(row_key(&repo));
         }
+    }
+    let mut hosts: HashMap<String, (String, String)> = HashMap::new();
+    let mut local: HashMap<String, String> = HashMap::new();
+    for h in &host_rows {
+        let Some(id) = record(h, "id") else { continue };
+        let (host, path) = (text(h, "host").unwrap_or_default(), text(h, "path").unwrap_or_default());
+        let own = path.rsplit('/').next().unwrap_or_default().to_lowercase();
+        if let Some(repos) = naming.get(&(host.clone(), path.clone())) {
+            let named = repos.iter().find(|r| map.names.get(*r).is_some_and(|n| n.to_lowercase() == own));
+            if let Some(r) = named.or_else(|| repos.iter().next()) {
+                local.insert(row_key(&id), r.clone());
+            }
+        }
+        hosts.insert(row_key(&id), (host, path));
     }
     pull_states.sort_by_key(|s| time(s, "valid_from"));
     let mut newest: HashMap<String, &Value> = HashMap::new();
@@ -1001,5 +1042,5 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
     moves.sort_by_key(|m| m.at);
     commits.sort_by_key(|c| c.at);
 
-    Ok(Trail { map, agents, kernel_sessions, replies, edits, checks, git, prompts, commits, pulls, ci, moves })
+    Ok(Trail { map, agents, kernel_sessions, replies, edits, checks, git, prompts, commits, pulls, ci, moves, files })
 }
