@@ -18,15 +18,27 @@ export function ModelBadge({ model, pal }: { model: string; pal: Palette }) {
   )
 }
 
-export function Place({ c }: { c: { place: string | null; in_flight: boolean; landed: number; added: number; landed_as?: string | null } }) {
-  if (c.place === 'mainline') return <Badge size="xs" color="teal" variant="light">main line</Badge>
-  if (c.landed_as) return <Badge size="xs" color="teal" variant="light">landed as {c.landed_as.slice(0, 8)}</Badge>
-  if (c.landed > 0 && c.landed >= c.added) return <Badge size="xs" color="teal" variant="light">landed by a squash</Badge>
-  if (c.landed > 0) return <Badge size="xs" color="teal" variant="outline">part landed</Badge>
-  if (c.in_flight) return <Badge size="xs" color="yellow" variant="light">in flight</Badge>
-  if (c.place === 'recovered') return <Badge size="xs" color="red" variant="light">reflog only</Badge>
-  if (c.place === 'branch') return <Badge size="xs" color="red" variant="outline">never landed</Badge>
-  return <Badge size="xs" color="gray" variant="light">not placed yet</Badge>
+export function Place({ c }: { c: { fate: string; landed: number; added: number; landed_as?: string | null; side?: string | null } }) {
+  switch (c.fate) {
+    case 'mainline':
+      return <Badge size="xs" color="teal" variant="light">main line</Badge>
+    case 'squash':
+      return <Badge size="xs" color="teal" variant="outline">squash of branch work</Badge>
+    case 'landed':
+      return <Badge size="xs" color="teal" variant="light">{c.landed_as ? `landed as ${c.landed_as.slice(0, 8)}` : 'landed by a squash'}</Badge>
+    case 'in_flight':
+      return <Badge size="xs" color="yellow" variant="light">in flight</Badge>
+    case 'side':
+      return <Badge size="xs" color="pink" variant="light">only in {c.side ?? 'a side folder'}</Badge>
+    case 'reset':
+      return <Badge size="xs" color="orange" variant="light">reset away</Badge>
+    case 'snapshot':
+      return <Badge size="xs" color="gray" variant="outline">snapshot</Badge>
+    case 'branch':
+      return c.landed > 0 ? <Badge size="xs" color="teal" variant="outline">part landed</Badge> : <Badge size="xs" color="red" variant="outline">never landed</Badge>
+    default:
+      return <Badge size="xs" color="gray" variant="light">not placed yet</Badge>
+  }
 }
 
 const verdict = (v: boolean | null | undefined) =>
@@ -47,7 +59,7 @@ export function Whole({ repo, hash }: { repo: string; hash: string }) {
         {c.effort ? ` · effort ${c.effort}` : ''}{c.context ? ` · ${n(c.context)} tokens of context` : ''}
       </Text>
       <Text fz="xs">
-        {c.landed_as ? `rewritten onto the main line as ${c.landed_as.slice(0, 10)} · ` : ''}+{n(c.added)} −{n(c.removed)} · landed {n(c.landed)} · alive {n(c.alive)} · {c.in_flight ? `in flight ${n(c.added - c.landed)}` : `never landed ${n(c.never_landed)}`}
+        {c.fate} · {c.landed_as ? `rewritten onto the main line as ${c.landed_as.slice(0, 10)} · ` : ''}{c.side ? `only in ${c.side} · ` : ''}+{n(c.added)} −{n(c.removed)} · landed {n(c.landed)} · alive {n(c.alive)} · {c.in_flight ? `in flight ${n(c.added - c.landed)}` : `never landed ${n(c.never_landed)}`}
         {c.reverted ? ' · reverted later' : ''}
       </Text>
       {c.checks.length > 0 && (

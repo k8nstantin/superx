@@ -7,8 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use super::findings::in_flight;
-use super::trail::Trail;
+use super::trail::{in_flight, Trail};
 use super::DayFile;
 
 /// A CI run on the commit.
@@ -67,6 +66,8 @@ pub struct CommitDetail {
     pub added: i64,
     pub removed: i64,
     pub place: Option<String>,
+    pub fate: &'static str,
+    pub side: Option<String>,
     pub in_flight: bool,
     pub squash: bool,
     /// The main-line commit this same change was rewritten as.
@@ -155,6 +156,8 @@ pub fn commit(trail: &Trail, repo: &str, hash: &str) -> Option<CommitDetail> {
         added: c.added,
         removed: c.removed,
         place: c.place.clone(),
+        fate: c.fate,
+        side: c.side.clone(),
         in_flight: in_flight(c),
         squash: c.squash,
         landed_as: c.landed_as.clone(),

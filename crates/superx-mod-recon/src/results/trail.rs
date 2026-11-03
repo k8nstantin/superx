@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use superx_kernel::types::{RecordId, Value};
 use superx_kernel::{Db, Result};
 
-use super::compare::{credit, family, split, Claim};
+use super::compare::{credit, family, says_word, split, Claim};
 use super::{every, flag, int, model_of, owned, text, uuid_text, DayFile};
 use crate::crawler::hosts::ci::{CHECK_SUITE, COMMIT_STATUS, PIPELINE, WORKFLOW_RUN};
 use crate::crawler::hosts::held::{record, row_key, time};
@@ -170,6 +170,52 @@ pub fn move_kind(action: &str) -> &'static str {
     }
 }
 
+/// git's own stash commits, by the subjects `git stash` writes: `WIP on
+/// <branch>: …` (the work, a merge of the head and the index), `index on
+/// <branch>: …`, `untracked files on <branch>: …`, and `On <branch>: …`
+/// for a stash given a message, a merge like the first.
+pub fn stash(subject: &str, parents: i64) -> bool {
+    subject.starts_with("WIP on ")
+        || subject.starts_with("index on ")
+        || subject.starts_with("untracked files on ")
+        || (parents >= 2 && subject.starts_with("On ") && subject.contains(": "))
+}
+
+/// Whether a commit off the main line may still land: it is on a checked-out
+/// branch, or in an open pull request, and no rewrite of it landed.
+pub fn in_flight(c: &Commit) -> bool {
+    c.landed_as.is_none() && (c.place.as_deref() == Some("in_flight") || (c.open_pull && c.place.as_deref() != Some("mainline")))
+}
+
+/// Where a commit's work went, in one word: `snapshot`, counted nowhere;
+/// `mainline`, or `squash` for a main-line commit whose lines are the branch
+/// commits' it carried; `landed`, all of it, by a squash, a replay or a
+/// rewrite; `in_flight`; `side`, only in a folder that is a copy of the
+/// repository, never given to it; `reset`, only the reflog holds it; or
+/// `branch`, a branch or a tag holds it and it never landed, or only part of
+/// it did.
+pub fn fate(c: &Commit) -> &'static str {
+    if c.snapshot {
+        "snapshot"
+    } else if c.place.as_deref() == Some("mainline") {
+        if c.squash {
+            "squash"
+        } else {
+            "mainline"
+        }
+    } else if c.landed_as.is_some() || (c.added > 0 && c.landed >= c.added) {
+        "landed"
+    } else if in_flight(c) {
+        "in_flight"
+    } else if c.side.is_some() {
+        "side"
+    } else if c.place.as_deref() == Some("recovered") {
+        "reset"
+    } else {
+        "branch"
+    }
+}
+
 /// A move that rewrote what a ref held: an amend, a reset, a rebase, or a
 /// forced update fetched from a host.
 pub fn rewrites(kind: &str) -> bool {
@@ -307,6 +353,18 @@ pub struct Commit {
     /// The newest of those tests failed nothing.
     pub tests_green: Option<bool>,
     pub built: Option<bool>,
+    /// The repository row the crawl read it in: the repository itself, or
+    /// a folder that is a copy of it.
+    pub folder: String,
+    /// The folder holding it, when only a copy of the repository does and
+    /// the repository itself never got it (a build folder's experiment).
+    pub side: Option<String>,
+    pub parents: i64,
+    /// git's own stash commit, or a subject with attr_recon_snapshot_words:
+    /// a savepoint, not work meant to land. It counts nowhere.
+    pub snapshot: bool,
+    /// Where its work went, in one word ([`fate`]).
+    pub fate: &'static str,
 }
 
 /// A pull request, who opened it and what CI said along the way.
@@ -402,6 +460,9 @@ pub struct Trail {
     pub moves: Vec<Move>,
     /// Every commit's files, by the commit's row.
     pub files: HashMap<String, Vec<DayFile>>,
+    /// The main line each repository's newest crawl read, and how it was
+    /// chosen, by the repository's name.
+    pub mainlines: BTreeMap<String, (String, String)>,
 }
 
 /// The trail as last loaded, kept until it is older than the crawler's
@@ -672,7 +733,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
 
     // The commits: where each went, who made it, what landed and lived.
     let commit_rows =
-        every(db, "commit", "repository, hash, author, author_name, committed_at, added, removed, subject, patch_id").await?;
+        every(db, "commit", "repository, hash, author, author_name, committed_at, added, removed, subject, patch_id, parents").await?;
     let mut placements = every(db, "placement", "commit, place, valid_from").await?;
     let landed_rows = every(db, "landed_via", "commit, path, via").await?;
     let mut survival = every(db, "survival", "commit, alive, valid_from").await?;
@@ -682,7 +743,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
         "commit, session, tool_call.reply AS reply, tool_call.reply.model AS model, at AS tied_at",
     )
     .await?;
-    let mut crawls = every(db, "crawl", "repository, identity, started_at").await?;
+    let mut crawls = every(db, "crawl", "repository, identity, mainline, mainline_from, started_at").await?;
     placements.sort_by_key(|p| std::cmp::Reverse(time(p, "valid_from")));
     let mut place: HashMap<String, String> = HashMap::new();
     for p in &placements {
@@ -699,9 +760,17 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
     }
     crawls.sort_by_key(|c| std::cmp::Reverse(time(c, "started_at")));
     let mut identity: HashMap<String, String> = HashMap::new();
+    let mut mainlines: BTreeMap<String, (String, String)> = BTreeMap::new();
     for c in &crawls {
-        if let (Some(repo), Some(who)) = (record(c, "repository"), text(c, "identity")) {
-            identity.entry(map.canon(&row_key(&repo))).or_insert(who);
+        let Some(repo) = record(c, "repository").map(|r| row_key(&r)) else { continue };
+        if let Some(who) = text(c, "identity") {
+            identity.entry(map.canon(&repo)).or_insert(who);
+        }
+        // The main line the crawl of the repository itself read, not a copy's.
+        if map.canon(&repo) == repo {
+            if let (Some(line), Some(from)) = (text(c, "mainline"), text(c, "mainline_from")) {
+                mainlines.entry(map.name(Some(&repo))).or_insert((line, from));
+            }
         }
     }
     let tied: HashMap<String, Tie> = owned(tie_rows)
@@ -724,7 +793,10 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
         .filter_map(|c| {
             let id = record(c, "id")?;
             let key = row_key(&id);
-            let repo = map.canon(&row_key(&record(c, "repository")?));
+            let folder = row_key(&record(c, "repository")?);
+            let repo = map.canon(&folder);
+            let subject = text(c, "subject").unwrap_or_default();
+            let parents = int(c, "parents");
             let author = text(c, "author").unwrap_or_default();
             let (added, removed) = (int(c, "added"), int(c, "removed"));
             let tie = tied.get(&key);
@@ -755,7 +827,12 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
                 hash: text(c, "hash").unwrap_or_default(),
                 author_name: text(c, "author_name").unwrap_or_default(),
                 at: time(c, "committed_at")?,
-                subject: text(c, "subject").unwrap_or_default(),
+                snapshot: stash(&subject, parents) || says_word(&subject, &params.snapshot_words, false),
+                subject,
+                side: None,
+                parents,
+                fate: "",
+                folder,
                 id,
                 key,
                 repo,
@@ -812,7 +889,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
             c.landed = c.added;
             continue;
         }
-        if !off(c) || !c.ours {
+        if !off(c) || !c.ours || c.snapshot {
             continue;
         }
         let mut through: BTreeMap<String, i64> = BTreeMap::new();
@@ -879,7 +956,10 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
     for c in commits.drain(..) {
         copies.entry((c.repo.clone(), c.hash.clone())).or_default().push(c);
     }
-    for (_, mut held) in copies {
+    for ((repo, _), mut held) in copies {
+        // Held only by folders that are copies of the repository: work the
+        // repository itself never got.
+        let side = (!held.iter().any(|c| c.folder == repo)).then(|| map.name(Some(&held[0].folder)));
         held.sort_by_key(|c| std::cmp::Reverse((rank(c), c.alive.unwrap_or(-1), c.landed)));
         let strongest = held.iter().map(&evidence).max().unwrap_or(0);
         let witness = held
@@ -890,6 +970,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
         if let Some(w) = witness.filter(|_| evidence(&one) < strongest) {
             (one.family, one.by, one.session, one.reply, one.tied_at) = w;
         }
+        one.side = side;
         commits.push(one);
     }
 
@@ -909,7 +990,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
     }
     let mut originals: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (i, c) in commits.iter().enumerate() {
-        if c.place.as_deref() == Some("mainline") {
+        if c.place.as_deref() == Some("mainline") || c.snapshot {
             continue;
         }
         if let Some(&t) = c.patch_id.as_ref().and_then(|p| twin_of.get(&(c.repo.clone(), p.clone()))) {
@@ -1173,9 +1254,12 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
         })
         .collect();
     moves.sort_by_key(|m| m.at);
+    for c in &mut commits {
+        c.fate = fate(c);
+    }
     commits.sort_by_key(|c| c.at);
 
-    Ok(Trail { map, agents, kernel_sessions, replies, edits, checks, git, prompts, commits, pulls, ci, moves, files })
+    Ok(Trail { map, agents, kernel_sessions, replies, edits, checks, git, prompts, commits, pulls, ci, moves, files, mainlines })
 }
 
 #[cfg(test)]

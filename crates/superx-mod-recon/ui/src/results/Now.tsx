@@ -252,7 +252,12 @@ function RepoBoard({ w, r, pal }: { w: Window; r: WinRepo; pal: Palette }) {
           <Tile label="replies · tool calls" value={`${n(t.replies)} · ${n(t.tool_calls)}`} sub={`${n(t.out_tokens)} output tokens`} />
           <Tile label="lines the agents edited" value={`+${n(t.edit_added)}`} sub={`−${n(t.edit_removed)} in ${t.edit_files} files`} />
           <Tile label="commits" value={n(t.commits)} sub={`+${n(t.commit_added)} −${n(t.commit_removed)}`} />
-          <Tile label="where they are" value={`${t.commits_mainline} on main`} sub={`${t.commits_in_flight} in flight · ${t.commits_branch} branch · ${t.commits_recovered} reflog`} tone={t.commits_branch + t.commits_recovered > 0 ? 'warn' : undefined} />
+          <Tile
+            label="where they are"
+            value={`${t.commits_mainline + t.commits_landed} landed`}
+            sub={`${t.commits_in_flight} in flight · ${t.commits_side} side folder · ${t.commits_branch} branch · ${t.commits_recovered} reset · ${t.commits_snapshot} snapshots`}
+            tone={t.commits_branch + t.commits_recovered > 0 ? 'warn' : undefined}
+          />
           <Tile label="lines landed · alive" value={`${n(t.landed)} · ${n(t.alive)}`} sub={`${t.reverted} reverted`} />
           <Tile label="pull requests" value={`${t.prs_opened} opened`} sub={`${t.prs_merged} merged · ${t.prs_closed} closed`} />
           <Tile label="CI runs" value={`${t.ci_passed} passed`} sub={`${t.ci_failed} failed`} tone={t.ci_failed && !t.ci_passed ? 'bad' : t.ci_failed ? 'warn' : undefined} />

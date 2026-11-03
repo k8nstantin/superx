@@ -5,7 +5,7 @@ import { EChart, INK, type Clicked } from '../EChart'
 import { category, grid, legend, percent, PART_COLOUR, stacked, tip, value, zoom } from './charts'
 import { CommitRows, type Behind } from './Rows'
 import type { Scoped } from './scope'
-import { cap, enough, group, inPart, n, outcome, parts, partName, pct, weekLabel, weekOf, type Outcome, type Palette, type Part } from './shared'
+import { cap, enough, group, inPart, n, neverLanded, outcome, parts, partName, pct, weekLabel, weekOf, type Outcome, type Palette, type Part } from './shared'
 
 // Which model's work reached the main line, and is still there: each
 // model's committed lines split into what lives, what was replaced, what
@@ -94,10 +94,15 @@ export function Landed({ s, pal, open }: { s: Scoped; pal: Palette; open: (b: Be
       </div>
     )
   }
-  const trend = (height: number, part: Part) => (
+  const trend = (height: number, part: 'alive' | 'never') => (
     <EChart
       height={height}
-      onClick={(p: Clicked) => p.seriesName && p.dataIndex != null && behindPart(p.seriesName, part, weeks[p.dataIndex])}
+      onClick={(p: Clicked) => {
+        if (!p.seriesName || p.dataIndex == null) return
+        const [m, w] = [p.seriesName, weeks[p.dataIndex]]
+        if (part === 'alive') behindPart(m, 'alive', w)
+        else open({ title: `${m}: never landed, week of ${weekLabel(w)}`, commits: (by.get(m) ?? []).filter((c) => (inPart(c, 'never') || inPart(c, 'reset')) && weekOf(c.at) === w) })
+      }}
       option={{
         legend: legend(),
         grid: grid({ bottom: 28 }),
@@ -119,7 +124,7 @@ export function Landed({ s, pal, open }: { s: Scoped; pal: Palette; open: (b: Be
             itemStyle: { color: pal.colour(m) },
             data: weeks.map((w) => {
               const o = outcome(per.get(w) ?? [])
-              return o.decided ? pct(o[part], o.decided) : null
+              return o.decided ? pct(part === 'never' ? neverLanded(o) : o.alive, o.decided) : null
             }),
           }
         }),
@@ -131,7 +136,7 @@ export function Landed({ s, pal, open }: { s: Scoped; pal: Palette; open: (b: Be
     { i: 'lines', title: 'The same, in lines', note: 'volume as well as share', w: 6, h: 10, render: (h) => shares(h, true) },
     { i: 'weekly', title: `Week by week, the lines ${model} committed`, note: 'pick a model; zoom with the slider; click a bar for its commits', w: 12, h: 11, render: weekly },
     { i: 'alive', title: 'Still alive, by the week the lines were committed', note: 'share of decided lines (in flight left out) blame credits today · dot size = lines committed', w: 6, h: 10, render: (h) => trend(h, 'alive') },
-    { i: 'never', title: 'Never landed, by the week the lines were committed', note: 'share of decided lines whose files never reached the main line', w: 6, h: 10, render: (h) => trend(h, 'never') },
+    { i: 'never', title: 'Never landed, by the week the lines were committed', note: 'share of decided lines left on a branch or reset away', w: 6, h: 10, render: (h) => trend(h, 'never') },
     { i: 'commits', title: `Every credited commit in view (${n(s.commits.length)})`, note: 'click a row for the whole commit', w: 12, h: 12, scroll: true, render: () => <CommitRows commits={s.commits} pal={pal} /> },
   ]
   return <Board name="results.landed" cards={cards} />

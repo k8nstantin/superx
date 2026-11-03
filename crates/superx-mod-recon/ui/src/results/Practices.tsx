@@ -4,7 +4,7 @@ import type { FoundCommit } from '../api'
 import { category, grid, grouped, legend, percent, PART_COLOUR, stacked, tip, value, zoom } from './charts'
 import type { Behind } from './Rows'
 import type { Scoped } from './scope'
-import { cap, enough, group, kTok, n, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
+import { cap, enough, group, kTok, n, neverLanded, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
 
 // What the agents did before committing, against what became of the
 // commit: tests run since the session's previous commit, the thinking
@@ -63,7 +63,7 @@ export function Practices({ s, pal, open }: { s: Scoped; pal: Palette; open: (b:
         series: [
           grouped('landed', buckets.map((b) => { const o = outcome(b.commits); return pct(o.landed, o.decided) }), '#3987e5'),
           grouped('still alive', buckets.map((b) => { const o = outcome(b.commits); return pct(o.alive, o.decided) }), PART_COLOUR.alive),
-          grouped('never landed', buckets.map((b) => { const o = outcome(b.commits); return pct(o.never, o.decided) }), PART_COLOUR.never),
+          grouped('never landed', buckets.map((b) => { const o = outcome(b.commits); return pct(neverLanded(o), o.decided) }), PART_COLOUR.never),
         ],
       }}
     />

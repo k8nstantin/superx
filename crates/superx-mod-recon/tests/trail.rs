@@ -142,3 +142,37 @@ async fn a_change_rewritten_onto_the_main_line_landed_and_counts_once_as_the_cop
     assert!(found.commits.iter().all(|c| c.hash != landed), "the main line's copy is not counted again: {:?}", found.commits);
     std::fs::remove_dir_all(&root).expect("clean up");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_commit_has_one_fate_and_a_snapshot_counts_nowhere() {
+    let kernel = kernel().await;
+    let db = own_db().await;
+    let root = scratch();
+    let dir = root.join("work");
+    repo(&dir);
+    let base = commit(&dir, &[("a.txt", "one\n")], "first");
+    // A savepoint kept while the work goes on, then dropped.
+    let savepoint = commit(&dir, &[("a.txt", "one\ntwo\n")], "ENG-1 SAVEPOINT (not for merge): halfway");
+    git(&dir, &["reset", "-q", "--hard", &base]);
+    // Work reset away, to be done again.
+    let thrown = commit(&dir, &[("b.txt", "x\n")], "try one");
+    git(&dir, &["reset", "-q", "--hard", &base]);
+    // A branch never merged.
+    git(&dir, &["checkout", "-q", "-b", "idea"]);
+    let parked = commit(&dir, &[("c.txt", "y\n")], "an idea");
+    git(&dir, &["checkout", "-q", "main"]);
+    // Work stashed: git's own commits.
+    std::fs::write(dir.join("a.txt"), "one\nstashed\n").expect("an edit");
+    git(&dir, &["stash", "-q"]);
+    let stashed = git(&dir, &["rev-parse", "refs/stash"]);
+    pass(&kernel, &db, &params(&[(INCLUDE_PARAM, strings(&[&dir]))]), &mut Crawler::default()).await;
+
+    let trail = load(&db, &params(&[])).await.expect("the trail");
+    let fate = |hash: &str| trail.commits.iter().find(|c| c.hash == hash).map(|c| (c.place.as_deref().unwrap_or_default().to_string(), c.fate));
+    assert_eq!(fate(&base), Some(("mainline".to_string(), "mainline")));
+    assert_eq!(fate(&savepoint), Some(("recovered".to_string(), "snapshot")), "its subject says it is not for merge");
+    assert_eq!(fate(&thrown), Some(("recovered".to_string(), "reset")), "only the reflog holds it");
+    assert_eq!(fate(&parked), Some(("branch".to_string(), "branch")), "a branch holds it and it never landed");
+    assert_eq!(fate(&stashed).map(|f| f.1), Some("snapshot"), "git's own stash commit");
+    std::fs::remove_dir_all(&root).expect("clean up");
+}

@@ -6,7 +6,7 @@ import { compact } from './shared'
 // draws: a category axis, a value axis, a legend, a tooltip, and the fixed
 // colours of a commit's outcome.
 
-export const PART_COLOUR: Record<Part, string> = { alive: OK, replaced: '#3987e5', flight: CANCEL, never: FAIL }
+export const PART_COLOUR: Record<Part, string> = { alive: OK, replaced: '#3987e5', flight: CANCEL, side: '#d55181', never: FAIL, reset: '#d95926' }
 
 export const grid = (extra: Record<string, unknown> = {}) => ({ left: 8, right: 18, top: 40, bottom: 8, containLabel: true, ...extra })
 

@@ -157,6 +157,9 @@ export type FoundCommit = {
   added: number
   removed: number
   place: string | null
+  /// mainline, squash, landed, in_flight, side, branch, reset or snapshot.
+  fate: Fate
+  side: string | null
   in_flight: boolean
   landed_as: string | null
   landed: number
@@ -185,6 +188,7 @@ export type FoundPull = {
   title: string
   url: string
   created_at: string
+  target_branch: string
   state: string
   merged: boolean
   merged_at: string | null
@@ -238,7 +242,27 @@ export type Findings = {
   workflows: Workflow[]
   ci_kinds: Record<string, number>
   folders: { folder: string; repo: string }[]
+  /// The main line each repository's newest crawl read, and how it was chosen.
+  mainlines: { repo: string; mainline: string; from: string }[]
+  branches: BranchWeek[]
   computed_at: string
+}
+
+/// Where a commit's work went.
+export type Fate = 'mainline' | 'squash' | 'landed' | 'in_flight' | 'side' | 'branch' | 'reset' | 'snapshot'
+
+/// One branch of a repository in one week, from its reflog.
+export type BranchWeek = {
+  repo: string
+  branch: string
+  week: string
+  commits: number
+  lines: number
+  landed: number
+  never: number
+  merges: number
+  rewrites: number
+  updates: number
 }
 
 export const fetchFindings = () => fetch('/api/results/findings').then((r) => answer<Findings>(r))
@@ -267,9 +291,12 @@ export type WinTotals = {
   commit_added: number
   commit_removed: number
   commits_mainline: number
+  commits_landed: number
   commits_in_flight: number
+  commits_side: number
   commits_branch: number
   commits_recovered: number
+  commits_snapshot: number
   landed: number
   alive: number
   reverted: number
@@ -357,6 +384,7 @@ export type WinCommit = {
   added: number
   removed: number
   place: string | null
+  fate: Fate
   in_flight: boolean
   landed: number
   alive: number | null
@@ -444,6 +472,8 @@ export type CommitDetail = {
   added: number
   removed: number
   place: string | null
+  fate: Fate
+  side: string | null
   in_flight: boolean
   squash: boolean
   landed_as: string | null

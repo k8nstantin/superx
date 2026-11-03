@@ -3,7 +3,7 @@ import { EChart, FAIL, INK, INK_MUTED, type Clicked } from '../EChart'
 import { category, grid, grouped, legend, percent, tip, value, zoom } from './charts'
 import type { Behind } from './Rows'
 import type { Scoped } from './scope'
-import { correlation, group, inPart, n, outcome, pct, sum, weekLabel, weekOf, type Palette } from './shared'
+import { correlation, group, inPart, n, neverLanded, outcome, pct, sum, weekLabel, weekOf, type Palette } from './shared'
 
 // Are you directing better, and does it show in the code: your prompts,
 // corrections, escalations and stops week by week and per model, set
@@ -27,7 +27,7 @@ function weekRows(s: Scoped): WeekRow[] {
       escalations: sum(ws, (w) => w.escalations),
       interrupts: sum(ws, (w) => w.interrupts),
       committed: o.decided,
-      never: o.never,
+      never: neverLanded(o),
       alive: o.alive,
     }
   })
@@ -55,7 +55,7 @@ export function Direction({ s, pal, open }: { s: Scoped; pal: Palette; open: (b:
     open({
       title: `Week of ${weekLabel(week)}: ${what}`,
       week: { week, repos: s.repos },
-      commits: s.commits.filter((c) => weekOf(c.at) === week && inPart(c, 'never')),
+      commits: s.commits.filter((c) => weekOf(c.at) === week && (inPart(c, 'never') || inPart(c, 'reset'))),
       note: 'Your prompts that week, then its credited commits whose lines never landed.',
     })
   const scatter = (height: number, x: (r: WeekRow) => number, y: (r: WeekRow) => number, xName: string, yName: string, r: number | null) => (

@@ -3,7 +3,7 @@ import { EChart, type Clicked } from '../EChart'
 import { category, grid, legend, stacked, tip, value, zoom } from './charts'
 import { CommitRows, type Behind } from './Rows'
 import type { Scoped } from './scope'
-import { group, inPart, n, outcome, pct, sum, weekLabel, weekOf, type Palette } from './shared'
+import { group, inPart, n, neverLanded, outcome, pct, sum, weekLabel, weekOf, type Palette } from './shared'
 
 // Where work was rewritten away: the reflog's rewrites (rebases, amends,
 // resets, forced updates from a host) week by week, the committed lines
@@ -25,14 +25,14 @@ export function rewritesAnswer(s: Scoped): string {
   const kinds = KINDS.map(([k]) => [k, sum(top.ws, (w) => w.moves[k] ?? 0)] as [string, number]).filter(([, v]) => v > 0)
   const o = outcome(s.commits.filter((c) => weekOf(c.at) === top.week))
   return `The most rewriting was the week of ${weekLabel(top.week)}: ${kinds.map(([k, v]) => `${n(v)} ${k}${v === 1 ? '' : 's'}`).join(', ')}${
-    o.decided ? `; ${pct(o.never, o.decided)}% of the ${n(o.decided)} decided lines committed that week never landed` : ''
+    o.decided ? `; ${pct(neverLanded(o), o.decided)}% of the ${n(o.decided)} decided lines committed that week never landed` : ''
   }.`
 }
 
 export function Rewrites({ s, pal, open }: { s: Scoped; pal: Palette; open: (b: Behind) => void }) {
   const weeks = [...new Set(s.repoWeeks.filter((w) => w.rewrites > 0).map((w) => w.week))].sort()
   const rw = group(s.repoWeeks, (w) => w.week)
-  const never = s.commits.filter((c) => inPart(c, 'never'))
+  const never = s.commits.filter((c) => inPart(c, 'never') || inPart(c, 'reset'))
   const neverWeeks = [...new Set(never.map((c) => weekOf(c.at)))].sort()
   const repos = [...new Set(never.map((c) => c.repo))].sort()
   const reverted = s.everything.filter((c) => c.reverted)

@@ -11,6 +11,7 @@ import { Landed, landedAnswer } from './Landed'
 import { Now } from './Now'
 import { Practices, practicesAnswer } from './Practices'
 import { Rewrites, rewritesAnswer } from './Rewrites'
+import { Branches, branchesAnswer } from './Branches'
 import { BehindDrawer, type Behind } from './Rows'
 import { ALL, JUDGED, judged, repositories, scoped, type Scope } from './scope'
 import { local, n, palette } from './shared'
@@ -28,6 +29,7 @@ export const RESULT_VIEWS: [string, string][] = [
   ['direction', 'Direction'],
   ['cost', 'Cost'],
   ['rewrites', 'Rewrites'],
+  ['branches', 'Branches'],
   ['gaps', 'Gaps'],
 ]
 
@@ -40,6 +42,7 @@ const QUESTION: Record<string, string> = {
   direction: 'Are you directing better, and does it show in the code?',
   cost: 'What does a surviving line cost?',
   rewrites: 'Where was work rewritten away?',
+  branches: 'Which branches are busy, and what landed from each?',
   gaps: 'What recon cannot judge yet',
 }
 
@@ -51,6 +54,8 @@ const METHOD: Record<string, string> = {
   direction: 'A correction is a prompt with one of attr_recon_correction_words, an escalation one with attr_recon_escalation_words, a stop the operator interrupting the agent.',
   cost: 'Output tokens and active hours of the replies made in the repositories in view; active time is the gaps between a session\'s replies of one model, each capped at attr_recon_active_secs.',
   rewrites: 'From the reflogs of every checkout and mirror recon reads: what each ref held, and what moved it.',
+  branches: 'From every branch\'s reflog: commits made on it, merges, rewrites, and moves fetched from or pushed to a host (a mirror\'s branch is marked host). A commit counts for the branch it was made on.',
+  gaps: 'Done means merged into the main line. A snapshot (a savepoint, a stash) counts nowhere; work only a side folder holds is left out of the rates.',
 }
 
 export function Results({ sub, go }: { sub: string; go: (sub: string) => void }) {
@@ -76,6 +81,8 @@ export function Results({ sub, go }: { sub: string; go: (sub: string) => void })
         return costAnswer(s, pal)
       case 'rewrites':
         return rewritesAnswer(s)
+      case 'branches':
+        return branchesAnswer(s, f)
       case 'gaps': {
         const g = gaps(f)
         return g.length ? `${g.length} things limit what recon can judge.` : 'Nothing limits what recon can judge.'
@@ -130,6 +137,7 @@ export function Results({ sub, go }: { sub: string; go: (sub: string) => void })
       {s && view === 'direction' && <Direction s={s} pal={pal} open={setBehind} />}
       {s && view === 'cost' && <Cost s={s} pal={pal} />}
       {s && view === 'rewrites' && <Rewrites s={s} pal={pal} open={setBehind} />}
+      {s && f && view === 'branches' && <Branches s={s} f={f} />}
       {f && view === 'gaps' && <Gaps f={f} />}
       <BehindDrawer behind={behind} close={() => setBehind(null)} pal={pal} />
     </Stack>

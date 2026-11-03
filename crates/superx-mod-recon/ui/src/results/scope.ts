@@ -1,4 +1,4 @@
-import type { Findings, FoundCommit, FoundPull, RepoWeek, Week, Workflow } from '../api'
+import type { BranchWeek, Findings, FoundCommit, FoundPull, RepoWeek, Week, Workflow } from '../api'
 
 // Which part of the findings a view reads: one repository, the judged ones
 // (those whose main line took some credited work; the others cannot say
@@ -12,7 +12,7 @@ export const ALL = '__all'
 /// The repositories whose main line took any credited commit's lines.
 export function judged(f: Findings): string[] {
   const out = new Set<string>()
-  for (const c of f.commits) if (c.model && !c.bulk && c.landed > 0) out.add(c.repo)
+  for (const c of f.commits) if (c.model && !c.bulk && c.fate !== 'snapshot' && c.landed > 0) out.add(c.repo)
   return [...out].sort()
 }
 
@@ -32,6 +32,7 @@ export type Scoped = {
   weeks: Week[]
   repoWeeks: RepoWeek[]
   workflows: Workflow[]
+  branches: BranchWeek[]
   repos: string[]
 }
 
@@ -42,11 +43,12 @@ export function scoped(f: Findings, s: Scope): Scoped {
   const everything = f.commits.filter((c) => inRepo(c.repo))
   return {
     everything,
-    commits: everything.filter((c) => c.model !== '' && !c.bulk && (s.evidence === 'all' || c.by === 'printed')),
+    commits: everything.filter((c) => c.fate !== 'snapshot' && c.model !== '' && !c.bulk && (s.evidence === 'all' || c.by === 'printed')),
     pulls: f.pulls.filter((p) => inRepo(p.repo)),
     weeks: f.weeks.filter((w) => inRepo(w.repo)),
     repoWeeks: f.repo_weeks.filter((w) => inRepo(w.repo)),
     workflows: f.workflows.filter((w) => inRepo(w.repo)),
+    branches: f.branches.filter((b) => inRepo(b.repo)),
     repos,
   }
 }

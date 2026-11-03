@@ -7,13 +7,13 @@
 //! slices them any way (by effort, by context, tested or not) and every bar
 //! opens on the commits behind it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use serde::Serialize;
 
 use super::compare::says_word;
-use super::trail::{rewrites, Trail};
+use super::trail::{in_flight, rewrites, Trail};
 use crate::crawler::hosts::ci::{PIPELINE, WORKFLOW_RUN};
 use crate::params::Params;
 
@@ -40,6 +40,10 @@ pub struct FoundCommit {
     pub added: i64,
     pub removed: i64,
     pub place: Option<String>,
+    /// Where its work went, in one word ([`super::trail::fate`]).
+    pub fate: &'static str,
+    /// The folder holding it, when only a copy of the repository does.
+    pub side: Option<String>,
     /// On a checked-out branch, or in an open pull request: it may still
     /// land, so its lines off the main line are not counted as never landed.
     pub in_flight: bool,
@@ -76,6 +80,8 @@ pub struct FoundPull {
     pub title: String,
     pub url: String,
     pub created_at: DateTime<Utc>,
+    /// The branch it asked to merge into.
+    pub target_branch: String,
     pub state: String,
     pub merged: bool,
     pub merged_at: Option<DateTime<Utc>>,
@@ -147,6 +153,37 @@ pub struct Workflow {
     pub turned: i64,
 }
 
+/// The main line a repository's newest crawl read, and how it was chosen
+/// (override, host_default, origin_head, local_branch, head).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MainLine {
+    pub repo: String,
+    pub mainline: String,
+    pub from: String,
+}
+
+/// One branch of a repository in one week, from its reflog: the commits made
+/// on it and what became of them, its merges, its rewrites, and its moves
+/// fetched from or pushed to a host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BranchWeek {
+    pub repo: String,
+    /// As its ref names it, without `refs/heads/` or `refs/remotes/`; a
+    /// host's own branch, as the crawler's mirror of the host holds it,
+    /// followed by `(host)`.
+    pub branch: String,
+    pub week: String,
+    pub commits: i64,
+    pub lines: i64,
+    /// Of the commits made on it, those whose work landed, and those that
+    /// never did (left on a branch or a tag, or reset away).
+    pub landed: i64,
+    pub never: i64,
+    pub merges: i64,
+    pub rewrites: i64,
+    pub updates: i64,
+}
+
 /// A folder read as another repository: a clone or a build folder whose
 /// remote names that repository's host repository.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -166,6 +203,8 @@ pub struct Findings {
     /// CI runs held, by kind.
     pub ci_kinds: BTreeMap<String, i64>,
     pub folders: Vec<Folder>,
+    pub mainlines: Vec<MainLine>,
+    pub branches: Vec<BranchWeek>,
     pub computed_at: String,
 }
 
@@ -190,12 +229,6 @@ fn slot<'a>(weeks: &'a mut BTreeMap<(String, String, String), Week>, at: DateTim
         repo: repo.to_string(),
         ..Week::default()
     })
-}
-
-/// Whether a commit off the main line may still land: it is on a checked-out
-/// branch, or in an open pull request.
-pub(crate) fn in_flight(c: &super::trail::Commit) -> bool {
-    c.landed_as.is_none() && (c.place.as_deref() == Some("in_flight") || (c.open_pull && c.place.as_deref() != Some("mainline")))
 }
 
 /// Whether a run is a host's own CI run, not one of its parts or a status.
@@ -268,6 +301,8 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
                 added: c.added,
                 removed: c.removed,
                 place: c.place.clone(),
+                fate: c.fate,
+                side: c.side.clone(),
                 in_flight: in_flight(c),
                 landed_as: c.landed_as.clone(),
                 landed: c.landed,
@@ -300,6 +335,7 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
             title: p.title.clone(),
             url: p.url.clone(),
             created_at: p.created_at,
+            target_branch: p.target_branch.clone(),
             state: p.state.clone(),
             merged: p.merged,
             merged_at: p.merged_at,
@@ -364,6 +400,36 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
         }
     }
 
+    // Each branch's weeks, from its reflog: HEAD and the stash are not
+    // branches, and tags keep no reflog.
+    let commit_at: HashMap<(&str, &str), &super::trail::Commit> = trail.commits.iter().map(|c| (c.repo.as_str(), c.hash.as_str())).zip(trail.commits.iter()).collect();
+    let mut branches: BTreeMap<(String, String, String), BranchWeek> = BTreeMap::new();
+    for m in &trail.moves {
+        let short = m.git_ref.strip_prefix("refs/heads/").or_else(|| m.git_ref.strip_prefix("refs/remotes/"));
+        let Some(short) = short.filter(|s| !s.ends_with("/HEAD")) else { continue };
+        let branch = if m.mirror { format!("{short} (host)") } else { short.to_string() };
+        let repo = name(Some(&m.repo));
+        let week = week_of(m.at);
+        let b = branches.entry((repo.clone(), branch.clone(), week.clone())).or_insert_with(|| BranchWeek { repo, branch, week, ..BranchWeek::default() });
+        match m.kind {
+            "commit" | "amend" | "cherry_pick" | "revert" => {
+                b.commits += 1;
+                if let Some(c) = m.new.as_deref().and_then(|h| commit_at.get(&(m.repo.as_str(), h))) {
+                    b.lines += c.added;
+                    match c.fate {
+                        "mainline" | "squash" | "landed" => b.landed += 1,
+                        "branch" | "reset" => b.never += 1,
+                        _ => {}
+                    }
+                }
+            }
+            "merge" => b.merges += 1,
+            "push" | "fetch" | "forced" | "pull" => b.updates += 1,
+            _ => {}
+        }
+        b.rewrites += i64::from(rewrites(m.kind));
+    }
+
     Findings {
         commits,
         pulls,
@@ -372,6 +438,8 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
         workflows: workflows.into_values().collect(),
         ci_kinds,
         folders: trail.map.folders.iter().map(|(folder, repo)| Folder { folder: folder.clone(), repo: repo.clone() }).collect(),
+        mainlines: trail.mainlines.iter().map(|(repo, (mainline, from))| MainLine { repo: repo.clone(), mainline: mainline.clone(), from: from.clone() }).collect(),
+        branches: branches.into_values().collect(),
         computed_at: Utc::now().to_rfc3339(),
     }
 }

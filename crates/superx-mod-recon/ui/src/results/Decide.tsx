@@ -12,7 +12,7 @@ import { practicesAnswer } from './Practices'
 import { rewritesAnswer } from './Rewrites'
 import { ModelBadge, type Behind } from './Rows'
 import type { Scoped } from './scope'
-import { cap, enough as enoughOf, group, kTok, n, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
+import { cap, enough as enoughOf, group, kTok, n, neverLanded, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
 
 // What to decide from it all: each model's scorecard on what its work
 // became and what it cost, two models set against each other only where
@@ -26,7 +26,9 @@ type Row = {
   landed: number
   alive: number
   never: number
+  reset: number
   flight: number
+  side: number
   testedShare: number | null
   tokensPerAlive: number | null
   alivePerHour: number | null
@@ -61,8 +63,10 @@ function scorecard(s: Scoped, pal: Palette): Row[] {
         committed: o.committed,
         landed: pct(o.landed, o.decided),
         alive: pct(o.alive, o.decided),
-        never: pct(o.never, o.decided),
+        never: pct(neverLanded(o), o.decided),
+        reset: pct(o.reset, o.decided),
         flight: o.flight,
+        side: o.side,
         testedShare: printed.length ? pct(printed.filter((c) => c.tested).length, printed.length) : null,
         tokensPerAlive: o.alive ? tokens / o.alive : null,
         alivePerHour: hours ? o.alive / hours : null,
@@ -83,7 +87,9 @@ const COLS: Col[] = [
   { h: 'Landed', v: (r) => r.landed, show: (r) => `${r.landed}%`, better: 'up' },
   { h: 'Still alive', v: (r) => r.alive, show: (r) => `${r.alive}%`, better: 'up' },
   { h: 'Never landed', v: (r) => r.never, show: (r) => `${r.never}%`, better: 'down' },
+  { h: 'of it reset away', v: (r) => r.reset, show: (r) => `${r.reset}%`, better: 'down' },
   { h: 'In flight', v: (r) => r.flight, show: (r) => n(r.flight), better: null },
+  { h: 'Side folders', v: (r) => r.side, show: (r) => n(r.side), better: null },
   { h: 'Tested first', v: (r) => r.testedShare, show: (r) => (r.testedShare == null ? '—' : `${r.testedShare}%`), better: 'up' },
   { h: 'Tokens / alive line', v: (r) => r.tokensPerAlive, show: (r) => (r.tokensPerAlive == null ? '—' : n(r.tokensPerAlive)), better: 'down' },
   { h: 'Alive lines / hour', v: (r) => r.alivePerHour, show: (r) => (r.alivePerHour == null ? '—' : n(r.alivePerHour)), better: 'up' },
@@ -147,7 +153,7 @@ function contextAnswer(s: Scoped): string | null {
   const bins = edges.slice(0, 5).map((lo, i) => {
     const hi = edges[i + 1]
     const o = outcome(printed.filter((c) => (c.context as number) >= lo && (i === 4 ? (c.context as number) <= hi : (c.context as number) < hi)))
-    return { lo, hi, o, never: pct(o.never, o.decided) }
+    return { lo, hi, o, never: pct(neverLanded(o), o.decided) }
   })
   const worst = [...bins].sort((a, b) => b.never - a.never)[0]
   const best = [...bins].sort((a, b) => a.never - b.never)[0]

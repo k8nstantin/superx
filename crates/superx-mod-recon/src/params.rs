@@ -121,6 +121,12 @@ const DEFAULT_CORRECTION_WORDS: &[&str] = &[
 pub const ESCALATION_WORDS_PARAM: &str = "attr_recon_escalation_words";
 const DEFAULT_ESCALATION_WORDS: &[&str] = &["fuck", "shit", "wtf", "damn", "useless", "garbage"];
 
+/// The words in a commit's subject that say it is a snapshot (a savepoint
+/// kept while the work goes on), not work meant to land (#539): such a
+/// commit counts nowhere. git's own stash commits are known without them.
+pub const SNAPSHOT_WORDS_PARAM: &str = "attr_recon_snapshot_words";
+const DEFAULT_SNAPSHOT_WORDS: &[&str] = &["savepoint", "not for merge"];
+
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -145,6 +151,7 @@ pub struct Params {
     pub rework_words: Vec<String>,
     pub correction_words: Vec<String>,
     pub escalation_words: Vec<String>,
+    pub snapshot_words: Vec<String>,
 }
 
 impl Params {
@@ -198,7 +205,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 21] = [
+pub const NAMES: [&str; 22] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -220,6 +227,7 @@ pub const NAMES: [&str; 21] = [
     REWORK_WORDS_PARAM,
     CORRECTION_WORDS_PARAM,
     ESCALATION_WORDS_PARAM,
+    SNAPSHOT_WORDS_PARAM,
 ];
 
 /// What a parameter is for, as the tab shows it (#539): when the crawler
@@ -258,6 +266,7 @@ pub fn about(name: &str) -> Option<About> {
         REWORK_WORDS_PARAM => ("measures", "list", "Words a commit's subject starts with, or has after a space, when work is done again."),
         CORRECTION_WORDS_PARAM => ("measures", "list", "Whole words in your prompt that correct the agent."),
         ESCALATION_WORDS_PARAM => ("measures", "list", "Words in your prompt, at a word's start, that escalate."),
+        SNAPSHOT_WORDS_PARAM => ("measures", "list", "Words in a commit's subject that make it a snapshot, not work: it counts nowhere."),
         _ => return None,
     };
     Some(About { group, decides, input })
@@ -316,6 +325,7 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         rework_words: r.strings(REWORK_WORDS_PARAM, DEFAULT_REWORK_WORDS),
         correction_words: r.strings(CORRECTION_WORDS_PARAM, DEFAULT_CORRECTION_WORDS),
         escalation_words: r.strings(ESCALATION_WORDS_PARAM, DEFAULT_ESCALATION_WORDS),
+        snapshot_words: r.strings(SNAPSHOT_WORDS_PARAM, DEFAULT_SNAPSHOT_WORDS),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -483,7 +493,7 @@ mod tests {
 
     /// The parameters before the rename, as `superx-performance` named them,
     /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 21] = [
+    const TODAY: [(&str, &str); 22] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -509,6 +519,7 @@ mod tests {
              start over, from scratch, revert, undo, not what, fix it",
         ),
         ("escalation_words", "fuck, shit, wtf, damn, useless, garbage"),
+        ("snapshot_words", "savepoint, not for merge"),
     ];
 
     #[test]

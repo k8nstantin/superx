@@ -13,8 +13,8 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
 
 use super::compare::says_word;
-use super::findings::{host_run, in_flight};
-use super::trail::{rewrites, Trail};
+use super::findings::host_run;
+use super::trail::{in_flight, rewrites, Trail};
 use super::DayFile;
 use crate::params::Params;
 
@@ -43,9 +43,16 @@ pub struct Totals {
     pub commit_added: i64,
     pub commit_removed: i64,
     pub commits_mainline: i64,
+    /// Off the main line, its work landed all the same: a squash, a replay
+    /// or a rewrite.
+    pub commits_landed: i64,
     pub commits_in_flight: i64,
+    /// Only in a folder that is a copy of the repository.
+    pub commits_side: i64,
     pub commits_branch: i64,
     pub commits_recovered: i64,
+    /// Snapshots: counted nowhere else.
+    pub commits_snapshot: i64,
     pub landed: i64,
     pub alive: i64,
     pub reverted: i64,
@@ -152,6 +159,7 @@ pub struct Commit {
     pub added: i64,
     pub removed: i64,
     pub place: Option<String>,
+    pub fate: &'static str,
     pub in_flight: bool,
     pub landed: i64,
     pub alive: Option<i64>,
@@ -477,17 +485,22 @@ pub fn window(trail: &Trail, params: &Params, from: DateTime<Utc>, to: DateTime<
     // The window's commits, and their files.
     for (i, c) in trail.commits.iter().enumerate().filter(|(_, c)| inside(c.at) && !c.copy) {
         let a = accs.entry(name(Some(&c.repo))).or_default();
+        if c.snapshot {
+            a.repo.totals.commits_snapshot += 1;
+            continue;
+        }
         a.commits.push(i);
         let t = &mut a.repo.totals;
         t.commits += 1;
         t.commit_added += c.added;
         t.commit_removed += c.removed;
-        match c.place.as_deref() {
-            Some("mainline") => t.commits_mainline += 1,
-            _ if in_flight(c) => t.commits_in_flight += 1,
-            Some("branch") => t.commits_branch += 1,
-            Some("recovered") => t.commits_recovered += 1,
-            _ => {}
+        match c.fate {
+            "mainline" | "squash" => t.commits_mainline += 1,
+            "landed" => t.commits_landed += 1,
+            "in_flight" => t.commits_in_flight += 1,
+            "side" => t.commits_side += 1,
+            "reset" => t.commits_recovered += 1,
+            _ => t.commits_branch += 1,
         }
         if !c.squash {
             t.landed += c.landed;
@@ -537,6 +550,7 @@ pub fn window(trail: &Trail, params: &Params, from: DateTime<Utc>, to: DateTime<
                 added: c.added,
                 removed: c.removed,
                 place: c.place.clone(),
+                fate: c.fate,
                 in_flight: in_flight(c),
                 landed: c.landed,
                 alive: c.alive,

@@ -44,39 +44,57 @@ export function palette(weeks: Pick<Week, 'model' | 'replies'>[]): Palette {
   }
 }
 
-/// How a set of commits' lines split. `committed` is every line they added;
-/// `landed` the lines of files whose versions the main line carries; of
-/// those, `alive` is what blame credits today and `replaced` the rest;
-/// `flight` what may still land (a checked-out branch or an open pull
-/// request); `never` the lines of files that never reached the main line.
-/// `decided` is committed less what is in flight: the rates divide by it,
-/// so open work counts neither for a model nor against it.
-export type Outcome = { commits: number; committed: number; decided: number; landed: number; alive: number; replaced: number; flight: number; never: number }
+/// How a set of commits' lines split, by each commit's fate. `committed` is
+/// every line they added; `landed` the lines of files whose versions the main
+/// line carries, squashed, replayed or rewritten included; of those, `alive`
+/// is what blame credits today and `replaced` the rest. `flight` may still
+/// land (a checked-out branch or an open pull request); `side` is work kept
+/// only in a folder that is a copy of the repository, never given to it (a
+/// build folder's experiment); `never` was left on a branch or a tag; `reset`
+/// only the reflog still holds. `decided` is committed less flight and side:
+/// the rates divide by it. A snapshot (a savepoint, a stash) counts nowhere.
+export type Outcome = {
+  commits: number
+  committed: number
+  decided: number
+  landed: number
+  alive: number
+  replaced: number
+  flight: number
+  side: number
+  never: number
+  reset: number
+}
 
 export function outcome(cs: FoundCommit[]): Outcome {
-  const o: Outcome = { commits: 0, committed: 0, decided: 0, landed: 0, alive: 0, replaced: 0, flight: 0, never: 0 }
+  const o: Outcome = { commits: 0, committed: 0, decided: 0, landed: 0, alive: 0, replaced: 0, flight: 0, side: 0, never: 0, reset: 0 }
   for (const c of cs) {
+    if (c.fate === 'snapshot') continue
     o.commits += 1
     o.committed += c.added
     o.landed += c.landed
     const alive = Math.min(c.alive ?? 0, c.landed)
     o.alive += alive
     o.replaced += c.landed - alive
-    if (c.in_flight) o.flight += Math.max(0, c.added - c.landed)
-    else if (c.place !== 'mainline') o.never += c.never_landed
+    if (c.fate === 'in_flight') o.flight += Math.max(0, c.added - c.landed)
+    else if (c.fate === 'side') o.side += Math.max(0, c.added - c.landed)
+    else if (c.fate === 'reset') o.reset += c.never_landed
+    else if (c.fate === 'branch') o.never += c.never_landed
   }
-  o.decided = Math.max(0, o.committed - o.flight)
+  o.decided = Math.max(0, o.committed - o.flight - o.side)
   return o
 }
 
-/// Which part of an outcome a commit counts in, for a drill-down.
-export const parts = ['alive', 'replaced', 'flight', 'never'] as const
+/// The parts an outcome is drawn in, and which a commit counts in.
+export const parts = ['alive', 'replaced', 'flight', 'side', 'never', 'reset'] as const
 export type Part = (typeof parts)[number]
 export const partName: Record<Part, string> = {
   alive: 'landed, still alive',
   replaced: 'landed, since replaced',
   flight: 'in flight',
-  never: 'never landed',
+  side: 'only in a side folder',
+  never: 'never landed, left on a branch',
+  reset: 'never landed, reset away',
 }
 export function inPart(c: FoundCommit, p: Part): boolean {
   switch (p) {
@@ -85,11 +103,18 @@ export function inPart(c: FoundCommit, p: Part): boolean {
     case 'replaced':
       return c.landed > (c.alive ?? 0)
     case 'flight':
-      return c.in_flight && c.added > c.landed
+      return c.fate === 'in_flight'
+    case 'side':
+      return c.fate === 'side'
     case 'never':
-      return !c.in_flight && c.place !== 'mainline' && c.never_landed > 0
+      return c.fate === 'branch' && c.never_landed > 0
+    case 'reset':
+      return c.fate === 'reset' && c.never_landed > 0
   }
 }
+
+/// Lines that never landed, of either kind.
+export const neverLanded = (o: Outcome) => o.never + o.reset
 
 /// Pearson's r; null below three points or with no spread.
 export function correlation(xs: number[], ys: number[]): number | null {
