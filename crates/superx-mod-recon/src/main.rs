@@ -306,7 +306,11 @@ async fn run(instance: &Instance) -> Result<(), String> {
     let served = tokio::select! {
         served = serving.into_future() => served,
         () = async {
-            let _ = stopping.wait_for(|asked| *asked).await;
+            // The sender lives as long as this function: were it gone, no
+            // stop could come, and the bound never starts.
+            if stopping.wait_for(|asked| *asked).await.is_err() {
+                std::future::pending::<()>().await;
+            }
             tokio::time::sleep(daemon::stop_wait() / 2).await;
         } => {
             tracing::warn!(target: "recon", "requests still running at the stop were cut off");
