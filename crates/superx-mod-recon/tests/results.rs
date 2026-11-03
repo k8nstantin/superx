@@ -6,7 +6,7 @@ pub mod common;
 use common::*;
 use superx_mod_recon::crawler::Crawler;
 use superx_mod_recon::params::INCLUDE_PARAM;
-use superx_mod_recon::results::{models, Measures};
+use superx_mod_recon::results::{day, models, Measures};
 
 /// An assistant line of `model`, one content block of reply `id`.
 fn reply(id: &str, model: &str, content: serde_json::Value, output: i64, extra: serde_json::Value) -> serde_json::Value {
@@ -95,5 +95,30 @@ async fn each_model_counts_its_replies_newest_tokens_thinking_tool_calls_edited_
             t.model
         );
     }
+
+    // What is behind a bar: the day of the commit, and the day of the work.
+    let on = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").expect("a day");
+    let committed = read.days.iter().find(|d| d.model == OPUS && d.measures.commits > 0).expect("the commit's day").day.clone();
+    let behind = day(&db, OPUS, on(&committed)).await.expect("the commit's day");
+    assert_eq!(behind.commits.len(), 1, "{behind:?}");
+    let c = &behind.commits[0];
+    assert_eq!(
+        (c.hash.as_str(), c.repo.as_str(), c.subject.as_str(), c.added, c.removed, c.landed, c.place.as_deref()),
+        (second.as_str(), "work", "second", 2, 0, true, Some("mainline")),
+        "{c:?}"
+    );
+    assert_eq!(c.alive, Some(2), "the two lines it wrote, alive at the tip");
+    assert_eq!(c.files.iter().map(|f| (f.path.as_str(), f.added, f.removed)).collect::<Vec<_>>(), [("a.txt", 2, 0)]);
+    assert!(c.session.is_some(), "the session whose call made it");
+    let worked = read.days.iter().find(|d| d.model == OPUS && d.measures.lines_added > 0).expect("the edit's day").day.clone();
+    let behind = day(&db, OPUS, on(&worked)).await.expect("the work's day");
+    assert_eq!(
+        behind.edits.iter().map(|e| (e.path.as_str(), e.added, e.removed, e.tool.as_str())).collect::<Vec<_>>(),
+        [("/repo/a.rs", 2, 1, "Edit")],
+        "{behind:?}"
+    );
+    assert_eq!(behind.sessions.iter().map(|s| s.replies).collect::<Vec<_>>(), [3], "its one session, with its three replies");
+    let behind = day(&db, SONNET, on(&worked)).await.expect("sonnet's day");
+    assert_eq!((behind.sessions.len(), behind.edits.len(), behind.commits.len()), (2, 0, 0), "{behind:?}");
     std::fs::remove_dir_all(&root).expect("clean up");
 }

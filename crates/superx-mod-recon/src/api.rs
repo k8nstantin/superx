@@ -274,6 +274,29 @@ pub async fn models(State(kernel): State<Kernel>) -> Response {
     }
 }
 
+/// What `GET /api/results/day` is asked: a model and a UTC day.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DayQuery {
+    pub model: String,
+    pub day: String,
+}
+
+/// `GET /api/results/day?model=…&day=YYYY-MM-DD`: [`crate::results::day`],
+/// what is behind one model's bar on one day.
+pub async fn drill(State(kernel): State<Kernel>, axum::extract::Query(q): axum::extract::Query<DayQuery>) -> Response {
+    let Ok(day) = chrono::NaiveDate::parse_from_str(&q.day, "%Y-%m-%d") else {
+        return refuse(StatusCode::BAD_REQUEST, format!("day wants YYYY-MM-DD, not {}", q.day));
+    };
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match crate::results::day(&db, &q.model, day).await {
+        Ok(detail) => Json(detail).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
 /// One parameter as the tab shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Shown {
