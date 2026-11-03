@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use superx_kernel::types::Value;
 use superx_kernel::{Db, Kernel, Result};
 
-use crate::crawler::lines;
+use crate::crawler::{hosts, lines, repos};
 use crate::credentials::{self, Credentials, BITBUCKET, GITHUB};
 use crate::instance::Instance;
 use crate::params::{self, Resolved};
@@ -350,11 +350,13 @@ fn folder_lines(out: &mut String, folder: &Folder) {
     let _ = writeln!(out, "repos       {}", folder.repos.display());
 }
 
-/// What one source did, in a line: what it worked through, its outside
-/// calls when it made any, the rows it added, and how it ended when it did
-/// not end well. The lines source says too what the kernel held over the
-/// lines it read, the lines that fed no table, and the fields its lines
-/// showed (#537).
+/// What one source did, in a line: what it worked through, what it checked
+/// against its source, its outside calls, the rows it added, and how it
+/// ended when it did not end well. The lines source says what the kernel
+/// held over the lines it read, the lines that fed no table, and the fields
+/// its lines showed (#537); the repos source the commits it read against
+/// those git holds, and the hosts source the objects it read against the
+/// totals the hosts state, and its waits (#538, step 25).
 fn source_line(s: &LastSource) -> String {
     let n = |name: &str| s.counts.get(name).copied().unwrap_or(0);
     let mut line = if s.source == lines::SOURCE {
@@ -367,6 +369,31 @@ fn source_line(s: &LastSource) -> String {
             n("fields_seen"),
             n("fields_new"),
             n("fields_not_stored"),
+            s.rows_written
+        )
+    } else if s.source == repos::SOURCE {
+        format!(
+            "{} read, {} in a shape it does not know · {} commits read of {} held · {} calls, {} failed, {} cut off · {} rows",
+            s.items,
+            s.unread,
+            n("commits_read"),
+            n("commits_held"),
+            s.calls,
+            s.failed,
+            s.timed_out,
+            s.rows_written
+        )
+    } else if s.source == hosts::SOURCE {
+        format!(
+            "{} read, {} in a shape it does not know · {} objects read of {} stated · {} calls, {} failed, {} cut off, {} waits · {} rows",
+            s.items,
+            s.unread,
+            n("totals_read"),
+            n("totals_stated"),
+            s.calls,
+            s.failed,
+            s.timed_out,
+            n("rate_waits"),
             s.rows_written
         )
     } else {
@@ -567,10 +594,53 @@ mod tests {
         );
         assert!(
             t.contains(
-                "  repos     125 read, 0 in a shape it does not know · 149 calls, 1 failed, 0 cut off · 14 rows \
-                 (partial: 1 git calls cut off)\n"
+                "  repos     125 read, 0 in a shape it does not know · 0 commits read of 0 held · 149 calls, 1 failed, \
+                 0 cut off · 14 rows (partial: 1 git calls cut off)\n"
             ),
             "{t}"
+        );
+    }
+
+    #[test]
+    fn status_prints_the_repos_and_hosts_sources_lines_as_step_25_words_them() {
+        let source = |name: &str, counts: &[(&str, i64)], outcome: &str, note: Option<&str>| LastSource {
+            source: name.to_string(),
+            items: 4,
+            unread: 1,
+            calls: 30,
+            failed: 2,
+            timed_out: 1,
+            rows_written: 77,
+            counts: counts.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            outcome: outcome.to_string(),
+            note: note.map(str::to_string),
+        };
+        let h = Holdings {
+            last_pass: Some(LastPass {
+                finished_at: DateTime::parse_from_rfc3339("2026-11-03T10:00:00Z").expect("time").to_utc(),
+                outcome: "partial".to_string(),
+                rows_written: 154,
+                sources: vec![
+                    source("repos", &[("commits_read", 511), ("commits_held", 512), ("repositories_new", 3)], "partial", Some("a: 511 commits read of 512 held")),
+                    source("hosts", &[("totals_read", 90), ("totals_stated", 90), ("rate_waits", 5), ("objects_new", 9)], "complete", None),
+                ],
+            }),
+            ..Holdings::default()
+        };
+        let t = text_of(&Database::Ready(h), &folder(), &from_values(&BTreeMap::new()));
+        assert!(
+            t.contains(
+                "  repos     4 read, 1 in a shape it does not know · 511 commits read of 512 held · 30 calls, 2 failed, \
+                 1 cut off · 77 rows (partial: a: 511 commits read of 512 held)\n"
+            ),
+            "{t}"
+        );
+        assert!(
+            t.contains(
+                "  hosts     4 read, 1 in a shape it does not know · 90 objects read of 90 stated · 30 calls, 2 failed, \
+                 1 cut off, 5 waits · 77 rows\n"
+            ),
+            "the outcome after it only when it did not end complete: {t}"
         );
     }
 

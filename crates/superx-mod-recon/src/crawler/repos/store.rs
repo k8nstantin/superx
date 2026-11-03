@@ -11,8 +11,9 @@ use superx_kernel::types::{RecordId, Uuid, Value};
 use superx_kernel::{Db, Result};
 
 use crate::crawler::lines::kernel::record_uuid_of;
+use crate::crawler::repos::operations::Operations;
 use crate::crawler::store::Row;
-use crate::crawler::value::{at, flag, text};
+use crate::crawler::value::{at, flag, int, list, text};
 
 /// A checkout's state, as a `checkout_state` row says it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +21,9 @@ pub struct CheckoutState {
     pub branch: Option<String>,
     pub first_branch: Option<String>,
     pub present: bool,
+    /// What git is in the middle of there; `None` when not read (#538,
+    /// step 12).
+    pub operations: Option<Operations>,
 }
 
 /// A directory, as a `directory` row says it.
@@ -46,6 +50,8 @@ pub struct Checkout {
 pub struct Held {
     /// Every repository, by its common git directory.
     pub repositories: HashMap<String, RecordId>,
+    /// Each repository's name, by its common git directory.
+    pub names: HashMap<String, String>,
     /// Every checkout, by its root.
     pub checkouts: HashMap<String, Checkout>,
     /// Each checkout's newest state, by the checkout row's UUID: a map
@@ -55,9 +61,10 @@ pub struct Held {
     pub directories: HashMap<String, DirectoryRow>,
 }
 
-const HELD: &str = "SELECT id, common_dir FROM repository;\
+const HELD: &str = "SELECT id, common_dir, name FROM repository;\
      SELECT id, repository, repository.common_dir AS common, toplevel FROM checkout;\
-     SELECT checkout, branch, first_branch, present, valid_from FROM checkout_state;\
+     SELECT checkout, branch, first_branch, present, operations, operation_commits, rebase_branch, rebase_onto, \
+            rebase_done, rebase_left, bisect_start, valid_from FROM checkout_state;\
      SELECT path, source, checkout, exact, valid_from FROM directory;";
 
 /// Read the list as it stands.
@@ -75,6 +82,9 @@ pub async fn held(db: &Db) -> Result<Held> {
     for r in &repositories {
         if let (Some(id), Some(common)) = (record(r, "id"), text(r, &["common_dir"])) {
             held.repositories.insert(common.to_string(), id);
+            if let Some(name) = text(r, &["name"]) {
+                held.names.insert(common.to_string(), name.to_string());
+            }
         }
     }
     for r in &checkouts {
@@ -94,6 +104,7 @@ pub async fn held(db: &Db) -> Result<Held> {
                 branch: text(r, &["branch"]).map(str::to_string),
                 first_branch: text(r, &["first_branch"]).map(str::to_string),
                 present: flag(r, &["present"])?,
+                operations: operations(r),
             },
             time(r, "valid_from")?,
         ))
@@ -114,6 +125,28 @@ pub async fn held(db: &Db) -> Result<Held> {
         held.directories.insert(path, row);
     }
     Ok(held)
+}
+
+/// A `checkout_state` row's operations: `None` where they were not read.
+fn operations(r: &Value) -> Option<Operations> {
+    let texts = |key: &str| -> Option<Vec<String>> {
+        match at(r, &[key])? {
+            Value::Array(_) => Some(list(r, &[key]).iter().filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            }).collect()),
+            _ => None,
+        }
+    };
+    Some(Operations {
+        operations: texts("operations")?,
+        commits: texts("operation_commits"),
+        rebase_branch: text(r, &["rebase_branch"]).map(str::to_string),
+        rebase_onto: text(r, &["rebase_onto"]).map(str::to_string),
+        rebase_done: int(r, &["rebase_done"]),
+        rebase_left: int(r, &["rebase_left"]),
+        bisect_start: text(r, &["bisect_start"]).map(str::to_string),
+    })
 }
 
 /// Every working directory a session worked in, as the `lines` source
@@ -162,11 +195,22 @@ pub fn checkout(repository: &RecordId, toplevel: &str, at_time: DateTime<Utc>) -
 /// A checkout's state, when it changed.
 #[must_use]
 pub fn checkout_state(checkout: &RecordId, state: &CheckoutState) -> Row {
-    Row::new()
+    let row = Row::new()
         .link("checkout", checkout)
         .some_text("branch", state.branch.clone())
         .some_text("first_branch", state.first_branch.clone())
-        .flag("present", state.present)
+        .flag("present", state.present);
+    match &state.operations {
+        None => row,
+        Some(ops) => row
+            .texts("operations", &ops.operations)
+            .some_texts("operation_commits", ops.commits.as_deref())
+            .some_text("rebase_branch", ops.rebase_branch.clone())
+            .some_text("rebase_onto", ops.rebase_onto.clone())
+            .some_int("rebase_done", ops.rebase_done)
+            .some_int("rebase_left", ops.rebase_left)
+            .some_text("bisect_start", ops.bisect_start.clone()),
+    }
 }
 
 /// A directory's row, when it changed.
