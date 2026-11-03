@@ -56,6 +56,7 @@ use crate::crawler::hosts::held::{row_key, HostMemory};
 use crate::crawler::hosts::objects::Accounts;
 use crate::crawler::hosts::{self, HostPath};
 use crate::crawler::lines::kernel::record_uuid_of;
+use crate::crawler::progress::Progress;
 use crate::crawler::repos::crawl::{Context, Finished, Job, JobCheckout};
 use crate::crawler::repos::git::Git;
 use crate::crawler::repos::store::{Checkout, CheckoutState, DirectoryRow, Held};
@@ -102,6 +103,7 @@ pub struct Crawled {
 ///
 /// [`superx_kernel::KernelError`] when the module's database cannot answer
 /// or refuses a row.
+#[allow(clippy::too_many_arguments)] // skill-allow: allow — the pass's own inputs, and since #539 the progress its workers report to
 pub async fn crawl(
     db: &Db,
     params: &Params,
@@ -109,6 +111,7 @@ pub async fn crawl(
     memory: &mut Memory,
     active: &BTreeSet<String>,
     began: DateTime<Utc>,
+    progress: &Progress,
     stop: &mut Stop,
 ) -> Result<Crawled> {
     let mut run = SourceRun::start(SOURCE);
@@ -335,6 +338,7 @@ pub async fn crawl(
             hosts: Arc::new(shared(db, params, places, memory).await?),
             events,
             checkouts,
+            progress: progress.clone(),
         };
         let (finished, error) = workers(ctx, jobs, params, stop).await;
         stopped = stopped || finished.iter().any(|f| f.stopped) || stop.requested();
@@ -455,13 +459,21 @@ async fn workers(ctx: Context, jobs: Vec<Job>, params: &Params, stop: &mut Stop)
     let at_once = usize::try_from(params.repos_at_once).unwrap_or(usize::MAX).clamp(1, Semaphore::MAX_PERMITS);
     let gate = Arc::new(Semaphore::new(at_once));
     let ctx = Arc::new(ctx);
+    ctx.progress.queued(jobs.iter().map(|j| (j.name.clone(), j.common.display().to_string())));
     let mut running: JoinSet<(usize, Result<Finished>)> = JoinSet::new();
     for (i, job) in jobs.into_iter().enumerate() {
         let Some(Ok(turn)) = stop.unless(Arc::clone(&gate).acquire_owned()).await else { break };
         let (ctx, mut own) = (Arc::clone(&ctx), stop.clone());
         running.spawn(async move {
             let _turn = turn;
-            (i, crawl::run(&ctx, &job, &mut own).await)
+            let crawled = crawl::run(&ctx, &job, &mut own).await;
+            let outcome = match &crawled {
+                Ok(f) if f.stopped => "stopped",
+                Ok(f) => f.outcome,
+                Err(_) => "failed",
+            };
+            ctx.progress.repo_done(&job.common.display().to_string(), outcome);
+            (i, crawled)
         });
     }
     let mut finished: Vec<(usize, Finished)> = Vec::new();

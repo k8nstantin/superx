@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::credentials::Token;
 use crate::crawler::hosts::{Endpoints, Host};
+use crate::crawler::progress::Watch;
 use crate::crawler::store::{Batch, Row};
 use crate::crawler::Stop;
 
@@ -321,12 +322,14 @@ pub struct Calls {
     /// with its status, for the host crawl's note.
     pub failures: Vec<String>,
     pub answers: Vec<String>,
+    /// Where each call and wait is reported as it happens (#539).
+    pub watch: Option<Watch>,
 }
 
 impl Calls {
     #[must_use]
     pub fn new(client: Client, host: Host, token: Token, crawl: RecordId) -> Self {
-        Self { client, host, token, crawl, counts: Counts::default(), failures: Vec::new(), answers: Vec::new() }
+        Self { client, host, token, crawl, counts: Counts::default(), failures: Vec::new(), answers: Vec::new(), watch: None }
     }
 
     /// GET `url` with `etag` as If-None-Match, waiting first when the
@@ -386,6 +389,9 @@ impl Calls {
     async fn wait(&mut self, wait: Duration, stop: &mut Stop) -> bool {
         self.counts.rate_waits += 1;
         self.counts.waited_ms = self.counts.waited_ms.saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX));
+        if let Some(w) = &self.watch {
+            w.progress.host_wait(&w.common_dir, w.host.as_deref().unwrap_or_default());
+        }
         stop.unless(tokio::time::sleep(wait)).await.is_some()
     }
 
@@ -410,6 +416,9 @@ impl Calls {
         self.counts.calls += 1;
         self.counts.not_modified += i64::from(got.ended == Ended::NotModified);
         self.counts.timed_out += i64::from(a.timed_out);
+        if let Some(w) = &self.watch {
+            w.progress.host_call(&w.common_dir, w.host.as_deref().unwrap_or_default(), &a.path, got.ended == Ended::Failed);
+        }
         match got.ended {
             Ended::Failed => {
                 self.counts.failed += 1;

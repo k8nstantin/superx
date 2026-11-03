@@ -287,7 +287,9 @@ async fn run(instance: &Instance) -> Result<(), String> {
         askpass: std::env::current_exe().ok(),
         endpoints: crawler::hosts::Endpoints::default(),
     };
-    let crawling = tokio::spawn(crawler::run_in(kernel.clone(), places, crawler::Stop::new(watched)));
+    // What the crawler is doing this second, which the page reads (#539).
+    let progress = crawler::progress::Progress::default();
+    let crawling = tokio::spawn(crawler::run_in(kernel.clone(), places, progress.clone(), crawler::Stop::new(watched)));
     let on_stop = {
         let asked = Arc::clone(&asked);
         async move {
@@ -295,7 +297,7 @@ async fn run(instance: &Instance) -> Result<(), String> {
             asked.send_replace(true);
         }
     };
-    let served = axum::serve(listener, server::app(kernel.clone(), instance.clone(), port))
+    let served = axum::serve(listener, server::app(kernel.clone(), instance.clone(), port, progress))
         .with_graceful_shutdown(on_stop)
         .await;
     asked.send_replace(true);

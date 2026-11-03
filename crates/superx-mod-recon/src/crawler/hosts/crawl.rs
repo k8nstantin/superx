@@ -18,6 +18,7 @@ use crate::crawler::hosts::held::{self, Asked, HostMemory, Known};
 use crate::crawler::hosts::objects::{accounts, account_id, held as held_of, key_value, Accounts, From, Held, Shape, Taken};
 use crate::crawler::hosts::pulls::{self, Page};
 use crate::crawler::hosts::{bitbucket, github, Host, HostPath, SOURCE};
+use crate::crawler::progress::Watch;
 use crate::crawler::store::{reserve, Batch, Row};
 use crate::crawler::{Outcome, SourceRun, Stop};
 
@@ -151,13 +152,14 @@ pub struct Keep<'k> {
 
 impl HostCrawl {
     /// Start a host repository's crawl beside the crawl `repo_crawl`: its
-    /// token, and, with one, its first call (steps 4, 17, 18).
+    /// token, and, with one, its first call (steps 4, 17, 18); each call
+    /// reported to `watch` as it happens.
     ///
     /// # Errors
     ///
     /// [`superx_kernel::KernelError`] when the database cannot answer for
     /// what it holds of the host repository.
-    pub async fn start(shared: &Shared, hp: HostPath, repo_crawl: RecordId, stop: &mut Stop) -> Result<Self> {
+    pub async fn start(shared: &Shared, hp: HostPath, repo_crawl: RecordId, watch: Option<Watch>, stop: &mut Stop) -> Result<Self> {
         let (repository, new_repository) = match shared.known.repositories.get(&(hp.host, hp.path.clone())) {
             Some(id) => (id.clone(), false),
             None => (reserve("host_repository"), true),
@@ -206,7 +208,7 @@ impl HostCrawl {
                 return Ok(crawl);
             }
         };
-        crawl.calls = Some(Calls::new(client, crawl.hp.host, token, crawl.id.clone()));
+        crawl.calls = Some(Calls { watch, ..Calls::new(client, crawl.hp.host, token, crawl.id.clone()) });
         let path = match crawl.hp.host {
             Host::GitHub => format!("/repos/{}", crawl.hp.path),
             Host::Bitbucket => format!("/repositories/{}", crawl.hp.path),

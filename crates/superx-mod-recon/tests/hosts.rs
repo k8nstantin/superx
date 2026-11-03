@@ -1181,3 +1181,34 @@ async fn the_passs_log_line_names_hosts_items_and_host_calls() {
     assert!(hosts.items == 1 && hosts.calls > 1);
     world.done();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_crawls_calls_are_reported_beside_its_repository_as_they_are_made_and_the_repository_lists_its_last_host_crawl() {
+    let world = World::new("github.com").await;
+    world.github.on(GITHUB, vec![Answer::json(&github_repository(77, "main"))]);
+    let progress = superx_mod_recon::crawler::progress::Progress::default();
+    let mut crawler = world.crawler().reporting_to(progress.clone());
+    world.pass(&mut crawler).await;
+    let hc = world.host_crawl().await;
+    let last = progress.snapshot().last.expect("the last pass");
+    let reported = &last.repos[0].hosts;
+    assert_eq!(reported.len(), 1, "{last:?}");
+    assert_eq!(reported[0].name, "github.com/acme/widget");
+    assert_eq!(
+        (Some(reported[0].calls), Some(reported[0].failed), Some(reported[0].waits), reported[0].done),
+        (int(&hc, "calls"), int(&hc, "failed"), int(&hc, "rate_waits"), true),
+        "every call its row counts, reported as it was made: {hc:?}"
+    );
+    assert!(reported[0].calls > 1, "{reported:?}");
+
+    let repos = superx_mod_recon::api::repositories(&world.db).await.expect("repositories");
+    assert_eq!(repos.len(), 1, "{repos:?}");
+    let listed = &repos[0].hosts;
+    assert_eq!(listed.len(), 1, "{repos:?}");
+    assert_eq!(
+        (listed[0].name.as_str(), Some(listed[0].calls), Some(listed[0].failed), Some(listed[0].outcome.clone())),
+        ("github.com/acme/widget", int(&hc, "calls"), int(&hc, "failed"), text(&hc, "outcome")),
+        "its last host crawl, as its row holds it"
+    );
+    world.done();
+}

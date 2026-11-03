@@ -8,16 +8,19 @@
 //! a parameter (with [`crate::server`]'s Host check against a name of its
 //! own pointed at 127.0.0.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use superx_kernel::types::Value;
 use superx_kernel::{Db, Kernel, NodeKind};
 
+use crate::crawler::hosts::held::{record, row_key, time};
+use crate::crawler::progress::{Now, Progress};
 use crate::params::{self, NAMES};
 use crate::MODULE_NAME;
 
@@ -94,6 +97,166 @@ pub async fn stats(State(kernel): State<Kernel>) -> Response {
     };
     match days(&db).await {
         Ok(days) => Json(serde_json::json!({ "days": days })).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
+/// `GET /api/now`: what the crawler is doing this second, and the last pass.
+pub async fn now(State(progress): State<Progress>) -> Json<Now> {
+    Json(progress.snapshot())
+}
+
+/// A repository's last crawl, as its `crawl` row holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LastCrawl {
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub outcome: String,
+    pub note: Option<String>,
+    pub mainline: String,
+    pub tip: Option<String>,
+    pub commits_read: i64,
+    pub commits_new: i64,
+    pub refs_read: i64,
+    pub reflog_read: i64,
+    pub files_blamed: i64,
+    pub files_left: i64,
+    pub git_calls: i64,
+    pub git_failed: i64,
+    pub git_timeouts: i64,
+    pub rows_written: i64,
+}
+
+/// A host repository's last crawl, as its `host_crawl` row holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostLast {
+    pub name: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub outcome: String,
+    pub note: Option<String>,
+    pub calls: i64,
+    pub failed: i64,
+    pub not_modified: i64,
+    pub rate_waits: i64,
+    pub objects_new: i64,
+    pub objects_changed: i64,
+}
+
+/// A repository: its crawls, the commits the module holds of it, its last
+/// crawl and its last complete one, and the host repositories crawled beside
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Repo {
+    pub name: String,
+    pub common_dir: String,
+    pub crawls: i64,
+    pub commits_held: i64,
+    pub last: Option<LastCrawl>,
+    pub last_complete: Option<DateTime<Utc>>,
+    pub hosts: Vec<HostLast>,
+}
+
+/// Every repository the module holds, by name, each with its last crawl.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError`] when the database does not answer.
+pub async fn repositories(db: &Db) -> superx_kernel::Result<Vec<Repo>> {
+    let mut answer = db
+        .query(
+            "SELECT id, name, common_dir FROM repository;\n\
+             SELECT repository, started_at, finished_at, outcome, note, mainline, tip, commits_read, commits_new, refs_read, \
+             reflog_read, files_blamed, files_left, git_calls, git_failed, git_timeouts, rows_written FROM crawl;\n\
+             SELECT repository, count() AS n FROM commit GROUP BY repository;\n\
+             SELECT host_repository, host_repository.host AS host, host_repository.path AS path, crawl.repository AS repository, \
+             started_at, finished_at, outcome, note, calls, failed, not_modified, rate_waits, objects_new, objects_changed FROM host_crawl;",
+        )
+        .await?;
+    let repos: Vec<Value> = answer.take(0)?;
+    let mut crawls: Vec<Value> = answer.take(1)?;
+    let held: Vec<Value> = answer.take(2)?;
+    let mut host_crawls: Vec<Value> = answer.take(3)?;
+    // Newest first, sorted here: an engine's order on a time is not trusted.
+    crawls.sort_by_key(|c| std::cmp::Reverse(time(c, "started_at")));
+    host_crawls.sort_by_key(|c| std::cmp::Reverse(time(c, "started_at")));
+    let held: BTreeMap<String, i64> =
+        held.iter().filter_map(|h| Some((row_key(&record(h, "repository")?), int(h, "n")))).collect();
+    let mut out: Vec<Repo> = repos
+        .iter()
+        .filter_map(|r| {
+            let id = record(r, "id")?;
+            let key = row_key(&id);
+            let mine: Vec<&Value> = crawls.iter().filter(|c| record(c, "repository").is_some_and(|x| row_key(&x) == key)).collect();
+            let last = mine.first().and_then(|c| last_crawl(c));
+            let last_complete = mine.iter().find(|c| text(c, "outcome").as_deref() == Some("complete")).and_then(|c| time(c, "started_at"));
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            let hosts = host_crawls
+                .iter()
+                .filter(|h| record(h, "repository").is_some_and(|x| row_key(&x) == key))
+                .filter(|h| record(h, "host_repository").is_some_and(|x| seen.insert(row_key(&x))))
+                .filter_map(host_last)
+                .collect();
+            Some(Repo {
+                name: text(r, "name").unwrap_or_default(),
+                common_dir: text(r, "common_dir").unwrap_or_default(),
+                crawls: i64::try_from(mine.len()).unwrap_or(i64::MAX),
+                commits_held: held.get(&key).copied().unwrap_or(0),
+                last,
+                last_complete,
+                hosts,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.common_dir.cmp(&b.common_dir)));
+    Ok(out)
+}
+
+fn last_crawl(c: &Value) -> Option<LastCrawl> {
+    Some(LastCrawl {
+        started_at: time(c, "started_at")?,
+        finished_at: time(c, "finished_at")?,
+        outcome: text(c, "outcome")?,
+        note: text(c, "note"),
+        mainline: text(c, "mainline").unwrap_or_default(),
+        tip: text(c, "tip"),
+        commits_read: int(c, "commits_read"),
+        commits_new: int(c, "commits_new"),
+        refs_read: int(c, "refs_read"),
+        reflog_read: int(c, "reflog_read"),
+        files_blamed: int(c, "files_blamed"),
+        files_left: int(c, "files_left"),
+        git_calls: int(c, "git_calls"),
+        git_failed: int(c, "git_failed"),
+        git_timeouts: int(c, "git_timeouts"),
+        rows_written: int(c, "rows_written"),
+    })
+}
+
+fn host_last(h: &Value) -> Option<HostLast> {
+    Some(HostLast {
+        name: format!("{}/{}", text(h, "host")?, text(h, "path")?),
+        started_at: time(h, "started_at")?,
+        finished_at: time(h, "finished_at")?,
+        outcome: text(h, "outcome")?,
+        note: text(h, "note"),
+        calls: int(h, "calls"),
+        failed: int(h, "failed"),
+        not_modified: int(h, "not_modified"),
+        rate_waits: int(h, "rate_waits"),
+        objects_new: int(h, "objects_new"),
+        objects_changed: int(h, "objects_changed"),
+    })
+}
+
+/// `GET /api/repos`: [`repositories`], from the module's own database.
+pub async fn repos(State(kernel): State<Kernel>) -> Response {
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match repositories(&db).await {
+        Ok(repos) => Json(serde_json::json!({ "repos": repos })).into_response(),
         Err(e) => unavailable(&e),
     }
 }

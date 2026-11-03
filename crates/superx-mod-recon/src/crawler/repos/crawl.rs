@@ -16,6 +16,7 @@ use superx_kernel::{Db, Result};
 use crate::crawler::hosts::crawl::{Beside, Done, HostCrawl, Shared, Standing, Summary};
 use crate::crawler::hosts::held::{row_key, HostMemory};
 use crate::crawler::hosts::{Endpoints, Host, HostPath};
+use crate::crawler::progress::{Progress, Watch};
 use crate::crawler::repos::commits::{self, FileChange};
 use crate::crawler::repos::git::With;
 use crate::crawler::repos::known::{self, GitEvent, Known};
@@ -41,6 +42,8 @@ pub struct Context {
     pub events: Vec<GitEvent>,
     /// Every checkout on the list: its root and its repository's row.
     pub checkouts: Vec<(String, RecordId)>,
+    /// Where each worker reports what it is doing (#539).
+    pub progress: Progress,
 }
 
 /// A checkout of the repository a worker crawls.
@@ -215,10 +218,17 @@ pub async fn run(ctx: &Context, job: &Job, stop: &mut Stop) -> Result<Finished> 
     let since = (ctx.params.since_days > 0)
         .then(|| started_at - TimeDelta::days(i64::try_from(ctx.params.since_days).unwrap_or(i64::MAX / 86_400 / 1_000)));
     let id = reserve("crawl");
+    let key = job.common.display().to_string();
+    let step = |s: &'static str| ctx.progress.step(&key, s);
+    step("setup");
     let mut c = Crawl {
         ctx,
         job,
-        rec: Recorder::new(id.clone(), ctx.params.git_timeout_ms),
+        rec: Recorder::new(id.clone(), ctx.params.git_timeout_ms).watched(Watch {
+            progress: ctx.progress.clone(),
+            common_dir: key.clone(),
+            host: None,
+        }),
         id,
         started_at,
         since,
@@ -254,15 +264,23 @@ pub async fn run(ctx: &Context, job: &Job, stop: &mut Stop) -> Result<Finished> 
         None => return Ok(Finished { stopped: true, name: job.name.clone(), common: job.common.clone(), ..Finished::default() }),
     };
     if !readable {
+        step("writing");
         return c.finish(Vec::new(), "unreadable").await;
     }
     let went = async {
+        step("hosts");
         c.hosts_start(stop).await?;
+        step("refs");
         c.refs(stop).await?;
+        step("commits");
         c.commits(stop).await?;
+        step("reflogs");
         c.reflogs(stop).await?;
+        step("placements");
         c.placements(stop).await?;
+        step("landed");
         c.landed(stop).await?;
+        step("survival");
         c.survival(stop).await?;
         Some(())
     }
@@ -271,17 +289,21 @@ pub async fn run(ctx: &Context, job: &Job, stop: &mut Stop) -> Result<Finished> 
         return Ok(Finished { stopped: true, name: job.name.clone(), common: job.common.clone(), ..Finished::default() });
     }
     // The host crawls, once the repository's crawl is done.
+    step("host crawls");
     let beside = Beside { tip: c.mainline.tip.clone(), first_parent: c.first_parent_held() };
     let mut done: Vec<Done> = Vec::new();
     for mut hc in std::mem::take(&mut c.host_crawls) {
         hc.finish(&beside, stop).await;
+        ctx.progress.host_done(&key, &hc.hp.to_string());
         if hc.stopped || stop.requested() {
             return Ok(Finished { stopped: true, name: job.name.clone(), common: job.common.clone(), ..Finished::default() });
         }
         done.push(hc.done());
     }
+    step("sessions");
     c.sessions(&done).await?;
     let outcome = if c.rec.failed > 0 || c.rec.timeouts > 0 || c.counts.commits_read != c.counts.commits_held { "partial" } else { "complete" };
+    step("writing");
     c.finish(done, outcome).await
 }
 
@@ -336,7 +358,10 @@ impl Crawl<'_> {
             let held = self.ctx.hosts.known.repositories.get(&(hp.host, hp.path.clone()));
             let mut mirror_row = held.and_then(|r| self.ctx.hosts.known.mirrors.get(&row_key(r)).cloned());
             if taken {
-                let Ok(hc) = HostCrawl::start(&self.ctx.hosts, hp.clone(), self.id.clone(), stop).await else {
+                let key = self.job.common.display().to_string();
+                self.ctx.progress.host_started(&key, &hp.to_string());
+                let watch = Watch { progress: self.ctx.progress.clone(), common_dir: key, host: Some(hp.to_string()) };
+                let Ok(hc) = HostCrawl::start(&self.ctx.hosts, hp.clone(), self.id.clone(), Some(watch), stop).await else {
                     self.notes.push(format!("{hp}: what the database holds of it could not be read"));
                     continue;
                 };

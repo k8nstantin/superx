@@ -96,6 +96,9 @@ impl Crawl<'_> {
         let at_once = usize::try_from(self.ctx.params.blames_at_once).unwrap_or(usize::MAX).clamp(1, Semaphore::MAX_PERMITS);
         let gate = Arc::new(Semaphore::new(at_once));
         let timeout = self.rec.timeout();
+        let key = self.job.common.display().to_string();
+        let to_blame = i64::try_from(chosen.len()).unwrap_or(i64::MAX);
+        self.ctx.progress.blames(&key, 0, to_blame);
         let mut running: JoinSet<(String, Call)> = JoinSet::new();
         for path in chosen {
             let (gate, dir, with, tip) = (Arc::clone(&gate), dir.clone(), with.clone(), tip.clone());
@@ -110,6 +113,7 @@ impl Crawl<'_> {
         while let Some(joined) = stop.unless(running.join_next()).await? {
             let Ok((path, call)) = joined else { continue };
             self.counts.files_blamed += 1;
+            self.ctx.progress.blames(&key, self.counts.files_blamed, to_blame);
             if self.rec.record("blame", &call, OK) {
                 for (commit, n) in credited(&call.stdout) {
                     self.counts.blame_lines_read += n;

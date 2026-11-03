@@ -8,6 +8,7 @@ use std::path::Path;
 
 use superx_kernel::types::RecordId;
 
+use crate::crawler::progress::Watch;
 use crate::crawler::repos::git::{self, Call, With};
 use crate::crawler::store::{Batch, Row};
 use crate::crawler::Stop;
@@ -33,6 +34,8 @@ pub struct Recorder {
     pub bytes: i64,
     /// What git said of each call that failed, for the crawl's note.
     pub failures: Vec<String>,
+    /// Where each call is reported as it is recorded (#539).
+    watch: Option<Watch>,
 }
 
 impl Recorder {
@@ -48,7 +51,14 @@ impl Recorder {
             ms: 0,
             bytes: 0,
             failures: Vec::new(),
+            watch: None,
         }
+    }
+
+    /// The recorder reporting each call to `watch`.
+    #[must_use]
+    pub fn watched(self, watch: Watch) -> Self {
+        Self { watch: Some(watch), ..self }
     }
 
     /// The bound a call is cut off at.
@@ -74,6 +84,9 @@ impl Recorder {
         self.timeouts += i64::from(call.timed_out);
         self.ms = self.ms.saturating_add(i64::try_from(call.ms).unwrap_or(i64::MAX));
         self.bytes = self.bytes.saturating_add(i64::try_from(call.bytes_out).unwrap_or(i64::MAX));
+        if let Some(w) = &self.watch {
+            w.progress.git_call(&w.common_dir, !answered);
+        }
         if !answered {
             // The subcommand, and what it was asked of: its last argument.
             let mut named = call.args.iter().skip_while(|a| *a == "-c" || a.contains('='));
