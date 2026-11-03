@@ -133,3 +133,28 @@ export const setParam = (name: string, value: unknown) =>
     headers: { 'content-type': 'application/json', 'x-superx-recon': 'write' },
     body: JSON.stringify(value),
   }).then((r) => answer<Listing>(r))
+
+/// What a model did, summed (src/results.rs).
+export type Measures = {
+  replies: number
+  subagent_replies: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  thinking_tokens: number
+  thinking_spans: number
+  thinking_ms: number
+  tool_calls: number
+  lines_added: number
+  lines_removed: number
+  commits: number
+  commit_lines_added: number
+  commit_lines_removed: number
+}
+
+export type ModelDay = Measures & { day: string; model: string }
+export type ModelTotal = Measures & { model: string; sessions: number; first_day: string; last_day: string }
+export type Models = { days: ModelDay[]; totals: ModelTotal[] }
+
+export const fetchModels = () => fetch('/api/results/models').then((r) => answer<Models>(r))
