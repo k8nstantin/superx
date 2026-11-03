@@ -198,8 +198,10 @@ async fn every_git_call_in_an_operators_repository_carries_the_overrides_no_diff
     commit(&dir, &[("a.txt", "one\ntwo\n")], "first");
     commit(&dir, &[("a.txt", "one\nTWO\nthree\n"), ("b.txt", "b\n")], "second");
     git(&dir, &["branch", "side"]);
-    // HEAD on a branch with no commit yet: fsck says so on its error output
-    // and exits 2.
+    // HEAD on a branch with no commit yet, its index naming the empty tree
+    // the repository does not hold: fsck prints `missing tree` and exits 2.
+    // What it writes on its error output is the git's own (2.50 a notice
+    // of the unborn branch, 2.56 nothing), so the row is held to it.
     git(&dir, &["switch", "-q", "--orphan", "fresh"]);
     let index = dir.join(".git").join("index");
     let before = std::fs::read(&index).ok();
@@ -241,8 +243,17 @@ async fn every_git_call_in_an_operators_repository_carries_the_overrides_no_diff
     assert_eq!(text(shallow, "stderr"), None, "nothing on its error output");
     let fsck = calls.iter().find(|c| texts(c, "args").is_some_and(|a| subcommand(&a) == "fsck")).expect("fsck");
     assert_eq!(text(fsck, "step").as_deref(), Some("unreachable"));
-    let said = text(fsck, "stderr").expect("what fsck said");
-    assert!(said.contains("notice: HEAD points to an unborn branch (fresh)") && said.ends_with('\n'), "whole: {said:?}");
+    let own = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&common)
+        .args(["fsck", "--unreachable", "--connectivity-only", "--no-progress"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("fsck");
+    assert_eq!(own.status.code(), Some(2), "this git's fsck fails here too");
+    let said = String::from_utf8_lossy(&own.stderr).into_owned();
+    assert_eq!(text(fsck, "stderr"), (!said.is_empty()).then(|| said.clone()), "whole, as this git writes it, NONE when nothing");
     let crawl = rows(&db, "SELECT git_calls, git_failed, git_timeouts, bytes_read, outcome, note FROM crawl").await;
     let bytes: i64 = calls.iter().filter_map(|c| int(c, "bytes_out")).sum();
     assert_eq!(
@@ -250,7 +261,8 @@ async fn every_git_call_in_an_operators_repository_carries_the_overrides_no_diff
         (Some(i64::try_from(calls.len()).expect("a count")), Some(1), Some(0), Some(bytes))
     );
     assert_eq!(text(&crawl[0], "outcome").as_deref(), Some("partial"), "a call that failed");
-    assert!(text(&crawl[0], "note").is_some_and(|n| n.contains("git fsck") && n.contains("unborn branch (fresh)")), "{crawl:?}");
+    let named = format!("git fsck in {common}: {}", said.trim());
+    assert!(text(&crawl[0], "note").is_some_and(|n| n.contains(&named)), "{named:?} in {crawl:?}");
     std::fs::remove_dir_all(&root).expect("clean up");
 }
 
