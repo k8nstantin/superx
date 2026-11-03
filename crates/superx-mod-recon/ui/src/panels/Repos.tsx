@@ -16,7 +16,7 @@ function Outcome({ outcome }: { outcome: string }) {
 function Note({ note }: { note: string | null }) {
   if (!note) return null
   return (
-    <Text fz="xs" c="dimmed" lineClamp={3} title={note} style={{ overflowWrap: 'anywhere' }}>
+    <Text fz="xs" c="dimmed" lineClamp={2} title={note} style={{ overflowWrap: 'anywhere' }}>
       {note}
     </Text>
   )
@@ -42,7 +42,7 @@ function Row({ r }: { r: Repo }) {
   const c = r.last
   return (
     <Table.Tr>
-      <Table.Td>
+      <Table.Td miw={240}>
         <Text fz="sm" fw={600}>{r.name}</Text>
         <Text fz="xs" c="dimmed" ff="monospace" style={{ overflowWrap: 'anywhere' }}>{r.common_dir}</Text>
         <Text fz="xs" c="dimmed">{n(r.crawls)} crawls · last complete {day(r.last_complete)}</Text>
