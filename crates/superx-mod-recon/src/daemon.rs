@@ -18,6 +18,12 @@ use crate::instance::Instance;
 const WAIT_POLLS: u32 = 150; // skill-allow: §9-const — start/stop poll bound, 30 s
 const POLL: Duration = Duration::from_millis(200); // skill-allow: §9-duration — start/stop poll cadence
 
+/// How long `stop` waits for the process to exit.
+#[must_use]
+pub fn stop_wait() -> Duration {
+    POLL * WAIT_POLLS
+}
+
 /// The executable's name, as the system reports a running one.
 const EXE_NAME: &str = "superx-recon";
 
