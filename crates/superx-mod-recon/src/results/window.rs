@@ -475,7 +475,7 @@ pub fn window(trail: &Trail, params: &Params, from: DateTime<Utc>, to: DateTime<
     }
 
     // The window's commits, and their files.
-    for (i, c) in trail.commits.iter().enumerate().filter(|(_, c)| inside(c.at)) {
+    for (i, c) in trail.commits.iter().enumerate().filter(|(_, c)| inside(c.at) && !c.copy) {
         let a = accs.entry(name(Some(&c.repo))).or_default();
         a.commits.push(i);
         let t = &mut a.repo.totals;

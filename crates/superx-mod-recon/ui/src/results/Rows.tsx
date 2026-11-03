@@ -18,8 +18,9 @@ export function ModelBadge({ model, pal }: { model: string; pal: Palette }) {
   )
 }
 
-export function Place({ c }: { c: { place: string | null; in_flight: boolean; landed: number; added: number } }) {
+export function Place({ c }: { c: { place: string | null; in_flight: boolean; landed: number; added: number; landed_as?: string | null } }) {
   if (c.place === 'mainline') return <Badge size="xs" color="teal" variant="light">main line</Badge>
+  if (c.landed_as) return <Badge size="xs" color="teal" variant="light">landed as {c.landed_as.slice(0, 8)}</Badge>
   if (c.landed > 0 && c.landed >= c.added) return <Badge size="xs" color="teal" variant="light">landed by a squash</Badge>
   if (c.landed > 0) return <Badge size="xs" color="teal" variant="outline">part landed</Badge>
   if (c.in_flight) return <Badge size="xs" color="yellow" variant="light">in flight</Badge>
@@ -46,7 +47,7 @@ export function Whole({ repo, hash }: { repo: string; hash: string }) {
         {c.effort ? ` · effort ${c.effort}` : ''}{c.context ? ` · ${n(c.context)} tokens of context` : ''}
       </Text>
       <Text fz="xs">
-        +{n(c.added)} −{n(c.removed)} · landed {n(c.landed)} · alive {n(c.alive)} · {c.in_flight ? `in flight ${n(c.added - c.landed)}` : `never landed ${n(c.never_landed)}`}
+        {c.landed_as ? `rewritten onto the main line as ${c.landed_as.slice(0, 10)} · ` : ''}+{n(c.added)} −{n(c.removed)} · landed {n(c.landed)} · alive {n(c.alive)} · {c.in_flight ? `in flight ${n(c.added - c.landed)}` : `never landed ${n(c.never_landed)}`}
         {c.reverted ? ' · reverted later' : ''}
       </Text>
       {c.checks.length > 0 && (

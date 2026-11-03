@@ -158,6 +158,7 @@ export type FoundCommit = {
   removed: number
   place: string | null
   in_flight: boolean
+  landed_as: string | null
   landed: number
   alive: number | null
   never_landed: number
@@ -445,6 +446,7 @@ export type CommitDetail = {
   place: string | null
   in_flight: boolean
   squash: boolean
+  landed_as: string | null
   landed: number
   alive: number | null
   never_landed: number

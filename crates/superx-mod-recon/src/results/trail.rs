@@ -271,6 +271,15 @@ pub struct Commit {
     /// A main-line commit carrying branch work: its lines are the branch
     /// commits'.
     pub squash: bool,
+    /// git's stable patch id: the change itself, whatever its hash.
+    pub patch_id: Option<String>,
+    /// The main-line commit that is this same change rewritten (a
+    /// filter-branch, a rebase, a cherry-pick): this commit's work landed
+    /// as that one.
+    pub landed_as: Option<String>,
+    /// The other copy of a change counted under `landed_as`: counted once,
+    /// as the copy a session made.
+    pub copy: bool,
     /// Lines of it the main line took: all of a main-line commit's; of a
     /// branch commit's, the lines of each file whose version the main line
     /// carries.
@@ -663,7 +672,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
 
     // The commits: where each went, who made it, what landed and lived.
     let commit_rows =
-        every(db, "commit", "repository, hash, author, author_name, committed_at, added, removed, subject").await?;
+        every(db, "commit", "repository, hash, author, author_name, committed_at, added, removed, subject, patch_id").await?;
     let mut placements = every(db, "placement", "commit, place, valid_from").await?;
     let landed_rows = every(db, "landed_via", "commit, path, via").await?;
     let mut survival = every(db, "survival", "commit, alive, valid_from").await?;
@@ -724,6 +733,9 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
                 bulk: added + removed > bulk_lines,
                 ours: tie.is_some() || identity.get(&repo).is_some_and(|w| *w == author),
                 squash: false,
+                patch_id: text(c, "patch_id"),
+                landed_as: None,
+                copy: false,
                 landed: 0,
                 alive: None,
                 never_landed: 0,
@@ -879,6 +891,47 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
             (one.family, one.by, one.session, one.reply, one.tied_at) = w;
         }
         commits.push(one);
+    }
+
+    // A change rewritten onto the main line is the same change under another
+    // hash, and git's stable patch id names it: the copy left on a branch,
+    // a backup tag, refs/original or the stash landed as the main line's.
+    // It counts once, at the time and with the evidence of the copy a
+    // session made (the strongest evidence of either), its landing and
+    // blame the main line's.
+    let mut twin_of: HashMap<(String, String), usize> = HashMap::new();
+    for (i, c) in commits.iter().enumerate() {
+        if c.place.as_deref() == Some("mainline") && !c.squash {
+            if let Some(p) = &c.patch_id {
+                twin_of.entry((c.repo.clone(), p.clone())).or_insert(i);
+            }
+        }
+    }
+    let mut originals: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, c) in commits.iter().enumerate() {
+        if c.place.as_deref() == Some("mainline") {
+            continue;
+        }
+        if let Some(&t) = c.patch_id.as_ref().and_then(|p| twin_of.get(&(c.repo.clone(), p.clone()))) {
+            originals.entry(t).or_default().push(i);
+        }
+    }
+    for (t, mut list) in originals {
+        list.sort_by_key(|&i| (std::cmp::Reverse(evidence(&commits[i])), commits[i].at));
+        let keep = list[0];
+        let twin = commits[t].clone();
+        for &i in &list[1..] {
+            commits[i].copy = true;
+        }
+        let c = &mut commits[keep];
+        if evidence(&twin) > evidence(c) {
+            (c.family, c.by, c.session, c.reply, c.tied_at) = (twin.family.clone(), twin.by, twin.session.clone(), twin.reply, twin.tied_at);
+        }
+        c.landed = c.added;
+        c.never_landed = 0;
+        c.alive = twin.alive.map(|a| a.min(c.added));
+        c.landed_as = Some(twin.hash.clone());
+        commits[t].copy = true;
     }
 
     // What a later commit reverted: git's own `Revert "<subject>"`.

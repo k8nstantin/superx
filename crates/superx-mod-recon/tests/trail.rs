@@ -103,3 +103,42 @@ async fn a_commit_is_followed_from_the_session_that_tested_and_printed_it_to_wha
     assert!(whole(&trail, "elsewhere", &second).is_none(), "named by its repository");
     std::fs::remove_dir_all(&root).expect("clean up");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_rewritten_onto_the_main_line_landed_and_counts_once_as_the_copy_its_session_made() {
+    let kernel = kernel().await;
+    let db = own_db().await;
+    let root = scratch();
+    let dir = root.join("work");
+    repo(&dir);
+    let lines = |first: &str, last: &str| format!("{first}\n2\n3\n4\n5\n6\n7\n8\n9\n{last}\n");
+    commit(&dir, &[("a.txt", &lines("1", "10"))], "first");
+    // The session's change, on a branch: line 1.
+    git(&dir, &["checkout", "-q", "-b", "feat"]);
+    let made = commit(&dir, &[("a.txt", &lines("one", "10"))], "work");
+    // The main line changes line 10, then takes the change: the same patch,
+    // another file version, another hash.
+    git(&dir, &["checkout", "-q", "main"]);
+    commit(&dir, &[("a.txt", &lines("1", "ten"))], "tail");
+    git_at(&dir, &["cherry-pick", &made], Some("2026-10-02T12:00:00+02:00"));
+    let landed = git(&dir, &["rev-parse", "HEAD"]);
+    assert_ne!(landed, made, "the same change under another hash");
+
+    let mut c = Capture::new(&kernel, "one").await;
+    c.worked_in(&dir).await;
+    c.bash(&dir, "git commit -am 'work'", &format!("[feat {}] work\n 1 file changed, 1 insertion(+), 1 deletion(-)", &made[..7])).await;
+    pass(&kernel, &db, &params(&[(INCLUDE_PARAM, strings(&[&dir]))]), &mut Crawler::default()).await;
+
+    let p = params(&[]);
+    let trail = load(&db, &p).await.expect("the trail");
+    let found = findings(&trail, &p);
+    let work = found.commits.iter().find(|c| c.hash == made).unwrap_or_else(|| panic!("{:?}", found.commits));
+    assert_eq!(
+        (work.model.as_str(), work.by, work.place.as_deref(), work.landed_as.as_deref(), work.in_flight),
+        ("opus 5.5", Some("printed"), Some("branch"), Some(landed.as_str()), false),
+        "the session's copy, landed as the main line's: {work:?}"
+    );
+    assert_eq!((work.added, work.landed, work.never_landed, work.alive), (1, 1, 0, Some(1)), "its line landed and is alive at the tip: {work:?}");
+    assert!(found.commits.iter().all(|c| c.hash != landed), "the main line's copy is not counted again: {:?}", found.commits);
+    std::fs::remove_dir_all(&root).expect("clean up");
+}

@@ -69,6 +69,8 @@ pub struct CommitDetail {
     pub place: Option<String>,
     pub in_flight: bool,
     pub squash: bool,
+    /// The main-line commit this same change was rewritten as.
+    pub landed_as: Option<String>,
     pub landed: i64,
     pub alive: Option<i64>,
     pub never_landed: i64,
@@ -155,6 +157,7 @@ pub fn commit(trail: &Trail, repo: &str, hash: &str) -> Option<CommitDetail> {
         place: c.place.clone(),
         in_flight: in_flight(c),
         squash: c.squash,
+        landed_as: c.landed_as.clone(),
         landed: c.landed,
         alive: c.alive,
         never_landed: c.never_landed,

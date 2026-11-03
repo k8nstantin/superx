@@ -43,6 +43,8 @@ pub struct FoundCommit {
     /// On a checked-out branch, or in an open pull request: it may still
     /// land, so its lines off the main line are not counted as never landed.
     pub in_flight: bool,
+    /// The main-line commit this same change was rewritten as.
+    pub landed_as: Option<String>,
     pub landed: i64,
     pub alive: Option<i64>,
     pub never_landed: i64,
@@ -193,7 +195,7 @@ fn slot<'a>(weeks: &'a mut BTreeMap<(String, String, String), Week>, at: DateTim
 /// Whether a commit off the main line may still land: it is on a checked-out
 /// branch, or in an open pull request.
 pub(crate) fn in_flight(c: &super::trail::Commit) -> bool {
-    c.place.as_deref() == Some("in_flight") || (c.open_pull && c.place.as_deref() != Some("mainline"))
+    c.landed_as.is_none() && (c.place.as_deref() == Some("in_flight") || (c.open_pull && c.place.as_deref() != Some("mainline")))
 }
 
 /// Whether a run is a host's own CI run, not one of its parts or a status.
@@ -251,7 +253,7 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
     let commits: Vec<FoundCommit> = trail
         .commits
         .iter()
-        .filter(|c| c.ours && !c.squash)
+        .filter(|c| c.ours && !c.squash && !c.copy)
         .map(|c| {
             let reply = c.reply.and_then(|i| trail.replies.get(i));
             FoundCommit {
@@ -267,6 +269,7 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
                 removed: c.removed,
                 place: c.place.clone(),
                 in_flight: in_flight(c),
+                landed_as: c.landed_as.clone(),
                 landed: c.landed,
                 alive: c.alive,
                 never_landed: c.never_landed,
