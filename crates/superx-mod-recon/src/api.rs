@@ -314,6 +314,62 @@ pub async fn drill(State(kernel): State<Kernel>, axum::extract::Query(q): axum::
     }
 }
 
+/// `GET /api/results/findings`: [`crate::results::findings::findings`],
+/// every commit of ours and every pull request with what became of it, and
+/// each model's weeks, from the trail under the parameters in force.
+pub async fn findings(State(kernel): State<Kernel>) -> Response {
+    let resolved = match params::resolve(&kernel).await {
+        Ok(r) => r,
+        Err(e) => return unavailable(&e),
+    };
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match crate::results::trail::load(&db, &resolved.params).await {
+        Ok(trail) => Json(crate::results::findings::findings(&trail, &resolved.params)).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
+/// What `GET /api/results/window` is asked: two times (RFC 3339) and the
+/// timeline's step in seconds.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WindowQuery {
+    pub from: String,
+    pub to: String,
+    pub step: i64,
+}
+
+/// `GET /api/results/window?from=…&to=…&step=…`:
+/// [`crate::results::window::window`], what was done in each repository
+/// between the two times.
+pub async fn window(State(kernel): State<Kernel>, axum::extract::Query(q): axum::extract::Query<WindowQuery>) -> Response {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).map(|t| t.with_timezone(&chrono::Utc));
+    let (Ok(from), Ok(to)) = (parse(&q.from), parse(&q.to)) else {
+        return refuse(StatusCode::BAD_REQUEST, format!("from and to want RFC 3339 times, not {} and {}", q.from, q.to));
+    };
+    if from >= to || q.step <= 0 {
+        return refuse(StatusCode::BAD_REQUEST, format!("wants from before to and a step above 0, not {from} to {to} by {}", q.step));
+    }
+    let resolved = match params::resolve(&kernel).await {
+        Ok(r) => r,
+        Err(e) => return unavailable(&e),
+    };
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    let trail = match crate::results::trail::load(&db, &resolved.params).await {
+        Ok(t) => t,
+        Err(e) => return unavailable(&e),
+    };
+    match crate::results::window::window(&db, &trail, &resolved.params, from, to, q.step).await {
+        Ok(w) => Json(w).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
 /// One parameter as the tab shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Shown {

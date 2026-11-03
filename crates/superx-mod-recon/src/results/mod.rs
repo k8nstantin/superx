@@ -10,6 +10,9 @@
 //! (SurrealDB 3.1.4: `!= NONE` filters drop or keep the wrong rows).
 
 pub mod compare;
+pub mod findings;
+pub mod trail;
+pub mod window;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,7 +25,7 @@ use crate::crawler::hosts::held::{record, row_key, time};
 use crate::crawler::lines::kernel::{first_id, record_uuid_of};
 
 /// Rows read at once from one of the module's tables.
-const PAGE: i64 = 5_000; // skill-allow: §9-const — read-path bound, not a policy tunable
+pub(crate) const PAGE: i64 = 5_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
 /// Every row of `table`, its id and `fields`, read a page at a time in the
 /// order of its UUIDv7 ids (as the crawler walks the kernel's lines), so no
@@ -418,7 +421,7 @@ pub async fn day(db: &Db, model: &str, day: chrono::NaiveDate) -> Result<ModelDa
 }
 
 /// A uuid field as text.
-fn uuid_text(v: &Value, key: &str) -> Option<String> {
+pub(crate) fn uuid_text(v: &Value, key: &str) -> Option<String> {
     match v {
         Value::Object(o) => match o.get(key) {
             Some(Value::Uuid(u)) => Some(u.to_string()),
@@ -462,6 +465,6 @@ pub(crate) fn int(v: &Value, key: &str) -> i64 {
     }
 }
 
-fn flag(v: &Value, key: &str) -> bool {
+pub(crate) fn flag(v: &Value, key: &str) -> bool {
     matches!(v, Value::Object(o) if matches!(o.get(key), Some(Value::Bool(true))))
 }

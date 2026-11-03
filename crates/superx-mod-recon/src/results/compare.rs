@@ -29,6 +29,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use superx_kernel::{Db, Result};
 
+use super::trail::{place_at, places as places_of, RepoMap};
 use super::{every, int, model_of, owned, text};
 use crate::crawler::hosts::held::{record, row_key, time};
 use crate::params::Params;
@@ -198,23 +199,20 @@ pub fn pct(num: i64, den: i64) -> i64 {
     if den > 0 { (200 * num + den) / (2 * den) } else { 0 }
 }
 
-/// Each session's places, oldest first: when, and the repository there.
-type Places = HashMap<String, Vec<(DateTime<Utc>, Option<String>)>>;
-
 /// Each main-line commit's share of branch work: when it was done, its
 /// weight, and the model a printed tie gives it.
 type Shares = HashMap<String, Vec<(DateTime<Utc>, i64, Option<String>)>>;
 
 /// A run's span in a repository.
 #[derive(Debug, Clone)]
-struct Claim {
-    model: String,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+pub(crate) struct Claim {
+    pub(crate) model: String,
+    pub(crate) from: DateTime<Utc>,
+    pub(crate) to: DateTime<Utc>,
 }
 
 /// The one model whose claim covers `at`; none when none does or several do.
-fn credit(claims: &[Claim], at: DateTime<Utc>) -> Option<&str> {
+pub(crate) fn credit(claims: &[Claim], at: DateTime<Utc>) -> Option<&str> {
     let mut hit: Vec<&str> = claims.iter().filter(|c| c.from <= at && at <= c.to).map(|c| c.model.as_str()).collect();
     hit.sort_unstable();
     hit.dedup();
@@ -328,26 +326,10 @@ pub async fn compare(db: &Db, params: &Params) -> Result<Comparison> {
         });
     }
 
-    // Where a directory is: its own row's repository, else the checkout
-    // whose top level holds it, the deepest.
-    let names: HashMap<String, String> = repositories
-        .iter()
-        .filter_map(|r| Some((row_key(&record(r, "id")?), text(r, "name").unwrap_or_default())))
-        .collect();
-    let exact: HashMap<String, String> = directories
-        .iter()
-        .filter_map(|d| Some((text(d, "path")?, row_key(&record(d, "repository")?))))
-        .collect();
-    let mut tops: Vec<(String, String)> =
-        checkouts.iter().filter_map(|c| Some((text(c, "toplevel")?, row_key(&record(c, "repository")?)))).collect();
-    tops.sort_by_key(|(t, _)| std::cmp::Reverse(t.len()));
-    let repo_of = |cwd: &str| -> Option<String> {
-        exact.get(cwd).cloned().or_else(|| {
-            tops.iter()
-                .find(|(t, _)| cwd == t || cwd.strip_prefix(t.as_str()).is_some_and(|rest| rest.starts_with('/')))
-                .map(|(_, r)| r.clone())
-        })
-    };
+    // Where each session worked: its directories' repositories, as the
+    // trail places them.
+    let map = RepoMap::new(&repositories, &directories, &checkouts);
+    let names = &map.names;
 
     // Replies by session, oldest first; each session's places likewise.
     let mut by_session: BTreeMap<String, Vec<Reply>> = BTreeMap::new();
@@ -356,14 +338,7 @@ pub async fn compare(db: &Db, params: &Params) -> Result<Comparison> {
         let session = row_key(&session);
         by_session.entry(session).or_default().push(Reply { key: row_key(&id), at, family: family(&model_of(r)) });
     }
-    let mut place_of: Places = HashMap::new();
-    for p in &places {
-        let (Some(session), Some(at), Some(cwd)) = (record(p, "session"), time(p, "at"), text(p, "cwd")) else { continue };
-        place_of.entry(row_key(&session)).or_default().push((at, repo_of(&cwd)));
-    }
-    for v in place_of.values_mut() {
-        v.sort_by_key(|(at, _)| *at);
-    }
+    let place_of = places_of(&places, &map);
     let mut prompts_of: HashMap<String, Vec<(DateTime<Utc>, String)>> = HashMap::new();
     for p in &prompts {
         let (Some(session), Some(at)) = (record(p, "session"), time(p, "at")) else { continue };
@@ -380,10 +355,7 @@ pub async fn compare(db: &Db, params: &Params) -> Result<Comparison> {
         let here = place_of.get(session);
         let mut session_runs: Vec<Run> = Vec::new();
         for (i, r) in list.iter().enumerate() {
-            let repo = here.and_then(|p| {
-                p.iter().rev().find(|(at, _)| *at <= r.at).or_else(|| p.first()).and_then(|(_, repo)| repo.clone())
-            });
-            reply_repo.insert(r.key.clone(), repo);
+            reply_repo.insert(r.key.clone(), place_at(here, r.at));
             match session_runs.last_mut() {
                 Some(run) if run.family == r.family => {
                     run.last = r.at;
