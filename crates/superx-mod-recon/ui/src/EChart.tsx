@@ -68,7 +68,10 @@ function drawn(option: unknown): string | null {
   }
 }
 
-export function EChart({ option, height }: { option: Record<string, unknown>; height: number }) {
+/// What a click on a chart names: the series and the category it hit.
+export type Clicked = { seriesName?: string; seriesIndex?: number; name?: string; dataIndex?: number; value?: unknown }
+
+export function EChart({ option, height, onClick }: { option: Record<string, unknown>; height: number; onClick?: (p: Clicked) => void }) {
   const chart = useRef<ReactECharts>(null)
   // A tooltip open over a chart whose option is replaced re-shows itself
   // against the data it was opened on, which the refetch has just thrown
@@ -95,5 +98,15 @@ export function EChart({ option, height }: { option: Record<string, unknown>; he
     },
     ...option,
   }
-  return <ReactECharts ref={chart} option={merged} style={{ height }} notMerge lazyUpdate shouldSetOption={shouldSetOption} />
+  return (
+    <ReactECharts
+      ref={chart}
+      option={merged}
+      style={{ height, cursor: onClick ? 'pointer' : undefined }}
+      notMerge
+      lazyUpdate
+      shouldSetOption={shouldSetOption}
+      onEvents={onClick ? { click: onClick } : undefined}
+    />
+  )
 }

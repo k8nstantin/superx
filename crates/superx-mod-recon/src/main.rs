@@ -13,7 +13,7 @@
 //! - `superx-recon <prompt>` with `SUPERX_RECON_ASKPASS` in its
 //!   environment: git's askpass for the crawler's mirrors (#538, step 23).
 
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
@@ -297,9 +297,26 @@ async fn run(instance: &Instance) -> Result<(), String> {
             asked.send_replace(true);
         }
     };
-    let served = axum::serve(listener, server::app(kernel.clone(), instance.clone(), port, progress))
-        .with_graceful_shutdown(on_stop)
-        .await;
+    // A request still running when the stop comes has half of `stop`'s own
+    // wait to finish, so the process is gone before `stop` gives up. Without
+    // the bound a request that never answers kept the module from stopping,
+    // its listener already closed, until it was killed (2026-11-03).
+    let mut stopping = asked.subscribe();
+    let serving = axum::serve(listener, server::app(kernel.clone(), instance.clone(), port, progress)).with_graceful_shutdown(on_stop);
+    let served = tokio::select! {
+        served = serving.into_future() => served,
+        () = async {
+            // The sender lives as long as this function: were it gone, no
+            // stop could come, and the bound never starts.
+            if stopping.wait_for(|asked| *asked).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(daemon::stop_wait() / 2).await;
+        } => {
+            tracing::warn!(target: "recon", "requests still running at the stop were cut off");
+            Ok(())
+        }
+    };
     asked.send_replace(true);
     if let Err(e) = crawling.await {
         tracing::warn!(target: "recon", error = %e, "the crawler did not end cleanly");

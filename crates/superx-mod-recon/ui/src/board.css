@@ -1,0 +1,48 @@
+/* The grip is always visible, in the accent colour: react-grid-layout keeps
+   it at opacity 0 until hover and draws it in 40% black, invisible on the
+   midnight surface (operator 2026-11-03, "charts not resizable"; entities
+   met the same in 2026-09). The drop placeholder is a dashed accent outline
+   where the card lands. */
+.sx-board .react-grid-item > .react-resizable-handle {
+  opacity: 1;
+  background-image: none;
+  z-index: 3;
+}
+.sx-board .react-grid-item > .react-resizable-handle::after {
+  width: 10px;
+  height: 10px;
+  right: 4px;
+  bottom: 4px;
+  border-right: 2px solid #cc66ff;
+  border-bottom: 2px solid #cc66ff;
+  border-radius: 0 0 3px 0;
+}
+.sx-board .react-grid-item > .react-resizable-handle-e::after {
+  height: 24px;
+  bottom: auto;
+  top: 50%;
+  margin-top: -12px;
+  border-bottom: 0;
+  border-radius: 0;
+}
+.sx-board .react-grid-item > .react-resizable-handle-s::after {
+  width: 24px;
+  right: auto;
+  left: 50%;
+  margin-left: -12px;
+  border-right: 0;
+  border-radius: 0;
+}
+.sx-board .react-grid-item:hover > .react-resizable-handle::after {
+  border-color: #f6e8ff;
+}
+.sx-board .react-grid-placeholder {
+  background: rgba(184, 51, 232, 0.16) !important;
+  border: 1px dashed #b833e8;
+  border-radius: 8px;
+  opacity: 1 !important;
+}
+.sx-board .react-grid-item.react-draggable-dragging {
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  z-index: 4;
+}

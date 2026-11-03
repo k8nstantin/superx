@@ -22,6 +22,7 @@ use superx_kernel::{Db, Kernel, NodeKind};
 use crate::crawler::hosts::held::{record, row_key, time};
 use crate::crawler::progress::{Now, Progress};
 use crate::params::{self, NAMES};
+use crate::results::trail::Held;
 use crate::MODULE_NAME;
 
 /// The header a write carries.
@@ -46,32 +47,26 @@ pub struct Day {
     pub host_failed: i64,
 }
 
-/// The crawler's passes per UTC day, oldest first, from every `pass` row and
-/// every `pass_source` row the module holds.
+/// The crawler's passes per day in `zone` (the operator's own, as the page
+/// reads it), oldest first, from every `pass` row and every `pass_source`
+/// row the module holds, each by the day it finished.
 ///
 /// # Errors
 ///
 /// [`superx_kernel::KernelError`] when the database does not answer.
-pub async fn days(db: &Db) -> superx_kernel::Result<Vec<Day>> {
-    let mut answer = db
-        .query(
-            "SELECT time::format(time::floor(finished_at, 1d), '%Y-%m-%d') AS day, outcome, count() AS passes, \
-             math::sum(rows_written) AS rows FROM pass GROUP BY day, outcome;\n\
-             SELECT time::format(time::floor(finished_at, 1d), '%Y-%m-%d') AS day, source, math::sum(items) AS items, \
-             math::sum(calls) AS calls, math::sum(failed) AS failed FROM pass_source GROUP BY day, source;",
-        )
-        .await?;
-    let passes: Vec<Value> = answer.take(0)?;
-    let sources: Vec<Value> = answer.take(1)?;
+pub async fn days(db: &Db, zone: chrono::FixedOffset) -> superx_kernel::Result<Vec<Day>> {
+    let passes = crate::results::every(db, "pass", "finished_at, outcome, rows_written").await?;
+    let sources = crate::results::every(db, "pass_source", "finished_at, source, items, calls, failed").await?;
+    let day_of = |row: &Value| time(row, "finished_at").map(|t| t.with_timezone(&zone).format("%Y-%m-%d").to_string());
     let mut by_day: BTreeMap<String, Day> = BTreeMap::new();
     for row in &passes {
-        let (Some(day), Some(outcome)) = (text(row, "day"), text(row, "outcome")) else { continue };
+        let (Some(day), Some(outcome)) = (day_of(row), text(row, "outcome")) else { continue };
         let d = by_day.entry(day.clone()).or_insert_with(|| Day { day, ..Day::default() });
-        *d.passes.entry(outcome).or_insert(0) += int(row, "passes");
-        d.rows += int(row, "rows");
+        *d.passes.entry(outcome).or_insert(0) += 1;
+        d.rows += int(row, "rows_written");
     }
     for row in &sources {
-        let (Some(day), Some(source)) = (text(row, "day"), text(row, "source")) else { continue };
+        let (Some(day), Some(source)) = (day_of(row), text(row, "source")) else { continue };
         let d = by_day.entry(day.clone()).or_insert_with(|| Day { day, ..Day::default() });
         match source.as_str() {
             crate::crawler::lines::SOURCE => d.lines += int(row, "items"),
@@ -89,13 +84,25 @@ pub async fn days(db: &Db) -> superx_kernel::Result<Vec<Day>> {
     Ok(by_day.into_values().collect())
 }
 
-/// `GET /api/stats`: [`days`], from the module's own database.
-pub async fn stats(State(kernel): State<Kernel>) -> Response {
+/// What `GET /api/stats` is asked: the operator's time zone, as minutes
+/// east of UTC; none is UTC.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StatsQuery {
+    pub offset: Option<i32>,
+}
+
+/// `GET /api/stats?offset=…`: [`days`], from the module's own database, by
+/// the operator's days.
+pub async fn stats(State(kernel): State<Kernel>, axum::extract::Query(q): axum::extract::Query<StatsQuery>) -> Response {
+    let minutes = q.offset.unwrap_or(0);
+    let Some(zone) = minutes.checked_mul(60).and_then(chrono::FixedOffset::east_opt) else {
+        return refuse(StatusCode::BAD_REQUEST, format!("offset wants minutes east of UTC within a day, not {minutes}"));
+    };
     let db = match kernel.module_db(MODULE_NAME).await {
         Ok(db) => db,
         Err(e) => return unavailable(&e),
     };
-    match days(&db).await {
+    match days(&db, zone).await {
         Ok(days) => Json(serde_json::json!({ "days": days })).into_response(),
         Err(e) => unavailable(&e),
     }
@@ -257,6 +264,147 @@ pub async fn repos(State(kernel): State<Kernel>) -> Response {
     };
     match repositories(&db).await {
         Ok(repos) => Json(serde_json::json!({ "repos": repos })).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
+/// `GET /api/results/models`: [`crate::results::models`], from the module's
+/// own database.
+pub async fn models(State(kernel): State<Kernel>) -> Response {
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match crate::results::models(&db).await {
+        Ok(models) => Json(models).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
+/// `GET /api/results/compare`: [`crate::results::compare::compare`], from the
+/// module's own database, under the parameters in force.
+pub async fn compare(State(kernel): State<Kernel>) -> Response {
+    let resolved = match params::resolve(&kernel).await {
+        Ok(r) => r,
+        Err(e) => return unavailable(&e),
+    };
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match crate::results::compare::compare(&db, &resolved.params).await {
+        Ok(c) => Json(c).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
+/// What `GET /api/results/day` is asked: a model and a UTC day.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DayQuery {
+    pub model: String,
+    pub day: String,
+}
+
+/// `GET /api/results/day?model=…&day=YYYY-MM-DD`: [`crate::results::day`],
+/// what is behind one model's bar on one day.
+pub async fn drill(State(kernel): State<Kernel>, axum::extract::Query(q): axum::extract::Query<DayQuery>) -> Response {
+    let Ok(day) = chrono::NaiveDate::parse_from_str(&q.day, "%Y-%m-%d") else {
+        return refuse(StatusCode::BAD_REQUEST, format!("day wants YYYY-MM-DD, not {}", q.day));
+    };
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match crate::results::day(&db, &q.model, day).await {
+        Ok(detail) => Json(detail).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
+/// `GET /api/results/findings`: [`crate::results::findings::findings`],
+/// every commit of ours and every pull request with what became of it, and
+/// each model's weeks, from the trail under the parameters in force.
+pub async fn findings(State(kernel): State<Kernel>, State(held): State<Held>) -> Response {
+    let resolved = match params::resolve(&kernel).await {
+        Ok(r) => r,
+        Err(e) => return unavailable(&e),
+    };
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match held.get(&db, &resolved.params).await {
+        Ok(trail) => Json(crate::results::findings::findings(&trail, &resolved.params)).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
+/// What `GET /api/results/window` is asked: two times (RFC 3339) and the
+/// timeline's step in seconds.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WindowQuery {
+    pub from: String,
+    pub to: String,
+    pub step: i64,
+}
+
+/// `GET /api/results/window?from=…&to=…&step=…`:
+/// [`crate::results::window::window`], what was done in each repository
+/// between the two times.
+pub async fn window(
+    State(kernel): State<Kernel>,
+    State(held): State<Held>,
+    axum::extract::Query(q): axum::extract::Query<WindowQuery>,
+) -> Response {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).map(|t| t.with_timezone(&chrono::Utc));
+    let (Ok(from), Ok(to)) = (parse(&q.from), parse(&q.to)) else {
+        return refuse(StatusCode::BAD_REQUEST, format!("from and to want RFC 3339 times, not {} and {}", q.from, q.to));
+    };
+    if from >= to || q.step <= 0 {
+        return refuse(StatusCode::BAD_REQUEST, format!("wants from before to and a step above 0, not {from} to {to} by {}", q.step));
+    }
+    let resolved = match params::resolve(&kernel).await {
+        Ok(r) => r,
+        Err(e) => return unavailable(&e),
+    };
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match held.get(&db, &resolved.params).await {
+        Ok(trail) => Json(crate::results::window::window(&trail, &resolved.params, from, to, q.step)).into_response(),
+        Err(e) => unavailable(&e),
+    }
+}
+
+/// What `GET /api/results/commit` is asked: a repository's name and a
+/// commit's hash.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CommitQuery {
+    pub repo: String,
+    pub hash: String,
+}
+
+/// `GET /api/results/commit?repo=…&hash=…`: [`crate::results::commit::commit`],
+/// one commit whole.
+pub async fn commit(
+    State(kernel): State<Kernel>,
+    State(held): State<Held>,
+    axum::extract::Query(q): axum::extract::Query<CommitQuery>,
+) -> Response {
+    let resolved = match params::resolve(&kernel).await {
+        Ok(r) => r,
+        Err(e) => return unavailable(&e),
+    };
+    let db = match kernel.module_db(MODULE_NAME).await {
+        Ok(db) => db,
+        Err(e) => return unavailable(&e),
+    };
+    match held.get(&db, &resolved.params).await {
+        Ok(trail) => match crate::results::commit::commit(&trail, &q.repo, &q.hash) {
+            Some(c) => Json(c).into_response(),
+            None => refuse(StatusCode::NOT_FOUND, format!("no commit {} in {}", q.hash, q.repo)),
+        },
         Err(e) => unavailable(&e),
     }
 }
