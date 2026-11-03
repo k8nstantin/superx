@@ -126,12 +126,13 @@ impl Params {
 }
 
 /// One parameter as it stands: the value in force, as `status` prints it,
-/// and whether it was set or is the fallback.
+/// whether it was set or is the fallback, and the shape a value must take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Setting {
     pub name: &'static str,
     pub value: String,
     pub set: bool,
+    pub wanted: &'static str,
 }
 
 /// A parameter set to a value of the wrong shape.
@@ -167,6 +168,40 @@ pub const NAMES: [&str; 14] = [
     REPOS_AT_ONCE_PARAM,
     HOST_TIMEOUT_MS_PARAM,
 ];
+
+/// What a parameter is for, as the tab shows it (#539): when the crawler
+/// runs, where it looks, how much it does at once, and where it listens;
+/// and the input a value is typed into: `number`, `number or all`, `list`
+/// or `refs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct About {
+    pub group: &'static str,
+    pub decides: &'static str,
+    pub input: &'static str,
+}
+
+/// What `name` is for; `None` for a name that is not one of [`NAMES`].
+#[must_use]
+pub fn about(name: &str) -> Option<About> {
+    let (group, input, decides) = match name {
+        PORT_PARAM => ("listens", "number", "The port the module's own URL listens on, at 127.0.0.1; a change applies at restart."),
+        READ_SECS_PARAM => ("when", "number", "How often the crawler reads the lines captured since its last pass, in seconds; 0 pauses it."),
+        CRAWL_SECS_PARAM => ("when", "number", "Seconds between full crawls of the repositories; 0 pauses them."),
+        SINCE_DAYS_PARAM => ("when", "number", "How far back a crawl reads, in days; 0 reads all of history."),
+        INCLUDE_PARAM => ("where", "list", "Directories to crawl besides the ones the sessions worked in."),
+        EXCLUDE_PARAM => ("where", "list", "Repositories never crawled, by name or by a prefix of their path."),
+        MAINLINE_REFS_PARAM => ("where", "refs", "The ref a repository's work lands on, where it is not what origin/HEAD says."),
+        SURVIVAL_SKIP_PARAM => ("where", "list", "Paths never blamed, because their lines say nothing about whether work survived."),
+        REPOS_AT_ONCE_PARAM => ("how much", "number or all", "Repositories crawled in depth at once, each by a worker of its own."),
+        BLAMES_AT_ONCE_PARAM => ("how much", "number", "Blames run at once; each is a git process of its own."),
+        BLAME_FILES_PARAM => ("how much", "number or all", "Files blamed per repository to see what survives; 0 blames none."),
+        UNREACHABLE_COMMITS_PARAM => ("how much", "number or all", "Unreachable commits read per repository, at most."),
+        GIT_TIMEOUT_MS_PARAM => ("how much", "number", "Milliseconds a git call may take before it is abandoned."),
+        HOST_TIMEOUT_MS_PARAM => ("how much", "number", "Milliseconds a call to a host may take before it is cut off."),
+        _ => return None,
+    };
+    Some(About { group, decides, input })
+}
 
 /// Read every parameter from this module's registry entity. Before the
 /// module is registered, every parameter is its fallback.
@@ -248,7 +283,7 @@ impl Resolver<'_> {
         };
         let set = parsed.is_some();
         let value = parsed.unwrap_or(fallback);
-        self.settings.push(Setting { name, value: show(&value), set });
+        self.settings.push(Setting { name, value: show(&value), set, wanted });
         value
     }
 
@@ -267,29 +302,33 @@ impl Resolver<'_> {
         )
     }
 
-    /// A limit: a whole number, 0 or more, shown as `all` when there is none.
+    /// A limit: a whole number, 0 or more, or `"all"` for none, which is
+    /// how it is shown. With no way to clear a parameter, `"all"` is how a
+    /// limit once set is lifted again (#539).
     fn limit(&mut self, name: &'static str, fallback: u64) -> u64 {
         self.read(
             name,
-            "a whole number, 0 or more",
+            "a whole number, 0 or more, or \"all\"",
             fallback,
             |v| match v {
                 Value::Number(n) => n.to_int().and_then(|i| u64::try_from(i).ok()),
+                Value::String(s) if s == "all" => Some(ALL),
                 _ => None,
             },
             |&v| if v == ALL { "all".to_string() } else { v.to_string() },
         )
     }
 
-    /// How many at once: a whole number, 1 or more, shown as `all` when
-    /// there is no limit.
+    /// How many at once: a whole number, 1 or more, or `"all"` for no
+    /// limit, which is how it is shown.
     fn at_once(&mut self, name: &'static str, fallback: u64) -> u64 {
         self.read(
             name,
-            "a whole number, 1 or more",
+            "a whole number, 1 or more, or \"all\"",
             fallback,
             |v| match v {
                 Value::Number(n) => n.to_int().and_then(|i| u64::try_from(i).ok()).filter(|&i| i >= 1),
+                Value::String(s) if s == "all" => Some(ALL),
                 _ => None,
             },
             |&v| if v == ALL { "all".to_string() } else { v.to_string() },
@@ -517,9 +556,36 @@ mod tests {
             let r = from_values(&values);
             let named: Vec<&str> = r.problems.iter().map(|p| p.name).collect();
             assert_eq!(named, [REPOS_AT_ONCE_PARAM, HOST_TIMEOUT_MS_PARAM], "each reported by name");
-            assert!(r.problems.iter().all(|p| p.wanted == "a whole number, 1 or more"), "{:?}", r.problems);
+            let wanted: Vec<&str> = r.problems.iter().map(|p| p.wanted).collect();
+            assert_eq!(wanted, ["a whole number, 1 or more, or \"all\"", "a whole number, 1 or more"], "{:?}", r.problems);
             assert_eq!((r.params.repos_at_once, r.params.host_timeout_ms), (ALL, 120_000), "the fallbacks stand in");
         }
+    }
+
+    #[test]
+    fn a_limit_or_an_at_once_set_to_all_has_none_again_and_a_count_takes_no_all() {
+        let all = || Value::String("all".to_string());
+        let mut values = BTreeMap::new();
+        values.insert(BLAME_FILES_PARAM, all());
+        values.insert(REPOS_AT_ONCE_PARAM, all());
+        values.insert(GIT_TIMEOUT_MS_PARAM, all());
+        let r = from_values(&values);
+        assert_eq!((r.params.blame_files, r.params.repos_at_once), (ALL, ALL));
+        let named: Vec<&str> = r.problems.iter().map(|p| p.name).collect();
+        assert_eq!(named, [GIT_TIMEOUT_MS_PARAM], "{:?}", r.problems);
+        let blame = r.settings.iter().find(|s| s.name == BLAME_FILES_PARAM).expect("listed");
+        assert_eq!((blame.value.as_str(), blame.set, blame.wanted), ("all", true, "a whole number, 0 or more, or \"all\""));
+    }
+
+    #[test]
+    fn every_parameter_says_what_it_is_for() {
+        for name in NAMES {
+            let about = about(name).expect(name);
+            assert!(["when", "where", "how much", "listens"].contains(&about.group), "{name}: {about:?}");
+            assert!(["number", "number or all", "list", "refs"].contains(&about.input), "{name}: {about:?}");
+            assert!(!about.decides.is_empty(), "{name}");
+        }
+        assert_eq!(about("attr_recon_none"), None);
     }
 
     #[test]
