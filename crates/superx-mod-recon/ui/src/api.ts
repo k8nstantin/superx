@@ -180,3 +180,50 @@ export type ModelDayDetail = { model: string; day: string; commits: DayCommit[];
 
 export const fetchDay = (model: string, day: string) =>
   fetch(`/api/results/day?model=${encodeURIComponent(model)}&day=${encodeURIComponent(day)}`).then((r) => answer<ModelDayDetail>(r))
+
+/// The model comparison (src/results/compare.rs): mod-ui's measures, from
+/// recon's facts.
+export type Deviation = {
+  model: string
+  commits: number
+  added: number
+  removed: number
+  alive: number
+  survived_pct: number
+  removed_per_100_added: number
+  rework_commits: number
+  rework_pct: number
+  thrash_files: number
+  thrash_per_100_commits: number
+  multi_dir_commits: number
+  multi_dir_pct: number
+  dirs_per_commit_x10: number
+  operator_turns: number
+  corrections: number
+  corrections_per_100: number
+  escalations: number
+  out_tokens: number
+  messages: number
+  runs: number
+  thrown: number
+  tokens_thrown: number
+  tokens_per_line_landed: number
+  tokens_per_line_kept: number
+  median_age_days: number
+  context_avg: number
+  context_peak: number
+  minutes: number
+  minutes_thrown: number
+  alive_per_mtok: number
+  alive_per_hour: number
+  abandoned_commits: number
+  abandoned_lines: number
+  abandoned_pct: number
+  in_flight_lines: number
+}
+export type Handoff = { from: string; to: string; switches: number; commits: number; added: number; removed: number; alive: number; survived_pct: number }
+export type RepoModel = { repo: string; model: string; commits: number; added: number; alive: number; removed: number; survived_pct: number; rework_commits: number }
+export type UnjudgedRepo = { repo: string; mainline: string; off_mainline_commits: number; unresolved: boolean }
+export type CompareSummary = { handoffs: Handoff[]; deviations: Deviation[]; repos: RepoModel[]; unjudged: UnjudgedRepo[]; computed_at: string }
+
+export const fetchCompare = () => fetch('/api/results/compare').then((r) => answer<CompareSummary>(r))

@@ -1,5 +1,6 @@
 import { useMemo, useState, type ReactNode } from 'react'
 import { Button, Group, Paper, Text } from '@mantine/core'
+import { useElementSize } from '@mantine/hooks'
 import GridLayout, { useContainerWidth, type Layout, type LayoutItem } from 'react-grid-layout'
 import 'react-grid-layout/css/styles.css'
 import 'react-resizable/css/styles.css'
@@ -18,13 +19,23 @@ export type Card = {
   h: number
   /// What it draws, given the height left under its title, in pixels.
   render: (height: number) => ReactNode
+  /// A table that scrolls inside its card, rather than a chart that fills it.
+  scroll?: boolean
+}
+
+/// A card's body, measured, so what it draws takes exactly the room left.
+function Body({ render, scroll }: { render: (height: number) => ReactNode; scroll?: boolean }) {
+  const { ref, height } = useElementSize()
+  return (
+    <div ref={ref} style={{ flex: 1, minHeight: 0, overflow: scroll ? 'auto' : 'hidden' }}>
+      {height > 0 && render(Math.floor(height))}
+    </div>
+  )
 }
 
 const COLS = 12
 const ROW = 36
 const GAP: readonly [number, number] = [14, 14]
-/// The title and note at a card's top, and its padding.
-const HEAD = 64
 
 function key(board: string) {
   return `recon.board.${board}`
@@ -110,8 +121,6 @@ export function Board({ name, cards }: { name: string; cards: Card[] }) {
           }}
         >
           {cards.map((c) => {
-            const item = shown.find((l) => l.i === c.i)
-            const px = item ? item.h * ROW + (item.h - 1) * GAP[1] : c.h * ROW
             return (
               <div key={c.i}>
                 <Paper withBorder radius="md" p="sm" h="100%" style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -119,7 +128,7 @@ export function Board({ name, cards }: { name: string; cards: Card[] }) {
                     <Text fw={600}>{c.title}</Text>
                     {c.note && <Text size="xs" c="dimmed" lineClamp={1}>{c.note}</Text>}
                   </div>
-                  <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>{c.render(Math.max(120, px - HEAD))}</div>
+                  <Body render={c.render} scroll={c.scroll} />
                 </Paper>
               </div>
             )

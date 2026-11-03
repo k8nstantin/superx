@@ -13,6 +13,7 @@ const GROUPS: [string, string][] = [
   ['where', 'Where'],
   ['how much', 'How much'],
   ['listens', 'Listens'],
+  ['measures', 'Measures'],
 ]
 
 /// The value typed, as the JSON recon is sent: a number, "all", a list of

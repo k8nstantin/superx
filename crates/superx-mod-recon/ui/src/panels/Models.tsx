@@ -204,7 +204,7 @@ export function Models() {
   })
   const mins = (v: number) => `${n(v)} min`
   const cards: Card[] = [
-    { i: 'scoreboard', title: 'Every model, over all time', note: 'sessions, replies, tokens, thinking, tool calls, lines its edits wrote, the commits its calls made', w: 12, h: 13, render: () => <Scoreboard totals={totals} shown={shown} /> },
+    { i: 'scoreboard', title: 'Every model, over all time', note: 'sessions, replies, tokens, thinking, tool calls, lines its edits wrote, the commits its calls made', w: 12, h: 13, scroll: true, render: () => <Scoreboard totals={totals} shown={shown} /> },
     daily('replies', 'Replies per day', 'each reply once, however many lines it was written in', (d) => d.replies, n, 12),
     daily('edit-added', 'Lines its edits added, per day', 'from each edit’s patch', (d) => d.lines_added),
     daily('edit-removed', 'Lines its edits removed, per day', 'from each edit’s patch', (d) => d.lines_removed),

@@ -5,6 +5,7 @@ import { Repos } from './panels/Repos'
 import { Stats } from './panels/Stats'
 import { Params } from './panels/Params'
 import { Models } from './panels/Models'
+import { Comparison } from './panels/Comparison'
 
 // The tab, in two: the Crawler (what it does, has and runs on) and the
 // Results (what it gathers them for). One panel per file under panels/, each
@@ -57,6 +58,7 @@ export default function App() {
           </Tabs.Panel>
           <Tabs.Panel value="results" pt="lg">
             <Stack gap="xl">
+              <Comparison />
               <Models />
             </Stack>
           </Tabs.Panel>
