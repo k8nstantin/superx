@@ -72,6 +72,16 @@ const DEFAULT_SURVIVAL_SKIP: &[&str] =
 /// rule in code can know it.
 pub const MAINLINE_REFS_PARAM: &str = "attr_recon_mainline_refs";
 
+/// Repositories crawled in depth at once, each by a worker of its own
+/// (#538, decision repos-at-once): no limit until the operator sets one.
+pub const REPOS_AT_ONCE_PARAM: &str = "attr_recon_repos_at_once";
+const DEFAULT_REPOS_AT_ONCE: u64 = ALL;
+
+/// Milliseconds a call to a host may take before it is cut off (#538); its
+/// fallback is attr_recon_git_timeout_ms's.
+pub const HOST_TIMEOUT_MS_PARAM: &str = "attr_recon_host_timeout_ms";
+const DEFAULT_HOST_TIMEOUT_MS: u64 = DEFAULT_GIT_TIMEOUT_MS;
+
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -87,6 +97,8 @@ pub struct Params {
     pub unreachable_commits: u64,
     pub survival_skip: Vec<String>,
     pub mainline_refs: BTreeMap<String, String>,
+    pub repos_at_once: u64,
+    pub host_timeout_ms: u64,
 }
 
 impl Params {
@@ -139,7 +151,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 12] = [
+pub const NAMES: [&str; 14] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -152,6 +164,8 @@ pub const NAMES: [&str; 12] = [
     UNREACHABLE_COMMITS_PARAM,
     SURVIVAL_SKIP_PARAM,
     MAINLINE_REFS_PARAM,
+    REPOS_AT_ONCE_PARAM,
+    HOST_TIMEOUT_MS_PARAM,
 ];
 
 /// Read every parameter from this module's registry entity. Before the
@@ -198,6 +212,8 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         unreachable_commits: r.limit(UNREACHABLE_COMMITS_PARAM, DEFAULT_UNREACHABLE_COMMITS),
         survival_skip: r.strings(SURVIVAL_SKIP_PARAM, DEFAULT_SURVIVAL_SKIP),
         mainline_refs: r.refs(MAINLINE_REFS_PARAM),
+        repos_at_once: r.at_once(REPOS_AT_ONCE_PARAM, DEFAULT_REPOS_AT_ONCE),
+        host_timeout_ms: r.count(HOST_TIMEOUT_MS_PARAM, 1, DEFAULT_HOST_TIMEOUT_MS),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -259,6 +275,21 @@ impl Resolver<'_> {
             fallback,
             |v| match v {
                 Value::Number(n) => n.to_int().and_then(|i| u64::try_from(i).ok()),
+                _ => None,
+            },
+            |&v| if v == ALL { "all".to_string() } else { v.to_string() },
+        )
+    }
+
+    /// How many at once: a whole number, 1 or more, shown as `all` when
+    /// there is no limit.
+    fn at_once(&mut self, name: &'static str, fallback: u64) -> u64 {
+        self.read(
+            name,
+            "a whole number, 1 or more",
+            fallback,
+            |v| match v {
+                Value::Number(n) => n.to_int().and_then(|i| u64::try_from(i).ok()).filter(|&i| i >= 1),
                 _ => None,
             },
             |&v| if v == ALL { "all".to_string() } else { v.to_string() },
@@ -346,7 +377,7 @@ mod tests {
 
     /// The parameters before the rename, as `superx-performance` named them,
     /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 12] = [
+    const TODAY: [(&str, &str); 14] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -359,6 +390,8 @@ mod tests {
         ("unreachable_commits", "all"),
         ("survival_skip", "/dist/, .lock, .tsbuildinfo, .png, .jpg, .jpeg, .ico, .woff, .woff2, .svg, .pdf"),
         ("mainline_refs", "none"),
+        ("repos_at_once", "all"),
+        ("host_timeout_ms", "120000"),
     ];
 
     #[test]
@@ -456,6 +489,37 @@ mod tests {
         assert!(r.problems.is_empty(), "{:?}", r.problems);
         assert_eq!(r.params.crawl_secs, 0, "the repositories paused");
         assert_eq!(r.params.blame_files, 0, "blame nothing");
+    }
+
+    #[test]
+    fn attr_recon_repos_at_once_and_attr_recon_host_timeout_ms_follow_todays_parameters_in_that_order_with_their_fallbacks_and_a_value_of_the_wrong_shape_is_reported_by_name() {
+        let names: Vec<&str> = from_values(&BTreeMap::new()).settings.iter().map(|s| s.name).collect();
+        assert_eq!(names[names.len() - 2..], [REPOS_AT_ONCE_PARAM, HOST_TIMEOUT_MS_PARAM], "after today's, in that order");
+        assert_eq!(names[..names.len() - 2], NAMES[..12], "today's stay as they were");
+
+        let fallback = from_values(&BTreeMap::new());
+        assert_eq!((fallback.params.repos_at_once, fallback.params.host_timeout_ms), (ALL, fallback.params.git_timeout_ms));
+        let shown: Vec<(&str, &str)> = fallback.settings[12..].iter().map(|s| (s.name, s.value.as_str())).collect();
+        assert_eq!(shown, [(REPOS_AT_ONCE_PARAM, "all"), (HOST_TIMEOUT_MS_PARAM, "120000")], "no limit is shown all");
+        assert!(fallback.settings[12..].iter().all(|s| !s.set));
+
+        let mut values = BTreeMap::new();
+        values.insert(REPOS_AT_ONCE_PARAM, number(3));
+        values.insert(HOST_TIMEOUT_MS_PARAM, number(9_000));
+        let set = from_values(&values);
+        assert!(set.problems.is_empty(), "{:?}", set.problems);
+        assert_eq!((set.params.repos_at_once, set.params.host_timeout_ms), (3, 9_000));
+
+        for wrong in [number(0), number(-1), Value::String("4".to_string())] {
+            let mut values = BTreeMap::new();
+            values.insert(REPOS_AT_ONCE_PARAM, wrong.clone());
+            values.insert(HOST_TIMEOUT_MS_PARAM, wrong);
+            let r = from_values(&values);
+            let named: Vec<&str> = r.problems.iter().map(|p| p.name).collect();
+            assert_eq!(named, [REPOS_AT_ONCE_PARAM, HOST_TIMEOUT_MS_PARAM], "each reported by name");
+            assert!(r.problems.iter().all(|p| p.wanted == "a whole number, 1 or more"), "{:?}", r.problems);
+            assert_eq!((r.params.repos_at_once, r.params.host_timeout_ms), (ALL, 120_000), "the fallbacks stand in");
+        }
     }
 
     #[test]
