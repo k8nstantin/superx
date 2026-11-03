@@ -234,6 +234,7 @@ export type Findings = {
   repo_weeks: RepoWeek[]
   workflows: Workflow[]
   ci_kinds: Record<string, number>
+  folders: { folder: string; repo: string }[]
   computed_at: string
 }
 

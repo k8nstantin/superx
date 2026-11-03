@@ -2,14 +2,12 @@ import { Board, type Card } from '../Board'
 import { EChart, INK } from '../EChart'
 import { category, grid, legend, stacked, tip, value, zoom } from './charts'
 import type { Scoped } from './scope'
-import { group, n, outcome, sum, weekLabel, type Palette } from './shared'
+import { cap, enough, group, n, outcome, sum, weekLabel, type Palette } from './shared'
 
 // What a surviving line costs: each model's output tokens and active hours,
 // in the repositories in view, per line that landed and per line still
 // alive; and the spend week by week. Active hours are the gaps between a
 // session's replies of one model, each capped at attr_recon_active_secs.
-
-const cap = (m: string) => m.charAt(0).toUpperCase() + m.slice(1)
 
 type Spend = { model: string; tokens: number; hours: number; thinking: number; landed: number; alive: number }
 
@@ -26,7 +24,8 @@ function spend(s: Scoped, pal: Palette): Spend[] {
 }
 
 export function costAnswer(s: Scoped, pal: Palette): string {
-  const rows = spend(s, pal).filter((r) => r.alive > 0)
+  const ranked = enough(group(s.commits, (c) => c.model))
+  const rows = spend(s, pal).filter((r) => r.alive > 0 && ranked.has(r.model))
   if (!rows.length) return 'No credited line is alive in this view yet.'
   rows.sort((a, b) => a.tokens / a.alive - b.tokens / b.alive)
   return `A line still alive cost ${rows

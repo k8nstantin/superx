@@ -22,20 +22,11 @@ export function gaps(f: Findings): Gap[] {
         detail: 'Its main line, as recon reads it, took none of them, so nothing there can be judged. If it lands work on another branch, attr_recon_mainline_refs names it.',
       })
   }
-  const hashes = group(f.commits, (c) => c.hash)
-  const shared = new Map<string, Map<string, number>>()
-  for (const cs of hashes.values()) {
-    const repos = [...new Set(cs.map((c) => c.repo))]
-    if (repos.length < 2) continue
-    for (const a of repos) for (const b of repos) if (a !== b) shared.set(a, (shared.get(a) ?? new Map()).set(b, (shared.get(a)?.get(b) ?? 0) + 1))
-  }
-  const ours = group(f.commits, (c) => c.repo)
-  for (const [repo, others] of shared) {
-    const [other, count] = [...others.entries()].sort((a, b) => b[1] - a[1])[0]
-    const total = ours.get(repo)?.length ?? 0
-    if (count * 2 >= total)
-      out.push({ title: `${repo} holds ${n(count)} of the same commits as ${other}`, detail: `${n(count)} of its ${n(total)} commits are also in ${other}: a clone of it, so its commits are counted twice.` })
-  }
+  for (const [repo, folders] of group(f.folders, (x) => x.repo))
+    out.push({
+      title: `${folders.map((x) => x.folder).join(', ')} ${folders.length === 1 ? 'is' : 'are'} read as ${repo}`,
+      detail: `Each is a folder whose remote names ${repo}'s host repository (a clone or a build folder): the work done there is ${repo}'s, and a commit both hold counts once.`,
+    })
   const withCi = new Set(f.workflows.map((w) => w.repo))
   for (const repo of byRepo.keys())
     if (!withCi.has(repo)) out.push({ title: `${repo}: no CI run held`, detail: 'Nothing on its host judges its code, or the crawler holds no host for it.' })

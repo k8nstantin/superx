@@ -10,23 +10,31 @@ import { group, n, pct, quantile, sum, weekLabel, weekOf, type Palette } from '.
 // runs per week, each workflow over all time, who opened each pull request,
 // whether its first CI run was red, and how long it waited to merge.
 
+/// Each repository's CI: how long it has gone without a passing run, or
+/// how often it passes.
 export function ciAnswer(s: Scoped): string {
-  const weeks = [...s.repoWeeks].filter((w) => w.ci_passed + w.ci_failed > 0).sort((a, b) => a.week.localeCompare(b.week))
-  const byWeek = group(weeks, (w) => w.week)
-  const ordered = [...byWeek.keys()].sort()
-  if (!ordered.length) return 'No CI runs are held for these repositories: nothing on their hosts judges the code.'
-  const passed = (w: string) => sum(byWeek.get(w) ?? [], (r) => r.ci_passed)
-  const failed = (w: string) => sum(byWeek.get(w) ?? [], (r) => r.ci_failed)
-  const last = [...ordered].reverse().find((w) => passed(w) > 0)
-  const after = ordered.filter((w) => !last || w > last)
-  const red = sum(after, failed)
-  if (after.length && red > 0) {
-    const firstRed = s.pulls.filter((p) => p.ci_first === false && after.includes(weekOf(p.created_at)))
-    const merged = firstRed.filter((p) => p.merged).length
-    return `CI has not passed since the week of ${weekLabel(after[0])}: 0 of ${n(red)} runs in ${after.length} weeks. ${n(firstRed.length)} pull requests opened red since; ${n(merged)} were merged anyway.`
-  }
-  const total = sum(ordered, passed) + sum(ordered, failed)
-  return `CI passed ${pct(sum(ordered, passed), total)}% of ${n(total)} runs.`
+  const byRepo = group(s.repoWeeks.filter((w) => w.ci_passed + w.ci_failed > 0), (w) => w.repo)
+  if (!byRepo.size) return 'No CI runs are held for these repositories: nothing on their hosts judges the code.'
+  const said = [...byRepo.entries()]
+    .map(([repo, ws]) => {
+      const weeks = [...ws].sort((a, b) => a.week.localeCompare(b.week))
+      const last = [...weeks].reverse().find((w) => w.ci_passed > 0)
+      const after = weeks.filter((w) => !last || w.week > last.week)
+      const red = sum(after, (w) => w.ci_failed)
+      if (after.length && red > 0) {
+        const since = after[0].week
+        const opened = s.pulls.filter((p) => p.repo === repo && p.ci_first === false && weekOf(p.created_at) >= since)
+        return {
+          red,
+          text: `${repo}'s CI has not passed since the week of ${weekLabel(since)}: 0 of ${n(red)} runs. ${n(opened.length)} pull requests opened red since; ${n(opened.filter((p) => p.merged).length)} were merged anyway`,
+        }
+      }
+      const passed = sum(weeks, (w) => w.ci_passed)
+      const total = passed + sum(weeks, (w) => w.ci_failed)
+      return { red: 0, text: `${repo}'s CI passed ${pct(passed, total)}% of ${n(total)} runs` }
+    })
+    .sort((a, b) => b.red - a.red)
+  return `${said.map((x) => x.text).join('. ')}.`
 }
 
 export function Ci({ s, pal, open }: { s: Scoped; pal: Palette; open: (b: Behind) => void }) {

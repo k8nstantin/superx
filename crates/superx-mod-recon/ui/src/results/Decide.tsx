@@ -12,7 +12,7 @@ import { practicesAnswer } from './Practices'
 import { rewritesAnswer } from './Rewrites'
 import { ModelBadge, type Behind } from './Rows'
 import type { Scoped } from './scope'
-import { group, kTok, n, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
+import { cap, enough as enoughOf, group, kTok, n, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
 
 // What to decide from it all: each model's scorecard on what its work
 // became and what it cost, two models set against each other only where
@@ -112,15 +112,19 @@ function shared(s: Scoped, a: string, b: string): { a: FoundCommit[]; b: FoundCo
 
 export function headToHead(s: Scoped, a: string, b: string): string {
   const sh = shared(s, a, b)
-  if (!sh.cells.length) return `${a} and ${b} never committed in the same repository in the same week here, so there is no fair comparison yet.`
+  if (!sh.cells.length) return `${cap(a)} and ${b} never committed in the same repository in the same week here, so there is no fair comparison yet.`
   const oa = outcome(sh.a)
   const ob = outcome(sh.b)
-  return `Where both worked (${sh.cells.length} repository-weeks): ${a} landed ${pct(oa.landed, oa.committed)}% and kept ${pct(oa.alive, oa.committed)}% of ${n(oa.committed)} lines; ${b} landed ${pct(ob.landed, ob.committed)}% and kept ${pct(ob.alive, ob.committed)}% of ${n(ob.committed)}.`
+  const cells = sh.cells.length === 1 ? 'one repository-week' : `${sh.cells.length} repository-weeks`
+  return `Where both worked (${cells}): ${a} landed ${pct(oa.landed, oa.committed)}% and kept ${pct(oa.alive, oa.committed)}% of ${n(oa.committed)} lines; ${b} landed ${pct(ob.landed, ob.committed)}% and kept ${pct(ob.alive, ob.committed)}% of ${n(ob.committed)}.`
 }
 
 function effortAnswer(s: Scoped): string | null {
   const printed = s.commits.filter((c) => c.by === 'printed' && c.effort)
-  const best = [...group(printed, (c) => c.model).entries()]
+  const byModel = group(printed, (c) => c.model)
+  const ranked = enoughOf(byModel)
+  const best = [...byModel.entries()]
+    .filter(([m]) => ranked.has(m))
     .map(([m, cs]) => {
       const levels = [...group(cs, (c) => c.effort as string).entries()].map(([e, xs]) => ({ e, o: outcome(xs) })).filter((x) => x.o.committed > 0)
       if (levels.length < 2) return null
@@ -132,7 +136,7 @@ function effortAnswer(s: Scoped): string | null {
     .filter((x): x is NonNullable<typeof x> => x != null)
     .sort((x, y) => y.gap - x.gap)[0]
   if (!best) return null
-  return `${best.m} at ${best.hi.e} effort kept ${pct(best.hi.o.alive, best.hi.o.committed)}% alive (${best.hi.o.commits} commits); at ${best.lo.e}, ${pct(best.lo.o.alive, best.lo.o.committed)}% (${best.lo.o.commits}). The two efforts ran in different weeks, so this is what happened, not yet a cause.`
+  return `${cap(best.m)} at ${best.hi.e} effort kept ${pct(best.hi.o.alive, best.hi.o.committed)}% alive (${best.hi.o.commits} commits); at ${best.lo.e}, ${pct(best.lo.o.alive, best.lo.o.committed)}% (${best.lo.o.commits}). The two efforts ran in different weeks, so this is what happened, not yet a cause.`
 }
 
 function contextAnswer(s: Scoped): string | null {

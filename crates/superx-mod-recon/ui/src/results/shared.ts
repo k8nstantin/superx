@@ -8,7 +8,7 @@ import type { FoundCommit, Week } from '../api'
 
 export const n = (v: number | null | undefined) => (v == null ? '—' : Math.round(v).toLocaleString('en-US'))
 export const pct = (a: number, b: number) => (b ? Math.round((100 * a) / b) : 0)
-export const kTok = (v: number) => (v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${Math.round(v / 1e3)}k` : String(Math.round(v)))
+export const kTok = (v: number) => (Math.round(v / 1e3) >= 1000 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${Math.round(v / 1e3)}k` : String(Math.round(v)))
 export const compact = (v: number) => (Math.abs(v) >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : Math.abs(v) >= 1e4 ? `${Math.round(v / 1e3)}k` : n(v))
 
 /// The Monday of `iso`'s week, UTC, as `2026-11-02`.
@@ -125,3 +125,14 @@ export function group<T>(rows: T[], key: (r: T) => string): Map<string, T[]> {
 }
 
 export const sum = <T,>(rows: T[], f: (r: T) => number) => rows.reduce((a, r) => a + f(r), 0)
+
+/// A model's name at the start of a sentence.
+export const cap = (m: string) => m.charAt(0).toUpperCase() + m.slice(1)
+
+/// The keys whose rows are at least as many as the middle key's: the ones
+/// with enough evidence to be ranked, by the data's own middle.
+export function enough<T>(groups: Map<string, T[]>): Set<string> {
+  const counts = [...groups.values()].map((v) => v.length).sort((a, b) => a - b)
+  const middle = quantile(counts, 0.5)
+  return new Set([...groups.entries()].filter(([, v]) => v.length >= middle).map(([k]) => k))
+}

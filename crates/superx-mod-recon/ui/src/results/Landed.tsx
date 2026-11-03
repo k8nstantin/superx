@@ -5,17 +5,16 @@ import { EChart, INK, type Clicked } from '../EChart'
 import { category, grid, legend, percent, PART_COLOUR, stacked, tip, value, zoom } from './charts'
 import { CommitRows, type Behind } from './Rows'
 import type { Scoped } from './scope'
-import { group, inPart, n, outcome, parts, partName, pct, weekLabel, weekOf, type Outcome, type Palette, type Part } from './shared'
+import { cap, enough, group, inPart, n, outcome, parts, partName, pct, weekLabel, weekOf, type Outcome, type Palette, type Part } from './shared'
 
 // Which model's work reached the main line, and is still there: each
 // model's committed lines split into what lives, what was replaced, what
 // may still land and what never did; then the same week by week.
 
-const cap = (m: string) => m.charAt(0).toUpperCase() + m.slice(1)
-
 export function landedAnswer(s: Scoped): string {
   const by = group(s.commits, (c) => c.model)
-  const rows = [...by.entries()].map(([m, cs]) => [m, outcome(cs)] as [string, Outcome]).filter(([, o]) => o.committed > 0)
+  const ranked = enough(by)
+  const rows = [...by.entries()].filter(([m]) => ranked.has(m)).map(([m, cs]) => [m, outcome(cs)] as [string, Outcome]).filter(([, o]) => o.committed > 0)
   if (!rows.length) return 'No credited commits in this view.'
   rows.sort((a, b) => b[1].landed / b[1].committed - a[1].landed / a[1].committed)
   const top = rows.slice(0, 5)

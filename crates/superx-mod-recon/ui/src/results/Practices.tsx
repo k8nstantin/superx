@@ -4,7 +4,7 @@ import type { FoundCommit } from '../api'
 import { category, grid, grouped, legend, percent, PART_COLOUR, stacked, tip, value, zoom } from './charts'
 import type { Behind } from './Rows'
 import type { Scoped } from './scope'
-import { group, kTok, n, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
+import { cap, enough, group, kTok, n, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
 
 // What the agents did before committing, against what became of the
 // commit: tests run since the session's previous commit, the thinking
@@ -12,8 +12,6 @@ import { group, kTok, n, outcome, pct, quantile, sum, weekLabel, weekOf, type Pa
 // subagent did it. Only a commit its session printed carries these.
 
 type Bucket = { label: string; commits: FoundCommit[] }
-
-const cap = (m: string) => m.charAt(0).toUpperCase() + m.slice(1)
 
 /// The models with most printed commits, most first.
 function leading(printed: FoundCommit[], pal: Palette): string[] {
@@ -25,20 +23,21 @@ export function practicesAnswer(s: Scoped, pal: Palette): string {
   const printed = s.commits.filter((c) => c.by === 'printed')
   if (!printed.length) return 'No commit in this view was printed by its session, so what came before it is unknown.'
   const tested = printed.filter((c) => c.tested).length
-  const lead = leading(printed, pal)
-  const effects = lead
+  const ranked = enough(group(printed, (c) => c.model))
+  const effects = leading(printed, pal)
+    .filter((m) => ranked.has(m))
     .map((m) => {
       const yes = outcome(printed.filter((c) => c.model === m && c.tested === true))
       const no = outcome(printed.filter((c) => c.model === m && c.tested === false))
-      return { m, yes, no, gap: pct(yes.alive, yes.committed) - pct(no.alive, no.committed) }
+      return { m, yes, no }
     })
     .filter((e) => e.yes.commits > 0 && e.no.commits > 0)
-    .sort((a, b) => Math.abs(b.gap) - Math.abs(a.gap))
-  const e = effects[0]
-  const lead_ = e
-    ? `${cap(e.m)}'s commits made after a test run kept ${pct(e.yes.alive, e.yes.committed)}% alive (${e.yes.commits} commits); without one, ${pct(e.no.alive, e.no.committed)}% (${e.no.commits}). `
-    : ''
-  return `${lead_}${n(tested)} of ${n(printed.length)} printed commits (${pct(tested, printed.length)}%) came after their session ran tests.`
+  const said = effects
+    .map((e) => `${cap(e.m)} ${pct(e.yes.alive, e.yes.committed)}% (${e.yes.commits} commits) against ${pct(e.no.alive, e.no.committed)}% (${e.no.commits})`)
+    .join('; ')
+  return `${n(tested)} of ${n(printed.length)} printed commits (${pct(tested, printed.length)}%) came after their session ran tests.${
+    said ? ` Lines still alive, tested first against not: ${said}.` : ''
+  }`
 }
 
 export function Practices({ s, pal, open }: { s: Scoped; pal: Palette; open: (b: Behind) => void }) {

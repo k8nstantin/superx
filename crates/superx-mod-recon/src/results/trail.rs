@@ -35,12 +35,17 @@ use crate::crawler::hosts::held::{record, row_key, time};
 use crate::params::Params;
 
 /// Where a working directory is: the repository of its own `directory`
-/// row, else that of the checkout whose top level holds it, the deepest.
+/// row, else that of the checkout whose top level holds it, the deepest;
+/// and, once folded, the repository a folder is a copy of.
 pub struct RepoMap {
     /// Each repository's name, by its row.
     pub names: HashMap<String, String>,
     exact: HashMap<String, String>,
     tops: Vec<(String, String)>,
+    canonical: HashMap<String, String>,
+    /// The folders read as another repository: a folder's name, the
+    /// repository's.
+    pub folders: Vec<(String, String)>,
 }
 
 impl RepoMap {
@@ -54,16 +59,38 @@ impl RepoMap {
         let mut tops: Vec<(String, String)> =
             checkouts.iter().filter_map(|c| Some((text(c, "toplevel")?, row_key(&record(c, "repository")?)))).collect();
         tops.sort_by_key(|(t, _)| std::cmp::Reverse(t.len()));
-        Self { names, exact, tops }
+        Self { names, exact, tops, canonical: HashMap::new(), folders: Vec::new() }
+    }
+
+    /// Reads each folder in `canonical` as the repository it names.
+    pub fn fold(&mut self, canonical: HashMap<String, String>) {
+        let mut folders: Vec<(String, String)> = canonical
+            .iter()
+            .filter(|(folder, repo)| folder != repo)
+            .map(|(folder, repo)| (self.name(Some(folder)), self.name(Some(repo))))
+            .collect();
+        folders.sort();
+        self.folders = folders;
+        self.canonical = canonical;
+    }
+
+    /// The repository a repository row is read as: itself, or the one its
+    /// folder is a copy of.
+    pub fn canon(&self, repo: &str) -> String {
+        self.canonical.get(repo).cloned().unwrap_or_else(|| repo.to_string())
     }
 
     pub fn repo_of(&self, cwd: &str) -> Option<String> {
-        self.exact.get(cwd).cloned().or_else(|| {
-            self.tops
-                .iter()
-                .find(|(t, _)| cwd == t || cwd.strip_prefix(t.as_str()).is_some_and(|rest| rest.starts_with('/')))
-                .map(|(_, r)| r.clone())
-        })
+        self.exact
+            .get(cwd)
+            .cloned()
+            .or_else(|| {
+                self.tops
+                    .iter()
+                    .find(|(t, _)| cwd == t || cwd.strip_prefix(t.as_str()).is_some_and(|rest| rest.starts_with('/')))
+                    .map(|(_, r)| r.clone())
+            })
+            .map(|r| self.canon(&r))
     }
 
     /// A repository's name; empty for none.
@@ -411,7 +438,48 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
     let repositories = every(db, "repository", "name").await?;
     let directories = every(db, "directory", "path, checkout.repository AS repository").await?;
     let checkouts = every(db, "checkout", "toplevel, repository").await?;
-    let map = RepoMap::new(&repositories, &directories, &checkouts);
+    let mut map = RepoMap::new(&repositories, &directories, &checkouts);
+    let host_rows = every(db, "host_repository", "host, path").await?;
+    let remote_rows = every(db, "remote_state", "repository, host, path").await?;
+    // Which repository each host repository is: the local repositories
+    // whose remotes name it, the one of its own name first. Every other
+    // folder whose remote names it (a clone, a build folder) is that
+    // repository: its work is done there, its commits are its commits.
+    let mut naming: HashMap<(String, String), BTreeSet<String>> = HashMap::new();
+    for r in &remote_rows {
+        if let (Some(repo), Some(host), Some(path)) = (record(r, "repository"), text(r, "host"), text(r, "path")) {
+            naming.entry((host, path)).or_default().insert(row_key(&repo));
+        }
+    }
+    let mut hosts: HashMap<String, (String, String)> = HashMap::new();
+    let mut local: HashMap<String, String> = HashMap::new();
+    for h in &host_rows {
+        let Some(id) = record(h, "id") else { continue };
+        let (host, path) = (text(h, "host").unwrap_or_default(), text(h, "path").unwrap_or_default());
+        let own = path.rsplit('/').next().unwrap_or_default().to_lowercase();
+        if let Some(repos) = naming.get(&(host.clone(), path.clone())) {
+            let named = repos.iter().find(|r| map.names.get(*r).is_some_and(|n| n.to_lowercase() == own));
+            if let Some(r) = named.or_else(|| repos.iter().next()) {
+                local.insert(row_key(&id), r.clone());
+            }
+        }
+        hosts.insert(row_key(&id), (host, path));
+    }
+    let mut canonical: HashMap<String, String> = HashMap::new();
+    for (key, repos) in &naming {
+        let Some(repo) = host_rows
+            .iter()
+            .find(|h| text(h, "host").as_ref() == Some(&key.0) && text(h, "path").as_ref() == Some(&key.1))
+            .and_then(|h| record(h, "id"))
+            .and_then(|id| local.get(&row_key(&id)))
+        else {
+            continue;
+        };
+        for folder in repos {
+            canonical.insert(folder.clone(), repo.clone());
+        }
+    }
+    map.fold(canonical);
     let session_rows = every(db, "session", "kernel_session, agent").await?;
     let place_rows = every(db, "session_place", "session, cwd, at").await?;
     let reply_rows = every(db, "reply", "session, at, model, effort, subagent").await?;
@@ -624,7 +692,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
     let mut identity: HashMap<String, String> = HashMap::new();
     for c in &crawls {
         if let (Some(repo), Some(who)) = (record(c, "repository"), text(c, "identity")) {
-            identity.entry(row_key(&repo)).or_insert(who);
+            identity.entry(map.canon(&row_key(&repo))).or_insert(who);
         }
     }
     let tied: HashMap<String, Tie> = owned(tie_rows)
@@ -647,7 +715,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
         .filter_map(|c| {
             let id = record(c, "id")?;
             let key = row_key(&id);
-            let repo = row_key(&record(c, "repository")?);
+            let repo = map.canon(&row_key(&record(c, "repository")?));
             let author = text(c, "author").unwrap_or_default();
             let (added, removed) = (int(c, "added"), int(c, "removed"));
             let tie = tied.get(&key);
@@ -780,6 +848,39 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
         c.alive = Some(c.alive.unwrap_or(0) + alive);
     }
 
+    // The same commit held by two folders of one repository is one commit:
+    // where it went from the copy that went furthest, who made it from the
+    // copy with the strongest evidence.
+    let rank = |c: &Commit| match c.place.as_deref() {
+        Some("mainline") => 4,
+        Some("in_flight") => 3,
+        Some("branch") => 2,
+        Some("recovered") => 1,
+        _ => 0,
+    };
+    let evidence = |c: &Commit| match c.by {
+        Some("printed") => 2,
+        Some("claim") => 1,
+        _ => 0,
+    };
+    let mut copies: BTreeMap<(String, String), Vec<Commit>> = BTreeMap::new();
+    for c in commits.drain(..) {
+        copies.entry((c.repo.clone(), c.hash.clone())).or_default().push(c);
+    }
+    for (_, mut held) in copies {
+        held.sort_by_key(|c| std::cmp::Reverse((rank(c), c.alive.unwrap_or(-1), c.landed)));
+        let strongest = held.iter().map(&evidence).max().unwrap_or(0);
+        let witness = held
+            .iter()
+            .find(|c| evidence(c) == strongest)
+            .map(|c| (c.family.clone(), c.by, c.session.clone(), c.reply, c.tied_at));
+        let mut one = held.swap_remove(0);
+        if let Some(w) = witness.filter(|_| evidence(&one) < strongest) {
+            (one.family, one.by, one.session, one.reply, one.tied_at) = w;
+        }
+        commits.push(one);
+    }
+
     // What a later commit reverted: git's own `Revert "<subject>"`.
     let mut by_subject: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for (i, c) in commits.iter().enumerate() {
@@ -831,8 +932,6 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
 
     // The hosts: which repository each host repository is, its pull
     // requests and their commits, its CI runs.
-    let host_rows = every(db, "host_repository", "host, path").await?;
-    let remote_rows = every(db, "remote_state", "repository, host, path").await?;
     let pull_rows = every(db, "pull_request", "host_repository, number, created_at, source_branch, target_branch, url").await?;
     let mut pull_states = every(
         db,
@@ -845,29 +944,6 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
     let mut ci_states = every(db, "ci_run_state", "ci_run, status, conclusion, completed_at, valid_from").await?;
     let move_rows = every(db, "ref_move", "repository, mirror, ref, at, old, new, identity, action").await?;
 
-    // Which repository each host repository is: the local repositories
-    // whose remotes name it, the one of its own name first, since a build
-    // folder cloned from it is another repository with the same remote.
-    let mut naming: HashMap<(String, String), BTreeSet<String>> = HashMap::new();
-    for r in &remote_rows {
-        if let (Some(repo), Some(host), Some(path)) = (record(r, "repository"), text(r, "host"), text(r, "path")) {
-            naming.entry((host, path)).or_default().insert(row_key(&repo));
-        }
-    }
-    let mut hosts: HashMap<String, (String, String)> = HashMap::new();
-    let mut local: HashMap<String, String> = HashMap::new();
-    for h in &host_rows {
-        let Some(id) = record(h, "id") else { continue };
-        let (host, path) = (text(h, "host").unwrap_or_default(), text(h, "path").unwrap_or_default());
-        let own = path.rsplit('/').next().unwrap_or_default().to_lowercase();
-        if let Some(repos) = naming.get(&(host.clone(), path.clone())) {
-            let named = repos.iter().find(|r| map.names.get(*r).is_some_and(|n| n.to_lowercase() == own));
-            if let Some(r) = named.or_else(|| repos.iter().next()) {
-                local.insert(row_key(&id), r.clone());
-            }
-        }
-        hosts.insert(row_key(&id), (host, path));
-    }
     pull_states.sort_by_key(|s| time(s, "valid_from"));
     let mut newest: HashMap<String, &Value> = HashMap::new();
     let mut first_merged: HashMap<String, DateTime<Utc>> = HashMap::new();
@@ -1031,7 +1107,7 @@ pub async fn load(db: &Db, params: &Params) -> Result<Trail> {
         .filter_map(|m| {
             let action = text(m, "action").unwrap_or_default();
             Some(Move {
-                repo: row_key(&record(m, "repository")?),
+                repo: map.canon(&row_key(&record(m, "repository")?)),
                 mirror: record(m, "mirror").is_some(),
                 git_ref: text(m, "ref").unwrap_or_default(),
                 at: time(m, "at")?,

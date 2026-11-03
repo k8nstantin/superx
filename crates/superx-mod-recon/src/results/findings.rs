@@ -145,6 +145,14 @@ pub struct Workflow {
     pub turned: i64,
 }
 
+/// A folder read as another repository: a clone or a build folder whose
+/// remote names that repository's host repository.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Folder {
+    pub folder: String,
+    pub repo: String,
+}
+
 /// The findings answer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Findings {
@@ -155,6 +163,7 @@ pub struct Findings {
     pub workflows: Vec<Workflow>,
     /// CI runs held, by kind.
     pub ci_kinds: BTreeMap<String, i64>,
+    pub folders: Vec<Folder>,
     pub computed_at: String,
 }
 
@@ -359,6 +368,7 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
         repo_weeks: repo_weeks.into_values().collect(),
         workflows: workflows.into_values().collect(),
         ci_kinds,
+        folders: trail.map.folders.iter().map(|(folder, repo)| Folder { folder: folder.clone(), repo: repo.clone() }).collect(),
         computed_at: Utc::now().to_rfc3339(),
     }
 }
