@@ -20,12 +20,16 @@ export type Gap = { title: string; detail: string; set?: { repo: string; ref: st
 const short = (ref: string) => ref.replace(/^refs\/remotes\/[^/]+\//, '').replace(/^refs\/heads\//, '')
 
 /// The done branch, read from merged pull requests: the branch most of a
-/// repository's merged pull requests went into, with how many did.
+/// repository's newest half of merged pull requests went into, with how many
+/// did, so a branch renamed long ago (master to main) no longer counts.
 export function mergedInto(f: Findings, repo: string): { branch: string; merged: number; of: number } | null {
-  const merged = f.pulls.filter((p) => p.repo === repo && p.merged && p.target_branch)
+  const merged = f.pulls
+    .filter((p) => p.repo === repo && p.merged && p.target_branch)
+    .sort((a, b) => (b.merged_at ?? b.created_at).localeCompare(a.merged_at ?? a.created_at))
   if (!merged.length) return null
-  const [branch, count] = [...group(merged, (p) => p.target_branch).entries()].map(([b, ps]) => [b, ps.length] as [string, number]).sort((a, b) => b[1] - a[1])[0]
-  return { branch, merged: count, of: merged.length }
+  const newest = merged.slice(0, Math.ceil(merged.length / 2))
+  const [branch, count] = [...group(newest, (p) => p.target_branch).entries()].map(([b, ps]) => [b, ps.length] as [string, number]).sort((a, b) => b[1] - a[1])[0]
+  return { branch, merged: count, of: newest.length }
 }
 
 export function gaps(f: Findings): Gap[] {
@@ -34,7 +38,7 @@ export function gaps(f: Findings): Gap[] {
     const into = mergedInto(f, m.repo)
     if (into && short(m.mainline) !== into.branch)
       out.push({
-        title: `${m.repo}: the crawler reads ${short(m.mainline)} as its main line, but ${n(into.merged)} of ${n(into.of)} merged pull requests went into ${into.branch}`,
+        title: `${m.repo}: the crawler reads ${short(m.mainline)} as its main line, but ${n(into.merged)} of its newest ${n(into.of)} merged pull requests went into ${into.branch}`,
         detail: `Done is merged: until the main line is ${into.branch}, work merged there counts as never landed.`,
         set: { repo: m.repo, ref: `origin/${into.branch}` },
       })
@@ -140,7 +144,7 @@ export function Gaps({ f }: { f: Findings }) {
               return (
                 <List.Item key={m.repo}>
                   <Text fz="sm" c={agrees ? undefined : 'yellow.5'}>
-                    {m.repo}: {short(m.mainline)} ({m.from.replace('_', ' ')}){into ? ` · ${n(into.merged)} of ${n(into.of)} merged pull requests went into ${into.branch}` : ' · no merged pull requests to check it against'}
+                    {m.repo}: {short(m.mainline)} ({m.from.replace('_', ' ')}){into ? ` · ${n(into.merged)} of its newest ${n(into.of)} merged pull requests went into ${into.branch}` : ' · no merged pull requests to check it against'}
                   </Text>
                 </List.Item>
               )
