@@ -46,7 +46,7 @@ export function Whole({ repo, hash }: { repo: string; hash: string }) {
         {c.effort ? ` · effort ${c.effort}` : ''}{c.context ? ` · ${n(c.context)} tokens of context` : ''}
       </Text>
       <Text fz="xs">
-        +{n(c.added)} −{n(c.removed)} · landed {n(c.landed)} · alive {n(c.alive)} · never landed {n(c.never_landed)}
+        +{n(c.added)} −{n(c.removed)} · landed {n(c.landed)} · alive {n(c.alive)} · {c.in_flight ? `in flight ${n(c.added - c.landed)}` : `never landed ${n(c.never_landed)}`}
         {c.reverted ? ' · reverted later' : ''}
       </Text>
       {c.checks.length > 0 && (
