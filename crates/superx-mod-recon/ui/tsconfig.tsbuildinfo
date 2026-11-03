@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/echart.tsx","./src/api.ts","./src/main.tsx","./src/panels/params.tsx","./src/panels/stats.tsx"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/echart.tsx","./src/api.ts","./src/main.tsx","./src/time.ts","./src/panels/now.tsx","./src/panels/params.tsx","./src/panels/repos.tsx","./src/panels/stats.tsx"],"version":"5.9.3"}

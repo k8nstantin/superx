@@ -24,6 +24,7 @@
 
 pub mod hosts;
 pub mod lines;
+pub mod progress;
 pub mod repos;
 pub mod store;
 pub mod value;
@@ -195,13 +196,15 @@ pub struct Places {
 }
 
 /// What the crawler keeps from one pass to the next: its connection to its
-/// own database, where its own things are, and each source's memory.
+/// own database, where its own things are, each source's memory, and what
+/// it is doing this second ([`progress`]), which the tab reads.
 #[derive(Default)]
 pub struct Crawler {
     db: Option<Db>,
     places: Places,
     lines: lines::Memory,
     repos: repos::Memory,
+    progress: progress::Progress,
 }
 
 impl Crawler {
@@ -210,6 +213,18 @@ impl Crawler {
     pub fn new(places: Places) -> Self {
         Self { places, ..Self::default() }
     }
+
+    /// The crawler reporting what it does to `progress`.
+    #[must_use]
+    pub fn reporting_to(self, progress: progress::Progress) -> Self {
+        Self { progress, ..self }
+    }
+
+    /// What it is doing this second.
+    #[must_use]
+    pub fn progress(&self) -> &progress::Progress {
+        &self.progress
+    }
 }
 
 /// Pass after pass, until asked to stop: one right away, then one every
@@ -217,12 +232,13 @@ impl Crawler {
 /// Nothing is read while it is 0, or while the module's database is not
 /// provisioned; both are looked at again a minute later.
 pub async fn run(kernel: Kernel, stop: Stop) {
-    run_in(kernel, Places::default(), stop).await;
+    run_in(kernel, Places::default(), progress::Progress::default(), stop).await;
 }
 
-/// [`run`], the crawler finding its own things at `places`.
-pub async fn run_in(kernel: Kernel, places: Places, mut stop: Stop) {
-    let mut crawler = Crawler::new(places);
+/// [`run`], the crawler finding its own things at `places` and reporting
+/// what it does to `progress`.
+pub async fn run_in(kernel: Kernel, places: Places, progress: progress::Progress, mut stop: Stop) {
+    let mut crawler = Crawler::new(places).reporting_to(progress);
     loop {
         let wait_secs = match params::resolve(&kernel).await {
             Err(e) => {
@@ -295,7 +311,7 @@ pub async fn pass(kernel: &Kernel, params: &Params, crawler: &mut Crawler, stop:
     };
     let result = passes(kernel, &db, params, crawler, stop).await;
     if result.is_err() {
-        *crawler = Crawler::new(crawler.places.clone());
+        *crawler = Crawler::new(crawler.places.clone()).reporting_to(crawler.progress.clone());
     }
     result
 }
@@ -325,6 +341,7 @@ async fn passes(
     stop: &mut Stop,
 ) -> superx_kernel::Result<Pass> {
     let started_at = Utc::now();
+    crawler.progress.pass_started(started_at);
     let mut sources = Vec::new();
     // `lines` first: the logs report a change first, and `repos` follows
     // them to the repositories they were written in.
@@ -335,11 +352,13 @@ async fn passes(
             (failed(lines::SOURCE, &e), BTreeSet::new())
         }
     };
+    crawler.progress.lines_read(lines.items, lines.counts.get("lines_held").copied().unwrap_or(0));
     let stopped = lines.outcome == Outcome::Stopped;
     sources.push(lines);
     if !stopped {
         // `repos`, its workers crawling `hosts` beside it.
-        match repos::crawl(db, params, &crawler.places, &mut crawler.repos, &worked_in, started_at, stop).await {
+        let progress = &crawler.progress;
+        match repos::crawl(db, params, &crawler.places, &mut crawler.repos, &worked_in, started_at, progress, stop).await {
             Ok(crawled) => {
                 sources.push(crawled.repos);
                 sources.push(crawled.hosts);
@@ -370,7 +389,10 @@ async fn passes(
         outcome,
         note: (!note.is_empty()).then(|| note.join("; ")),
     };
-    record(db, &pass).await?;
+    crawler.progress.recording();
+    let recorded = record(db, &pass).await;
+    crawler.progress.pass_ended(pass.outcome, pass.rows_written, pass.finished_at);
+    recorded?;
     Ok(pass)
 }
 

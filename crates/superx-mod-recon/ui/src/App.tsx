@@ -1,4 +1,6 @@
 import { Container, Stack, Text, Title } from '@mantine/core'
+import { Now } from './panels/Now'
+import { Repos } from './panels/Repos'
 import { Stats } from './panels/Stats'
 import { Params } from './panels/Params'
 
@@ -11,9 +13,11 @@ export default function App() {
         <Stack gap={2}>
           <Title order={2}>Recon</Title>
           <Text c="dimmed" size="sm">
-            The crawler: what it did, day by day, and the parameters it runs on.
+            The crawler: what it is doing now, each repository as its last crawl left it, what it did day by day, and the parameters it runs on.
           </Text>
         </Stack>
+        <Now />
+        <Repos />
         <Stats />
         <Params />
       </Stack>

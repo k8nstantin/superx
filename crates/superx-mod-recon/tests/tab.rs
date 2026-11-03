@@ -10,7 +10,8 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use common::*;
 use superx_kernel::types::Value;
-use superx_mod_recon::api::{days, Day, WRITE_HEADER};
+use superx_mod_recon::api::{days, repositories, Day, WRITE_HEADER};
+use superx_mod_recon::crawler::progress::{Progress, STEPS};
 use superx_mod_recon::crawler::Crawler;
 use superx_mod_recon::instance::Instance;
 use superx_mod_recon::params::{
@@ -22,6 +23,11 @@ use tower::ServiceExt as _;
 const PORT: u16 = 5152;
 
 fn app(kernel: &superx_kernel::Kernel) -> axum::Router {
+    reporting(kernel, Progress::default())
+}
+
+/// The module's routes, the crawler reporting to `progress`.
+fn reporting(kernel: &superx_kernel::Kernel, progress: Progress) -> axum::Router {
     let home = scratch();
     let instance = Instance {
         home: home.clone(),
@@ -31,7 +37,7 @@ fn app(kernel: &superx_kernel::Kernel) -> axum::Router {
         data_dir: home.join("db"),
         log_filter: "info".to_string(),
     };
-    server::app(kernel.clone(), instance, PORT)
+    server::app(kernel.clone(), instance, PORT, progress)
 }
 
 /// One request to the module's routes, addressed to it by `host`: the status
@@ -201,4 +207,88 @@ async fn a_change_without_the_write_header_to_a_name_that_is_no_parameter_or_of_
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let resolved = params::resolve(&kernel).await.expect("resolves");
     assert!(resolved.settings.iter().all(|s| !s.set), "nothing written: {:?}", resolved.settings);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn now_follows_the_pass_each_repository_waiting_running_and_done_with_every_git_call_its_crawl_made_and_keeps_it_as_the_last_pass() {
+    let kernel = kernel().await;
+    let db = own_db().await;
+    let root = scratch();
+    let dir = root.join("work");
+    repo(&dir);
+    commit(&dir, &[("a.txt", "one\ntwo\n")], "first");
+    commit(&dir, &[("a.txt", "one\nTWO\n")], "second");
+    let progress = Progress::default();
+    let app = reporting(&kernel, progress.clone());
+    let (status, body) = ask(&app, &own(), "GET", "/api/now", false, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).expect("json"), serde_json::json!({ "pass": null, "last": null, "last_crawl": null }), "nothing ran yet");
+
+    let mut crawler = Crawler::default().reporting_to(progress.clone());
+    let done = pass(&kernel, &db, &params(&[(INCLUDE_PARAM, strings(&[&dir]))]), &mut crawler).await;
+    let (status, body) = ask(&app, &own(), "GET", "/api/now", false, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let now: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(now["pass"].is_null(), "nothing runs once it ended: {now}");
+    let last = &now["last"];
+    assert_eq!((last["phase"].as_str(), last["outcome"].as_str(), last["rows"].as_i64()), (Some("done"), Some(done.outcome), Some(done.rows_written)), "{last}");
+    let lines = done.source("lines").expect("the lines source");
+    assert_eq!(last["lines_read"].as_i64(), Some(lines.items));
+    let crawl = rows(&db, "SELECT git_calls, git_failed, outcome FROM crawl").await;
+    assert_eq!(crawl.len(), 1, "{crawl:?}");
+    let repos = last["repos"].as_array().expect("its repositories");
+    assert_eq!(repos.len(), 1, "{last}");
+    let r = &repos[0];
+    assert_eq!((r["state"].as_str(), r["step"].as_str(), r["step_index"].as_u64(), r["steps"].as_u64()), (Some("done"), Some("done"), Some(11), Some(STEPS.len() as u64)));
+    assert_eq!(
+        (r["git_calls"].as_i64(), r["git_failed"].as_i64(), r["outcome"].as_str().map(str::to_string)),
+        (int(&crawl[0], "git_calls"), int(&crawl[0], "git_failed"), text(&crawl[0], "outcome")),
+        "every git call the crawl made, reported as it was made: {r}"
+    );
+    assert_eq!(r["common_dir"].as_str(), Some(dir.join(".git").to_string_lossy().as_ref()));
+    assert_eq!(now["last_crawl"], now["last"], "the pass crawled a repository: it is the last crawl too");
+    std::fs::remove_dir_all(&root).expect("clean up");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_repository_shows_its_crawls_its_last_crawl_as_its_row_holds_it_its_last_complete_one_and_the_commits_held() {
+    let kernel = kernel().await;
+    let db = own_db().await;
+    let root = scratch();
+    let dir = root.join("work");
+    repo(&dir);
+    commit(&dir, &[("a.txt", "one\n")], "first");
+    let p = params(&[(INCLUDE_PARAM, strings(&[&dir])), (CRAWL_SECS_PARAM, number(1))]);
+    let mut crawler = Crawler::default();
+    pass(&kernel, &db, &p, &mut crawler).await;
+    commit(&dir, &[("b.txt", "two\n")], "second");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    pass(&kernel, &db, &p, &mut crawler).await;
+
+    let read = repositories(&db).await.expect("repositories");
+    assert_eq!(read.len(), 1, "{read:?}");
+    let r = &read[0];
+    let crawls = rows(&db, "SELECT started_at, outcome, commits_read, commits_new, git_calls, rows_written FROM crawl").await;
+    assert_eq!(r.crawls, i64::try_from(crawls.len()).expect("a count"));
+    assert!(r.crawls >= 2, "{r:?}");
+    let newest = crawls
+        .iter()
+        .max_by_key(|c| match field(c, "started_at") {
+            Some(Value::Datetime(d)) => chrono::DateTime::<chrono::Utc>::from(*d),
+            _ => panic!("a time"),
+        })
+        .expect("a crawl");
+    let last = r.last.as_ref().expect("its last crawl");
+    assert_eq!(
+        (Some(last.outcome.clone()), Some(last.commits_read), Some(last.commits_new), Some(last.git_calls), Some(last.rows_written)),
+        (text(newest, "outcome"), int(newest, "commits_read"), int(newest, "commits_new"), int(newest, "git_calls"), int(newest, "rows_written")),
+        "the newest crawl, as its row holds it"
+    );
+    assert_eq!(r.commits_held, count(&db, "commit").await, "every commit held of it");
+    assert_eq!(r.commits_held, 2);
+    assert_eq!(r.name, "work");
+    if last.outcome == "complete" {
+        assert_eq!(r.last_complete, Some(last.started_at));
+    }
+    std::fs::remove_dir_all(&root).expect("clean up");
 }
