@@ -2033,6 +2033,60 @@ async fn range_walk_pages_without_losing_or_repeating_rows() {
     assert!(!s.truncated);
 }
 
+/// A page of a thousand whole rows passed the SurrealDB client's 64 MiB
+/// message limit on 2026-11-04: the client dropped the daemon's one
+/// socket, and capture's query in flight failed with the page's (#568).
+/// The walk reads each page's ids and line lengths first, then the rows
+/// in batches under a budget, without the line's text or the parts of a
+/// tool's structured result the stats never read; whatever the budget,
+/// the rows and their order are the walk's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn range_walk_reads_its_rows_in_batches_under_a_budget_without_what_the_stats_never_read() {
+    use superx_mod_ui::stats::{walk_messages, walk_messages_in};
+    let kernel = fresh_kernel().await;
+    let (agent, session) = seed_agent_and_session(&kernel, "claude_code", "batches").await;
+    for i in 0..5 {
+        log_tool_message(&kernel, &session, &agent, serde_json::json!({"seq": i, "message": {"content": []}})).await;
+    }
+    // A line kept as capture keeps it now: its text beside its parsed
+    // copy, an edit's structured result holding the whole file it began
+    // from, a command's output and a read's file.
+    kernel
+        .db()
+        .query(
+            "CREATE message SET session = $s, agent = $a, role = 'user', content = 'edited', \
+             valid_from = time::now() + 1m, raw_text = '{\"toolUseResult\":{}}', \
+             raw = { toolUseResult: { type: 'update', interrupted: false, \
+                     structuredPatch: [{ lines: ['+a', '-b'] }], originalFile: 'THE WHOLE FILE', \
+                     stdout: 'OUT', stderr: '', file: { content: 'READ' } } };",
+        )
+        .bind(("s", session.clone()))
+        .bind(("a", agent.clone()))
+        .await
+        .expect("seed")
+        .check()
+        .expect("ok");
+
+    let whole = walk_messages(&kernel, None, 100, 3).await.expect("walk");
+    let alone = walk_messages_in(&kernel, None, 100, 3, 1).await.expect("walk");
+    let ids = |rows: &[superx_kernel::MessageRecord]| -> Vec<String> {
+        rows.iter().map(|m| superx_ops::record_uuid(&m.id)).collect()
+    };
+    assert_eq!(whole.len(), 6, "five logged and the edit, each once");
+    assert_eq!(ids(&alone), ids(&whole), "the same rows in the same order, each read on its own");
+
+    let structured = match whole[0].raw.as_ref().and_then(|r| r.get("toolUseResult")) {
+        Some(superx_kernel::types::Value::Object(o)) => o.clone(),
+        other => panic!("the newest row is the edit, its structured result kept: {other:?}"),
+    };
+    for kept in ["structuredPatch", "type", "interrupted"] {
+        assert!(structured.get(kept).is_some(), "{kept}: the stats read it, and it is read");
+    }
+    for left in ["originalFile", "file", "stdout", "stderr"] {
+        assert!(structured.get(left).is_none(), "{left}: the stats never read it, and it is not fetched");
+    }
+}
+
 /// An agent that reads through the shell is reading. `cat | head` is
 /// a read with a path; `sed -i` is not a read; `echo` is nothing; and a
 /// chain that ends in `cargo test` is a verification (#367).
