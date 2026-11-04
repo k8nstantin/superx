@@ -93,7 +93,13 @@ async fn get(kernel: &Kernel, instance: &Instance, path: &str, host: Option<&str
     if let Some(host) = host {
         request = request.header(axum::http::header::HOST, host);
     }
-    let r = server::app(kernel.clone(), instance.clone(), PORT, superx_mod_recon::crawler::progress::Progress::default())
+    let r = server::app(
+        kernel.clone(),
+        instance.clone(),
+        PORT,
+        superx_mod_recon::crawler::progress::Progress::default(),
+        superx_mod_recon::watcher::Watched::default(),
+    )
         .oneshot(request.body(axum::body::Body::empty()).expect("request"))
         .await
         .expect("response");

@@ -127,6 +127,123 @@ const DEFAULT_ESCALATION_WORDS: &[&str] = &["fuck", "shit", "wtf", "damn", "usel
 pub const SNAPSHOT_WORDS_PARAM: &str = "attr_recon_snapshot_words";
 const DEFAULT_SNAPSHOT_WORDS: &[&str] = &["savepoint", "not for merge"];
 
+/// How often the watcher reads the newest lines, in seconds; 0 pauses it
+/// (#566).
+pub const WATCH_SECS_PARAM: &str = "attr_recon_watch_secs";
+const DEFAULT_WATCH_SECS: u64 = 5; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_secs
+
+/// Sessions the watcher holds at once, the most recently active kept: no
+/// limit until the operator sets one (#566).
+pub const WATCH_SESSIONS_PARAM: &str = "attr_recon_watch_sessions";
+const DEFAULT_WATCH_SESSIONS: u64 = ALL;
+
+/// How far back each session is kept, and read back at a start, in seconds
+/// (#566).
+pub const WATCH_WINDOW_SECS_PARAM: &str = "attr_recon_watch_window_secs";
+const DEFAULT_WATCH_WINDOW_SECS: u64 = 21_600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_window_secs
+
+/// Seconds an agent may call tools with no word to the operator, or stall
+/// mid-turn, before the watcher reports it; and the calls it must have made
+/// in that time to be quiet (#566).
+pub const WATCH_QUIET_SECS_PARAM: &str = "attr_recon_watch_quiet_secs";
+const DEFAULT_WATCH_QUIET_SECS: u64 = 600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_quiet_secs
+pub const WATCH_QUIET_CALLS_PARAM: &str = "attr_recon_watch_quiet_calls";
+const DEFAULT_WATCH_QUIET_CALLS: u64 = 10; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_quiet_calls
+
+/// Seconds after a turn ended with a background job running, and nothing
+/// said since, before the watcher reports it (#566).
+pub const WATCH_BEHIND_SECS_PARAM: &str = "attr_recon_watch_behind_secs";
+const DEFAULT_WATCH_BEHIND_SECS: u64 = 300; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_behind_secs
+
+/// A run on its own since the operator's last message that the watcher
+/// names: this long, in seconds, and this many tool calls (#566).
+pub const WATCH_RUN_SECS_PARAM: &str = "attr_recon_watch_run_secs";
+const DEFAULT_WATCH_RUN_SECS: u64 = 600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_run_secs
+pub const WATCH_RUN_CALLS_PARAM: &str = "attr_recon_watch_run_calls";
+const DEFAULT_WATCH_RUN_CALLS: u64 = 20; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_run_calls
+
+/// Tool calls after the operator's stop, before a word, at which the watcher
+/// reports it (#566).
+pub const WATCH_STOP_CALLS_PARAM: &str = "attr_recon_watch_stop_calls";
+const DEFAULT_WATCH_STOP_CALLS: u64 = 2; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_stop_calls
+
+/// The operator saying the same thing again: within this many seconds,
+/// sharing this percentage of the shorter message's words, the shorter one
+/// having this many words at least (#566).
+pub const WATCH_REPEAT_SECS_PARAM: &str = "attr_recon_watch_repeat_secs";
+const DEFAULT_WATCH_REPEAT_SECS: u64 = 600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_repeat_secs
+pub const WATCH_REPEAT_SHARE_PARAM: &str = "attr_recon_watch_repeat_share";
+const DEFAULT_WATCH_REPEAT_SHARE: u64 = 75; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_repeat_share
+pub const WATCH_ORDER_WORDS_PARAM: &str = "attr_recon_watch_order_words";
+const DEFAULT_WATCH_ORDER_WORDS: u64 = 3; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_order_words
+
+/// The operator's newest messages read for frustration: the watcher reports
+/// it when more than half escalate (#566).
+pub const WATCH_MOOD_PROMPTS_PARAM: &str = "attr_recon_watch_mood_prompts";
+const DEFAULT_WATCH_MOOD_PROMPTS: u64 = 5; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_mood_prompts
+
+/// Tool calls failing in a row at which the watcher says the agent
+/// struggles (#566).
+pub const WATCH_FAILURES_PARAM: &str = "attr_recon_watch_failures";
+const DEFAULT_WATCH_FAILURES: u64 = 3; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_failures
+
+/// Words in the operator's message that stop the agent (#566); an
+/// interrupt stops it without words.
+pub const STOP_WORDS_PARAM: &str = "attr_recon_stop_words";
+const DEFAULT_STOP_WORDS: &[&str] = &["stop", "halt", "enough"];
+
+/// Words or phrases in the operator's message that ask for status (#566).
+pub const STATUS_WORDS_PARAM: &str = "attr_recon_status_words";
+const DEFAULT_STATUS_WORDS: &[&str] =
+    &["status", "what is going on", "what's going on", "whats going on", "what's up", "whats up", "eta", "where are we"];
+
+/// Words a message starts with when it is a question (#566); one ending in
+/// `?` is one too.
+pub const QUESTION_WORDS_PARAM: &str = "attr_recon_question_words";
+const DEFAULT_QUESTION_WORDS: &[&str] =
+    &["what", "why", "how", "when", "where", "who", "which", "is", "are", "was", "were", "does", "did", "should"];
+
+/// Words or phrases a message starts with when it approves what the agent
+/// proposed (#566).
+pub const YES_WORDS_PARAM: &str = "attr_recon_yes_words";
+const DEFAULT_YES_WORDS: &[&str] = &["yes", "approved", "approve", "go", "ok", "okay", "proceed", "do it", "sure"];
+
+/// Words or phrases in the agent's words that announce work the orders did
+/// not say (#566).
+pub const WATCH_SCOPE_WORDS_PARAM: &str = "attr_recon_watch_scope_words";
+const DEFAULT_WATCH_SCOPE_WORDS: &[&str] =
+    &["review", "rehearsal", "rehearse", "rerun", "re-run", "regenerate", "rewrite", "from scratch", "refactor"];
+
+/// Words or phrases in the agent's words that make a long estimate (#566).
+pub const WATCH_LONG_WORDS_PARAM: &str = "attr_recon_watch_long_words";
+const DEFAULT_WATCH_LONG_WORDS: &[&str] = &["hours", "an hour", "overnight"];
+
+/// Where task files live: a session whose message names one is held to it
+/// (#566).
+pub const WATCH_SPEC_PATHS_PARAM: &str = "attr_recon_watch_spec_paths";
+const DEFAULT_WATCH_SPEC_PATHS: &[&str] = &["kn-specs/tasks/", "specs/recon/tasks/"];
+
+/// Actions beyond the session, each a pattern found in a call's tool or in
+/// what it was called on, with the words an order must say for it (#566).
+pub const WATCH_EFFECTS_PARAM: &str = "attr_recon_watch_effects";
+const DEFAULT_WATCH_EFFECTS: &[(&str, &[&str])] = &[
+    ("CommentToJira", &["jira", "comment"]),
+    ("createJiraIssue", &["jira", "ticket", "issue"]),
+    ("deploy", &["deploy"]),
+    ("editJiraIssue", &["jira"]),
+    ("gh pr create", &["pr", "pull request"]),
+    ("gh pr merge", &["merge"]),
+    ("git branch -D", &["delete", "branch"]),
+    ("git commit", &["commit", "commits", "committed"]),
+    ("git merge", &["merge", "merged"]),
+    ("git push", &["push", "pushed", "pr", "pull request", "merge"]),
+    ("git push --force", &["force"]),
+    ("git rebase", &["rebase"]),
+    ("git reset", &["reset"]),
+    ("rm -rf", &["delete", "remove", "drop", "clean"]),
+    ("transitionJiraIssue", &["jira"]),
+];
+
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -152,6 +269,28 @@ pub struct Params {
     pub correction_words: Vec<String>,
     pub escalation_words: Vec<String>,
     pub snapshot_words: Vec<String>,
+    pub watch_secs: u64,
+    pub watch_sessions: u64,
+    pub watch_window_secs: u64,
+    pub watch_quiet_secs: u64,
+    pub watch_quiet_calls: u64,
+    pub watch_behind_secs: u64,
+    pub watch_run_secs: u64,
+    pub watch_run_calls: u64,
+    pub watch_stop_calls: u64,
+    pub watch_repeat_secs: u64,
+    pub watch_repeat_share: u64,
+    pub watch_order_words: u64,
+    pub watch_mood_prompts: u64,
+    pub watch_failures: u64,
+    pub stop_words: Vec<String>,
+    pub status_words: Vec<String>,
+    pub question_words: Vec<String>,
+    pub yes_words: Vec<String>,
+    pub watch_scope_words: Vec<String>,
+    pub watch_long_words: Vec<String>,
+    pub watch_spec_paths: Vec<String>,
+    pub watch_effects: BTreeMap<String, Vec<String>>,
 }
 
 impl Params {
@@ -205,7 +344,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 22] = [
+pub const NAMES: [&str; 44] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -228,12 +367,35 @@ pub const NAMES: [&str; 22] = [
     CORRECTION_WORDS_PARAM,
     ESCALATION_WORDS_PARAM,
     SNAPSHOT_WORDS_PARAM,
+    WATCH_SECS_PARAM,
+    WATCH_SESSIONS_PARAM,
+    WATCH_WINDOW_SECS_PARAM,
+    WATCH_QUIET_SECS_PARAM,
+    WATCH_QUIET_CALLS_PARAM,
+    WATCH_BEHIND_SECS_PARAM,
+    WATCH_RUN_SECS_PARAM,
+    WATCH_RUN_CALLS_PARAM,
+    WATCH_STOP_CALLS_PARAM,
+    WATCH_REPEAT_SECS_PARAM,
+    WATCH_REPEAT_SHARE_PARAM,
+    WATCH_ORDER_WORDS_PARAM,
+    WATCH_MOOD_PROMPTS_PARAM,
+    WATCH_FAILURES_PARAM,
+    STOP_WORDS_PARAM,
+    STATUS_WORDS_PARAM,
+    QUESTION_WORDS_PARAM,
+    YES_WORDS_PARAM,
+    WATCH_SCOPE_WORDS_PARAM,
+    WATCH_LONG_WORDS_PARAM,
+    WATCH_SPEC_PATHS_PARAM,
+    WATCH_EFFECTS_PARAM,
 ];
 
 /// What a parameter is for, as the tab shows it (#539): when the crawler
-/// runs, where it looks, how much it does at once, and where it listens;
-/// and the input a value is typed into: `number`, `number or all`, `list`
-/// or `refs`.
+/// runs, where it looks, how much it does at once, where it listens, what
+/// the measures use and how the watcher watches (#566); and the input a
+/// value is typed into: `number`, `number or all`, `list`, `refs` or
+/// `pairs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct About {
     pub group: &'static str,
@@ -267,6 +429,48 @@ pub fn about(name: &str) -> Option<About> {
         CORRECTION_WORDS_PARAM => ("measures", "list", "Whole words in your prompt that correct the agent."),
         ESCALATION_WORDS_PARAM => ("measures", "list", "Words in your prompt, at a word's start, that escalate."),
         SNAPSHOT_WORDS_PARAM => ("measures", "list", "Words in a commit's subject that make it a snapshot, not work: it counts nowhere."),
+        WATCH_SECS_PARAM => ("watches", "number", "How often the watcher reads the newest lines, in seconds; 0 pauses it."),
+        WATCH_SESSIONS_PARAM => ("watches", "number or all", "Sessions the watcher holds at once, the most recently active kept."),
+        WATCH_WINDOW_SECS_PARAM => ("watches", "number", "How far back each session is kept, and read back at a start, in seconds."),
+        WATCH_QUIET_SECS_PARAM => (
+            "watches",
+            "number",
+            "Seconds an agent may call tools with no word to you, or stall mid-turn, before the watcher reports it.",
+        ),
+        WATCH_QUIET_CALLS_PARAM => ("watches", "number", "Tool calls it must have made in that time for the watcher to report it quiet."),
+        WATCH_BEHIND_SECS_PARAM => (
+            "watches",
+            "number",
+            "Seconds after a turn ended with a background job running, and nothing said since, before the watcher reports it.",
+        ),
+        WATCH_RUN_SECS_PARAM => (
+            "watches",
+            "number",
+            "Seconds an agent may run on its own since your last message before the watcher names the run.",
+        ),
+        WATCH_RUN_CALLS_PARAM => ("watches", "number", "Tool calls a run must have made for the watcher to name it."),
+        WATCH_STOP_CALLS_PARAM => ("watches", "number", "Tool calls after your stop, before a word, at which the watcher reports it."),
+        WATCH_REPEAT_SECS_PARAM => ("watches", "number", "Seconds within which saying the same thing again is a repeated order."),
+        WATCH_REPEAT_SHARE_PARAM => ("watches", "number", "Percent of the shorter message's words two messages share to be the same order."),
+        WATCH_ORDER_WORDS_PARAM => ("watches", "number", "The fewest words the shorter of two messages has for them to be the same order."),
+        WATCH_MOOD_PROMPTS_PARAM => (
+            "watches",
+            "number",
+            "Your newest messages read for frustration: the watcher reports it when more than half escalate.",
+        ),
+        WATCH_FAILURES_PARAM => ("watches", "number", "Tool calls failing in a row at which the watcher says the agent struggles."),
+        STOP_WORDS_PARAM => ("watches", "list", "Words in your message that stop the agent; an interrupt stops it without words."),
+        STATUS_WORDS_PARAM => ("watches", "list", "Words or phrases in your message that ask for status."),
+        QUESTION_WORDS_PARAM => ("watches", "list", "Words your message starts with when it is a question; one ending in ? is one too."),
+        YES_WORDS_PARAM => ("watches", "list", "Words or phrases your message starts with when it approves what the agent proposed."),
+        WATCH_SCOPE_WORDS_PARAM => ("watches", "list", "Words or phrases in the agent's words that announce work your orders did not say."),
+        WATCH_LONG_WORDS_PARAM => ("watches", "list", "Words or phrases in the agent's words that make a long estimate."),
+        WATCH_SPEC_PATHS_PARAM => ("watches", "list", "Where task files live: a session whose message names one is held to it."),
+        WATCH_EFFECTS_PARAM => (
+            "watches",
+            "pairs",
+            "Actions beyond the session, each a pattern found in a call's tool or in what it was called on, with the words an order must say for it.",
+        ),
         _ => return None,
     };
     Some(About { group, decides, input })
@@ -326,6 +530,28 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         correction_words: r.strings(CORRECTION_WORDS_PARAM, DEFAULT_CORRECTION_WORDS),
         escalation_words: r.strings(ESCALATION_WORDS_PARAM, DEFAULT_ESCALATION_WORDS),
         snapshot_words: r.strings(SNAPSHOT_WORDS_PARAM, DEFAULT_SNAPSHOT_WORDS),
+        watch_secs: r.count(WATCH_SECS_PARAM, 0, DEFAULT_WATCH_SECS),
+        watch_sessions: r.at_once(WATCH_SESSIONS_PARAM, DEFAULT_WATCH_SESSIONS),
+        watch_window_secs: r.count(WATCH_WINDOW_SECS_PARAM, 1, DEFAULT_WATCH_WINDOW_SECS),
+        watch_quiet_secs: r.count(WATCH_QUIET_SECS_PARAM, 1, DEFAULT_WATCH_QUIET_SECS),
+        watch_quiet_calls: r.count(WATCH_QUIET_CALLS_PARAM, 1, DEFAULT_WATCH_QUIET_CALLS),
+        watch_behind_secs: r.count(WATCH_BEHIND_SECS_PARAM, 1, DEFAULT_WATCH_BEHIND_SECS),
+        watch_run_secs: r.count(WATCH_RUN_SECS_PARAM, 1, DEFAULT_WATCH_RUN_SECS),
+        watch_run_calls: r.count(WATCH_RUN_CALLS_PARAM, 1, DEFAULT_WATCH_RUN_CALLS),
+        watch_stop_calls: r.count(WATCH_STOP_CALLS_PARAM, 1, DEFAULT_WATCH_STOP_CALLS),
+        watch_repeat_secs: r.count(WATCH_REPEAT_SECS_PARAM, 1, DEFAULT_WATCH_REPEAT_SECS),
+        watch_repeat_share: r.count(WATCH_REPEAT_SHARE_PARAM, 1, DEFAULT_WATCH_REPEAT_SHARE),
+        watch_order_words: r.count(WATCH_ORDER_WORDS_PARAM, 1, DEFAULT_WATCH_ORDER_WORDS),
+        watch_mood_prompts: r.count(WATCH_MOOD_PROMPTS_PARAM, 1, DEFAULT_WATCH_MOOD_PROMPTS),
+        watch_failures: r.count(WATCH_FAILURES_PARAM, 1, DEFAULT_WATCH_FAILURES),
+        stop_words: r.strings(STOP_WORDS_PARAM, DEFAULT_STOP_WORDS),
+        status_words: r.strings(STATUS_WORDS_PARAM, DEFAULT_STATUS_WORDS),
+        question_words: r.strings(QUESTION_WORDS_PARAM, DEFAULT_QUESTION_WORDS),
+        yes_words: r.strings(YES_WORDS_PARAM, DEFAULT_YES_WORDS),
+        watch_scope_words: r.strings(WATCH_SCOPE_WORDS_PARAM, DEFAULT_WATCH_SCOPE_WORDS),
+        watch_long_words: r.strings(WATCH_LONG_WORDS_PARAM, DEFAULT_WATCH_LONG_WORDS),
+        watch_spec_paths: r.strings(WATCH_SPEC_PATHS_PARAM, DEFAULT_WATCH_SPEC_PATHS),
+        watch_effects: r.pairs(WATCH_EFFECTS_PARAM, DEFAULT_WATCH_EFFECTS),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -444,6 +670,41 @@ impl Resolver<'_> {
         )
     }
 
+    /// An object of patterns to lists of words, each a string that is not
+    /// empty (#566), shown as each pattern, an arrow and its words, the pairs
+    /// joined by semicolons, in the patterns' order as strings.
+    fn pairs(&mut self, name: &'static str, fallback: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        self.read(
+            name,
+            "an object of patterns to lists of non-empty strings",
+            fallback.iter().map(|(k, ws)| ((*k).to_string(), ws.iter().map(|w| (*w).to_string()).collect())).collect(),
+            |v| match v {
+                Value::Object(o) => o
+                    .iter()
+                    .map(|(k, ws)| match ws {
+                        Value::Array(items) if !k.is_empty() => items
+                            .iter()
+                            .map(|i| match i {
+                                Value::String(s) if !s.is_empty() => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<String>>>()
+                            .map(|ws| (k.clone(), ws)),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => None,
+            },
+            |pairs| {
+                if pairs.is_empty() {
+                    "none".to_string()
+                } else {
+                    pairs.iter().map(|(k, ws)| format!("{k} → {}", ws.join(", "))).collect::<Vec<_>>().join("; ")
+                }
+            },
+        )
+    }
+
     fn refs(&mut self, name: &'static str) -> BTreeMap<String, String> {
         self.read(
             name,
@@ -493,7 +754,7 @@ mod tests {
 
     /// The parameters before the rename, as `superx-performance` named them,
     /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 22] = [
+    const TODAY: [(&str, &str); 44] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -520,6 +781,35 @@ mod tests {
         ),
         ("escalation_words", "fuck, shit, wtf, damn, useless, garbage"),
         ("snapshot_words", "savepoint, not for merge"),
+        ("watch_secs", "5"),
+        ("watch_sessions", "all"),
+        ("watch_window_secs", "21600"),
+        ("watch_quiet_secs", "600"),
+        ("watch_quiet_calls", "10"),
+        ("watch_behind_secs", "300"),
+        ("watch_run_secs", "600"),
+        ("watch_run_calls", "20"),
+        ("watch_stop_calls", "2"),
+        ("watch_repeat_secs", "600"),
+        ("watch_repeat_share", "75"),
+        ("watch_order_words", "3"),
+        ("watch_mood_prompts", "5"),
+        ("watch_failures", "3"),
+        ("stop_words", "stop, halt, enough"),
+        ("status_words", "status, what is going on, what's going on, whats going on, what's up, whats up, eta, where are we"),
+        ("question_words", "what, why, how, when, where, who, which, is, are, was, were, does, did, should"),
+        ("yes_words", "yes, approved, approve, go, ok, okay, proceed, do it, sure"),
+        ("watch_scope_words", "review, rehearsal, rehearse, rerun, re-run, regenerate, rewrite, from scratch, refactor"),
+        ("watch_long_words", "hours, an hour, overnight"),
+        ("watch_spec_paths", "kn-specs/tasks/, specs/recon/tasks/"),
+        (
+            "watch_effects",
+            "CommentToJira → jira, comment; createJiraIssue → jira, ticket, issue; deploy → deploy; editJiraIssue → jira; \
+             gh pr create → pr, pull request; gh pr merge → merge; git branch -D → delete, branch; \
+             git commit → commit, commits, committed; git merge → merge, merged; git push → push, pushed, pr, pull request, merge; \
+             git push --force → force; git rebase → rebase; git reset → reset; rm -rf → delete, remove, drop, clean; \
+             transitionJiraIssue → jira",
+        ),
     ];
 
     #[test]
@@ -670,8 +960,8 @@ mod tests {
     fn every_parameter_says_what_it_is_for() {
         for name in NAMES {
             let about = about(name).expect(name);
-            assert!(["when", "where", "how much", "listens", "measures"].contains(&about.group), "{name}: {about:?}");
-            assert!(["number", "number or all", "list", "refs"].contains(&about.input), "{name}: {about:?}");
+            assert!(["when", "where", "how much", "listens", "measures", "watches"].contains(&about.group), "{name}: {about:?}");
+            assert!(["number", "number or all", "list", "refs", "pairs"].contains(&about.input), "{name}: {about:?}");
             assert!(!about.decides.is_empty(), "{name}");
         }
         assert_eq!(about("attr_recon_none"), None);

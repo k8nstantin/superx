@@ -25,7 +25,7 @@ use superx_kernel::Kernel;
 use superx_mod_recon::credentials::{self, Credentials, BITBUCKET, GITHUB};
 use superx_mod_recon::crawler::repos::mirror::ASKPASS_ENV;
 use superx_mod_recon::instance::{Instance, PASSWORD_ENV};
-use superx_mod_recon::{crawler, daemon, folder, params, registry, server, status, MODULE_NAME, SCHEMA_DDL};
+use superx_mod_recon::{crawler, daemon, folder, params, registry, server, status, watcher, MODULE_NAME, SCHEMA_DDL};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::watch;
@@ -289,6 +289,10 @@ async fn run(instance: &Instance) -> Result<(), String> {
     };
     // What the crawler is doing this second, which the page reads (#539).
     let progress = crawler::progress::Progress::default();
+    // The watcher beside it (#566): its own loop on the same stop, so one
+    // stop ends both; the page reads its snapshot.
+    let seen = watcher::Watched::default();
+    let watching = tokio::spawn(watcher::run(kernel.clone(), watched.clone(), seen.clone()));
     let crawling = tokio::spawn(crawler::run_in(kernel.clone(), places, progress.clone(), crawler::Stop::new(watched)));
     let on_stop = {
         let asked = Arc::clone(&asked);
@@ -302,7 +306,8 @@ async fn run(instance: &Instance) -> Result<(), String> {
     // the bound a request that never answers kept the module from stopping,
     // its listener already closed, until it was killed (2026-11-03).
     let mut stopping = asked.subscribe();
-    let serving = axum::serve(listener, server::app(kernel.clone(), instance.clone(), port, progress)).with_graceful_shutdown(on_stop);
+    let serving =
+        axum::serve(listener, server::app(kernel.clone(), instance.clone(), port, progress, seen)).with_graceful_shutdown(on_stop);
     let served = tokio::select! {
         served = serving.into_future() => served,
         () = async {
@@ -320,6 +325,9 @@ async fn run(instance: &Instance) -> Result<(), String> {
     asked.send_replace(true);
     if let Err(e) = crawling.await {
         tracing::warn!(target: "recon", error = %e, "the crawler did not end cleanly");
+    }
+    if let Err(e) = watching.await {
+        tracing::warn!(target: "recon", error = %e, "the watcher did not end cleanly");
     }
     match &served {
         Ok(()) => told(registry::stopped(&kernel).await, "stopped"),

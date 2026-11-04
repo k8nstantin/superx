@@ -51,6 +51,21 @@ pub async fn kernel() -> Kernel {
     kernel
 }
 
+/// Sign the kernel's session in again as `superx_kernel`, as [`kernel`]
+/// signed it in: after a test moved it to another database and back (#566).
+pub async fn sign_in(kernel: &Kernel) {
+    kernel
+        .db()
+        .signin(surrealdb::opt::auth::Database {
+            namespace: "superx".to_string(),
+            database: "kernel".to_string(),
+            username: "superx_kernel".to_string(),
+            password: KERNEL_PASSWORD.to_string(),
+        })
+        .await
+        .expect("service sign-in");
+}
+
 pub async fn own_db() -> superx_kernel::Db {
     let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
     db.use_ns("superx").use_db(MODULE_NAME).await.expect("nsdb");

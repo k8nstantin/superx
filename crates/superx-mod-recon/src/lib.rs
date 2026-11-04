@@ -21,6 +21,12 @@
 //! `superx param set recon <name> <json>` tunes it, and it publishes
 //! its URL there (`attr_module_ui_url`).
 //!
+//! TWO PARTS (operator, 2026-11-04): the crawler gathers the history; the
+//! watcher ([`watcher`]) watches every session as it works, judges each act
+//! against the operator's orders and the task file it executes, and reports
+//! what it finds on the module's page as it happens. They share nothing
+//! that runs.
+//!
 //! READ-ONLY toward everything but its own database. It reads the kernel's
 //! captured lines with SELECT and the repositories with git, read-only
 //! (#446), and writes nothing outside its own database, except its own
@@ -38,6 +44,7 @@ pub mod results;
 pub mod server;
 pub mod status;
 pub mod ui;
+pub mod watcher;
 
 use superx_kernel::{KernelModuleDescriptor, NodeKind};
 
