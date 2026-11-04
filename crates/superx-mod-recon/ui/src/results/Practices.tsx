@@ -1,17 +1,29 @@
 import { Board, type Card } from '../Board'
-import { EChart, FAIL, OK, type Clicked } from '../EChart'
+import { EChart, FAIL, INK, OK, type Clicked } from '../EChart'
 import type { FoundCommit } from '../api'
 import { category, grid, grouped, legend, percent, PART_COLOUR, stacked, tip, value, zoom } from './charts'
 import type { Behind } from './Rows'
 import type { Scoped } from './scope'
-import { cap, enough, group, kTok, n, neverLanded, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
+import { alivePct, cap, enough, group, kTok, n, neverLanded, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
 
 // What the agents did before committing, against what became of the
 // commit: tests run since the session's previous commit, the thinking
 // effort and the context of the reply that committed, and whether a
-// subagent did it. Only a commit its session printed carries these.
+// subagent did it. Only a commit its session printed carries these. And the
+// size of every credited commit, against what of it lives.
 
 type Bucket = { label: string; commits: FoundCommit[] }
+
+/// The credited commits in fifths by the lines each committed, the edges the
+/// data's own and shared by every model.
+function bySize(commits: FoundCommit[]): Bucket[] {
+  const sizes = commits.map((c) => c.added).sort((a, b) => a - b)
+  const edges = [0, 0.2, 0.4, 0.6, 0.8, 1].map((q) => Math.round(quantile(sizes, q)))
+  return edges.slice(0, 5).map((lo, i) => {
+    const hi = edges[i + 1]
+    return { label: `${n(lo)}–${n(hi)} lines`, commits: commits.filter((c) => c.added >= lo && (i === 4 ? c.added <= hi : c.added < hi)) }
+  })
+}
 
 /// The models with most printed commits, most first.
 function leading(printed: FoundCommit[], pal: Palette): string[] {
@@ -33,11 +45,16 @@ export function practicesAnswer(s: Scoped, pal: Palette): string {
     })
     .filter((e) => e.yes.commits > 0 && e.no.commits > 0)
   const said = effects
-    .map((e) => `${cap(e.m)} ${pct(e.yes.alive, e.yes.decided)}% (${e.yes.commits} commits) against ${pct(e.no.alive, e.no.decided)}% (${e.no.commits})`)
+    .map((e) => `${cap(e.m)} ${alivePct(e.yes)}% (${e.yes.commits} commits) against ${alivePct(e.no)}% (${e.no.commits})`)
     .join('; ')
+  const sizes = bySize(s.commits).map((b) => ({ ...b, o: outcome(b.commits) })).filter((b) => b.o.decided - b.o.unread > 0)
+  const small = sizes[0]
+  const big = sizes[sizes.length - 1]
+  const size =
+    sizes.length > 1 ? ` The smallest fifth of commits (${small.label}) kept ${alivePct(small.o)}% of their lines alive; the largest (${big.label}), ${alivePct(big.o)}%.` : ''
   return `${n(tested)} of ${n(printed.length)} printed commits (${pct(tested, printed.length)}%) came after their session ran tests.${
     said ? ` Lines still alive, tested first against not: ${said}.` : ''
-  }`
+  }${size}`
 }
 
 export function Practices({ s, pal, open }: { s: Scoped; pal: Palette; open: (b: Behind) => void }) {
@@ -62,7 +79,7 @@ export function Practices({ s, pal, open }: { s: Scoped; pal: Palette; open: (b:
         yAxis: percent(),
         series: [
           grouped('landed', buckets.map((b) => { const o = outcome(b.commits); return pct(o.landed, o.decided) }), '#3987e5'),
-          grouped('still alive', buckets.map((b) => { const o = outcome(b.commits); return pct(o.alive, o.decided) }), PART_COLOUR.alive),
+          grouped('still alive', buckets.map((b) => alivePct(outcome(b.commits))), PART_COLOUR.alive),
           grouped('never landed', buckets.map((b) => { const o = outcome(b.commits); return pct(neverLanded(o), o.decided) }), PART_COLOUR.never),
         ],
       }}
@@ -88,11 +105,63 @@ export function Practices({ s, pal, open }: { s: Scoped; pal: Palette; open: (b:
     const commits = printed.filter((c) => c.context != null && c.context >= lo && (i === 4 ? c.context <= hi : c.context < hi))
     return { label: `${kTok(lo)}–${kTok(hi)}\n(${commits.length})`, commits }
   })
+  // Every credited commit by its size, each leading model on the same edges.
+  const sized = bySize(s.commits)
+  const sizeModels = leading(s.commits, pal).slice(0, 5)
+  const sizeChart = (height: number) => (
+    <EChart
+      height={height}
+      onClick={(p: Clicked) => {
+        if (p.dataIndex == null || !p.seriesName) return
+        const b = sized[p.dataIndex]
+        const m = p.seriesName
+        open({ title: `${m}, commits of ${b.label}`, commits: m === 'every model' ? b.commits : b.commits.filter((c) => c.model === m) })
+      }}
+      option={{
+        legend: legend(),
+        grid: grid({ bottom: 8 }),
+        tooltip: {
+          ...tip({ axisPointer: { type: 'line' } }),
+          formatter: (ps: { dataIndex: number; marker: string; seriesName: string }[]) => {
+            const b = sized[ps[0].dataIndex]
+            return `<b>${b.label}</b><br/>${ps
+              .map((p) => {
+                const o = outcome(p.seriesName === 'every model' ? b.commits : b.commits.filter((c) => c.model === p.seriesName))
+                return `${p.marker}${p.seriesName}: ${n(o.commits)} commits · landed ${pct(o.landed, o.decided)}% · alive ${alivePct(o)}% · reset ${pct(o.reset, o.decided)}%`
+              })
+              .join('<br/>')}`
+          },
+        },
+        xAxis: category(sized.map((b) => b.label)),
+        yAxis: percent(),
+        series: ['every model', ...sizeModels].map((m) => ({
+          name: m,
+          type: 'line',
+          symbolSize: 8,
+          connectNulls: false,
+          lineStyle: { width: m === 'every model' ? 3 : 2, type: m === 'every model' ? 'dashed' : 'solid', color: m === 'every model' ? INK : pal.colour(m) },
+          itemStyle: { color: m === 'every model' ? INK : pal.colour(m) },
+          data: sized.map((b) => {
+            const o = outcome(m === 'every model' ? b.commits : b.commits.filter((c) => c.model === m))
+            return o.decided - o.unread > 0 ? alivePct(o) : null
+          }),
+        })),
+      }}
+    />
+  )
   const weeks = [...new Set(s.weeks.map((w) => w.week))].sort()
   const wk = group(s.weeks, (w) => w.week)
   const testedWeeks = [...new Set(printed.map((c) => weekOf(c.at)))].sort()
   const cards: Card[] = [
     { i: 'tested', title: 'Commits made after the session ran tests, and without', note: 'tests run since the session\'s previous commit · shares of decided lines (in flight left out) · click a group for its commits', w: 12, h: 11, render: rates(tested, 'Tested first') },
+    {
+      i: 'size',
+      title: 'Lines still alive, by the size of the commit that carried them',
+      note: 'every credited commit in fifths by lines committed · share of decided lines blame credits today · click a point for its commits',
+      w: 12,
+      h: 10,
+      render: sizeChart,
+    },
     { i: 'effort', title: 'By the thinking effort of the reply that committed', w: 6, h: 10, render: rates(effort, 'Effort') },
     { i: 'context', title: 'By the context the committing reply carried', note: 'fifths of the commits by tokens sent', w: 6, h: 10, render: rates(context, 'Context') },
     { i: 'subagent', title: 'Main session or subagent', w: 6, h: 10, render: rates(subagent, 'Who committed') },

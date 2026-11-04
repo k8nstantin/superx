@@ -6,7 +6,19 @@ import { compact } from './shared'
 // draws: a category axis, a value axis, a legend, a tooltip, and the fixed
 // colours of a commit's outcome.
 
-export const PART_COLOUR: Record<Part, string> = { alive: OK, replaced: '#3987e5', flight: CANCEL, side: '#d55181', never: FAIL, reset: '#d95926' }
+// A commit's outcome in the eight hues of the validated dark palette, in the
+// one order of them that passes every adjacent check (validate_palette.js,
+// dark, on the card surface): alive green, never landed red, replaced blue.
+export const PART_COLOUR: Record<Part, string> = {
+  alive: OK,
+  untouched: '#d95926',
+  replaced: '#3987e5',
+  unread: CANCEL,
+  flight: '#d55181',
+  side: '#008300',
+  never: FAIL,
+  reset: '#9085e9',
+}
 
 export const grid = (extra: Record<string, unknown> = {}) => ({ left: 8, right: 18, top: 40, bottom: 8, containLabel: true, ...extra })
 

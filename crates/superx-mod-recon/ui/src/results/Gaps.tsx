@@ -2,15 +2,16 @@ import { Alert, Button, Group, List, Paper, Stack, Text, Title } from '@mantine/
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { fetchParams, setParam, type Findings } from '../api'
 import { judged } from './scope'
-import { group, n, sum } from './shared'
+import { group, local, n, outcome, pct, stillAlive, sum } from './shared'
 
 // What recon cannot judge yet, read from the facts. First, for each
 // repository, whether the main line the crawler reads is the branch its work
 // is merged into: where its merged pull requests went says so, and a
 // mismatch is one click from set. Then repositories whose main line took
-// none of the credited work, folders read as a repository, snapshots left
-// out, repositories no CI judges, commits no session's work covers, and work
-// done in no repository.
+// none of the credited work, repositories parked (most of their alive code in
+// files nothing changed since), folders read as a repository, snapshots and
+// merges left out, lines whose blame was never read, repositories no CI
+// judges, commits no session's work covers, and work done in no repository.
 
 const MAINLINE = 'attr_recon_mainline_refs'
 
@@ -43,7 +44,7 @@ export function gaps(f: Findings): Gap[] {
         set: { repo: m.repo, ref: `origin/${into.branch}` },
       })
   }
-  const credited = f.commits.filter((c) => c.model && !c.bulk && c.fate !== 'snapshot')
+  const credited = f.commits.filter((c) => c.model && !c.bulk && !c.merge && c.fate !== 'snapshot')
   const ok = new Set(judged(f))
   const byRepo = group(credited, (c) => c.repo)
   for (const [repo, cs] of byRepo) {
@@ -51,6 +52,22 @@ export function gaps(f: Findings): Gap[] {
       out.push({
         title: `${repo}: none of its ${n(cs.length)} credited commits counts as landed`,
         detail: 'Its main line, as recon reads it, took none of them, so nothing there can be judged.',
+      })
+  }
+  // Parked: most of what is alive sits in files nothing changed since. There,
+  // alive is no evidence the work was good: nothing put it to the test.
+  for (const [repo, cs] of byRepo) {
+    const o = outcome(cs)
+    const last = f.mainlines.find((m) => m.repo === repo)?.last_change
+    if (ok.has(repo) && o.untouched > o.alive)
+      out.push({
+        title: `${repo}: ${pct(o.untouched, stillAlive(o))}% of its alive lines sit in files nothing changed since${last ? ` (its main line last changed ${local(last)})` : ''}`,
+        detail: 'Alive there says nothing of the work: nothing put it to the test. Survived change counts only the lines whose files the main line changed again.',
+      })
+    if (o.unread > 0)
+      out.push({
+        title: `${repo}: ${n(o.unread)} landed lines whose blame was never read`,
+        detail: 'They are left out of every alive rate rather than counted as replaced.',
       })
   }
   for (const [repo, folders] of group(f.folders, (x) => x.repo))
@@ -66,6 +83,12 @@ export function gaps(f: Findings): Gap[] {
       detail: `${n(stash)} are git's own stash commits; ${n(snapshots.length - stash)} say in their subject they are savepoints (attr_recon_snapshot_words), ${n(sum(snapshots, (c) => c.added))} lines in all.`,
     })
   }
+  const merges = f.commits.filter((c) => c.merge)
+  if (merges.length)
+    out.push({
+      title: `${n(merges.length)} merge commits count nowhere`,
+      detail: 'A merge carries the merged commits\' lines, which those commits count; credited to whoever ran it, they had counted twice.',
+    })
   const withCi = new Set(f.workflows.map((w) => w.repo))
   for (const repo of byRepo.keys())
     if (!withCi.has(repo)) out.push({ title: `${repo}: no CI run held`, detail: 'Nothing on its host judges its code, or the crawler holds no host for it.' })
@@ -78,7 +101,7 @@ export function gaps(f: Findings): Gap[] {
         detail: `${n(sum(ws, (w) => w.runs))} runs, ${n(sum(ws, (w) => w.failed))} failed. Whether it runs the tests decides whether its verdicts say anything about the code.`,
       })
   }
-  const uncredited = group(f.commits.filter((c) => !c.model && !c.bulk && c.fate !== 'snapshot'), (c) => c.repo)
+  const uncredited = group(f.commits.filter((c) => !c.model && !c.bulk && !c.merge && c.fate !== 'snapshot'), (c) => c.repo)
   for (const [repo, cs] of uncredited)
     if (byRepo.has(repo))
       out.push({
@@ -145,6 +168,7 @@ export function Gaps({ f }: { f: Findings }) {
                 <List.Item key={m.repo}>
                   <Text fz="sm" c={agrees ? undefined : 'yellow.5'}>
                     {m.repo}: {short(m.mainline)} ({m.from.replace('_', ' ')}){into ? ` · ${n(into.merged)} of its newest ${n(into.of)} merged pull requests went into ${into.branch}` : ' · no merged pull requests to check it against'}
+                    {m.last_change ? ` · last changed ${local(m.last_change)}` : ''}
                   </Text>
                 </List.Item>
               )

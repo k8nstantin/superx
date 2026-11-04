@@ -46,36 +46,54 @@ export function palette(weeks: Pick<Week, 'model' | 'replies'>[]): Palette {
 
 /// How a set of commits' lines split, by each commit's fate. `committed` is
 /// every line they added; `landed` the lines of files whose versions the main
-/// line carries, squashed, replayed or rewritten included; of those, `alive`
-/// is what blame credits today and `replaced` the rest. `flight` may still
-/// land (a checked-out branch or an open pull request); `side` is work kept
-/// only in a folder that is a copy of the repository, never given to it (a
-/// build folder's experiment); `never` was left on a branch or a tag; `reset`
-/// only the reflog still holds. `decided` is committed less flight and side:
-/// the rates divide by it. A snapshot (a savepoint, a stash) counts nowhere.
+/// line carries, squashed, replayed or rewritten included. Of those:
+/// `alive` blame credits today though the main line changed their files
+/// again since (put to the test, and still there); `untouched` sit in files
+/// nothing changed since (alive by default, evidence of nothing: a parked
+/// repository's code); `replaced` the main line changed away; `unread`
+/// whose blame was never read. `flight` may still land (a checked-out branch
+/// or an open pull request); `side` is work kept only in a folder that is a
+/// copy of the repository, never given to it (a build folder's experiment);
+/// `never` was left on a branch or a tag; `reset` only the reflog still
+/// holds. `decided` is committed less flight and side: the rates divide by
+/// it. A snapshot (a savepoint, a stash) and a merge count nowhere.
 export type Outcome = {
   commits: number
   committed: number
   decided: number
   landed: number
   alive: number
+  untouched: number
   replaced: number
+  unread: number
   flight: number
   side: number
   never: number
   reset: number
 }
 
+/// A commit's landed lines: alive though put to the test, alive untouched,
+/// replaced; all null where its blame was never read.
+function lived(c: FoundCommit): { alive: number; untouched: number; replaced: number } | null {
+  if (c.alive == null) return null
+  const alive = Math.min(c.alive, c.landed)
+  const untouched = Math.min(alive, Math.max(0, c.landed - c.landed_changed))
+  return { alive: alive - untouched, untouched, replaced: c.landed - alive }
+}
+
 export function outcome(cs: FoundCommit[]): Outcome {
-  const o: Outcome = { commits: 0, committed: 0, decided: 0, landed: 0, alive: 0, replaced: 0, flight: 0, side: 0, never: 0, reset: 0 }
+  const o: Outcome = { commits: 0, committed: 0, decided: 0, landed: 0, alive: 0, untouched: 0, replaced: 0, unread: 0, flight: 0, side: 0, never: 0, reset: 0 }
   for (const c of cs) {
-    if (c.fate === 'snapshot') continue
+    if (c.fate === 'snapshot' || c.merge) continue
     o.commits += 1
     o.committed += c.added
     o.landed += c.landed
-    const alive = Math.min(c.alive ?? 0, c.landed)
-    o.alive += alive
-    o.replaced += c.landed - alive
+    const l = lived(c)
+    if (l) {
+      o.alive += l.alive
+      o.untouched += l.untouched
+      o.replaced += l.replaced
+    } else o.unread += c.landed
     if (c.fate === 'in_flight') o.flight += Math.max(0, c.added - c.landed)
     else if (c.fate === 'side') o.side += Math.max(0, c.added - c.landed)
     else if (c.fate === 'reset') o.reset += c.never_landed
@@ -85,23 +103,40 @@ export function outcome(cs: FoundCommit[]): Outcome {
   return o
 }
 
+/// Every landed line blame credits today, put to the test or not.
+export const stillAlive = (o: Outcome) => o.alive + o.untouched
+
+/// The share of decided lines still alive, of those whose blame was read.
+export const alivePct = (o: Outcome) => pct(stillAlive(o), o.decided - o.unread)
+
+/// Of the landed lines whose files the main line changed again since, the
+/// share still there: survival with the untouched (parked) code left out.
+export const survivedPct = (o: Outcome) => pct(o.alive, o.alive + o.replaced)
+
 /// The parts an outcome is drawn in, and which a commit counts in.
-export const parts = ['alive', 'replaced', 'flight', 'side', 'never', 'reset'] as const
+export const parts = ['alive', 'untouched', 'replaced', 'unread', 'flight', 'side', 'never', 'reset'] as const
 export type Part = (typeof parts)[number]
 export const partName: Record<Part, string> = {
-  alive: 'landed, still alive',
+  alive: 'alive, its files changed since',
+  untouched: 'alive, its files untouched since',
   replaced: 'landed, since replaced',
+  unread: 'landed, blame not read',
   flight: 'in flight',
   side: 'only in a side folder',
   never: 'never landed, left on a branch',
   reset: 'never landed, reset away',
 }
 export function inPart(c: FoundCommit, p: Part): boolean {
+  const l = lived(c)
   switch (p) {
     case 'alive':
-      return (c.alive ?? 0) > 0
+      return (l?.alive ?? 0) > 0
+    case 'untouched':
+      return (l?.untouched ?? 0) > 0
     case 'replaced':
-      return c.landed > (c.alive ?? 0)
+      return (l?.replaced ?? 0) > 0
+    case 'unread':
+      return l == null && c.landed > 0
     case 'flight':
       return c.fate === 'in_flight'
     case 'side':

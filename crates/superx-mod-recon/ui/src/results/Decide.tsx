@@ -12,7 +12,7 @@ import { practicesAnswer } from './Practices'
 import { rewritesAnswer } from './Rewrites'
 import { ModelBadge, type Behind } from './Rows'
 import type { Scoped } from './scope'
-import { cap, enough as enoughOf, group, kTok, n, neverLanded, outcome, pct, quantile, sum, weekLabel, weekOf, type Palette } from './shared'
+import { alivePct, cap, enough as enoughOf, group, kTok, n, neverLanded, outcome, pct, quantile, stillAlive, sum, survivedPct, weekLabel, weekOf, type Palette } from './shared'
 
 // What to decide from it all: each model's scorecard on what its work
 // became and what it cost, two models set against each other only where
@@ -25,6 +25,7 @@ type Row = {
   committed: number
   landed: number
   alive: number
+  survived: number | null
   never: number
   reset: number
   flight: number
@@ -62,14 +63,15 @@ function scorecard(s: Scoped, pal: Palette): Row[] {
         commits: o.commits,
         committed: o.committed,
         landed: pct(o.landed, o.decided),
-        alive: pct(o.alive, o.decided),
+        alive: alivePct(o),
+        survived: o.alive + o.replaced ? survivedPct(o) : null,
         never: pct(neverLanded(o), o.decided),
         reset: pct(o.reset, o.decided),
         flight: o.flight,
         side: o.side,
         testedShare: printed.length ? pct(printed.filter((c) => c.tested).length, printed.length) : null,
-        tokensPerAlive: o.alive ? tokens / o.alive : null,
-        alivePerHour: hours ? o.alive / hours : null,
+        tokensPerAlive: stillAlive(o) ? tokens / stillAlive(o) : null,
+        alivePerHour: hours ? stillAlive(o) / hours : null,
         corrections: prompts ? (100 * sum(ws, (w) => w.corrections)) / prompts : null,
         escalations: prompts ? (100 * sum(ws, (w) => w.escalations)) / prompts : null,
         pulls: ps.length,
@@ -86,6 +88,7 @@ const COLS: Col[] = [
   { h: 'Lines committed', v: (r) => r.committed, show: (r) => n(r.committed), better: null },
   { h: 'Landed', v: (r) => r.landed, show: (r) => `${r.landed}%`, better: 'up' },
   { h: 'Still alive', v: (r) => r.alive, show: (r) => `${r.alive}%`, better: 'up' },
+  { h: 'Survived change', v: (r) => r.survived, show: (r) => (r.survived == null ? '—' : `${r.survived}%`), better: 'up' },
   { h: 'Never landed', v: (r) => r.never, show: (r) => `${r.never}%`, better: 'down' },
   { h: 'of it reset away', v: (r) => r.reset, show: (r) => `${r.reset}%`, better: 'down' },
   { h: 'In flight', v: (r) => r.flight, show: (r) => n(r.flight), better: null },
@@ -122,7 +125,7 @@ export function headToHead(s: Scoped, a: string, b: string): string {
   const oa = outcome(sh.a)
   const ob = outcome(sh.b)
   const cells = sh.cells.length === 1 ? 'one repository-week' : `${sh.cells.length} repository-weeks`
-  return `Where both worked (${cells}): ${a} landed ${pct(oa.landed, oa.decided)}% and kept ${pct(oa.alive, oa.decided)}% of ${n(oa.decided)} decided lines; ${b} landed ${pct(ob.landed, ob.decided)}% and kept ${pct(ob.alive, ob.decided)}% of ${n(ob.decided)}.`
+  return `Where both worked (${cells}): ${a} landed ${pct(oa.landed, oa.decided)}% and kept ${alivePct(oa)}% of ${n(oa.decided)} decided lines; ${b} landed ${pct(ob.landed, ob.decided)}% and kept ${alivePct(ob)}% of ${n(ob.decided)}.`
 }
 
 function effortAnswer(s: Scoped): string | null {
@@ -134,15 +137,15 @@ function effortAnswer(s: Scoped): string | null {
     .map(([m, cs]) => {
       const levels = [...group(cs, (c) => c.effort as string).entries()].map(([e, xs]) => ({ e, o: outcome(xs) })).filter((x) => x.o.decided > 0)
       if (levels.length < 2) return null
-      levels.sort((x, y) => pct(y.o.alive, y.o.decided) - pct(x.o.alive, x.o.decided))
+      levels.sort((x, y) => alivePct(y.o) - alivePct(x.o))
       const hi = levels[0]
       const lo = levels[levels.length - 1]
-      return { m, hi, lo, gap: pct(hi.o.alive, hi.o.decided) - pct(lo.o.alive, lo.o.decided) }
+      return { m, hi, lo, gap: alivePct(hi.o) - alivePct(lo.o) }
     })
     .filter((x): x is NonNullable<typeof x> => x != null)
     .sort((x, y) => y.gap - x.gap)[0]
   if (!best) return null
-  return `${cap(best.m)} at ${best.hi.e} effort kept ${pct(best.hi.o.alive, best.hi.o.decided)}% alive (${best.hi.o.commits} commits); at ${best.lo.e}, ${pct(best.lo.o.alive, best.lo.o.decided)}% (${best.lo.o.commits}). The two efforts ran in different weeks, so this is what happened, not yet a cause.`
+  return `${cap(best.m)} at ${best.hi.e} effort kept ${alivePct(best.hi.o)}% alive (${best.hi.o.commits} commits); at ${best.lo.e}, ${alivePct(best.lo.o)}% (${best.lo.o.commits}). The two efforts ran in different weeks, so this is what happened, not yet a cause.`
 }
 
 function contextAnswer(s: Scoped): string | null {
@@ -237,7 +240,7 @@ export function Decide({ s, pal, open, go }: { s: Scoped; pal: Palette; open: (b
         }
         const rate = (cs: FoundCommit[] | undefined, part: 'landed' | 'alive') => {
           const o = outcome(cs ?? [])
-          return pct(o[part], o.decided)
+          return part === 'alive' ? alivePct(o) : pct(o.landed, o.decided)
         }
         return (
           <Stack gap={6}>
