@@ -169,10 +169,16 @@ export type FoundCommit = {
   in_flight: boolean
   landed_as: string | null
   landed: number
+  /// What blame credits it today; null where its lines were never blamed.
   alive: number | null
   never_landed: number
+  /// Of the lines it landed, those in files the main line changed again
+  /// since: put to the test. The rest sit in files nothing touched since.
+  landed_changed: number
   files: number
   bulk: boolean
+  /// A merge: the merged commits carry its lines, so it authored none.
+  merge: boolean
   reverted: boolean
   ci: boolean | null
   ci_names: { name: string; verdict: boolean | null }[]
@@ -248,10 +254,32 @@ export type Findings = {
   workflows: Workflow[]
   ci_kinds: Record<string, number>
   folders: { folder: string; repo: string }[]
-  /// The main line each repository's newest crawl read, and how it was chosen.
-  mainlines: { repo: string; mainline: string; from: string }[]
+  /// The main line each repository's newest crawl read, how it was chosen,
+  /// and its newest commit: how long the repository has been parked.
+  mainlines: { repo: string; mainline: string; from: string; last_change: string | null }[]
   branches: BranchWeek[]
+  files: FoundFile[]
   computed_at: string
+}
+
+/// One file's share of the work: one model's credited commits that changed
+/// it, by how they were credited, and what became of their lines in it.
+export type FoundFile = {
+  repo: string
+  path: string
+  model: string
+  printed: boolean
+  /// The commits, as their places in Findings.commits.
+  commits: number[]
+  added: number
+  landed: number
+  flight: number
+  side: number
+  never: number
+  reset: number
+  /// The main-line commits that changed it, anyone's, and the newest.
+  main_changes: number
+  last_main_change: string | null
 }
 
 /// Where a commit's work went.

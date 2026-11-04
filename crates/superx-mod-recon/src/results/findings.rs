@@ -52,9 +52,15 @@ pub struct FoundCommit {
     pub landed: i64,
     pub alive: Option<i64>,
     pub never_landed: i64,
+    /// Of the lines it landed, those in files the main line changed again
+    /// since: the lines put to the test. The rest sit in files nothing
+    /// touched since, alive by default.
+    pub landed_changed: i64,
     /// Its files.
     pub files: i64,
     pub bulk: bool,
+    /// A merge: the merged commits carry its lines, so it authored none.
+    pub merge: bool,
     pub reverted: bool,
     pub ci: Option<bool>,
     pub ci_names: Vec<CiName>,
@@ -160,6 +166,32 @@ pub struct MainLine {
     pub repo: String,
     pub mainline: String,
     pub from: String,
+    /// The newest commit on it: how long the repository has been parked.
+    pub last_change: Option<DateTime<Utc>>,
+}
+
+/// One file's share of the work: one model's credited commits that changed
+/// it, by how they were credited, and what became of their lines in it.
+/// Paths blame never reads (attr_recon_survival_skip) are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FoundFile {
+    pub repo: String,
+    pub path: String,
+    pub model: String,
+    /// Credited by their sessions' own output, not by a claim.
+    pub printed: bool,
+    /// The commits, as their places in [`Findings::commits`].
+    pub commits: Vec<usize>,
+    pub added: i64,
+    pub landed: i64,
+    pub flight: i64,
+    pub side: i64,
+    /// Left on a branch or a tag, and reset away.
+    pub never: i64,
+    pub reset: i64,
+    /// The main-line commits that changed it, anyone's, and the newest.
+    pub main_changes: i64,
+    pub last_main_change: Option<DateTime<Utc>>,
 }
 
 /// One branch of a repository in one week, from its reflog: the commits made
@@ -205,6 +237,7 @@ pub struct Findings {
     pub folders: Vec<Folder>,
     pub mainlines: Vec<MainLine>,
     pub branches: Vec<BranchWeek>,
+    pub files: Vec<FoundFile>,
     pub computed_at: String,
 }
 
@@ -283,10 +316,9 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
         }
     }
 
-    let commits: Vec<FoundCommit> = trail
-        .commits
+    let ours: Vec<&super::trail::Commit> = trail.commits.iter().filter(|c| c.ours && !c.squash && !c.copy).collect();
+    let commits: Vec<FoundCommit> = ours
         .iter()
-        .filter(|c| c.ours && !c.squash && !c.copy)
         .map(|c| {
             let reply = c.reply.and_then(|i| trail.replies.get(i));
             FoundCommit {
@@ -308,8 +340,10 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
                 landed: c.landed,
                 alive: c.alive,
                 never_landed: c.never_landed,
+                landed_changed: c.landed_changed,
                 files: trail.files.get(&c.key).map_or(0, |f| i64::try_from(f.len()).unwrap_or(i64::MAX)),
                 bulk: c.bulk,
+                merge: c.merge,
                 reverted: c.reverted,
                 ci: c.ci,
                 ci_names: c.ci_names.iter().map(|(name, verdict)| CiName { name: name.clone(), verdict: *verdict }).collect(),
@@ -430,7 +464,14 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
         b.rewrites += i64::from(rewrites(m.kind));
     }
 
+    let mut last_change: HashMap<String, DateTime<Utc>> = HashMap::new();
+    for c in trail.commits.iter().filter(|c| c.place.as_deref() == Some("mainline")) {
+        let last = last_change.entry(name(Some(&c.repo))).or_insert(c.at);
+        *last = (*last).max(c.at);
+    }
+
     Findings {
+        files: files(trail, params, &ours),
         commits,
         pulls,
         weeks: weeks.into_values().collect(),
@@ -438,8 +479,72 @@ pub fn findings(trail: &Trail, params: &Params) -> Findings {
         workflows: workflows.into_values().collect(),
         ci_kinds,
         folders: trail.map.folders.iter().map(|(folder, repo)| Folder { folder: folder.clone(), repo: repo.clone() }).collect(),
-        mainlines: trail.mainlines.iter().map(|(repo, (mainline, from))| MainLine { repo: repo.clone(), mainline: mainline.clone(), from: from.clone() }).collect(),
+        mainlines: trail
+            .mainlines
+            .iter()
+            .map(|(repo, (mainline, from))| MainLine {
+                repo: repo.clone(),
+                mainline: mainline.clone(),
+                from: from.clone(),
+                last_change: last_change.get(repo).copied(),
+            })
+            .collect(),
         branches: branches.into_values().collect(),
         computed_at: Utc::now().to_rfc3339(),
     }
+}
+
+/// Every file the credited commits changed, one row per model and kind of
+/// credit, `ours` being [`Findings::commits`]' commits in their order. A
+/// file's version that the main line carries landed; the rest of a commit's
+/// lines in it went where the commit did. Bulk drops, merges and snapshots
+/// author nothing, and paths blame never reads are left out.
+fn files(trail: &Trail, params: &Params, ours: &[&super::trail::Commit]) -> Vec<FoundFile> {
+    let name = |repo: &String| trail.map.name(Some(repo));
+    let mut main: HashMap<(&str, &str), (i64, DateTime<Utc>)> = HashMap::new();
+    for c in trail.commits.iter().filter(|c| c.place.as_deref() == Some("mainline") && !c.merge) {
+        for f in trail.files.get(&c.key).map(Vec::as_slice).unwrap_or_default() {
+            let seen = main.entry((c.repo.as_str(), f.path.as_str())).or_insert((0, c.at));
+            seen.0 += 1;
+            seen.1 = seen.1.max(c.at);
+        }
+    }
+    let mut rows: BTreeMap<(String, String, String, bool), FoundFile> = BTreeMap::new();
+    for (i, c) in ours.iter().enumerate() {
+        let Some(model) = &c.family else { continue };
+        if c.bulk || c.merge || c.snapshot {
+            continue;
+        }
+        let whole = c.place.as_deref() == Some("mainline") || c.landed_as.is_some();
+        let printed = c.by == Some("printed");
+        for f in trail.files.get(&c.key).map(Vec::as_slice).unwrap_or_default() {
+            if params.skips_survival(&f.path) {
+                continue;
+            }
+            let (repo, path) = (name(&c.repo), f.path.clone());
+            let (changes, last) = main.get(&(c.repo.as_str(), f.path.as_str())).copied().map_or((0, None), |(n, at)| (n, Some(at)));
+            let row = rows.entry((repo.clone(), path.clone(), model.clone(), printed)).or_insert_with(|| FoundFile {
+                repo,
+                path,
+                model: model.clone(),
+                printed,
+                main_changes: changes,
+                last_main_change: last,
+                ..FoundFile::default()
+            });
+            row.commits.push(i);
+            row.added += f.added;
+            let landed = if whole || trail.landed_via.contains_key(&(c.key.clone(), f.path.clone())) { f.added } else { 0 };
+            row.landed += landed;
+            let rest = f.added - landed;
+            match c.fate {
+                "in_flight" => row.flight += rest,
+                "side" => row.side += rest,
+                "reset" => row.reset += rest,
+                "branch" => row.never += rest,
+                _ => {}
+            }
+        }
+    }
+    rows.into_values().collect()
 }

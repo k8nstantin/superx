@@ -2,7 +2,7 @@ import { Board, type Card } from '../Board'
 import { EChart, INK } from '../EChart'
 import { category, grid, legend, stacked, tip, value, zoom } from './charts'
 import type { Scoped } from './scope'
-import { cap, enough, group, n, outcome, sum, weekLabel, type Palette } from './shared'
+import { cap, enough, group, n, outcome, stillAlive, sum, weekLabel, type Palette } from './shared'
 
 // What a surviving line costs: each model's output tokens and active hours,
 // in the repositories in view, per line that landed and per line still
@@ -19,7 +19,7 @@ function spend(s: Scoped, pal: Palette): Spend[] {
     .map((m) => {
       const o = outcome(c.get(m) ?? [])
       const ws = w.get(m) ?? []
-      return { model: m, tokens: sum(ws, (x) => x.out_tokens), hours: sum(ws, (x) => x.active_secs) / 3600, thinking: sum(ws, (x) => x.thinking_ms) / 3.6e6, landed: o.landed, alive: o.alive }
+      return { model: m, tokens: sum(ws, (x) => x.out_tokens), hours: sum(ws, (x) => x.active_secs) / 3600, thinking: sum(ws, (x) => x.thinking_ms) / 3.6e6, landed: o.landed, alive: stillAlive(o) }
     })
 }
 

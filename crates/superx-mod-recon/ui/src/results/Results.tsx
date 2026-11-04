@@ -6,6 +6,7 @@ import { Ci, ciAnswer } from './Ci'
 import { Cost, costAnswer } from './Cost'
 import { Decide } from './Decide'
 import { Direction, directionAnswer } from './Direction'
+import { Files, filesAnswer } from './Files'
 import { Gaps, gaps } from './Gaps'
 import { Landed, landedAnswer } from './Landed'
 import { Now } from './Now'
@@ -24,6 +25,7 @@ export const RESULT_VIEWS: [string, string][] = [
   ['decide', 'Decide'],
   ['now', 'Now'],
   ['landed', 'Landed'],
+  ['files', 'Files'],
   ['ci', 'CI & pull requests'],
   ['practices', 'Practices'],
   ['direction', 'Direction'],
@@ -37,6 +39,7 @@ const QUESTION: Record<string, string> = {
   decide: 'Which model, how to direct it, and what to fix?',
   now: 'What was done in each repository, and what is stuck?',
   landed: "Which model's work reached the main line, and is still there?",
+  files: "Where does the agents' work die?",
   ci: 'Does CI tell you anything, and how do pull requests go?',
   practices: 'Does testing first, thinking effort or context change what lands?',
   direction: 'Are you directing better, and does it show in the code?',
@@ -47,8 +50,9 @@ const QUESTION: Record<string, string> = {
 }
 
 const METHOD: Record<string, string> = {
-  decide: 'A commit is a model\'s when its own session printed it, else when that model\'s run was the only one in the repository at the time. Bulk drops (above attr_recon_bulk_lines) are left out.',
-  landed: 'Landed: the lines of each file whose version the main line carries, squash-merges included. Alive: what blame credits today; a squash\'s blame goes to the branch commits it carried. In flight: on a checked-out branch or an open pull request. Older work has had longer to be replaced: Decide sets models against each other only where both worked.',
+  decide: 'A commit is a model\'s when its own session printed it, else when that model\'s run was the only one in the repository at the time. Bulk drops (above attr_recon_bulk_lines) and merges are left out, and so are lines in paths blame never reads (attr_recon_survival_skip: built output, lock files, binaries). Survived change: of the landed lines whose files the main line changed again since, the share still there.',
+  landed: 'Landed: the lines of each file whose version the main line carries, squash-merges included. Alive: what blame credits today; a squash\'s blame goes to the branch commits it carried. Alive lines are split by whether the main line changed their files again since (put to the test) or never did (untouched: alive by default, as in a parked repository). Landed lines whose blame was never read are shown apart and left out of the alive rates. In flight: on a checked-out branch or an open pull request. Older work has had longer to be replaced: Decide sets models against each other only where both worked.',
+  files: 'Each file\'s lines from the credited commits that changed it: landed where the main line carries that file\'s version, else where the commit went (left on a branch, reset away, in flight). Paths blame never reads are left out. Main-line changes count every commit on the main line that changed the file, anyone\'s.',
   ci: 'Host CI runs are GitHub workflow runs and Bitbucket pipelines; a pull request\'s first verdict is the first run on its commits that gave one.',
   practices: 'Only a commit its session printed carries what came before it: the tests and builds that session ran since its previous commit, and the effort and context of the reply that committed.',
   direction: 'A correction is a prompt with one of attr_recon_correction_words, an escalation one with attr_recon_escalation_words, a stop the operator interrupting the agent.',
@@ -71,6 +75,8 @@ export function Results({ sub, go }: { sub: string; go: (sub: string) => void })
     switch (view) {
       case 'landed':
         return landedAnswer(s)
+      case 'files':
+        return filesAnswer(s)
       case 'ci':
         return ciAnswer(s)
       case 'practices':
@@ -132,6 +138,7 @@ export function Results({ sub, go }: { sub: string; go: (sub: string) => void })
       {view !== 'now' && q.isError && <Alert color="red" title="The findings did not load">{String(q.error)}</Alert>}
       {s && f && view === 'decide' && <Decide s={s} pal={pal} open={setBehind} go={go} />}
       {s && view === 'landed' && <Landed s={s} pal={pal} open={setBehind} />}
+      {s && f && view === 'files' && <Files s={s} f={f} pal={pal} open={setBehind} />}
       {s && view === 'ci' && <Ci s={s} pal={pal} open={setBehind} />}
       {s && view === 'practices' && <Practices s={s} pal={pal} open={setBehind} />}
       {s && view === 'direction' && <Direction s={s} pal={pal} open={setBehind} />}

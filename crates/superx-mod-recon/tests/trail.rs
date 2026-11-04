@@ -5,7 +5,7 @@ pub mod common;
 
 use common::*;
 use superx_mod_recon::crawler::Crawler;
-use superx_mod_recon::params::INCLUDE_PARAM;
+use superx_mod_recon::params::{BULK_LINES_PARAM, INCLUDE_PARAM};
 use superx_mod_recon::results::commit::commit as whole;
 use superx_mod_recon::results::findings::findings;
 use superx_mod_recon::results::trail::load;
@@ -140,6 +140,80 @@ async fn a_change_rewritten_onto_the_main_line_landed_and_counts_once_as_the_cop
     );
     assert_eq!((work.added, work.landed, work.never_landed, work.alive), (1, 1, 0, Some(1)), "its line landed and is alive at the tip: {work:?}");
     assert!(found.commits.iter().all(|c| c.hash != landed), "the main line's copy is not counted again: {:?}", found.commits);
+    std::fs::remove_dir_all(&root).expect("clean up");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_authors_nothing_a_squash_keeps_its_pieces_blame_and_lines_are_put_to_the_test_where_the_main_line_changed_again() {
+    let kernel = kernel().await;
+    let db = own_db().await;
+    let root = scratch();
+    let dir = root.join("work");
+    repo(&dir);
+    let lines = |prefix: &str, n: usize| (1..=n).map(|i| format!("{prefix}{i}\n")).collect::<String>();
+    commit_at(&dir, &[("base.txt", "base\n")], "base", "2026-10-01T09:00:00+00:00");
+    // An attempt abandoned: one bulk drop, with a file the next attempt
+    // writes the same.
+    git(&dir, &["checkout", "-q", "-b", "v1"]);
+    let drop = commit_at(&dir, &[("big.txt", &lines("b", 30)), ("shared.txt", &lines("s", 3))], "v1: all at once", "2026-10-01T10:00:00+00:00");
+    // The attempt that landed, in two pieces, squash-merged: a bulk commit
+    // too, as #557 was.
+    git(&dir, &["checkout", "-q", "main"]);
+    git(&dir, &["checkout", "-q", "-b", "v2"]);
+    let first = commit_at(&dir, &[("shared.txt", &lines("s", 3)), ("x.txt", &lines("x", 5))], "v2: x", "2026-10-01T11:00:00+00:00");
+    let second = commit_at(&dir, &[("y.txt", &lines("y", 5))], "v2: y", "2026-10-01T11:30:00+00:00");
+    git(&dir, &["checkout", "-q", "main"]);
+    git(&dir, &["merge", "-q", "--squash", "v2"]);
+    git_at(&dir, &["commit", "-q", "-m", "v2 (#2)"], Some("2026-10-01T12:00:00+00:00"));
+    let squash = git(&dir, &["rev-parse", "HEAD"]);
+    // A branch merged by a merge commit: its lines are its commit's.
+    git(&dir, &["checkout", "-q", "-b", "side"]);
+    let side = commit_at(&dir, &[("z.txt", &lines("z", 3))], "side: z", "2026-10-01T13:00:00+00:00");
+    git(&dir, &["checkout", "-q", "main"]);
+    git_at(&dir, &["merge", "-q", "--no-ff", "-m", "Merge side", "side"], Some("2026-10-01T14:00:00+00:00"));
+    let merge = git(&dir, &["rev-parse", "HEAD"]);
+    // The main line changes x.txt again; y.txt and shared.txt never.
+    let later = commit_at(&dir, &[("x.txt", &format!("{}X5\n", lines("x", 4)))], "x again", "2026-10-02T09:00:00+00:00");
+
+    let mut c = Capture::new(&kernel, "one").await;
+    c.worked_in(&dir).await;
+    for (hash, branch, subject) in [
+        (&drop, "v1", "v1: all at once"),
+        (&first, "v2", "v2: x"),
+        (&second, "v2", "v2: y"),
+        (&side, "side", "side: z"),
+        (&merge, "main", "Merge side"),
+        (&later, "main", "x again"),
+    ] {
+        c.bash(&dir, &format!("git commit -m '{subject}'"), &format!("[{branch} {}] {subject}\n 1 file changed", &hash[..7])).await;
+    }
+    let p = params(&[(INCLUDE_PARAM, strings(&[&dir])), (BULK_LINES_PARAM, number(12))]);
+    pass(&kernel, &db, &p, &mut Crawler::default()).await;
+
+    let trail = load(&db, &p).await.expect("the trail");
+    let found = findings(&trail, &p);
+    let get = |hash: &str| found.commits.iter().find(|c| c.hash == hash).unwrap_or_else(|| panic!("{hash}: {:?}", found.commits));
+    // The merge authored nothing: the side commit's lines are the side commit's.
+    let m = get(&merge);
+    assert_eq!((m.merge, m.added, m.landed, m.model.as_str()), (true, 0, 0, "opus 5.5"), "{m:?}");
+    assert_eq!((get(&side).landed, get(&side).merge), (3, false));
+    // The squash's blame went to its pieces, though an abandoned drop
+    // landed a file version through it too: the same lines as a piece's.
+    assert!(found.commits.iter().all(|c| c.hash != squash), "the squash is no one's: {:?}", found.commits);
+    assert!(get(&drop).bulk, "the drop counts nowhere");
+    let (x, y) = (get(&first), get(&second));
+    assert_eq!((x.fate, x.landed, y.fate, y.landed), ("landed", 8, "landed", 5), "{x:?} {y:?}");
+    let (xa, ya) = (x.alive.unwrap_or(-1), y.alive.unwrap_or(-1));
+    assert!(xa > 0 && ya > 0 && xa <= 8 && ya <= 5 && xa + ya <= 12, "the squash's 12 alive lines, split over its pieces: {x:?} {y:?}");
+    // Put to the test: x.txt changed again on the main line after it
+    // landed; shared.txt and y.txt never did.
+    assert_eq!((x.landed_changed, y.landed_changed), (5, 0), "{x:?} {y:?}");
+    // One row per file, model and kind of credit, the main line's changes
+    // to it beside.
+    let xf = found.files.iter().find(|f| f.path == "x.txt").unwrap_or_else(|| panic!("{:?}", found.files));
+    assert_eq!((xf.model.as_str(), xf.printed, xf.added, xf.landed, xf.never, xf.main_changes), ("opus 5.5", true, 6, 6, 0, 2), "{xf:?}");
+    assert_eq!(xf.commits.iter().map(|&i| found.commits[i].hash.as_str()).collect::<Vec<_>>(), [first.as_str(), later.as_str()]);
+    assert!(found.files.iter().all(|f| f.path != "big.txt"), "a bulk drop authors no file's lines: {:?}", found.files);
     std::fs::remove_dir_all(&root).expect("clean up");
 }
 

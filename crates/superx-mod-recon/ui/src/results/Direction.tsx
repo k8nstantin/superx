@@ -3,7 +3,7 @@ import { EChart, FAIL, INK, INK_MUTED, type Clicked } from '../EChart'
 import { category, grid, grouped, legend, percent, tip, value, zoom } from './charts'
 import type { Behind } from './Rows'
 import type { Scoped } from './scope'
-import { correlation, group, inPart, n, neverLanded, outcome, pct, sum, weekLabel, weekOf, type Palette } from './shared'
+import { correlation, group, inPart, n, neverLanded, outcome, pct, stillAlive, sum, weekLabel, weekOf, type Palette } from './shared'
 
 // Are you directing better, and does it show in the code: your prompts,
 // corrections, escalations and stops week by week and per model, set
@@ -11,7 +11,7 @@ import { correlation, group, inPart, n, neverLanded, outcome, pct, sum, weekLabe
 // one of attr_recon_correction_words, an escalation one with
 // attr_recon_escalation_words.
 
-type WeekRow = { week: string; prompts: number; corrections: number; escalations: number; interrupts: number; committed: number; never: number; alive: number }
+type WeekRow = { week: string; prompts: number; corrections: number; escalations: number; interrupts: number; committed: number; never: number; alive: number; read: number }
 
 function weekRows(s: Scoped): WeekRow[] {
   const prompts = group(s.weeks, (w) => w.week)
@@ -28,7 +28,8 @@ function weekRows(s: Scoped): WeekRow[] {
       interrupts: sum(ws, (w) => w.interrupts),
       committed: o.decided,
       never: neverLanded(o),
-      alive: o.alive,
+      alive: stillAlive(o),
+      read: o.decided - o.unread,
     }
   })
 }
@@ -40,7 +41,7 @@ const paired = (rows: WeekRow[]) => rows.filter((r) => r.prompts > 0 && r.commit
 export function directionAnswer(s: Scoped): string {
   const pts = paired(weekRows(s))
   const rc = correlation(pts.map((r) => (100 * r.corrections) / r.prompts), pts.map((r) => (100 * r.never) / r.committed))
-  const re = correlation(pts.map((r) => (100 * r.escalations) / r.prompts), pts.map((r) => (100 * r.alive) / r.committed))
+  const re = correlation(pts.map((r) => (100 * r.escalations) / r.prompts), pts.map((r) => (r.read ? (100 * r.alive) / r.read : 0)))
   if (rc == null) return 'Too few weeks with both prompts and commits to set them against each other.'
   const strength = (r: number) => (Math.abs(r) >= 0.7 ? 'strongly' : Math.abs(r) >= 0.4 ? 'moderately' : 'barely')
   return `Week by week, your corrections ${strength(rc)} track the share of committed lines that never landed (r = ${rc.toFixed(2)} over ${pts.length} weeks)${
@@ -74,7 +75,7 @@ export function Direction({ s, pal, open }: { s: Scoped; pal: Palette; open: (b:
             const w = pts[p.dataIndex]
             return `<b>week of ${weekLabel(w.week)}</b><br/>${n(w.prompts)} prompts · ${n(w.corrections)} corrections · ${n(w.escalations)} escalations · ${n(
               w.interrupts,
-            )} stops<br/>${n(w.committed)} lines committed: ${pct(w.never, w.committed)}% never landed, ${pct(w.alive, w.committed)}% still alive`
+            )} stops<br/>${n(w.committed)} lines committed: ${pct(w.never, w.committed)}% never landed, ${pct(w.alive, w.read)}% still alive`
           },
         },
         xAxis: value((v) => `${v}`, { name: xName, nameLocation: 'middle', nameGap: 26, nameTextStyle: { color: INK_MUTED } }),
@@ -93,7 +94,7 @@ export function Direction({ s, pal, open }: { s: Scoped; pal: Palette; open: (b:
   )
   const xs = (k: keyof WeekRow) => pts.map((r) => (100 * (r[k] as number)) / r.prompts)
   const rc = correlation(xs('corrections'), pts.map((r) => (100 * r.never) / r.committed))
-  const re = correlation(xs('escalations'), pts.map((r) => (100 * r.alive) / r.committed))
+  const re = correlation(xs('escalations'), pts.map((r) => (r.read ? (100 * r.alive) / r.read : 0)))
   const byModel = group(s.weeks.filter((w) => w.model !== ''), (w) => w.model)
   const models = pal.models.filter((m) => sum(byModel.get(m) ?? [], (w) => w.prompts) > 0).slice(0, 8)
   const per = (m: string, k: 'corrections' | 'escalations' | 'interrupts') => {
@@ -112,10 +113,10 @@ export function Direction({ s, pal, open }: { s: Scoped; pal: Palette; open: (b:
     {
       i: 'escalations',
       title: 'Each week: your escalations against the lines still alive',
-      note: 'x: escalations per 100 prompts · y: share of committed lines alive today',
+      note: 'x: escalations per 100 prompts · y: share of committed lines alive today, of those whose blame was read',
       w: 6,
       h: 11,
-      render: (h) => scatter(h, (r) => (100 * r.escalations) / r.prompts, (r) => pct(r.alive, r.committed), 'escalations per 100 prompts', 'still alive', re),
+      render: (h) => scatter(h, (r) => (100 * r.escalations) / r.prompts, (r) => pct(r.alive, r.read), 'escalations per 100 prompts', 'still alive', re),
     },
     {
       i: 'weekly',
