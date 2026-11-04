@@ -21,7 +21,7 @@
 
   <rule id="kernel-read-only">
     <from>BLUEPRINT.md: "The kernel has zero knowledge of any module's domain."; "SELECT + CREATE only, no verb ever issues UPDATE / DELETE / DDL." The operator: the kernel is off limits to a module's work</from>
-    <text>The crawler reads the kernel's database with SELECT and nothing else, a bounded page at a time, in the order of its rows' ids, as the service account the instance names; it never writes it and never reads it through another client. No task changes superx-kernel, superx or superx-ops; what the module needs from the kernel it reads as the kernel writes it.</text>
+    <text>The crawler and the watcher read the kernel's database with SELECT and nothing else, a bounded page at a time, in the order of its rows' ids, as the service account the instance names; neither ever writes it or reads it through another client. No task changes superx-kernel, superx or superx-ops; what the module needs from the kernel it reads as the kernel writes it.</text>
     <breach>review of every query the module issues; tools/skill_audit.py (§10)</breach>
   </rule>
 
@@ -38,8 +38,8 @@
   </rule>
 
   <rule id="crawler-is-the-reader">
-    <from>The operator, 2026-10-26: the crawler is the reader; there are no readers beside it</from>
-    <text>One crawler reads everything the module holds: the lines, the repositories, the hosts. Nothing else in the module reads a source. A source is a part of the crawler, named for what it crawls, never a component beside it; nothing in the module, its code, its tests, its specs or its PRs is called a reader.</text>
+    <from>The operator, 2026-10-26: the crawler is the reader; there are no readers beside it. The operator, 2026-11-04: two things, the crawler that gathers the historical info and the watcher, all parts of mod-recon; they do very different tasks</from>
+    <text>Two parts of the module read, each for its own task, and share nothing that runs: the crawler reads everything the module holds into its structure, for history: the lines, the repositories, the hosts; the watcher reads the newest captured lines, the task files the sessions build from and the agents' memory folders, read-only, to watch every session as it works, and writes nothing. Nothing else in the module reads a source. A source is a part of the crawler, named for what it crawls, never a component beside it; nothing in the module, its code, its tests, its specs or its PRs is called a reader.</text>
     <breach>specs/recon/check.py (the word in a spec); review</breach>
   </rule>
 
@@ -87,7 +87,7 @@
 
   <rule id="capture-first">
     <from>BLUEPRINT.md: "It is never linked into `superx`, so nothing it does can reach capture." The operator, 2026-10-25: capturing correct, whole data is the kernel's purpose</from>
-    <text>Nothing the crawler does slows or stops capture: it reads the kernel's database a bounded page at a time, holds nothing open between pages, and reads nothing while attr_recon_read_secs is 0; a pass that cannot read waits for the next.</text>
+    <text>Nothing the crawler or the watcher does slows or stops capture: each reads the kernel's database a bounded page at a time, holds nothing open between pages, and reads nothing while its interval is 0 (attr_recon_read_secs for the crawler, attr_recon_watch_secs for the watcher); a pass or a look that cannot read waits for the next.</text>
     <breach>the live gates, read beside capture's own ticks; review</breach>
   </rule>
 

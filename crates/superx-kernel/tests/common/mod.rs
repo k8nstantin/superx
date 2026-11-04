@@ -34,6 +34,22 @@ pub async fn fresh_kernel() -> Result<Kernel, Box<dyn Error>> {
     Ok(Kernel::from_db(db))
 }
 
+/// Sign the kernel's session in again as `superx_kernel`, as
+/// [`fresh_kernel`] signed it in: after a test moved the session to
+/// another database and back.
+pub async fn sign_in(kernel: &Kernel) -> Result<(), Box<dyn Error>> {
+    kernel
+        .db()
+        .signin(Database {
+            namespace: TEST_NS.to_string(),
+            database: TEST_DB.to_string(),
+            username: "superx_kernel".to_string(),
+            password: TEST_PASSWORD.to_string(),
+        })
+        .await?;
+    Ok(())
+}
+
 /// Pin every linked adapter's root parameter to an empty directory so
 /// no test ever reads REAL machine data (un-parameterized adapters
 /// fall back to `$HOME` locations that exist on dev machines). Each

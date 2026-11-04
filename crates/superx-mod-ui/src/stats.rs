@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use superx_kernel::types::{Object, Value};
+use superx_kernel::types::{Object, RecordId, Value};
 use superx_kernel::{Kernel, MessageRecord, NodeKind, Result};
 
 use crate::api::{
@@ -2463,17 +2463,54 @@ pub const RANGE_ROW_CAP: u32 = 20_000; // skill-allow: §9-const — read-path b
 
 /// Rows per page of the range walk (#367). One `LIMIT 20000` over
 /// `message` carried every raw payload in a single frame, and the
-/// engine reset the connection on `30d` and `all`. Pages keep each
-/// frame small; their union is the same walk.
+/// engine reset the connection on `30d` and `all`. A page asks for each
+/// row's id, time and line length alone; the rows come in batches of
+/// [`WALK_BATCH_CHARS`] (#568). Their union is the same walk.
 pub const RANGE_PAGE: u32 = 1_000; // skill-allow: §9-const — read-path bound, not a policy tunable
 
-const WALK_FIRST: &str = "SELECT * FROM message ORDER BY valid_from DESC LIMIT $limit";
-const WALK_FIRST_SINCE: &str = "SELECT * FROM message WHERE valid_from > $since \
-     ORDER BY valid_from DESC LIMIT $limit";
-const WALK_NEXT: &str = "SELECT * FROM message WHERE valid_from <= $before \
-     ORDER BY valid_from DESC LIMIT $limit";
-const WALK_NEXT_SINCE: &str = "SELECT * FROM message WHERE valid_from <= $before \
-     AND valid_from > $since ORDER BY valid_from DESC LIMIT $limit";
+/// Characters of line the range walk reads in one answer (#568). The
+/// SurrealDB client drops its socket on an answer above its message
+/// limit, 64 MiB, and fails every request in flight on it: capture's
+/// with the page's, since the daemon has one socket. On 2026-11-04 a
+/// page of a thousand whole rows passed it, and capture died. A row read
+/// holds its line about twice, in `raw` and in `content`, at most four
+/// bytes a character, so a batch stays far below the limit; a row
+/// longer than a batch is read on its own.
+pub const WALK_BATCH_CHARS: i64 = 4 << 20; // skill-allow: §9-const — read-path bound, not a policy tunable
+
+/// A row's line length, in characters: its text as captured, else its
+/// parsed copy written out, for a row captured before `raw_text` was kept
+/// (#529). The text is measured, never read: only its length crosses.
+// skill-allow: §14-cast — the cast's text is only measured for the batch budget; no typed value is read from it
+macro_rules! line_chars { () => { "string::len(raw_text ?? <string> (raw ?? {}))" }; }
+
+const WALK_FIRST: &str =
+    concat!("SELECT id, valid_from, ", line_chars!(), " AS n FROM message ORDER BY valid_from DESC LIMIT $limit");
+const WALK_FIRST_SINCE: &str = concat!(
+    "SELECT id, valid_from, ",
+    line_chars!(),
+    " AS n FROM message WHERE valid_from > $since ORDER BY valid_from DESC LIMIT $limit"
+);
+const WALK_NEXT: &str = concat!(
+    "SELECT id, valid_from, ",
+    line_chars!(),
+    " AS n FROM message WHERE valid_from <= $before ORDER BY valid_from DESC LIMIT $limit"
+);
+const WALK_NEXT_SINCE: &str = concat!(
+    "SELECT id, valid_from, ",
+    line_chars!(),
+    " AS n FROM message WHERE valid_from <= $before AND valid_from > $since ORDER BY valid_from DESC LIMIT $limit"
+);
+
+/// A batch's rows, whole but for what the stats never read and would
+/// only fill the answer (#568): the line's text, which `raw` holds
+/// parsed, and the parts of a tool's structured result that hold a whole
+/// file or a command's output: the file an edit started from, a read's
+/// file, the output's two streams. Its `structuredPatch`, `type`,
+/// `content` and `interrupted` stay: [`recorded_diff`] and the
+/// interrupted count read them.
+const WALK_ROWS: &str = "SELECT * OMIT raw_text, raw.toolUseResult.originalFile, raw.toolUseResult.file, \
+     raw.toolUseResult.stdout, raw.toolUseResult.stderr FROM $ids";
 
 /// The newest rows of `message`, newest first, in pages. `since`
 /// bounds the range; `cap` bounds the rows. Each page continues from
@@ -2489,6 +2526,22 @@ pub async fn walk_messages(
     since: Option<chrono::DateTime<chrono::Utc>>,
     cap: u32,
     page: u32,
+) -> Result<Vec<MessageRecord>> {
+    walk_messages_in(kernel, since, cap, page, WALK_BATCH_CHARS).await
+}
+
+/// [`walk_messages`], reading at most `batch_chars` characters of line in
+/// one answer: a parameter, so a test can read every row on its own.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+pub async fn walk_messages_in(
+    kernel: &Kernel,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    cap: u32,
+    page: u32,
+    batch_chars: i64,
 ) -> Result<Vec<MessageRecord>> {
     let page = page.max(1);
     let mut out: Vec<MessageRecord> = Vec::new();
@@ -2508,7 +2561,7 @@ pub async fn walk_messages(
             (Some(_), None) => WALK_NEXT,
             (Some(_), Some(_)) => WALK_NEXT_SINCE,
         };
-        let rows: Vec<MessageRecord> = crate::answered("stats walk page", || async move {
+        let heads: Vec<Value> = crate::answered("stats walk page", || async move {
             let mut q = kernel.db().query(query).bind(("limit", want));
             if let Some(b) = before {
                 q = q.bind(("before", b));
@@ -2519,16 +2572,37 @@ pub async fn walk_messages(
             Ok(q.await?.take(0)?)
         })
         .await?;
-        let fetched = rows.len() as u32;
-        let mut added = 0u32;
-        for row in rows {
-            if (out.len() as u32) >= cap {
+        let fetched = heads.len() as u32;
+        // The page's rows not held yet, up to the cap, with their lines'
+        // lengths; then the rows themselves, a batch at a time, in the
+        // page's order.
+        let mut fresh: Vec<(RecordId, i64)> = Vec::new();
+        for head in &heads {
+            if (out.len() + fresh.len()) as u32 >= cap {
                 break;
             }
-            if seen.insert(superx_ops::record_uuid(&row.id)) {
-                out.push(row);
-                added += 1;
+            let Value::Object(o) = head else { continue };
+            let Some(Value::RecordId(id)) = o.get("id") else { continue };
+            if seen.insert(superx_ops::record_uuid(id)) {
+                let chars = match o.get("n") {
+                    Some(Value::Number(n)) => n.to_int().unwrap_or(0),
+                    _ => 0,
+                };
+                fresh.push((id.clone(), chars));
             }
+        }
+        let added = fresh.len() as u32;
+        let lengths: Vec<i64> = fresh.iter().map(|(_, chars)| *chars).collect();
+        for run in batches(&lengths, batch_chars) {
+            let ids: Vec<RecordId> = fresh[run.clone()].iter().map(|(id, _)| id.clone()).collect();
+            let rows: Vec<MessageRecord> = crate::answered("stats walk rows", || {
+                let ids = ids.clone();
+                async move { Ok(kernel.db().query(WALK_ROWS).bind(("ids", ids)).await?.take(0)?) }
+            })
+            .await?;
+            let mut by_id: HashMap<String, MessageRecord> =
+                rows.into_iter().map(|m| (superx_ops::record_uuid(&m.id), m)).collect();
+            out.extend(fresh[run].iter().filter_map(|(id, _)| by_id.remove(&superx_ops::record_uuid(id))));
         }
         if fetched < want {
             break; // the engine ran out of rows
@@ -2546,6 +2620,25 @@ pub async fn walk_messages(
         before = out.last().map(|m| m.valid_from);
     }
     Ok(out)
+}
+
+/// A page's rows cut into runs, in their order, each holding at most
+/// `budget` characters of line, `chars` giving each row's; a row longer
+/// than `budget` is a run of its own (#568).
+fn batches(chars: &[i64], budget: i64) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let (mut start, mut held) = (0, 0i64);
+    for (i, &n) in chars.iter().enumerate() {
+        if i > start && held.saturating_add(n) > budget {
+            runs.push(start..i);
+            (start, held) = (i, 0);
+        }
+        held = held.saturating_add(n);
+    }
+    if start < chars.len() {
+        runs.push(start..chars.len());
+    }
+    runs
 }
 
 /// Tools whose output is a command's own report. Everything else —
@@ -5357,5 +5450,24 @@ pub(crate) async fn resolved_active_secs(kernel: &Kernel) -> i64 {
     match crate::module_parameter(kernel, ACTIVE_SECS_PARAM).await {
         Some(Value::Number(n)) => n.to_int().filter(|&v| v > 0).unwrap_or(DEFAULT_ACTIVE_SECS),
         _ => DEFAULT_ACTIVE_SECS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::batches;
+
+    #[test]
+    fn a_page_is_cut_into_runs_of_at_most_the_budget_in_order_and_a_longer_row_is_a_run_of_its_own() {
+        assert_eq!(batches(&[3, 3, 3, 3], 6), [0..2, 2..4], "runs fill up to the budget");
+        assert_eq!(batches(&[3, 10, 3], 6), [0..1, 1..2, 2..3], "a row longer than the budget stands alone");
+        assert_eq!(batches(&[6, 0, 0, 1], 6), [0..3, 3..4], "rows of no length ride along");
+        assert_eq!(batches(&[1, 1, 1], 1), [0..1, 1..2, 2..3], "a budget of one reads each row on its own");
+        assert!(batches(&[], 6).is_empty(), "no row, no run");
+        let lengths = [5, 1, 7, 2, 2, 9, 1];
+        let runs = batches(&lengths, 8);
+        let flat: Vec<usize> = runs.iter().flat_map(Clone::clone).collect();
+        assert_eq!(flat, (0..lengths.len()).collect::<Vec<_>>(), "every row once, in order");
+        assert!(runs.iter().all(|r| r.len() == 1 || lengths[r.clone()].iter().sum::<i64>() <= 8), "{runs:?}");
     }
 }
