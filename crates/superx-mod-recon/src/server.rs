@@ -60,6 +60,7 @@ impl FromRef<Page> for Held {
 pub fn app(kernel: Kernel, instance: Instance, port: u16, progress: Progress) -> Router {
     Router::new()
         .route("/status", get(status))
+        .route("/api/ping", get(api::ping))
         .route("/api/now", get(api::now))
         .route("/api/repos", get(api::repos))
         .route("/api/results/models", get(api::models))

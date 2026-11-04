@@ -79,6 +79,12 @@ export type Now = { pass: PassNow | null; last: PassNow | null; last_crawl: Pass
 
 export const fetchNow = () => fetch('/api/now').then((r) => answer<Now>(r))
 
+/// Which module answers, and where the core dashboard lives, for the way
+/// back (#562); `core_url` is null when it is not in the registry.
+export type Ping = { module: string; version: string; core_url: string | null }
+
+export const fetchPing = () => fetch('/api/ping').then((r) => answer<Ping>(r))
+
 export type LastCrawl = {
   started_at: string
   finished_at: string
