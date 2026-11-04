@@ -1,5 +1,6 @@
 //! The watcher (#566): recon's second part, beside the crawler and sharing
-//! nothing that runs with it (rules crawler-is-the-reader). The crawler
+//! nothing that runs with it (specs/recon/rules.xml, the rule of the two
+//! parts that read). The crawler
 //! gathers the history into recon's database; the watcher watches every
 //! session as it works, the coding agents' adversary. Its own loop follows
 //! the newest captured lines ([`follow`]), holds one watch per session in
