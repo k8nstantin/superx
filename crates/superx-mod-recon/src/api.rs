@@ -113,6 +113,27 @@ pub async fn now(State(progress): State<Progress>) -> Json<Now> {
     Json(progress.snapshot())
 }
 
+/// What the page asks first (#562): which module answers, its version, and
+/// where the core dashboard lives, for the page's way back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Ping {
+    pub module: &'static str,
+    pub version: &'static str,
+    /// None when the core dashboard is not in the registry.
+    pub core_url: Option<String>,
+}
+
+/// `GET /api/ping`: [`Ping`], the core dashboard looked up at each ask. The
+/// page asks once a load, and a dashboard that moved is followed without a
+/// restart.
+pub async fn ping(State(kernel): State<Kernel>) -> Json<Ping> {
+    Json(Ping {
+        module: MODULE_NAME,
+        version: env!("CARGO_PKG_VERSION"),
+        core_url: crate::registry::core_dashboard_url(&kernel).await,
+    })
+}
+
 /// A repository's last crawl, as its `crawl` row holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LastCrawl {

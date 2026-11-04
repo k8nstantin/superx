@@ -1,6 +1,6 @@
-//! The tab (#539): its page at the module's own URL, the crawler's stats per
-//! day, and the parameters, read and set from the page as
-//! `superx param set recon` sets them.
+//! The tab (#539): its page at the module's own URL, its way back to the core
+//! dashboard (#562), the crawler's stats per day, and the parameters, read
+//! and set from the page as `superx param set recon` sets them.
 
 pub mod common;
 
@@ -10,6 +10,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use common::*;
 use superx_kernel::types::Value;
+use superx_kernel::{KernelModuleDescriptor, NodeKind};
 use superx_mod_recon::api::{days, repositories, Day, WRITE_HEADER};
 use superx_mod_recon::crawler::progress::{Progress, STEPS};
 use superx_mod_recon::crawler::Crawler;
@@ -79,6 +80,40 @@ async fn the_page_is_served_at_the_modules_own_url_and_a_request_addressed_to_an
         let (status, _) = ask(&app, &format!("evil.example:{PORT}"), "GET", path, false, None).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_page_is_told_the_way_back_to_the_core_dashboard_as_the_registry_has_it_at_each_ask() {
+    let kernel = kernel().await;
+    let app = app(&kernel);
+    let ping = || async {
+        let (status, body) = ask(&app, &own(), "GET", "/api/ping", false, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).expect("json")
+    };
+    // No core dashboard in the registry: no way back, rather than a dead one.
+    let answer = ping().await;
+    assert_eq!(answer["module"], "recon", "{answer}");
+    assert!(answer["core_url"].is_null(), "{answer}");
+    // Registered, its port unset: the port it keeps by default.
+    let ui = KernelModuleDescriptor {
+        name: "ui",
+        version: "0.0.0",
+        kind: NodeKind::KernelModule,
+        depends_on: &[],
+        required_metamodel: &[],
+    };
+    let ui = kernel.register_module(&ui).await.expect("the core dashboard registered");
+    assert_eq!(ping().await["core_url"], "http://127.0.0.1:5150");
+    // Its port moved: followed without a restart.
+    kernel.set_parameter(ui.clone(), "attr_ui_port", number(5160)).await.expect("its port");
+    assert_eq!(ping().await["core_url"], "http://127.0.0.1:5160");
+    // The URL it publishes comes first.
+    kernel
+        .set_parameter(ui, registry::MODULE_UI_URL_PARAM, Value::String("http://localhost:5170".to_string()))
+        .await
+        .expect("its URL");
+    assert_eq!(ping().await["core_url"], "http://localhost:5170");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
