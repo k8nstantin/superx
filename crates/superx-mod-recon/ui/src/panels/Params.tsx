@@ -14,11 +14,14 @@ const GROUPS: [string, string][] = [
   ['how much', 'How much'],
   ['listens', 'Listens'],
   ['measures', 'Measures'],
+  ['watches', 'Watches'],
 ]
 
 /// The value typed, as the JSON recon is sent: a number, "all", a list of
-/// lines, or an object of repository names to refs, one per line; `none`
-/// for an empty list or object, so an empty box never sets one.
+/// lines, an object of repository names to refs, one per line, or of
+/// patterns to their words, a pattern, `=` and its words separated by commas
+/// per line, the first `=` of a line splitting it (#566); `none` for an
+/// empty list or object, so an empty box never sets one.
 function typed(input: Param['input'], text: string): unknown {
   const t = text.trim()
   if (input === 'list') return t === 'none' ? [] : text.split('\n').map((l) => l.trim()).filter((l) => l !== '')
@@ -31,6 +34,18 @@ function typed(input: Param['input'], text: string): unknown {
     }
     return refs
   }
+  if (input === 'pairs') {
+    if (t === 'none') return {}
+    const pairs: Record<string, string[]> = {}
+    for (const line of text.split('\n')) {
+      const at = line.indexOf('=')
+      if (at < 0) continue
+      const pattern = line.slice(0, at).trim()
+      const words = line.slice(at + 1).split(',').map((w) => w.trim()).filter((w) => w !== '')
+      if (pattern && words.length > 0) pairs[pattern] = words
+    }
+    return pairs
+  }
   if (input === 'number or all' && t === 'all') return 'all'
   return /^\d+$/.test(t) ? Number(t) : t
 }
@@ -40,6 +55,7 @@ const hint: Record<Param['input'], string> = {
   'number or all': 'a whole number, or all',
   list: 'one per line, or none',
   refs: 'repository ref, a pair per line, or none',
+  pairs: 'pattern = word, word, a pair per line, or none',
 }
 
 function Row({ p }: { p: Param }) {
@@ -54,7 +70,7 @@ function Row({ p }: { p: Param }) {
       setSaved(true)
     },
   })
-  const many = p.input === 'list' || p.input === 'refs'
+  const many = p.input === 'list' || p.input === 'refs' || p.input === 'pairs'
   const field = many ? (
     <Textarea size="xs" autosize minRows={1} maxRows={6} value={text} placeholder={hint[p.input]}
       onChange={(e) => { setText(e.currentTarget.value); setSaved(false) }} />

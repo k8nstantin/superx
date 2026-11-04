@@ -20,7 +20,7 @@ export type Param = {
   wanted: string
   group: string
   decides: string
-  input: 'number' | 'number or all' | 'list' | 'refs'
+  input: 'number' | 'number or all' | 'list' | 'refs' | 'pairs'
 }
 
 export type Listing = {
@@ -495,3 +495,100 @@ export type CommitDetail = {
 
 export const fetchCommit = (repo: string, hash: string) =>
   fetch(`/api/results/commit?${new URLSearchParams({ repo, hash })}`).then((r) => answer<CommitDetail>(r))
+
+// The watcher (#566): what it holds, as /api/watch answers it.
+
+/// How loud a report is.
+export type Level = 'info' | 'warn' | 'alert'
+
+/// Words behind a report, whole, with whose they are.
+export type WatchWords = { whose: 'operator' | 'agent' | 'call'; text: string }
+
+/// One report of the watcher's.
+export type WatchReport = {
+  id: string
+  session: string
+  kind: string
+  level: Level
+  at: string
+  what: string
+  words: WatchWords[]
+}
+
+/// Text written at a time.
+export type Said = { at: string; text: string }
+
+/// A call running: its tool, what it was called on, since when.
+export type Doing = { tool: string; what: string; since: string }
+
+/// A message of the operator's, with its class and marks.
+export type OperatorMessage = {
+  at: string
+  came: 'typed' | 'queued' | 'interrupt' | 'shell' | 'command'
+  text: string
+  class: 'stop' | 'status_ask' | 'question' | 'approval' | 'order' | null
+  correction: boolean
+  escalation: boolean
+}
+
+/// One file of a memory folder.
+export type MemoryFile = { name: string; size: number; modified: string | null; description: string | null }
+
+/// The task file a session is held to, or why it holds it to nothing.
+export type SpecView = {
+  path: string
+  file: string | null
+  version: string | null
+  first_version: string | null
+  owns: string[]
+  forbid: string[]
+  why: string | null
+}
+
+/// One session as the watcher holds it.
+export type WatchSession = {
+  id: string
+  name: string
+  key: string
+  agent: string
+  model: string | null
+  folder: string | null
+  state: 'stalled' | 'working' | 'behind a job' | 'waiting on you' | 'idle'
+  newest: string | null
+  doing: Doing | null
+  said: Said | null
+  message: OperatorMessage | null
+  orders: string | null
+  run: { since: string | null; calls: Record<string, number>; lines: number }
+  jobs: Doing[]
+  recap: Said | null
+  spec: SpecView | null
+  memory: { folder: string | null; files: MemoryFile[]; why: string | null }
+}
+
+/// Rows the watcher could not read, by why and by agent.
+export type Unread = { why: 'no_line' | 'no_session' | 'agent'; agent: string; rows: number }
+
+/// What the watcher holds.
+export type Watch = {
+  looked_at: string | null
+  every_secs: number
+  paused: boolean
+  window_from: string | null
+  lines_read: number
+  unread: Unread[]
+  sessions: WatchSession[]
+  reports: WatchReport[]
+}
+
+export const fetchWatch = () => fetch('/api/watch').then((r) => answer<Watch>(r))
+
+/// One file of a session's memory folder, whole.
+export const fetchMemory = async (session: string, file: string): Promise<string> => {
+  const r = await fetch(`/api/watch/memory?${new URLSearchParams({ session, file })}`)
+  if (!r.ok) {
+    const body = await r.json().catch(() => null)
+    throw new Error(body?.error ?? `HTTP ${r.status}`)
+  }
+  return r.text()
+}
