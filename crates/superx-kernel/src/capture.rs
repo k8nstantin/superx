@@ -398,32 +398,19 @@ pub async fn run_loop(
             tracing::info!("capture loop shutting down");
             return Ok(());
         }
-        // Operator intent, honored live: a disabled capture module
-        // pauses the whole engine (lifecycle + telemetry record the
-        // transition); re-enabling resumes on the next tick.
-        let enabled = module_enabled(kernel, NodeKind::KernelModule, MODULE_NAME).await?;
-        if enabled != was_enabled {
-            if enabled {
-                tracing::info!("capture resumed by operator");
-                kernel
-                    .mark_active(NodeKind::KernelModule, MODULE_NAME, 0)
-                    .await?;
-            } else {
-                tracing::info!("capture paused by operator");
-                kernel
-                    .mark_disabled(NodeKind::KernelModule, MODULE_NAME)
-                    .await?;
+        match capture_pass(kernel, &shutdown, &mut was_enabled).await {
+            Ok(report) if report.total() > 0 => {
+                tracing::info!(events = report.total(), "capture tick");
             }
-            was_enabled = enabled;
-        }
-        let report = if enabled {
-            let sources = discover_paired(kernel).await?;
-            capture_tick(kernel, &sources, Some(&shutdown)).await?
-        } else {
-            TickReport::default()
-        };
-        if report.total() > 0 {
-            tracing::info!(events = report.total(), "capture tick");
+            Ok(_) => {}
+            // A failed pass is tried again at the next tick. An answer
+            // that drops the substrate's socket fails every request in
+            // flight on it, capture's included, and capture used to end
+            // there without a word (#368; #568 on 2026-11-04, 44 minutes
+            // lost). The cursors hold where it stood, so nothing is lost.
+            Err(e) => {
+                tracing::warn!(error = %e, "capture pass failed; tried again at the next tick");
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
@@ -435,6 +422,33 @@ pub async fn run_loop(
             }
         }
     }
+}
+
+/// One pass of the loop: the operator's intent, honored live (a disabled
+/// capture module pauses the whole engine; lifecycle and telemetry record
+/// the transition; re-enabling resumes on the next tick), then discovery
+/// and a tick.
+async fn capture_pass(
+    kernel: &Kernel,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+    was_enabled: &mut bool,
+) -> Result<TickReport> {
+    let enabled = module_enabled(kernel, NodeKind::KernelModule, MODULE_NAME).await?;
+    if enabled != *was_enabled {
+        if enabled {
+            tracing::info!("capture resumed by operator");
+            kernel.mark_active(NodeKind::KernelModule, MODULE_NAME, 0).await?;
+        } else {
+            tracing::info!("capture paused by operator");
+            kernel.mark_disabled(NodeKind::KernelModule, MODULE_NAME).await?;
+        }
+        *was_enabled = enabled;
+    }
+    if !enabled {
+        return Ok(TickReport::default());
+    }
+    let sources = discover_paired(kernel).await?;
+    capture_tick(kernel, &sources, Some(shutdown)).await
 }
 
 /// Resolve the poll interval from the capture module's parameter,

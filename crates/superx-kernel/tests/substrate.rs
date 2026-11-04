@@ -220,3 +220,18 @@ fn already_exists_classifier() {
     assert!(is_already_exists("The table 'module' already exists"));
     assert!(!is_already_exists("Found type 'string' for field 'uid'"));
 }
+
+/// A fork is a socket of its own to the same substrate (#570): it needs
+/// what the kernel signed in with, so a handle built from an already
+/// connected client, which kept no endpoint or credentials, is refused,
+/// and the part that asked serves over the shared socket instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_needs_the_endpoint_and_credentials_the_kernel_signed_in_with() -> Result<(), Box<dyn Error>> {
+    let kernel = fresh_kernel().await?;
+    match kernel.fork().await {
+        Err(superx_kernel::KernelError::Config(why)) => assert!(why.contains("fork needs a connected instance"), "{why}"),
+        Err(other) => panic!("a handle with no endpoint is a configuration refusal, not {other}"),
+        Ok(_) => panic!("a handle with no endpoint or credentials cannot open a socket of its own"),
+    }
+    Ok(())
+}
