@@ -44,6 +44,10 @@ pub struct Kernel {
     /// already-connected handle). Recorded so boot telemetry can
     /// state where the substrate lives.
     endpoint: Option<String>,
+    /// Where this kernel signed in, kept so a part can open a socket of
+    /// its own to the same place ([`Kernel::fork`]).
+    namespace: Option<String>,
+    database: Option<String>,
     /// The service password, retained so module-own-db connections
     /// (`superx_mod_<name>`, same password under the D11 single-
     /// password phase) can be opened on demand. Never logged.
@@ -129,6 +133,8 @@ impl Kernel {
         Ok(Self {
             db,
             endpoint: Some(endpoint.to_string()),
+            namespace: Some(namespace.to_string()),
+            database: Some(database.to_string()),
             service_password: Some(retained_password),
             home: None,
             runtime: crate::supervise::RuntimeTable::default(),
@@ -146,6 +152,8 @@ impl Kernel {
         Self {
             db,
             endpoint: None,
+            namespace: None,
+            database: None,
             service_password: None,
             home: None,
             runtime: crate::supervise::RuntimeTable::default(),
@@ -212,6 +220,27 @@ impl Kernel {
             ))
         })?;
         Ok(db)
+    }
+
+    /// A socket of its own to the same substrate, signed in as the same
+    /// service account, sharing this kernel's home and its running modules:
+    /// an answer that drops it fails that part's requests alone, never
+    /// capture's (#568, #570).
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::Config`] on a handle with no endpoint or credentials;
+    /// [`KernelError::Db`] as for [`Kernel::connect_service`].
+    pub async fn fork(&self) -> Result<Self> {
+        let (Some(endpoint), Some(namespace), Some(database), Some(password)) =
+            (&self.endpoint, &self.namespace, &self.database, &self.service_password)
+        else {
+            return Err(KernelError::Config("fork needs a connected instance (endpoint + credentials)".into()));
+        };
+        let mut forked = Self::connect_service_with_password(endpoint, namespace, database, password).await?;
+        forked.home.clone_from(&self.home);
+        forked.runtime = self.runtime.clone();
+        Ok(forked)
     }
 
     /// The connection URL this kernel signed in over, if known.

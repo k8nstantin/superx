@@ -333,7 +333,16 @@ impl KernelModule for UiModule {
 
     async fn startup(&self, kernel: &Kernel) -> Result<()> {
         let port = resolved_port(kernel).await;
-        server::spawn(kernel.clone(), port).await?;
+        // The page reads over a socket of its own (#568, #570): an answer
+        // that drops it fails the page's requests, never capture's.
+        let page = match kernel.fork().await {
+            Ok(own) => own,
+            Err(e) => {
+                tracing::warn!(target: "ui", error = %e, "the page reads over capture's socket: it could not open its own");
+                kernel.clone()
+            }
+        };
+        server::spawn(page, port).await?;
         let url = format!("http://127.0.0.1:{port}");
         tracing::info!(target: "ui", %url, "ui module serving");
         let mut payload = superx_kernel::types::Object::new();
