@@ -341,7 +341,7 @@ impl Watcher {
                 }
                 if let Some(text) = text {
                     finds.ended(track, run, &text, p);
-                    contracts.ended(track, run, &text, p);
+                    contracts.ended(track, run, &text, alerts, p);
                     if !run.failed {
                         tasks.ran(track, run, &text, alerts, p);
                     }
@@ -355,6 +355,7 @@ impl Watcher {
             Fed::Said(text) => tasks.said(track, at, &text, p),
             Fed::Compacted => finds.compacted(track, at),
             Fed::Unanswered(u) | Fed::Answered(u) => alerts.api(track, &u, at, p),
+            Fed::Running(i) => contracts.running(track, &track.runs[i], alerts),
             Fed::TurnEnded => {
                 if let Some(stopped) = contracts.turn_ended(track, at, alerts) {
                     tasks.build_stopped(session, &stopped.ticket, stopped.at, stopped.how, alerts);

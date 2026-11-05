@@ -1087,6 +1087,37 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     let mut w = Watcher::new();
     let s = look(&mut w, &kernel, &p, agent.at).await;
     assert!(of(&s, Kind::TaskFileBroken).is_empty(), "{:?}", s.alerts);
+
+    // A door gate run in the background ends where the agent reads its
+    // execution's end (2026-11-05, ENG-8080 v3-2: its output went to a file
+    // of the build's own); a change before your word goes on past it.
+    let (kernel, dir, mut agent, _t0) = setup("build-background").await;
+    let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+    agent.typed("Build kn-specs/tasks/ENG-9999.xml", 0).await;
+    agent.call("r", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml")}), 2).await;
+    agent.result("r", false, &numbered(TASK_FILE), 1).await;
+    agent.job("w1", &format!("date | tee gates/w.txt && {} >> gates/w.txt 2>&1; echo \"gcloud exit $?\" >> gates/w.txt", door("stage,run,8,n1")), 30).await;
+    agent.notified("w1", "completed", 240).await;
+    agent.call("c", "Bash", json!({"command": "cat gates/w.txt"}), 5).await;
+    let failed = "Creating execution...\nRunning execution...failed\nExecuting job failed\nERROR: (gcloud.run.jobs.execute) The execution failed.\n\
+                  gcloud run jobs executions describe kn-s8-rvxmh\ngcloud exit 1";
+    agent.result("c", false, failed, 1).await;
+    // The gate's evidence kept beside it is no going on.
+    agent.call("l", "Bash", json!({"command": "gcloud storage cat 'gs://b/runs/r/*.log' 2>&1 | tee gates/batch-log.txt | head -80"}), 5).await;
+    agent.result("l", false, "ValueError: line 43: a string that never closes\nexit 1", 1).await;
+    // A commit refused made none.
+    agent.call("x", "Bash", json!({"command": "git add a && git commit -m 'ENG-9999 step 8'"}), 5).await;
+    agent.result("x", true, "Permission to use Bash with command git add a && git commit has been denied.", 1).await;
+    agent.call("e", "Edit", json!({"file_path": at("gryphon-kn/kn/stages/s08_relationships.py"), "old_string": "a", "new_string": "b"}), 30).await;
+    agent.result("e", false, "ok", 1).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    let went_on = of(&s, Kind::TaskFileBroken);
+    assert_eq!(went_on.len(), 1, "{:?}", s.alerts);
+    assert!(went_on[0].what.starts_with("went on after the door gate «Writing relationships» failed: changed gryphon-kn/kn/stages/s08_relationships.py"), "{}", went_on[0].what);
+    let build = s.builds.first().expect("the build");
+    assert_eq!(build.gates.first().map(|g| (g.gate.as_str(), g.ended_well)), Some(("Writing relationships", Some(false))));
+    assert!(build.commits.is_empty(), "{:?}", build.commits);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

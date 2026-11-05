@@ -329,6 +329,8 @@ pub enum Fed {
     /// A run ended: with its result's text, or none when a notice or a
     /// stop ended it.
     Ended(usize, Option<String>),
+    /// Claude Code answered that a run goes on in the background.
+    Running(usize),
     /// A message of the operator's, and when the one before it came.
     Prompt { came: Came, stop: bool, text: String, previous: Option<DateTime<Utc>> },
     Said(String),
@@ -537,6 +539,7 @@ impl Track {
                     if run.background && !failed {
                         if let Some(job) = job {
                             self.jobs.insert(job, i);
+                            fed.push(Fed::Running(i));
                             continue;
                         }
                     }

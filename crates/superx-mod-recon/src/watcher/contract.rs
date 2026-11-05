@@ -50,6 +50,7 @@ use crate::params::Params;
 /// What gcloud prints when it starts an execution, and when one failed.
 const EXECUTED: [&str; 2] = ["Creating execution", "Execution ["];
 const EXECUTION_FAILED: &str = "The execution failed";
+const EXECUTION_SUCCEEDED: &str = "has successfully completed";
 
 /// What Python writes beside the code: no file of the repository.
 const GENERATED: [&str; 2] = ["/__pycache__/", ".pyc"]; // skill-allow: §9-const — the interpreter's own caches, not a policy tunable
@@ -75,6 +76,10 @@ struct Slot {
     taken: Option<String>,
     ran: Option<DateTime<Utc>>,
     ended_well: Option<bool>,
+    /// The job its launch runs, and whether the launch runs in the
+    /// background: its end is then read where the agent reads it.
+    job: Option<String>,
+    background: bool,
 }
 
 /// One local gate: its command's words, the last line it expects, and its
@@ -103,12 +108,14 @@ struct Rules {
 }
 
 /// A commit of the build: when, its first line, and whether it keeps the
-/// file's rules.
+/// file's rules; the call that made it, which a refusal unmakes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommitRow {
     pub at: DateTime<Utc>,
     pub line: String,
     pub ok: bool,
+    #[serde(skip)]
+    pub call: String,
 }
 
 /// A local gate and its newest run.
@@ -190,6 +197,10 @@ pub struct Contract {
     /// The door gate that failed, and when, until the operator's next
     /// message.
     failed: Option<(String, DateTime<Utc>)>,
+    /// An act past that failure, until its call is answered: a call refused
+    /// or failed did nothing. Its call, the break's key, its words and when
+    /// the gate failed.
+    past_failure: Option<(String, String, String, DateTime<Utc>)>,
 }
 
 /// Every session's task file, once read.
@@ -230,10 +241,18 @@ impl Contracts {
         }
     }
 
+    /// A call of `t`'s Claude Code answered runs in the background: an act
+    /// past a failed gate it was is done.
+    pub fn running(&mut self, t: &Track, run: &Run, alerts: &mut Alerts) {
+        if let Some(c) = self.by_session.get_mut(&t.session) {
+            c.answered(t, run, alerts);
+        }
+    }
+
     /// A call of `t`'s that ended, with its result's text: the read of the
     /// task file it was told to build, which makes its contract, or a door
     /// gate's run.
-    pub fn ended(&mut self, t: &Track, run: &Run, text: &str, p: &Params) {
+    pub fn ended(&mut self, t: &Track, run: &Run, text: &str, alerts: &mut Alerts, p: &Params) {
         if run.tool == "Read" {
             let read = run.path.as_deref().unwrap_or_default();
             if let Some((path, root, at)) = self.ordered.get(&t.session).filter(|(path, _, _)| read.ends_with(path.as_str())) {
@@ -252,11 +271,31 @@ impl Contracts {
             return;
         }
         let Some(c) = self.by_session.get_mut(&t.session) else { return };
+        c.answered(t, run, alerts);
+        // A commit refused or failed made none.
+        if run.failed {
+            c.commits.retain(|r| r.call != run.call);
+        }
         // A local gate passed when its expected last line came and nothing
         // failed: one command may run several gates.
         let failed = run.failed || text.lines().any(|l| ["FAILED", "ERROR", "Traceback"].iter().any(|w| l.trim_start().starts_with(w)));
         for l in c.locals.iter_mut().filter(|l| l.call.as_deref() == Some(run.call.as_str())) {
             l.passed = Some(!failed && l.last_line.as_deref().is_none_or(|want| text.lines().any(|line| line.trim() == want)));
+        }
+        // A door gate run in the background ends where the agent reads its
+        // execution's end, in any result that names the execution
+        // (`<job>-<id>`): ended well, or failed.
+        let (succeeded, failed) = (text.contains(EXECUTION_SUCCEEDED), text.contains(EXECUTION_FAILED));
+        if EXECUTED.iter().any(|e| text.contains(e)) && succeeded != failed {
+            let at = run.end.unwrap_or(run.start);
+            for slot in c.slots.iter_mut().filter(|s| s.background && s.taken.is_some() && s.ended_well.is_none()) {
+                if slot.job.as_deref().is_some_and(|job| text.contains(&format!("{job}-"))) {
+                    slot.ended_well = Some(succeeded);
+                    if slot.ends_well && failed {
+                        c.failed = Some((slot.gate.clone(), at));
+                    }
+                }
+            }
         }
         let Some(slot) = c.slots.iter_mut().find(|s| s.taken.as_deref() == Some(run.call.as_str())) else { return };
         if !(EXECUTED.iter().any(|e| text.contains(e)) || (text.trim().is_empty() && !run.failed)) {
@@ -307,12 +346,14 @@ impl Contracts {
             alerts.task_file(t, run, "forbidden", what, run.start);
         }
         if let Some((gate, failed)) = c.failed.clone() {
-            let act = changed.first().map(|rel| format!("changed {rel}")).or_else(|| launch.as_ref().map(|l| format!("launched {}", plan::titled(l, &p.watch_jobs))));
+            // Going on is work on what it builds: a file it owns, a launch, a
+            // commit or a push; the gate's evidence it keeps is none.
+            let act = changed.iter().find(|rel| c.owns.contains(rel)).map(|rel| format!("changed {rel}"));
+            let act = act.or_else(|| launch.as_ref().map(|l| format!("launched {}", plan::titled(l, &p.watch_jobs))));
             let act = act.or_else(|| commits(&run.what).then(|| "committed or pushed".to_string()));
             if let Some(act) = act {
                 let what = format!("went on after the door gate «{gate}» failed: {act}; {} stops the build on a failed gate", c.file);
-                alerts.task_file(t, run, &format!("went_on/{gate}"), what, failed);
-                c.failed = None;
+                c.past_failure = Some((run.call.clone(), format!("went_on/{gate}"), what, failed));
             }
         }
         if let Some(l) = &launch {
@@ -324,8 +365,11 @@ impl Contracts {
             let gates: Vec<usize> = (0..c.slots.len()).filter(|&i| c.slots[i].work.as_deref().map_or(ours, |w| plan::scheduled(w, l, &p.watch_jobs))).collect();
             match gates.iter().find(|&&i| c.slots[i].taken.is_none()) {
                 Some(&free) => {
-                    c.slots[free].taken = Some(run.call.clone());
-                    c.slots[free].ran = Some(run.start);
+                    let slot = &mut c.slots[free];
+                    slot.taken = Some(run.call.clone());
+                    slot.ran = Some(run.start);
+                    slot.job = plan::label(l, &p.watch_jobs).split_whitespace().next().map(str::to_string);
+                    slot.background = run.background;
                 }
                 None if !gates.is_empty() => {
                     let mut ids: Vec<&str> = gates.iter().map(|&i| c.slots[i].gate.as_str()).collect();
@@ -422,10 +466,19 @@ impl Contract {
             let ends_well = expect.contains("exit 0") && !expect.contains("exit 1");
             let launches: Vec<String> = elements(body, "cmd").into_iter().filter_map(|(_, cmd)| plan::launch(&plan::placeholders_whole(&plan::unescape(cmd)), &p.watch_jobs)).collect();
             if launches.is_empty() {
-                slots.push(Slot { gate: gate.clone(), work: None, ends_well, taken: None, ran: None, ended_well: None });
+                slots.push(Slot { gate: gate.clone(), work: None, ends_well, taken: None, ran: None, ended_well: None, job: None, background: false });
             }
             for l in launches {
-                slots.push(Slot { gate: gate.clone(), work: Some(plan::same_work(&l)), ends_well, taken: None, ran: None, ended_well: None });
+                slots.push(Slot {
+                    gate: gate.clone(),
+                    work: Some(plan::same_work(&l)),
+                    ends_well,
+                    taken: None,
+                    ran: None,
+                    ended_well: None,
+                    job: None,
+                    background: false,
+                });
             }
         }
         let mut locals = Vec::new();
@@ -479,6 +532,19 @@ impl Contract {
             verbs,
             bucket: forbid_text.contains("bucket"),
             failed: None,
+            past_failure: None,
+        }
+    }
+
+    /// A call answered: an act past a failed gate it was is a break when the
+    /// call did not fail, and nothing when it was refused.
+    fn answered(&mut self, t: &Track, run: &Run, alerts: &mut Alerts) {
+        if self.past_failure.as_ref().is_some_and(|(call, ..)| *call == run.call) {
+            let Some((_, key, what, failed)) = self.past_failure.take() else { return };
+            if !run.failed {
+                alerts.task_file(t, run, &key, what, failed);
+                self.failed = None;
+            }
         }
     }
 
@@ -502,7 +568,7 @@ impl Contract {
                 let what = format!("a commit whose message {why}, which {} forbids: {line}", self.file);
                 alerts.task_file(t, run, "commit", what, run.start);
             }
-            self.commits.push(CommitRow { at: run.start, line: line.chars().take(200).collect(), ok: !(unprefixed || trailer) });
+            self.commits.push(CommitRow { at: run.start, line: line.chars().take(200).collect(), ok: !(unprefixed || trailer), call: run.call.clone() });
         }
         if self.rules.pull_is_yours && (command::opens_pull(&run.what) || command::merges(&run.what).is_some()) {
             let what = format!("opened or merged a pull request itself: {} has you open it", self.file);
