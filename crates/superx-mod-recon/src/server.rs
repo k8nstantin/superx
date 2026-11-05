@@ -22,6 +22,7 @@ use crate::api;
 use crate::crawler::progress::Progress;
 use crate::instance::Instance;
 use crate::results::trail::Held;
+use crate::watcher::{self, Watched};
 
 /// The port HTTP leaves out of a request's Host.
 const HTTP_DEFAULT_PORT: u16 = 80; // skill-allow: §9-const — HTTP's own default port (RFC 9110), not a policy tunable
@@ -35,6 +36,7 @@ struct Page {
     instance: Instance,
     progress: Progress,
     trail: Held,
+    watched: Watched,
 }
 
 impl FromRef<Page> for Kernel {
@@ -55,9 +57,15 @@ impl FromRef<Page> for Held {
     }
 }
 
+impl FromRef<Page> for Watched {
+    fn from_ref(page: &Page) -> Self {
+        page.watched.clone()
+    }
+}
+
 /// The module's routes, for the server listening on `port`, the crawler
-/// reporting to `progress`.
-pub fn app(kernel: Kernel, instance: Instance, port: u16, progress: Progress) -> Router {
+/// reporting to `progress` and the watcher publishing to `watched`.
+pub fn app(kernel: Kernel, instance: Instance, port: u16, progress: Progress, watched: Watched) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/api/ping", get(api::ping))
@@ -72,8 +80,9 @@ pub fn app(kernel: Kernel, instance: Instance, port: u16, progress: Progress) ->
         .route("/api/stats", get(api::stats))
         .route("/api/params", get(api::params))
         .route("/api/params/{name}", put(api::set))
+        .route("/api/watch", get(watcher::routes::watch))
         .fallback(get(crate::ui::asset))
-        .with_state(Page { kernel, instance, progress, trail: Held::default() })
+        .with_state(Page { kernel, instance, progress, trail: Held::default(), watched })
         .layer(middleware::from_fn_with_state(port, only_its_own_name))
 }
 

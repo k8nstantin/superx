@@ -523,3 +523,71 @@ export type CommitDetail = {
 
 export const fetchCommit = (repo: string, hash: string) =>
   fetch(`/api/results/commit?${new URLSearchParams({ repo, hash })}`).then((r) => answer<CommitDetail>(r))
+
+/// Where a session's time went, in seconds (src/watcher/track.rs).
+export type Split = { thinking: number; writing: number; tools: number; jobs: number; operator: number; approval: number }
+export type Counts = { prompts: number; calls: number; launches: number }
+
+export type AlertKind = 'run_again' | 'long_run' | 'stop_not_followed' | 'plan_repeats'
+
+/// One of the watcher's alerts: the critical ones alone (#573).
+export type WatchAlert = {
+  id: string
+  session: string
+  name: string
+  kind: AlertKind
+  at: string
+  what: string
+  since: string | null
+  cost_secs: number | null
+  evidence: string[]
+}
+
+export type Doing = { tool: string; what: string; since: string; expected_end: string | null }
+
+export type WatchSession = {
+  id: string
+  name: string
+  model: string | null
+  folder: string | null
+  newest: string
+  state: 'working' | 'job running' | 'waiting on you' | 'waiting on your approval' | 'idle'
+  doing: Doing | null
+  jobs: Doing[]
+}
+
+export type WatchRun = {
+  session: string
+  name: string
+  model: string | null
+  tool: string
+  label: string
+  what: string
+  start: string
+  end: string | null
+  secs: number
+  background: boolean
+  failed: boolean
+  status: string | null
+}
+
+export type ModelTime = { model: string; split: Split; sessions: number; counts: Counts }
+export type WatchDay = { day: string; split: Split; sessions: number; counts: Counts; long_runs: number; alerts: Partial<Record<AlertKind, number>> }
+
+export type Watch = {
+  looked_at: string | null
+  every_secs: number
+  paused: boolean
+  window_from: string | null
+  lines_read: number
+  long_secs: number
+  repeat_secs: number
+  alerts: WatchAlert[]
+  sessions: WatchSession[]
+  runs: WatchRun[]
+  models: ModelTime[]
+  days: WatchDay[]
+}
+
+/// The watcher's snapshot, its measures by the operator's own days.
+export const fetchWatch = () => fetch(`/api/watch?offset=${-new Date().getTimezoneOffset()}`).then((r) => answer<Watch>(r))

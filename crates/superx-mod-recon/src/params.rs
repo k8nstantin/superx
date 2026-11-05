@@ -127,6 +127,50 @@ const DEFAULT_ESCALATION_WORDS: &[&str] = &["fuck", "shit", "wtf", "damn", "usel
 pub const SNAPSHOT_WORDS_PARAM: &str = "attr_recon_snapshot_words";
 const DEFAULT_SNAPSHOT_WORDS: &[&str] = &["savepoint", "not for merge"];
 
+/// How often the watcher looks at the lines captured since its last look,
+/// in seconds; 0 pauses it (#573).
+pub const WATCH_SECS_PARAM: &str = "attr_recon_watch_secs";
+const DEFAULT_WATCH_SECS: u64 = 5; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_secs
+
+/// How far back the watcher reads when it starts, in seconds: its measures
+/// and its alerts cover this window (#573).
+pub const WATCH_WINDOW_SECS_PARAM: &str = "attr_recon_watch_window_secs";
+const DEFAULT_WATCH_WINDOW_SECS: u64 = 604_800; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_window_secs
+
+/// A launch the same as one that ran to its end in at least this many
+/// seconds is finished work run again (#573).
+pub const WATCH_REPEAT_SECS_PARAM: &str = "attr_recon_watch_repeat_secs";
+const DEFAULT_WATCH_REPEAT_SECS: u64 = 600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_repeat_secs
+
+/// A background job running past this many seconds is a run going long
+/// (#573): long running means problems (operator, 2026-11-05).
+pub const WATCH_LONG_SECS_PARAM: &str = "attr_recon_watch_long_secs";
+const DEFAULT_WATCH_LONG_SECS: u64 = 3_600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_long_secs
+
+/// The commands that launch jobs: a simple command starting with one of
+/// them is a launch, and the words after it name the job and its input
+/// (#573).
+pub const WATCH_JOBS_PARAM: &str = "attr_recon_watch_jobs";
+const DEFAULT_WATCH_JOBS: &[&str] = &[
+    "gcloud run jobs execute",
+    "gcloud dataproc batches submit",
+    "gcloud builds submit",
+    "gcloud dataflow jobs run",
+    "terraform apply",
+    "bq query",
+    "kubectl apply",
+    "spark-submit",
+];
+
+/// The words your message starts with when you stop the agent (#573).
+pub const WATCH_STOP_WORDS_PARAM: &str = "attr_recon_watch_stop_words";
+const DEFAULT_WATCH_STOP_WORDS: &[&str] = &["stop", "halt", "cancel", "abort", "don't", "dont", "do not"];
+
+/// The files that hold a plan of runs: a path holding one of these is read
+/// for jobs launched more than once (#573).
+pub const WATCH_PLANS_PARAM: &str = "attr_recon_watch_plans";
+const DEFAULT_WATCH_PLANS: &[&str] = &["/tasks/"];
+
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -152,6 +196,13 @@ pub struct Params {
     pub correction_words: Vec<String>,
     pub escalation_words: Vec<String>,
     pub snapshot_words: Vec<String>,
+    pub watch_secs: u64,
+    pub watch_window_secs: u64,
+    pub watch_repeat_secs: u64,
+    pub watch_long_secs: u64,
+    pub watch_jobs: Vec<String>,
+    pub watch_stop_words: Vec<String>,
+    pub watch_plans: Vec<String>,
 }
 
 impl Params {
@@ -205,7 +256,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 22] = [
+pub const NAMES: [&str; 29] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -228,6 +279,13 @@ pub const NAMES: [&str; 22] = [
     CORRECTION_WORDS_PARAM,
     ESCALATION_WORDS_PARAM,
     SNAPSHOT_WORDS_PARAM,
+    WATCH_SECS_PARAM,
+    WATCH_WINDOW_SECS_PARAM,
+    WATCH_REPEAT_SECS_PARAM,
+    WATCH_LONG_SECS_PARAM,
+    WATCH_JOBS_PARAM,
+    WATCH_STOP_WORDS_PARAM,
+    WATCH_PLANS_PARAM,
 ];
 
 /// What a parameter is for, as the tab shows it (#539): when the crawler
@@ -267,6 +325,13 @@ pub fn about(name: &str) -> Option<About> {
         CORRECTION_WORDS_PARAM => ("measures", "list", "Whole words in your prompt that correct the agent."),
         ESCALATION_WORDS_PARAM => ("measures", "list", "Words in your prompt, at a word's start, that escalate."),
         SNAPSHOT_WORDS_PARAM => ("measures", "list", "Words in a commit's subject that make it a snapshot, not work: it counts nowhere."),
+        WATCH_SECS_PARAM => ("watches", "number", "How often the watcher looks at the newest lines, in seconds; 0 pauses it."),
+        WATCH_WINDOW_SECS_PARAM => ("watches", "number", "How far back the watcher reads when it starts, in seconds: its measures and alerts cover this."),
+        WATCH_REPEAT_SECS_PARAM => ("watches", "number", "A launch the same as one that ran to its end in at least this many seconds is an alert."),
+        WATCH_LONG_SECS_PARAM => ("watches", "number", "A background job running past this many seconds is an alert."),
+        WATCH_JOBS_PARAM => ("watches", "list", "Commands that launch jobs: the words after one name the job and its input."),
+        WATCH_STOP_WORDS_PARAM => ("watches", "list", "Words your message starts with when you stop the agent."),
+        WATCH_PLANS_PARAM => ("watches", "list", "Files holding a plan of runs: a path holding one of these is read for repeated launches."),
         _ => return None,
     };
     Some(About { group, decides, input })
@@ -326,6 +391,13 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         correction_words: r.strings(CORRECTION_WORDS_PARAM, DEFAULT_CORRECTION_WORDS),
         escalation_words: r.strings(ESCALATION_WORDS_PARAM, DEFAULT_ESCALATION_WORDS),
         snapshot_words: r.strings(SNAPSHOT_WORDS_PARAM, DEFAULT_SNAPSHOT_WORDS),
+        watch_secs: r.count(WATCH_SECS_PARAM, 0, DEFAULT_WATCH_SECS),
+        watch_window_secs: r.count(WATCH_WINDOW_SECS_PARAM, 1, DEFAULT_WATCH_WINDOW_SECS),
+        watch_repeat_secs: r.count(WATCH_REPEAT_SECS_PARAM, 1, DEFAULT_WATCH_REPEAT_SECS),
+        watch_long_secs: r.count(WATCH_LONG_SECS_PARAM, 1, DEFAULT_WATCH_LONG_SECS),
+        watch_jobs: r.strings(WATCH_JOBS_PARAM, DEFAULT_WATCH_JOBS),
+        watch_stop_words: r.strings(WATCH_STOP_WORDS_PARAM, DEFAULT_WATCH_STOP_WORDS),
+        watch_plans: r.strings(WATCH_PLANS_PARAM, DEFAULT_WATCH_PLANS),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -493,7 +565,7 @@ mod tests {
 
     /// The parameters before the rename, as `superx-performance` named them,
     /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 22] = [
+    const TODAY: [(&str, &str); 29] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -520,6 +592,17 @@ mod tests {
         ),
         ("escalation_words", "fuck, shit, wtf, damn, useless, garbage"),
         ("snapshot_words", "savepoint, not for merge"),
+        ("watch_secs", "5"),
+        ("watch_window_secs", "604800"),
+        ("watch_repeat_secs", "600"),
+        ("watch_long_secs", "3600"),
+        (
+            "watch_jobs",
+            "gcloud run jobs execute, gcloud dataproc batches submit, gcloud builds submit, gcloud dataflow jobs run, terraform apply, \
+             bq query, kubectl apply, spark-submit",
+        ),
+        ("watch_stop_words", "stop, halt, cancel, abort, don't, dont, do not"),
+        ("watch_plans", "/tasks/"),
     ];
 
     #[test]
@@ -670,7 +753,7 @@ mod tests {
     fn every_parameter_says_what_it_is_for() {
         for name in NAMES {
             let about = about(name).expect(name);
-            assert!(["when", "where", "how much", "listens", "measures"].contains(&about.group), "{name}: {about:?}");
+            assert!(["when", "where", "how much", "listens", "measures", "watches"].contains(&about.group), "{name}: {about:?}");
             assert!(["number", "number or all", "list", "refs"].contains(&about.input), "{name}: {about:?}");
             assert!(!about.decides.is_empty(), "{name}");
         }
