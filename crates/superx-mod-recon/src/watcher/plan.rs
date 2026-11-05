@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use super::command::{is_assignment, simple_commands, without_redirections};
+
 /// How much of a launch's input its label shows.
 const LABEL_INPUT_CHARS: usize = 48; // skill-allow: §9-const — display width of a label, not a policy tunable
 
@@ -49,6 +51,16 @@ pub fn label(launch: &str, jobs: &[String]) -> String {
     }
 }
 
+/// A launch as its time is counted: the job command it begins with, and
+/// the job and its input as [`label`] names them.
+#[must_use]
+pub fn titled(launch: &str, jobs: &[String]) -> String {
+    match jobs.iter().map(|j| j.trim()).filter(|j| !j.is_empty()).find(|j| launch.starts_with(j)) {
+        Some(job) => format!("{job} {}", label(launch, jobs)),
+        None => label(launch, jobs),
+    }
+}
+
 /// One job a plan launches more than once.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Repeat {
@@ -74,9 +86,39 @@ pub fn repeats(xml: &str, jobs: &[String]) -> Vec<Repeat> {
     found.into_iter().filter(|(_, by)| by.len() > 1).map(|(job, by)| Repeat { job, times: by.len(), by }).collect()
 }
 
+/// Whether `launch` is a run of the job a plan repeats (`job`, as
+/// [`repeats`] gives it): the same job command, the same job, or any where
+/// the plan names it by a placeholder, and the plan's input first in the
+/// launch's, part by part.
+#[must_use]
+pub fn scheduled(job: &str, launch: &str, jobs: &[String]) -> bool {
+    let Some(command) = jobs.iter().map(|j| j.trim()).filter(|j| !j.is_empty()).find(|j| job.starts_with(j) && launch.starts_with(j)) else {
+        return false;
+    };
+    let (planned, ran) = (job[command.len()..].trim(), launch[command.len()..].trim());
+    let name = |s: &str| s.split_whitespace().next().unwrap_or_default().to_string();
+    let (p, r) = (name(planned), name(ran));
+    if p != r && !(p.starts_with('<') && p.ends_with('>')) {
+        return false;
+    }
+    let (p, r) = (input(planned), input(ran));
+    p.len() <= r.len() && p.iter().zip(&r).all(|(a, b)| a == b)
+}
+
+/// A launch's input: the value of its `--args`, part by part.
+fn input(launch: &str) -> Vec<String> {
+    let words: Vec<&str> = launch.split_whitespace().collect();
+    let value = words.iter().enumerate().find_map(|(i, w)| {
+        w.strip_prefix("--args=").map(str::to_string).or_else(|| (*w == "--args").then(|| words.get(i + 1).map(|v| (*v).to_string())).flatten())
+    });
+    value
+        .map(|v| v.trim_matches(['\'', '"']).split(',').filter(|p| !p.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 /// A launch with its selections set aside: the input after `--args` up to
 /// its first placeholder or `*`.
-fn same_work(launch: &str) -> String {
+pub(super) fn same_work(launch: &str) -> String {
     let mut out = Vec::new();
     let mut args_next = false;
     for w in launch.split_whitespace() {
@@ -121,7 +163,7 @@ fn commands(xml: &str) -> Vec<(String, String)> {
 
 /// A placeholder written with spaces, `<the name of a table>`, kept as one
 /// word.
-fn placeholders_whole(cmd: &str) -> String {
+pub(super) fn placeholders_whole(cmd: &str) -> String {
     let mut inside = false;
     cmd.chars()
         .map(|c| {
@@ -136,71 +178,12 @@ fn placeholders_whole(cmd: &str) -> String {
         .collect()
 }
 
-fn attribute(head: &str, name: &str) -> Option<String> {
+pub(super) fn attribute(head: &str, name: &str) -> Option<String> {
     let at = head.find(&format!("{name}=\""))? + name.len() + 2;
     let end = head[at..].find('"')? + at;
     Some(unescape(&head[at..end]))
 }
 
-fn unescape(s: &str) -> String {
+pub(super) fn unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
-}
-
-/// A command's simple commands: split at `;`, `&&`, `||`, `|`, `&` and new
-/// lines outside quotes.
-fn simple_commands(command: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut quote: Option<char> = None;
-    let mut chars = command.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match (quote, ch) {
-            (Some(q), c) if c == q => {
-                quote = None;
-                cur.push(c);
-            }
-            (Some(_), c) => cur.push(c),
-            (None, '\'' | '"') => {
-                quote = Some(ch);
-                cur.push(ch);
-            }
-            // `2>&1` and `<&3` redirect; they end no command.
-            (None, '&') if cur.ends_with('>') || cur.ends_with('<') => cur.push(ch),
-            (None, ';' | '\n' | '|' | '&') => {
-                if matches!(chars.peek(), Some('|' | '&')) {
-                    chars.next();
-                }
-                out.push(std::mem::take(&mut cur));
-            }
-            (None, c) => cur.push(c),
-        }
-    }
-    out.push(cur);
-    out.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
-}
-
-/// A command's words without its redirections: `2>&1`, `>out`, and a `>`
-/// or `<` with the file after it.
-fn without_redirections<'a>(words: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut target = false;
-    for w in words {
-        if target {
-            target = false;
-            continue;
-        }
-        let rest = w.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
-        // `<door.stage_jobs.6.run>` is a task file's placeholder, not a redirection.
-        let placeholder = w.len() > 2 && w.starts_with('<') && w.ends_with('>') && !w.starts_with("<<");
-        if !placeholder && (rest.starts_with('>') || rest.starts_with('<')) {
-            target = rest.trim_start_matches(['>', '<', '&']).is_empty() && !rest.contains('&');
-            continue;
-        }
-        out.push(w);
-    }
-    out
-}
-
-fn is_assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }

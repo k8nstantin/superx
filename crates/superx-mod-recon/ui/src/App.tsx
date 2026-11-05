@@ -8,14 +8,15 @@ import { Repos } from './panels/Repos'
 import { Stats } from './panels/Stats'
 import { Params } from './panels/Params'
 import { RESULT_VIEWS, Results } from './results/Results'
-import { Watcher } from './watcher/Watcher'
+import { WATCH_VIEWS, Watcher } from './watcher/Watcher'
 
 // The tab, in three: the Crawler (what it does, has and runs on), the
 // Results (what it gathers them for, a view per question under results/)
 // and the Watcher (#573: the sessions and their jobs as they work, the
-// critical alerts, where the agents' time goes). The open one is kept in
-// the address: #crawler, #results/<view> or #watcher. Above it, the
-// header's trail (#562): SuperX, the module, the tab and the view.
+// critical alerts and their causes, what it found, where the agents' time
+// goes). The open one is kept in the address: #crawler, #results/<view> or
+// #watcher/<view>. Above it, the header's trail (#562): SuperX, the module,
+// the tab and the view.
 const VIEWS = ['crawler', 'results', 'watcher']
 
 function opened(): [string, string] {
@@ -35,7 +36,8 @@ function trail(core: string | null | undefined, view: string, sub: string): Crum
     const [, label] = RESULT_VIEWS.find(([k]) => k === sub) ?? RESULT_VIEWS[0]
     crumbs.push({ label: 'Results', href: '#results' }, { label })
   } else if (view === 'watcher') {
-    crumbs.push({ label: 'Watcher' })
+    const [, label] = WATCH_VIEWS.find(([k]) => k === sub) ?? WATCH_VIEWS[0]
+    crumbs.push({ label: 'Watcher', href: '#watcher' }, { label })
   } else {
     crumbs.push({ label: 'Crawler' })
   }
@@ -76,7 +78,7 @@ export default function App() {
             </Stack>
             <Tabs
               value={view}
-              onChange={(v) => v && go(v, v === 'results' ? sub : '')}
+              onChange={(v) => v && go(v, v === view ? sub : '')}
               keepMounted={false}
             >
               <Tabs.List>
@@ -96,7 +98,7 @@ export default function App() {
                 <Results sub={sub} go={(s) => go('results', s)} />
               </Tabs.Panel>
               <Tabs.Panel value="watcher" pt="lg">
-                <Watcher />
+                <Watcher sub={sub} go={(s) => go('watcher', s)} />
               </Tabs.Panel>
             </Tabs>
           </Stack>

@@ -528,9 +528,10 @@ export const fetchCommit = (repo: string, hash: string) =>
 export type Split = { thinking: number; writing: number; tools: number; jobs: number; operator: number; approval: number }
 export type Counts = { prompts: number; calls: number; launches: number }
 
-export type AlertKind = 'run_again' | 'long_run' | 'stop_not_followed' | 'plan_repeats'
+export type AlertKind = 'run_again' | 'long_run' | 'stop_not_followed' | 'plan_repeats' | 'endless_task' | 'task_file_broken' | 'build_stopped'
 
-/// One of the watcher's alerts: the critical ones alone (#573).
+/// One of the watcher's alerts: the critical ones alone (#573), each with
+/// where its cause starts and the alert that caused it.
 export type WatchAlert = {
   id: string
   session: string
@@ -541,11 +542,16 @@ export type WatchAlert = {
   since: string | null
   cost_secs: number | null
   evidence: string[]
+  call: string | null
+  from: string
+  launch: string | null
+  repeats: { job: string; times: number; by: string[] }[]
+  cause: string | null
 }
 
 export type Doing = { tool: string; what: string; since: string; expected_end: string | null }
 
-export type WatchSession = {
+export type WatchNow = {
   id: string
   name: string
   model: string | null
@@ -556,13 +562,18 @@ export type WatchSession = {
   jobs: Doing[]
 }
 
+export type WatchSessionRow = { id: string; name: string; model: string | null; folder: string | null; first: string; newest: string }
+
 export type WatchRun = {
   session: string
   name: string
   model: string | null
+  call: string
   tool: string
+  target: string
   label: string
   what: string
+  launch: string | null
   start: string
   end: string | null
   secs: number
@@ -571,8 +582,24 @@ export type WatchRun = {
   status: string | null
 }
 
-export type ModelTime = { model: string; split: Split; sessions: number; counts: Counts }
-export type WatchDay = { day: string; split: Split; sessions: number; counts: Counts; long_runs: number; alerts: Partial<Record<AlertKind, number>> }
+export type WatchTask = {
+  session: string
+  name: string
+  branch: string
+  tickets: string[]
+  asked: string
+  last: string
+  estimates: { at: string; secs: number; words: string }[]
+  merges: string[]
+  reopened: [string, string][]
+  /// The branches made for it after a merge, newest last.
+  versions: string[]
+  /// What the agent said was not done once it had read a merge of it.
+  not_done: [string, string][]
+  corrections: number
+  asks: number
+  after_merge_secs: number
+}
 
 export type Watch = {
   looked_at: string | null
@@ -580,14 +607,87 @@ export type Watch = {
   paused: boolean
   window_from: string | null
   lines_read: number
+  /// The captured rows the watcher does not read yet, by why and by agent.
+  unread: { why: string; agent: string; rows: number }[]
   long_secs: number
   repeat_secs: number
   alerts: WatchAlert[]
-  sessions: WatchSession[]
+  now: WatchNow[]
+  sessions: WatchSessionRow[]
   runs: WatchRun[]
-  models: ModelTime[]
-  days: WatchDay[]
+  tasks: WatchTask[]
 }
 
-/// The watcher's snapshot, its measures by the operator's own days.
-export const fetchWatch = () => fetch(`/api/watch?offset=${-new Date().getTimezoneOffset()}`).then((r) => answer<Watch>(r))
+/// What the watcher holds at its newest look.
+export const fetchWatch = () => fetch('/api/watch').then((r) => answer<Watch>(r))
+
+/// A day of a session's time on one thing, under one model.
+export type TimeRow = { day: string; session: string; model: string | null; tool: string; target: string; split: Split; calls: number; failed: number }
+export type HourRow = { hour: string; session: string; split: Split; counts: Counts }
+export type WatchTime = { rows: TimeRow[]; hours: HourRow[] }
+
+/// Where the time went, in the operator's own days.
+export const fetchWatchTime = () => fetch(`/api/watch/time?offset=${-new Date().getTimezoneOffset()}`).then((r) => answer<WatchTime>(r))
+
+export type Hidden =
+  | 'held'
+  | 'slept'
+  | 'thrash'
+  | 'refused'
+  | 'protected'
+  | 'compacted'
+  | 'reread'
+  | 'flood'
+  | 'interrupted'
+  | 'asked'
+  | 'corrected'
+  | 'undone'
+
+/// One thing the watcher dug out.
+export type Found = {
+  id: string
+  session: string
+  name: string
+  kind: Hidden
+  at: string
+  from: string
+  what: string
+  tool: string | null
+  target: string | null
+  call: string | null
+  secs: number | null
+  chars: number | null
+  times: number
+}
+
+export const fetchFound = () => fetch('/api/watch/found').then((r) => answer<Found[]>(r))
+
+/// One line of a session as a drill shows it; a call with how it ended.
+export type LineRow = {
+  at: string
+  kind: 'you' | 'thought' | 'said' | 'call' | 'failed' | 'job_ended' | 'compacted'
+  text: string
+  tool: string | null
+  call: string | null
+  target: string | null
+  end: string | null
+  secs: number | null
+  failed: boolean | null
+  status: string | null
+  background: boolean | null
+}
+
+export type Lines = { lines: LineRow[]; earlier: boolean }
+
+/// A session's lines from `from` to `to`, the newest of them.
+export const fetchLines = (session: string, from: string, to: string) =>
+  fetch(`/api/watch/lines?${new URLSearchParams({ session, from, to })}`).then((r) => answer<Lines>(r))
+
+export type CallsAsked = { session?: string; tool?: string; target?: string; under?: string; from?: string; to?: string }
+export type Calls = { calls: WatchRun[]; total: number }
+
+/// The calls asked for, newest first.
+export const fetchCalls = (asked: CallsAsked) => {
+  const q = new URLSearchParams(Object.entries(asked).filter(([, v]) => v != null && v !== '') as [string, string][])
+  return fetch(`/api/watch/calls?${q}`).then((r) => answer<Calls>(r))
+}

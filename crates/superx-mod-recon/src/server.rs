@@ -80,7 +80,7 @@ pub fn app(kernel: Kernel, instance: Instance, port: u16, progress: Progress, wa
         .route("/api/stats", get(api::stats))
         .route("/api/params", get(api::params))
         .route("/api/params/{name}", put(api::set))
-        .route("/api/watch", get(watcher::routes::watch))
+        .merge(watcher::routes::router())
         .fallback(get(crate::ui::asset))
         .with_state(Page { kernel, instance, progress, trail: Held::default(), watched })
         .layer(middleware::from_fn_with_state(port, only_its_own_name))

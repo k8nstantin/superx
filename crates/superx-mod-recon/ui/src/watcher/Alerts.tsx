@@ -1,0 +1,178 @@
+import { Fragment, useState } from 'react'
+import { Badge, Button, Group, Paper, Stack, Table, Text } from '@mantine/core'
+import type { Watch, WatchAlert, WatchTask } from '../api'
+import { EChart, FAIL, MONO, type Clicked } from '../EChart'
+import { category, grid, legend, stacked, tip, value } from '../results/charts'
+import { day } from '../time'
+import { dayOf, KIND, short, took, type Focus } from './data'
+import { around, Lines } from './Lines'
+import { History } from './Tasks'
+
+// The critical alerts, in one table, newest first: each opens on its cause.
+// What it is about and what it cost; the alert that caused it and the ones
+// it led to; for a plan, the gates that launch the same job; for a task that
+// never ends, its merges, reopenings and estimates; and the session's own
+// lines from where its cause starts to the alert.
+
+/// The task an alert of a task that never ends is about.
+function taskOf(a: WatchAlert, tasks: WatchTask[]): WatchTask | undefined {
+  const branch = a.id.split('/endless_task/')[1]?.split('/').slice(0, -1).join('/')
+  return tasks.find((t) => t.session === a.session && t.branch === branch)
+}
+
+function Cause({ a, w, open, core }: { a: WatchAlert; w: Watch; open: (id: string) => void; core: string | null }) {
+  const caused = a.cause ? w.alerts.find((x) => x.id === a.cause) : undefined
+  const led = w.alerts.filter((x) => x.cause === a.id)
+  const task = a.kind === 'endless_task' ? taskOf(a, w.tasks) : undefined
+  const [from, to] = around(a.from, a.at)
+  return (
+    <Stack gap="xs" py={4}>
+      <Group gap="lg" wrap="wrap">
+        {a.since && <Text fz="xs">since {day(a.since)}</Text>}
+        {a.cost_secs != null && <Text fz="xs">at stake: {took(a.cost_secs)}</Text>}
+        {a.launch && (
+          <Text fz="xs" ff={MONO} style={{ overflowWrap: 'anywhere' }}>
+            launch: {a.launch}
+          </Text>
+        )}
+      </Group>
+      {caused && (
+        <Group gap="xs">
+          <Text fz="xs" fw={600}>Caused by:</Text>
+          <Badge size="xs" color={KIND[caused.kind][1]}>{KIND[caused.kind][0]}</Badge>
+          <Text fz="xs">{caused.what}</Text>
+          <Button size="compact-xs" variant="subtle" onClick={() => open(caused.id)}>open it</Button>
+        </Group>
+      )}
+      {led.map((x) => (
+        <Group key={x.id} gap="xs">
+          <Text fz="xs" fw={600}>Led to:</Text>
+          <Badge size="xs" color={KIND[x.kind][1]}>{KIND[x.kind][0]}</Badge>
+          <Text fz="xs">{x.what}</Text>
+          <Button size="compact-xs" variant="subtle" onClick={() => open(x.id)}>open it</Button>
+        </Group>
+      ))}
+      {a.repeats.map((r) => (
+        <Paper key={r.job} withBorder p={6} radius="sm">
+          <Text fz="xs" fw={600}>
+            {r.times} launches of <Text span ff={MONO} fz="xs">{r.job}</Text>, by:
+          </Text>
+          {r.by.map((g, i) => (
+            <Text key={i} fz="xs" pl="sm">
+              {g}
+            </Text>
+          ))}
+        </Paper>
+      ))}
+      {task && <History t={task} />}
+      {a.kind !== 'endless_task' && a.evidence.length > 0 && (
+        <Stack gap={2}>
+          {a.evidence.map((e, i) => (
+            <Text key={i} fz="xs" ff={MONO} c="dimmed" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+              {e}
+            </Text>
+          ))}
+        </Stack>
+      )}
+      <Lines session={a.session} from={from} to={to} mark={a.call} core={core} />
+    </Stack>
+  )
+}
+
+/// The alerts per day, by kind: when things went wrong.
+function perDay(alerts: WatchAlert[]) {
+  const days = [...new Set(alerts.map((a) => dayOf(a.at)))].sort()
+  const kinds = (Object.keys(KIND) as (keyof typeof KIND)[]).filter((k) => alerts.some((a) => a.kind === k))
+  return {
+    days,
+    option: {
+      legend: legend(),
+      grid: grid(),
+      tooltip: tip(),
+      xAxis: category(days.map(short)),
+      yAxis: value(),
+      series: kinds.map((k) => stacked(KIND[k][0], days.map((d) => alerts.filter((a) => a.kind === k && dayOf(a.at) === d).length), KIND[k][1], 'a', { barMaxWidth: 26 })),
+    },
+  }
+}
+
+export function Alerts({ w, focus, setFocus, core }: { w: Watch; focus: Focus; setFocus: (f: Focus) => void; core: string | null }) {
+  const [opened, setOpened] = useState<string | null>(null)
+  const alerts = w.alerts.filter((a) => (!focus.session || a.session === focus.session) && (!focus.day || dayOf(a.at) === focus.day))
+  const chart = perDay(w.alerts.filter((a) => !focus.session || a.session === focus.session))
+  const open = (id: string) => {
+    setOpened(id)
+    requestAnimationFrame(() => document.getElementById(`alert-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
+  }
+  const lost = alerts.filter((a) => a.kind === 'run_again').reduce((t, a) => t + (a.cost_secs ?? 0), 0)
+  return (
+    <Stack gap="md">
+      <Text fz="sm" c="dimmed">
+        {alerts.length} critical alerts{focus.day ? ` on ${focus.day}` : ''}: {alerts.filter((a) => a.kind === 'endless_task').length} tasks that never end,{' '}
+        {alerts.filter((a) => a.kind === 'run_again').length} finished runs launched again ({took(lost)} run twice), {alerts.filter((a) => a.kind === 'long_run').length} runs gone long,{' '}
+        {alerts.filter((a) => a.kind === 'plan_repeats').length} plans that repeat, {alerts.filter((a) => a.kind === 'stop_not_followed').length} stops not followed,{' '}
+        {alerts.filter((a) => a.kind === 'task_file_broken').length} task files broken, {alerts.filter((a) => a.kind === 'build_stopped').length} builds stopped short. Click a row for its cause.
+      </Text>
+      {chart.days.length > 0 && (
+        <Paper withBorder radius="md" p="sm">
+          <Text fw={600} fz="sm">The alerts, day by day</Text>
+          <Text fz="xs" c="dimmed">click a day to see only its alerts, here and in every view</Text>
+          <EChart height={220} option={chart.option} onClick={(p: Clicked) => p.dataIndex != null && setFocus({ ...focus, day: chart.days[p.dataIndex] })} />
+        </Paper>
+      )}
+      <Paper withBorder radius="md">
+        <Table.ScrollContainer minWidth={900}>
+          <Table fz="sm" verticalSpacing={4} highlightOnHover>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>When</Table.Th>
+                <Table.Th>Alert</Table.Th>
+                <Table.Th>What</Table.Th>
+                <Table.Th>Session</Table.Th>
+                <Table.Th>At stake</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {alerts.length === 0 && (
+                <Table.Tr>
+                  <Table.Td colSpan={5}>
+                    <Text c="dimmed" fz="sm">No critical alert here.</Text>
+                  </Table.Td>
+                </Table.Tr>
+              )}
+              {alerts.map((a) => (
+                <Fragment key={a.id}>
+                  <Table.Tr id={`alert-${a.id}`} style={{ cursor: 'pointer' }} onClick={() => setOpened(opened === a.id ? null : a.id)}>
+                    <Table.Td ff={MONO} fz="xs" style={{ whiteSpace: 'nowrap' }}>
+                      {opened === a.id ? '▾' : '▸'} {day(a.at)}
+                    </Table.Td>
+                    <Table.Td>
+                      <Badge size="sm" variant="filled" color={KIND[a.kind][1]}>{KIND[a.kind][0]}</Badge>
+                    </Table.Td>
+                    <Table.Td style={{ overflowWrap: 'anywhere' }}>
+                      <Text fz="sm">{a.what}</Text>
+                      {a.cause && <Text fz="xs" c={FAIL}>caused by another alert</Text>}
+                    </Table.Td>
+                    <Table.Td>
+                      <Text fz="xs" ff={MONO} style={{ overflowWrap: 'anywhere', cursor: 'pointer' }} td="underline" onClick={(e) => { e.stopPropagation(); setFocus({ ...focus, session: a.session }) }}>
+                        {a.name}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td style={{ whiteSpace: 'nowrap' }}>{a.cost_secs != null ? took(a.cost_secs) : '—'}</Table.Td>
+                  </Table.Tr>
+                  {opened === a.id && (
+                    <Table.Tr>
+                      <Table.Td colSpan={5} bg="dark.7">
+                        <Cause a={a} w={w} open={open} core={core} />
+                      </Table.Td>
+                    </Table.Tr>
+                  )}
+                </Fragment>
+              ))}
+            </Table.Tbody>
+          </Table>
+        </Table.ScrollContainer>
+      </Paper>
+    </Stack>
+  )
+}

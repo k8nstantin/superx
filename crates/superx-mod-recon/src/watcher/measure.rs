@@ -1,89 +1,70 @@
-//! The watcher's measures (#573), from its snapshot, in the operator's own
-//! days: where the agents' time goes, by model and by day; and by day the
-//! sessions, prompts, calls and launches, the long runs and the alerts.
+//! The watcher's measures (#573), in the operator's own days: where every
+//! second of every session went, by day, model, and what it was on (the
+//! tool and its target); and each session's hours, with what it did in
+//! each.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use chrono::FixedOffset;
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::Serialize;
 
-use super::alerts::Kind;
-use super::track::{Counts, Split};
-use super::Snapshot;
+use super::track::{Counts, On, Spend, Split, Track};
 
-/// One model's time, in the window.
+/// A day of a session's time on one thing, under one model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ModelRow {
-    pub model: String,
-    pub split: Split,
-    pub sessions: usize,
-    pub counts: Counts,
-}
-
-/// One day, in the operator's zone.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DayRow {
+pub struct TimeRow {
     pub day: String,
+    pub session: String,
+    pub model: Option<String>,
+    pub tool: String,
+    pub target: String,
     pub split: Split,
-    pub sessions: usize,
+    pub calls: u32,
+    pub failed: u32,
+}
+
+/// An hour of a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HourRow {
+    pub hour: DateTime<Utc>,
+    pub session: String,
+    pub split: Split,
     pub counts: Counts,
-    /// Runs that started that day and ran past the long bound.
-    pub long_runs: usize,
-    /// The alerts raised that day, by kind.
-    pub alerts: BTreeMap<Kind, usize>,
 }
 
-/// Where each model's time went, the most worked first.
+/// Every session's time in the window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Time {
+    pub rows: Vec<TimeRow>,
+    pub hours: Vec<HourRow>,
+}
+
+/// The time of `tracks`, its days in `zone`.
 #[must_use]
-pub fn models(s: &Snapshot) -> Vec<ModelRow> {
-    let mut by: BTreeMap<String, (Split, BTreeSet<String>, Counts)> = BTreeMap::new();
-    for h in &s.hours {
-        let e = by.entry(h.model.clone().unwrap_or_else(|| "unknown".to_string())).or_default();
-        e.0.plus(&h.at.split);
-        e.1.insert(h.session.clone());
-        add(&mut e.2, &h.at.counts);
+pub fn time<'a>(tracks: impl Iterator<Item = &'a Track>, zone: FixedOffset) -> Time {
+    let mut days: BTreeMap<(String, String, Option<String>, On), Spend> = BTreeMap::new();
+    let mut hours: BTreeMap<(DateTime<Utc>, String), (Split, Counts)> = BTreeMap::new();
+    for t in tracks {
+        for (k, s) in &t.ledger {
+            let day = k.hour.with_timezone(&zone).format("%Y-%m-%d").to_string();
+            let e = days.entry((day, t.session.clone(), k.model.clone(), k.on.clone())).or_default();
+            e.split.plus(&s.split);
+            e.calls += s.calls;
+            e.failed += s.failed;
+            hours.entry((k.hour, t.session.clone())).or_default().0.plus(&s.split);
+        }
+        for (h, c) in &t.counts {
+            let e = &mut hours.entry((*h, t.session.clone())).or_default().1;
+            e.prompts += c.prompts;
+            e.calls += c.calls;
+            e.launches += c.launches;
+        }
     }
-    let mut rows: Vec<ModelRow> =
-        by.into_iter().map(|(model, (split, sessions, counts))| ModelRow { model, split, sessions: sessions.len(), counts }).collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.split.thinking + r.split.writing + r.split.tools + r.split.jobs));
-    rows
-}
-
-/// A day as it is summed.
-#[derive(Default)]
-struct Sum {
-    split: Split,
-    sessions: BTreeSet<String>,
-    counts: Counts,
-    long_runs: usize,
-    alerts: BTreeMap<Kind, usize>,
-}
-
-/// Every day of the window, in `zone`, oldest first.
-#[must_use]
-pub fn days(s: &Snapshot, zone: FixedOffset) -> Vec<DayRow> {
-    let day = |t: chrono::DateTime<chrono::Utc>| t.with_timezone(&zone).format("%Y-%m-%d").to_string();
-    let mut by: BTreeMap<String, Sum> = BTreeMap::new();
-    for h in &s.hours {
-        let e = by.entry(day(h.hour)).or_default();
-        e.split.plus(&h.at.split);
-        e.sessions.insert(h.session.clone());
-        add(&mut e.counts, &h.at.counts);
+    Time {
+        rows: days
+            .into_iter()
+            .map(|((day, session, model, on), s)| TimeRow { day, session, model, tool: on.tool, target: on.target, split: s.split, calls: s.calls, failed: s.failed })
+            .collect(),
+        hours: hours.into_iter().map(|((hour, session), (split, counts))| HourRow { hour, session, split, counts }).collect(),
     }
-    let long = i64::try_from(s.long_secs).unwrap_or(i64::MAX);
-    for r in s.runs.iter().filter(|r| r.background && r.secs >= long) {
-        by.entry(day(r.start)).or_default().long_runs += 1;
-    }
-    for a in &s.alerts {
-        *by.entry(day(a.at)).or_default().alerts.entry(a.kind).or_insert(0) += 1;
-    }
-    by.into_iter()
-        .map(|(day, e)| DayRow { day, split: e.split, sessions: e.sessions.len(), counts: e.counts, long_runs: e.long_runs, alerts: e.alerts })
-        .collect()
-}
-
-fn add(to: &mut Counts, c: &Counts) {
-    to.prompts += c.prompts;
-    to.calls += c.calls;
-    to.launches += c.launches;
 }

@@ -11,15 +11,30 @@
 //!   launched or a git change made before the agent's next words.
 //! - **A plan that repeats full runs**: a task file a session reads or
 //!   writes that launches the same job more than once.
+//! - **A task that never ends** ([`super::task`]): reopened after it was
+//!   merged.
+//! - **Its task file broken** ([`super::contract`]): a session building from
+//!   a task file changed what it forbids, ran a door gate again, went on
+//!   after a door gate failed, or reached the real data outside its gates.
+//! - **A build stopped short** ([`super::contract`]): a session building from
+//!   a task file handed the operator its turn before it wrote every file the
+//!   file builds.
+//!
+//! Each alert names the call it is about and the time its cause starts
+//! from, for the page to read the session's lines between; and the alert
+//! that caused it, when one did: the plan that launches a job run again, the
+//! run again that went long.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
 
+use super::command::ITS_OWN;
 use super::line::FILE_TOOLS;
-use super::plan;
+use super::plan::{self, Repeat};
+use super::task::Task;
 use super::track::{Run, Track};
 use crate::params::Params;
 
@@ -28,10 +43,6 @@ const STOP_WINDOW_SECS: i64 = 600; // skill-allow: §9-const — one turn's reac
 
 /// How many times its bound a job with no notice is still judged.
 const OPEN_HORIZON: i64 = 4; // skill-allow: §9-const — past it an unseen end is likelier than a run, not a policy tunable
-
-/// Paths an agent writes for itself, its memory and its scratch: writing
-/// there after a stop is noting it, not acting.
-const ITS_OWN: [&str; 3] = ["/.claude/", "/private/tmp/", "/tmp/"];
 
 /// The git commands that change a repository.
 const GIT_CHANGES: [&str; 7] = ["commit", "push", "merge", "reset", "rebase", "checkout", "branch"];
@@ -44,6 +55,9 @@ pub enum Kind {
     LongRun,
     StopNotFollowed,
     PlanRepeats,
+    EndlessTask,
+    TaskFileBroken,
+    BuildStopped,
 }
 
 /// One alert.
@@ -64,6 +78,18 @@ pub struct Alert {
     pub cost_secs: Option<i64>,
     /// The launch, the operator's words or the plan's gates, whole.
     pub evidence: Vec<String>,
+    /// The call it is about: the run launched again, the run gone long, the
+    /// act after a stop, the plan's read or write.
+    pub call: Option<String>,
+    /// Where its cause starts: the session's lines from here to `at` tell
+    /// it.
+    pub from: DateTime<Utc>,
+    /// What the run launched, for a run's alert.
+    pub launch: Option<String>,
+    /// The jobs a plan launches more than once, for a plan's alert.
+    pub repeats: Vec<Repeat>,
+    /// The alert that caused this one, by its id.
+    pub cause: Option<String>,
 }
 
 /// Every alert raised in the window, each once.
@@ -77,6 +103,11 @@ impl Alerts {
     fn raise(&mut self, alert: Alert) {
         if self.ids.insert(alert.id.clone()) {
             self.list.push(alert);
+        } else if alert.kind == Kind::LongRun {
+            // A run gone long goes on costing until it ends.
+            if let Some(a) = self.list.iter_mut().find(|a| a.id == alert.id) {
+                a.cost_secs = alert.cost_secs;
+            }
         }
     }
 
@@ -106,7 +137,12 @@ impl Alerts {
             what: format!("{label} launched again: the same launch{whose} already ran to its end, in {}", duration(took)),
             since: Some(first.start),
             cost_secs: Some(took),
-            evidence: vec![launch.to_string()],
+            evidence: vec![launch.to_string(), first.what.clone()],
+            call: Some(run.call.clone()),
+            from: first.end.unwrap_or(first.start).min(run.start),
+            launch: Some(launch.to_string()),
+            repeats: Vec::new(),
+            cause: None,
         });
     }
 
@@ -147,6 +183,11 @@ impl Alerts {
                     since: Some(run.start),
                     cost_secs: Some(run.secs(now)),
                     evidence: vec![run.what.clone()],
+                    call: Some(run.call.clone()),
+                    from: run.start,
+                    launch: run.launch.clone(),
+                    repeats: Vec::new(),
+                    cause: None,
                 });
             }
         }
@@ -168,6 +209,62 @@ impl Alerts {
             since: Some(*at),
             cost_secs: None,
             evidence: vec![words.clone(), run.what.clone()],
+            call: Some(run.call.clone()),
+            from: *at,
+            launch: run.launch.clone(),
+            repeats: Vec::new(),
+            cause: None,
+        });
+    }
+
+    /// A run that broke the task file its session builds from: `key` names
+    /// the rule and what broke it, once a session; `from` is where its cause
+    /// starts.
+    pub fn task_file(&mut self, track: &Track, run: &Run, key: &str, what: String, from: DateTime<Utc>) {
+        let id = format!("{}/task_file_broken/{key}", track.session);
+        // The same rule broken again: one alert, saying it all.
+        if let Some(a) = self.list.iter_mut().find(|a| a.id == id) {
+            a.what = what;
+            a.at = a.at.max(run.start);
+            return;
+        }
+        self.raise(Alert {
+            id,
+            session: track.session.clone(),
+            name: track.name.clone(),
+            kind: Kind::TaskFileBroken,
+            at: run.start,
+            what,
+            since: None,
+            cost_secs: None,
+            evidence: vec![run.what.clone()],
+            call: Some(run.call.clone()),
+            from,
+            launch: run.launch.clone(),
+            repeats: Vec::new(),
+            cause: None,
+        });
+    }
+
+    /// A build that handed the operator its turn at `at` before it wrote
+    /// what its task file builds, from its order at `from`; `words`, the
+    /// agent's last.
+    pub fn build_stopped(&mut self, track: &Track, at: DateTime<Utc>, from: DateTime<Utc>, what: String, words: Option<String>) {
+        self.raise(Alert {
+            id: format!("{}/build_stopped", track.session),
+            session: track.session.clone(),
+            name: track.name.clone(),
+            kind: Kind::BuildStopped,
+            at,
+            what,
+            since: Some(from),
+            cost_secs: Some((at - from).num_seconds()),
+            evidence: words.into_iter().collect(),
+            call: None,
+            from,
+            launch: None,
+            repeats: Vec::new(),
+            cause: None,
         });
     }
 
@@ -202,6 +299,39 @@ impl Alerts {
             since: None,
             cost_secs: None,
             evidence: repeats.iter().map(|r| format!("{}: {}", r.job, r.by.join("; "))).collect(),
+            call: Some(run.call.clone()),
+            from: run.start,
+            launch: None,
+            repeats,
+            cause: None,
+        });
+    }
+
+    /// A task that never ends, shown `how` (`reopened`): raised once, then
+    /// kept up to date as the task goes on.
+    pub fn endless(&mut self, task: &Task, how: &str, what: String, from: DateTime<Utc>, at: DateTime<Utc>, cost: i64) {
+        let id = format!("{}/endless_task/{}/{how}", task.session, task.branch);
+        if let Some(a) = self.list.iter_mut().find(|a| a.id == id) {
+            a.what = what;
+            a.at = a.at.max(at);
+            a.cost_secs = Some(cost);
+            return;
+        }
+        self.raise(Alert {
+            id,
+            session: task.session.clone(),
+            name: task.name.clone(),
+            kind: Kind::EndlessTask,
+            at,
+            what,
+            since: Some(task.asked),
+            cost_secs: Some(cost),
+            evidence: task.reopened.iter().map(|(_, how)| how.clone()).chain(task.estimates.iter().map(|e| e.words.clone())).collect(),
+            call: None,
+            from,
+            launch: None,
+            repeats: Vec::new(),
+            cause: None,
         });
     }
 
@@ -210,22 +340,35 @@ impl Alerts {
         self.list.retain(|a| a.at >= from);
     }
 
-    /// The alerts, newest first.
+    /// The alerts, newest first, each with the alert that caused it: a run
+    /// gone long that was launched again, by that alert; a run launched
+    /// again or gone long whose job a plan launches more than once, by the
+    /// plan's alert, the first raised.
     #[must_use]
-    pub fn newest_first(&self) -> Vec<Alert> {
-        let mut v = self.list.clone();
+    pub fn newest_first(&self, jobs: &[String]) -> Vec<Alert> {
+        let mut plans: Vec<&Alert> = self.list.iter().filter(|a| a.kind == Kind::PlanRepeats).collect();
+        plans.sort_by_key(|a| a.at);
+        let mut v: Vec<Alert> = self
+            .list
+            .iter()
+            .map(|a| {
+                let again = (a.kind == Kind::LongRun)
+                    .then(|| self.list.iter().find(|b| b.kind == Kind::RunAgain && b.session == a.session && b.call == a.call))
+                    .flatten();
+                let plan = || {
+                    let launch = a.launch.as_deref()?;
+                    plans.iter().copied().find(|p| p.repeats.iter().any(|r| plan::scheduled(&r.job, launch, jobs)))
+                };
+                let cause = match a.kind {
+                    Kind::LongRun => again.or_else(plan),
+                    Kind::RunAgain => plan(),
+                    _ => None,
+                };
+                Alert { cause: cause.map(|c| c.id.clone()), ..a.clone() }
+            })
+            .collect();
         v.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.id.cmp(&b.id)));
         v
-    }
-
-    /// The alerts by kind, for the measures.
-    #[must_use]
-    pub fn by_kind(&self) -> BTreeMap<String, usize> {
-        let mut m = BTreeMap::new();
-        for a in &self.list {
-            *m.entry(format!("{:?}", a.kind)).or_insert(0) += 1;
-        }
-        m
     }
 }
 

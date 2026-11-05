@@ -171,6 +171,74 @@ const DEFAULT_WATCH_STOP_WORDS: &[&str] = &["stop", "halt", "cancel", "abort", "
 pub const WATCH_PLANS_PARAM: &str = "attr_recon_watch_plans";
 const DEFAULT_WATCH_PLANS: &[&str] = &["/tasks/"];
 
+/// A command run in the foreground that sleeps, and runs this many seconds
+/// or more, is an agent asleep: deaf to you while it waits (#573).
+pub const WATCH_SLEEP_SECS_PARAM: &str = "attr_recon_watch_sleep_secs";
+const DEFAULT_WATCH_SLEEP_SECS: u64 = 60; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_sleep_secs
+
+/// A file edited this many times within `attr_recon_watch_thrash_secs` is
+/// edited over and over: trial and error (#573).
+pub const WATCH_THRASH_EDITS_PARAM: &str = "attr_recon_watch_thrash_edits";
+const DEFAULT_WATCH_THRASH_EDITS: u64 = 10; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_thrash_edits
+
+/// The span within which `attr_recon_watch_thrash_edits` edits of one file
+/// are edits over and over, in seconds (#573).
+pub const WATCH_THRASH_SECS_PARAM: &str = "attr_recon_watch_thrash_secs";
+const DEFAULT_WATCH_THRASH_SECS: u64 = 3_600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_thrash_secs
+
+/// A call's result this many characters long or longer floods the agent's
+/// context (#573).
+pub const WATCH_FLOOD_CHARS_PARAM: &str = "attr_recon_watch_flood_chars";
+const DEFAULT_WATCH_FLOOD_CHARS: u64 = 40_000; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_flood_chars
+
+/// The words your message starts with when you ask how the work stands
+/// (#573): asked while a job runs, the agent had not told you.
+pub const WATCH_STATUS_WORDS_PARAM: &str = "attr_recon_watch_status_words";
+const DEFAULT_WATCH_STATUS_WORDS: &[&str] = &["status", "update", "eta", "progress", "where are we", "how long", "what's going on", "whats going on", "is it done", "is it ready"];
+
+/// The protected places, each `pattern = words`: a change to a path holding
+/// the pattern, made when neither your message nor the agent's words you
+/// answered named one of the words, is listed (#573).
+pub const WATCH_PROTECTED_PARAM: &str = "attr_recon_watch_protected";
+const DEFAULT_WATCH_PROTECTED: &[&str] = &[
+    "/schema = schema",
+    ".sql = schema table ddl",
+    ".surql = schema",
+    "superx-kernel/ = kernel",
+    "terraform = terraform infrastructure",
+    ".tf = terraform infrastructure",
+    "/migrations/ = migration",
+    ".claude/skills/ = skill",
+    "BLUEPRINT.md = blueprint",
+    "DDL: = table schema column alter drop",
+];
+
+/// The branches others build on: a push that rewrites one undoes what was
+/// merged into it (#573).
+pub const WATCH_SHARED_BRANCHES_PARAM: &str = "attr_recon_watch_shared_branches";
+const DEFAULT_WATCH_SHARED_BRANCHES: &[&str] = &["main", "master", "sandbox", "develop", "dev", "staging", "production", "release"];
+
+/// Words of the agent's that say work is not done (#573): said after it read
+/// the merge of a task's branch and before your next message, the task you
+/// took for done was not.
+pub const WATCH_NOT_DONE_WORDS_PARAM: &str = "attr_recon_watch_not_done_words";
+const DEFAULT_WATCH_NOT_DONE_WORDS: &[&str] = &[
+    "not done",
+    "not run",
+    "not finished",
+    "not verified",
+    "not checked",
+    "wasn't checked",
+    "isn't done",
+    "remains",
+    "still needs",
+    "still has to",
+    "left to do",
+    "your steps",
+    "before you start",
+    "before you hand",
+];
+
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -203,6 +271,14 @@ pub struct Params {
     pub watch_jobs: Vec<String>,
     pub watch_stop_words: Vec<String>,
     pub watch_plans: Vec<String>,
+    pub watch_sleep_secs: u64,
+    pub watch_thrash_edits: u64,
+    pub watch_thrash_secs: u64,
+    pub watch_flood_chars: u64,
+    pub watch_status_words: Vec<String>,
+    pub watch_protected: Vec<String>,
+    pub watch_shared_branches: Vec<String>,
+    pub watch_not_done_words: Vec<String>,
 }
 
 impl Params {
@@ -256,7 +332,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 29] = [
+pub const NAMES: [&str; 37] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -286,6 +362,14 @@ pub const NAMES: [&str; 29] = [
     WATCH_JOBS_PARAM,
     WATCH_STOP_WORDS_PARAM,
     WATCH_PLANS_PARAM,
+    WATCH_SLEEP_SECS_PARAM,
+    WATCH_THRASH_EDITS_PARAM,
+    WATCH_THRASH_SECS_PARAM,
+    WATCH_FLOOD_CHARS_PARAM,
+    WATCH_STATUS_WORDS_PARAM,
+    WATCH_PROTECTED_PARAM,
+    WATCH_SHARED_BRANCHES_PARAM,
+    WATCH_NOT_DONE_WORDS_PARAM,
 ];
 
 /// What a parameter is for, as the tab shows it (#539): when the crawler
@@ -332,6 +416,14 @@ pub fn about(name: &str) -> Option<About> {
         WATCH_JOBS_PARAM => ("watches", "list", "Commands that launch jobs: the words after one name the job and its input."),
         WATCH_STOP_WORDS_PARAM => ("watches", "list", "Words your message starts with when you stop the agent."),
         WATCH_PLANS_PARAM => ("watches", "list", "Files holding a plan of runs: a path holding one of these is read for repeated launches."),
+        WATCH_SLEEP_SECS_PARAM => ("watches", "number", "A foreground command that sleeps and runs this many seconds or more is the agent asleep, deaf to you."),
+        WATCH_THRASH_EDITS_PARAM => ("watches", "number", "A file edited this many times within the span below is edited over and over."),
+        WATCH_THRASH_SECS_PARAM => ("watches", "number", "The span, in seconds, within which those edits of one file are edits over and over."),
+        WATCH_FLOOD_CHARS_PARAM => ("watches", "number", "A call's result this many characters long or longer floods the agent's context."),
+        WATCH_STATUS_WORDS_PARAM => ("watches", "list", "Words your message starts with when you ask how the work stands."),
+        WATCH_PROTECTED_PARAM => ("watches", "list", "Protected places, each `pattern = words`: a change there your message did not name is listed."),
+        WATCH_SHARED_BRANCHES_PARAM => ("watches", "list", "Branches others build on: a push that rewrites one is listed, and reopens the task."),
+        WATCH_NOT_DONE_WORDS_PARAM => ("watches", "list", "Words of the agent's saying work is not done: after it reads a task's merge, before your next message, they reopen the task."),
         _ => return None,
     };
     Some(About { group, decides, input })
@@ -398,6 +490,14 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         watch_jobs: r.strings(WATCH_JOBS_PARAM, DEFAULT_WATCH_JOBS),
         watch_stop_words: r.strings(WATCH_STOP_WORDS_PARAM, DEFAULT_WATCH_STOP_WORDS),
         watch_plans: r.strings(WATCH_PLANS_PARAM, DEFAULT_WATCH_PLANS),
+        watch_sleep_secs: r.count(WATCH_SLEEP_SECS_PARAM, 1, DEFAULT_WATCH_SLEEP_SECS),
+        watch_thrash_edits: r.count(WATCH_THRASH_EDITS_PARAM, 1, DEFAULT_WATCH_THRASH_EDITS),
+        watch_thrash_secs: r.count(WATCH_THRASH_SECS_PARAM, 1, DEFAULT_WATCH_THRASH_SECS),
+        watch_flood_chars: r.count(WATCH_FLOOD_CHARS_PARAM, 1, DEFAULT_WATCH_FLOOD_CHARS),
+        watch_status_words: r.strings(WATCH_STATUS_WORDS_PARAM, DEFAULT_WATCH_STATUS_WORDS),
+        watch_protected: r.strings(WATCH_PROTECTED_PARAM, DEFAULT_WATCH_PROTECTED),
+        watch_shared_branches: r.strings(WATCH_SHARED_BRANCHES_PARAM, DEFAULT_WATCH_SHARED_BRANCHES),
+        watch_not_done_words: r.strings(WATCH_NOT_DONE_WORDS_PARAM, DEFAULT_WATCH_NOT_DONE_WORDS),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -565,7 +665,7 @@ mod tests {
 
     /// The parameters before the rename, as `superx-performance` named them,
     /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 29] = [
+    const TODAY: [(&str, &str); 37] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -603,6 +703,23 @@ mod tests {
         ),
         ("watch_stop_words", "stop, halt, cancel, abort, don't, dont, do not"),
         ("watch_plans", "/tasks/"),
+        ("watch_sleep_secs", "60"),
+        ("watch_thrash_edits", "10"),
+        ("watch_thrash_secs", "3600"),
+        ("watch_flood_chars", "40000"),
+        ("watch_status_words", "status, update, eta, progress, where are we, how long, what's going on, whats going on, is it done, is it ready"),
+        (
+            "watch_protected",
+            "/schema = schema, .sql = schema table ddl, .surql = schema, superx-kernel/ = kernel, terraform = terraform infrastructure, \
+             .tf = terraform infrastructure, /migrations/ = migration, .claude/skills/ = skill, BLUEPRINT.md = blueprint, \
+             DDL: = table schema column alter drop",
+        ),
+        ("watch_shared_branches", "main, master, sandbox, develop, dev, staging, production, release"),
+        (
+            "watch_not_done_words",
+            "not done, not run, not finished, not verified, not checked, wasn't checked, isn't done, remains, still needs, still has to, \
+             left to do, your steps, before you start, before you hand",
+        ),
     ];
 
     #[test]

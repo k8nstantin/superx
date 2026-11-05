@@ -5,11 +5,12 @@
 
 pub mod common;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, FixedOffset, SecondsFormat, TimeDelta, Utc};
 use common::*;
 use serde_json::{json, Value as Json};
 use superx_kernel::types::{Object, RecordId, Value};
@@ -18,7 +19,10 @@ use superx_mod_recon::instance::Instance;
 use superx_mod_recon::params::{Params, WATCH_PLANS_PARAM};
 use superx_mod_recon::server;
 use superx_mod_recon::watcher::alerts::Kind;
-use superx_mod_recon::watcher::{plan, Snapshot, Watched, Watcher};
+use superx_mod_recon::watcher::command::{self, Push};
+use superx_mod_recon::watcher::found::Hidden;
+use superx_mod_recon::watcher::track::Split;
+use superx_mod_recon::watcher::{measure, plan, task, Snapshot, Watched, Watcher};
 use tower::ServiceExt as _;
 
 const PORT: u16 = 5152;
@@ -157,6 +161,15 @@ impl Agent {
     async fn turn_end(&mut self, after: i64) -> DateTime<Utc> {
         self.event(json!({"type": "system", "subtype": "turn_duration", "durationMs": 5}), after).await
     }
+
+    /// The context compacted: the summary Claude Code writes in its place.
+    async fn compacted(&mut self, after: i64) -> DateTime<Utc> {
+        self.message(
+            json!({"type": "user", "isCompactSummary": true, "message": {"role": "user", "content": "This session is being continued from a previous conversation."}}),
+            after,
+        )
+        .await
+    }
 }
 
 async fn setup(key: &str) -> (Kernel, PathBuf, Agent, DateTime<Utc>) {
@@ -169,7 +182,19 @@ async fn setup(key: &str) -> (Kernel, PathBuf, Agent, DateTime<Utc>) {
 
 async fn look(watcher: &mut Watcher, kernel: &Kernel, p: &Params, now: DateTime<Utc>) -> Snapshot {
     watcher.look(kernel, p, now).await.expect("a look");
-    watcher.snapshot(p, false)
+    watcher.snapshot()
+}
+
+/// Every session's time summed, over every row the measure gives.
+fn total(w: &Watcher, keep: impl Fn(&measure::TimeRow) -> bool) -> (Split, u32) {
+    let time = measure::time(w.tracks(), FixedOffset::east_opt(0).expect("utc"));
+    let mut split = Split::default();
+    let mut calls = 0;
+    for r in time.rows.iter().filter(|r| keep(r)) {
+        split.plus(&r.split);
+        calls += r.calls;
+    }
+    (split, calls)
 }
 
 fn of(s: &Snapshot, kind: Kind) -> Vec<&superx_mod_recon::watcher::alerts::Alert> {
@@ -294,7 +319,7 @@ async fn a_background_job_past_the_long_bound_is_one_alert_at_the_crossing_and_p
     let long = of(&s, Kind::LongRun);
     assert_eq!(long.len(), 1, "{:?}", s.alerts);
     assert_eq!(long[0].at, start + TimeDelta::hours(1), "raised when it crossed the hour");
-    let now = s.sessions.iter().find(|x| x.name == "claude_code/long").expect("live");
+    let now = s.now.iter().find(|x| x.name == "claude_code/long").expect("live");
     assert_eq!(now.state, "job running");
     assert_eq!(now.jobs.len(), 1);
     let s = look(&mut w, &kernel, &p, agent.at + TimeDelta::minutes(5)).await;
@@ -323,13 +348,13 @@ async fn a_foreground_call_waiting_past_the_command_limit_waits_on_your_approval
     agent.call("tf", "Bash", json!({"command": "terraform apply plan.tf"}), 3).await;
     let mut w = Watcher::new();
     let s = look(&mut w, &kernel, &p, agent.at + TimeDelta::minutes(20)).await;
-    let now = s.sessions.iter().find(|x| x.name == "claude_code/approve").expect("live");
+    let now = s.now.iter().find(|x| x.name == "claude_code/approve").expect("live");
     assert_eq!(now.state, "waiting on your approval");
     assert!(s.alerts.is_empty(), "{:?}", s.alerts);
     agent.result("tf", false, "Apply complete", 20 * 60).await;
-    let s = look(&mut w, &kernel, &p, agent.at).await;
-    let approval: i64 = s.hours.iter().map(|h| h.at.split.approval).sum();
-    assert_eq!(approval, 20 * 60, "the wait was the operator's approval, not the tool's run");
+    look(&mut w, &kernel, &p, agent.at).await;
+    let (split, _) = total(&w, |r| r.tool == "Bash" && r.target == "terraform apply plan.tf");
+    assert_eq!(split.approval, 20 * 60, "the wait was the operator's approval, not the tool's run, and it was on the apply");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -418,20 +443,17 @@ async fn every_gap_goes_to_what_ended_it_thinking_writing_tools_jobs_your_answer
     agent.wait(3600);
     agent.said("back", 0).await;
     let mut w = Watcher::new();
-    let s = look(&mut w, &kernel, &p, agent.at).await;
-    let mut t = superx_mod_recon::watcher::track::Split::default();
-    for h in &s.hours {
-        t.plus(&h.at.split);
-    }
+    look(&mut w, &kernel, &p, agent.at).await;
+    let (t, _) = total(&w, |_| true);
     assert_eq!(t.thinking, 5);
     assert_eq!(t.writing, 10 + 2 + 3 + 2 + 4, "words and calls");
     assert_eq!(t.tools, 30 + 1, "the test's run, and the job's start");
     assert_eq!(t.jobs, 600 + 3000, "your question while the job ran, and the job to its notice");
     assert_eq!(t.operator, 300 + 120 + 3600, "your next message, your answer, the session left");
     assert_eq!(t.approval, 0);
-    let models = superx_mod_recon::watcher::measure::models(&s);
-    assert_eq!(models[0].model, "claude-opus-5-5");
-    assert_eq!(models[0].counts.prompts, 3);
+    let time = measure::time(w.tracks(), FixedOffset::east_opt(0).expect("utc"));
+    assert!(time.rows.iter().all(|r| r.model.as_deref() == Some("claude-opus-5-5")), "every second under the model at work");
+    assert_eq!(time.hours.iter().map(|h| h.counts.prompts).sum::<u32>(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -457,9 +479,8 @@ async fn api_watch_answers_the_alerts_the_sessions_the_runs_and_the_measures_by_
     agent.notified("g4", "completed", 65 * 60).await;
     agent.job("g6", JOB, 10).await;
     let mut w = Watcher::new();
-    let s = look(&mut w, &kernel, &p, agent.at + TimeDelta::minutes(1)).await;
-    let watched = Watched::default();
-    watched.publish(s);
+    look(&mut w, &kernel, &p, agent.at + TimeDelta::minutes(1)).await;
+    let watched = Watched::new(w);
     let instance = Instance {
         home: dir.clone(),
         endpoint: "mem://".to_string(),
@@ -477,11 +498,478 @@ async fn api_watch_answers_the_alerts_the_sessions_the_runs_and_the_measures_by_
     let v: Json = serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.expect("body")).expect("json");
     assert_eq!(v["alerts"][0]["kind"], "run_again", "{v}");
     assert_eq!(v["alerts"].as_array().map(Vec::len), Some(2), "run again, and the first run past the hour: {}", v["alerts"]);
-    assert_eq!(v["sessions"][0]["state"], "job running");
-    assert!(v["sessions"][0]["jobs"][0]["expected_end"].is_string(), "when the same launch ended last time: {}", v["sessions"][0]);
+    assert_eq!(v["now"][0]["state"], "job running");
+    assert!(v["now"][0]["jobs"][0]["expected_end"].is_string(), "when the same launch ended last time: {}", v["now"][0]);
     assert_eq!(v["runs"].as_array().map(Vec::len), Some(2), "{}", v["runs"]);
-    assert_eq!(v["models"][0]["model"], "claude-opus-5-5");
-    assert!(v["days"].as_array().is_some_and(|d| !d.is_empty() && d[0]["day"].as_str().is_some_and(|x| x.len() == 10)), "{}", v["days"]);
-    let r = app.oneshot(ask("/api/watch?offset=100000")).await.expect("answer");
-    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let session = v["now"][0]["id"].as_str().expect("the session").to_string();
+    let get = |uri: String| {
+        let app = app.clone();
+        async move {
+            let r = app.oneshot(ask(&uri)).await.expect("answer");
+            let status = r.status();
+            let v: Json = serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.expect("body")).expect("json");
+            (status, v)
+        }
+    };
+    let (status, time) = get("/api/watch/time?offset=-240".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = time["rows"].as_array().expect("rows");
+    assert!(rows.iter().any(|r| r["tool"] == "Bash" && r["split"]["jobs"].as_i64().is_some_and(|j| j > 3_600)), "the hour on the job, under the job: {time}");
+    assert!(rows.iter().all(|r| r["day"].as_str().is_some_and(|d| d.len() == 10)), "{time}");
+    let (status, _) = get("/api/watch/time?offset=100000".to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, found) = get("/api/watch/found".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(found.is_array(), "{found}");
+    let span = |t: DateTime<Utc>| t.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let (from, to) = (span(agent.at - TimeDelta::hours(3)), span(agent.at + TimeDelta::hours(1)));
+    let (status, lines) = get(format!("/api/watch/lines?session={session}&from={from}&to={to}")).await;
+    assert_eq!(status, StatusCode::OK, "{lines}");
+    let calls: Vec<&Json> = lines["lines"].as_array().expect("lines").iter().filter(|l| l["kind"] == "call").collect();
+    assert_eq!(calls.len(), 2, "both launches: {lines}");
+    assert_eq!(calls[0]["background"], true);
+    assert!(calls[0]["secs"].as_i64().is_some_and(|s| s >= 65 * 60), "the first job's run, by its notice: {}", calls[0]);
+    assert_eq!(lines["lines"][0]["kind"], "you", "the operator's word first: {lines}");
+    let (status, _) = get(format!("/api/watch/lines?session=nobody&from={from}&to={to}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, calls) = get("/api/watch/calls?tool=Bash".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls["total"], 2, "{calls}");
+}
+
+#[test]
+fn a_command_is_read_for_its_work_its_sleep_what_it_changes_and_what_it_pushes() {
+    assert_eq!(command::label("cd /w && cargo test -p x 2>&1 | tail -5"), "cargo test");
+    assert_eq!(command::label("git -C /r status --short | head"), "git status");
+    assert_eq!(command::label("python3 tools/skill_audit.py"), "python3 skill_audit.py");
+    assert_eq!(command::label("python3 -m unittest discover -s tests"), "python3 -m unittest");
+    assert_eq!(command::label("python3 - <<'EOF'\nprint(1)\nEOF"), "python3 stdin");
+    assert_eq!(command::label("TOKEN=$(gcloud auth print-access-token) && curl -s x"), "gcloud auth");
+    assert_eq!(command::label("nice -n 19 cargo build --release"), "cargo build");
+    assert_eq!(command::label("echo '--- x' && git log --oneline -3"), "git log");
+    assert_eq!(command::label("for f in a b; do wc -l $f; done"), "wc");
+    assert!(command::sleeps("sleep 300; gcloud run jobs executions describe x"));
+    assert!(!command::sleeps("grep -n sleep notes.txt"));
+    assert_eq!(command::changed("git add gryphon-kn/schema && git commit -m x"), ["gryphon-kn/schema"]);
+    assert_eq!(command::changed("sed -i '' 's/a/b/' src/a.rs"), ["src/a.rs"]);
+    assert_eq!(command::changed("cat a > /w/out.txt 2>&1"), ["/w/out.txt"]);
+    assert!(command::changed("grep -rn 'ALTER TABLE' src").is_empty(), "a search changes nothing");
+    assert!(command::changed("bq query --use_legacy_sql=false 'ALTER TABLE t ADD COLUMN c INT64'")[0].starts_with("DDL: "));
+    assert!(command::changed("gcloud dataproc batches submit spark-sql /s/alter-relationships.sql --project p")[0].starts_with("DDL: "));
+    assert_eq!(
+        command::pushes("git push --force-with-lease=sandbox:0276e913 origin 97749550:refs/heads/sandbox"),
+        [Push { branch: "sandbox".to_string(), force: true }]
+    );
+    assert_eq!(command::pushes("git push -q -u origin ENG-8079-task-file 2>&1 | grep -v x"), [Push { branch: "ENG-8079-task-file".to_string(), force: false }]);
+    assert!(command::pushes("git push -q origin --delete feat/x").is_empty(), "a deletion pushes no work");
+    assert_eq!(command::pushes("git push 2>&1 | tail -1")[0].branch, "");
+    assert_eq!(command::pushes("git push -u origin HEAD")[0].branch, "", "HEAD is the branch checked out");
+    assert_eq!(command::new_branch("git switch -c ENG-8078-task-file-v2 origin/sandbox 2>&1 | tail -1").as_deref(), Some("ENG-8078-task-file-v2"));
+    assert_eq!(command::merges("gh pr merge 449 --squash --admin"), Some(Some("449".to_string())));
+    assert_eq!(command::merges("gh pr merge --squash"), Some(None));
+    assert_eq!(command::merges("git status"), None);
+    assert_eq!(
+        command::merge_commits("3cf1a23 Merged in ENG-8080-annotate-design (pull request #109)\n9a1b2c3 annotate"),
+        [("ENG-8080-annotate-design".to_string(), 109)]
+    );
+    assert_eq!(command::merge_commits("Merge pull request #12 from k8nstantin/feat/573-x"), [("feat/573-x".to_string(), 12)]);
+    assert!(command::merge_commits("it merged in the end (pull request soon)").is_empty());
+    assert!(command::merge_commits("Merged in X (pull request #)").is_empty());
+    // A here-document's body is the command's input, not commands.
+    assert_eq!(
+        command::simple_commands("python3 -I - <<'EOF'\nimport os\nif x > 3: os.system('git push --force origin main')\nEOF\necho done"),
+        ["python3 -I - <<'EOF'", "echo done"]
+    );
+    assert!(command::changed("cd kn && python3 - <<EOF\nif a > 3: pass\nEOF").is_empty());
+    assert!(command::pushes("python3 - <<-'PY'\nrun('git push origin main')\n\tPY\ngit status").is_empty());
+    assert_eq!(command::changed("cat <<EOF > out.txt\nhello\nEOF"), ["out.txt"]);
+    assert_eq!(task::stem("ENG-8078-task-file-v2"), "ENG-8078-task-file");
+    assert_eq!(task::stem("feat/573-watcher-v2-opus-5-5-max"), "feat/573-watcher");
+    assert_eq!(task::stem("ENG-7811-revert-eng8071-v8-eng8072-v9-builds"), "ENG-7811-revert-eng8071-v8-eng8072", "its own version is the last");
+    assert_eq!(task::stem("ENG-8080-annotate-design"), "ENG-8080-annotate-design");
+    assert_eq!(task::stem("fix/view-v8x"), "fix/view-v8x");
+    assert_eq!(command::undoes("git reset --hard HEAD~1").as_deref(), Some("git reset --hard HEAD~1"));
+    assert_eq!(command::undoes("git reset HEAD a.rs"), None);
+    assert_eq!(task::estimate("I'm fixing the start rules on a sandbox branch, about 15 minutes"), Some(900));
+    assert_eq!(task::estimate("Running the harness now: about 30 to 40 minutes."), Some(2_400));
+    assert_eq!(task::estimate("That is about 4 to 6 hours"), Some(21_600));
+    assert_eq!(task::estimate("The ETA is about 3.5 hours"), Some(12_600));
+    assert_eq!(task::estimate("it took about 12 minutes last time"), None, "a measure, not a promise");
+    assert_eq!(task::estimate("pauses within ~2s"), None);
+    assert_eq!(task::estimate("At about 20 seconds per call"), None);
+    assert_eq!(task::keys("ENG-8078-task-file-v2"), ["ENG-8078"]);
+    assert!(task::keys("feat/573-watcher").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_second_goes_to_the_tool_and_what_it_was_called_on_thinking_to_what_came_after_it() {
+    let (kernel, _dir, mut agent, _t0) = setup("on").await;
+    let p = params(&[]);
+    agent.typed("fix the parser", 0).await;
+    agent.thought(20).await;
+    agent.call("r", "Read", json!({"file_path": "/w/src/parse.rs"}), 4).await;
+    agent.result("r", false, "fn parse() {}", 2).await;
+    agent.thought(30).await;
+    agent.call("e", "Edit", json!({"file_path": "/w/src/parse.rs", "old_string": "a", "new_string": "b"}), 10).await;
+    agent.result("e", false, "ok", 1).await;
+    agent.call("c", "Bash", json!({"command": "cd /w && cargo test -p parser 2>&1 | tail -20"}), 3).await;
+    agent.result("c", true, "test failed", 90).await;
+    agent.said("Fixed.", 5).await;
+    agent.turn_end(0).await;
+    agent.typed("thanks", 600).await;
+    let mut w = Watcher::new();
+    look(&mut w, &kernel, &p, agent.at).await;
+    let on = |tool: &'static str, target: &'static str| total(&w, move |r| r.tool == tool && r.target == target);
+    let (read, reads) = on("Read", "/w/src/parse.rs");
+    assert_eq!((read.thinking, read.writing, read.tools, reads), (20, 4, 2, 1), "the thought before the read is the read's");
+    let (edit, _) = on("Edit", "/w/src/parse.rs");
+    assert_eq!((edit.thinking, edit.writing, edit.tools), (30, 10, 1));
+    let (test, tests) = on("Bash", "cargo test");
+    assert_eq!((test.writing, test.tools, tests), (3, 90, 1));
+    let time = measure::time(w.tracks(), FixedOffset::east_opt(0).expect("utc"));
+    assert_eq!(time.rows.iter().filter(|r| r.target == "cargo test").map(|r| r.failed).sum::<u32>(), 1, "the failed run counted");
+    assert_eq!(on("(its words)", "").0.writing, 5);
+    assert_eq!(on("(your next message)", "").0.operator, 600);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_shows_nowhere_is_found_held_asleep_refused_protected_thrash_read_again_flooded_undone_compacted_and_what_you_said() {
+    let (kernel, _dir, mut agent, _t0) = setup("finds").await;
+    let p = params(&[]);
+    agent.typed("build the stage", 0).await;
+    agent.call("h", "Bash", json!({"command": "terraform apply plan.tf"}), 3).await;
+    agent.result("h", false, "Apply complete", 20 * 60).await;
+    agent.job("j", "./long.sh", 5).await;
+    agent.call("s", "Bash", json!({"command": "sleep 300; tail -5 /w/j.out"}), 3).await;
+    agent.result("s", false, "...", 300).await;
+    for x in ["x1", "x2"] {
+        agent.call(x, "Bash", json!({"command": "rm -rf build"}), 3).await;
+        agent.result(x, true, "Permission for this action was denied by the Claude Code auto mode classifier.", 1).await;
+    }
+    agent.call("p1", "Bash", json!({"command": "git add gryphon-kn/schema && git commit -m x"}), 3).await;
+    agent.result("p1", false, "", 1).await;
+    for k in 0..10 {
+        agent.call(&format!("t{k}"), "Edit", json!({"file_path": "/w/a.rs", "old_string": "a", "new_string": "b"}), 20).await;
+        agent.result(&format!("t{k}"), false, "ok", 1).await;
+    }
+    for r in ["r1", "r2"] {
+        agent.call(r, "Read", json!({"file_path": "/w/b.rs"}), 3).await;
+        agent.result(r, false, "x", 1).await;
+    }
+    agent.call("f", "Bash", json!({"command": "cat big.log"}), 3).await;
+    agent.result("f", false, &"x".repeat(50_000), 1).await;
+    agent.call("u", "Bash", json!({"command": "git reset --hard HEAD~1"}), 3).await;
+    agent.result("u", false, "", 1).await;
+    agent.compacted(30).await;
+    agent.call("r3", "Read", json!({"file_path": "/w/b.rs"}), 3).await;
+    agent.result("r3", false, "x", 1).await;
+    agent.typed("status?", 30).await;
+    agent.typed("wrong, i told you not to touch the schema", 30).await;
+    agent.typed("[Request interrupted by user]", 5).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    let found = w.found();
+    let kinds: BTreeSet<Hidden> = found.iter().map(|f| f.kind).collect();
+    for k in [
+        Hidden::Held,
+        Hidden::Slept,
+        Hidden::Refused,
+        Hidden::Protected,
+        Hidden::Thrash,
+        Hidden::Reread,
+        Hidden::Flood,
+        Hidden::Undone,
+        Hidden::Compacted,
+        Hidden::Asked,
+        Hidden::Corrected,
+        Hidden::Interrupted,
+    ] {
+        assert!(kinds.contains(&k), "{k:?} not found in {found:#?}");
+    }
+    let one = |k: Hidden, call: &str| found.iter().find(|f| f.kind == k && f.call.as_deref() == Some(call)).unwrap_or_else(|| panic!("{k:?} of {call}"));
+    assert_eq!(one(Hidden::Held, "h").secs, Some(20 * 60));
+    assert!(one(Hidden::Slept, "s").what.contains("while its job"), "{}", one(Hidden::Slept, "s").what);
+    assert_eq!(one(Hidden::Refused, "x2").times, 2, "the same call refused twice");
+    assert!(found.iter().any(|f| f.kind == Hidden::Protected && f.target.as_deref() == Some("/schema")), "{found:#?}");
+    assert_eq!(found.iter().find(|f| f.kind == Hidden::Thrash).map(|f| f.times), Some(10));
+    assert_eq!(found.iter().find(|f| f.kind == Hidden::Compacted).map(|f| f.times), Some(1), "b.rs read again after it");
+    assert!(s.alerts.is_empty(), "none of it is an alert: {:?}", s.alerts);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_merged_then_pushed_again_or_made_anew_is_one_alert_kept_up_to_date_and_its_words_are_its_record() {
+    let (kernel, _dir, mut agent, _t0) = setup("tailspin").await;
+    let p = params(&[]);
+    agent.typed("write the ENG-8080 xml", 0).await;
+    agent.call("b", "Bash", json!({"command": "git switch -c ENG-8080-annotate-design origin/sandbox"}), 3).await;
+    agent.result("b", false, "Switched to a new branch", 1).await;
+    agent.said("Writing it now, about 2 hours.", 2).await;
+    agent.call("p", "Bash", json!({"command": "git push -q -u origin ENG-8080-annotate-design"}), 60).await;
+    agent.result("p", false, "", 2).await;
+    agent.said("Everything on the branch is done, so your merge means done.", 2).await;
+    agent.typed("merged", 120).await;
+    agent.call("f", "Bash", json!({"command": "git fetch -q origin && git log --oneline -2 origin/sandbox"}), 5).await;
+    agent.result("f", false, "3cf1a23 Merged in ENG-8080-annotate-design (pull request #108)\n9a1b2c3 ENG-8080 annotate", 1).await;
+    agent.said("PR #108 is merged. One step remains before you start the agent: its build folder.", 10).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    assert!(of(&s, Kind::EndlessTask).is_empty(), "words raise nothing: {:?}", s.alerts);
+    let task = s.tasks.iter().find(|t| t.branch == "ENG-8080-annotate-design").expect("the task");
+    assert_eq!(task.not_done.len(), 1, "{:?}", task.not_done);
+    assert!(task.not_done[0].1.starts_with("PR #108 is merged. One step remains"), "{:?}", task.not_done);
+    agent.typed("why", 30).await;
+    agent.call("p2", "Bash", json!({"command": "git push 2>&1 | tail -1"}), 600).await;
+    agent.result("p2", false, "", 2).await;
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    let endless = of(&s, Kind::EndlessTask);
+    assert_eq!(endless.len(), 1, "{:?}", s.alerts);
+    assert!(endless[0].what.starts_with("ENG-8080 (ENG-8080-annotate-design) never ends"), "{}", endless[0].what);
+    assert!(endless[0].what.contains("reopened 1 times; the newest: pushed ENG-8080-annotate-design again"), "{}", endless[0].what);
+    agent.call("p3", "Bash", json!({"command": "git push -q origin ENG-8080-annotate-design"}), 60).await;
+    agent.result("p3", false, "", 2).await;
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    let endless = of(&s, Kind::EndlessTask);
+    assert_eq!(endless.len(), 1, "once, kept up to date: {:?}", s.alerts);
+    assert!(endless[0].what.contains("reopened 2 times"), "{}", endless[0].what);
+    // The same merge read again is one merge; the next pull request merged is another.
+    agent.call("f2", "Bash", json!({"command": "git log --oneline -1 origin/sandbox"}), 30).await;
+    agent.result("f2", false, "3cf1a23 Merged in ENG-8080-annotate-design (pull request #108)", 1).await;
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    let task = s.tasks.iter().find(|t| t.branch == "ENG-8080-annotate-design").expect("the task");
+    assert_eq!(task.tickets, ["ENG-8080"]);
+    assert_eq!(task.merges.len(), 1, "read again, merged once");
+    assert_eq!(task.estimates.first().map(|e| e.secs), Some(7_200));
+    agent.call("f3", "Bash", json!({"command": "git log --oneline -2 origin/sandbox"}), 30).await;
+    agent.result("f3", false, "77aa001 Merged in ENG-8080-annotate-design (pull request #109)\n3cf1a23 Merged in ENG-8080-annotate-design (pull request #108)", 1).await;
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    let task = s.tasks.iter().find(|t| t.branch == "ENG-8080-annotate-design").expect("the task");
+    assert_eq!(task.merges.len(), 2, "pushed again and merged again");
+    // A new version of a task merged is the task again, reopened; its first
+    // push is the same reopening.
+    agent.call("v", "Bash", json!({"command": "git switch -c ENG-8080-annotate-design-v2 origin/sandbox"}), 60).await;
+    agent.result("v", false, "", 1).await;
+    agent.call("p4", "Bash", json!({"command": "git push -u origin ENG-8080-annotate-design-v2"}), 60).await;
+    agent.result("p4", false, "", 1).await;
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    let endless = of(&s, Kind::EndlessTask);
+    assert_eq!(endless.len(), 1, "{:?}", s.alerts);
+    assert!(endless[0].what.contains("reopened 3 times; the newest: made ENG-8080-annotate-design-v2, a new version of it"), "{}", endless[0].what);
+    let task = s.tasks.iter().find(|t| t.branch == "ENG-8080-annotate-design").expect("the task");
+    assert_eq!(task.versions, ["ENG-8080-annotate-design-v2"]);
+
+    // Your word alone is no merge: the merge you speak of may be another
+    // session's. Nor is what comes after the agent's own merge a reopening.
+    let (kernel, _dir, mut agent, _t0) = setup("relayed").await;
+    agent.typed("build the watcher", 0).await;
+    agent.call("b", "Bash", json!({"command": "git switch -c feat/573-watcher main"}), 3).await;
+    agent.result("b", false, "", 1).await;
+    agent.call("p", "Bash", json!({"command": "git push -u origin HEAD"}), 3).await;
+    agent.result("p", false, "", 1).await;
+    agent.typed("GAVE TO ME AS READY I MERGED AND NOW A WHOLE NEW LOOP OF ISSUES", 60).await;
+    agent.said("The new alert fires when a task you took as done is reopened; one step remains: the deploy.", 10).await;
+    agent.call("p2", "Bash", json!({"command": "git push origin HEAD"}), 30).await;
+    agent.result("p2", false, "", 1).await;
+    agent.call("o", "Bash", json!({"command": "gh pr create --title x --body-file b.md"}), 3).await;
+    agent.result("o", false, "https://github.com/k8nstantin/superx/pull/574", 1).await;
+    agent.typed("merge it", 30).await;
+    agent.call("m", "Bash", json!({"command": "gh pr merge 574 --squash --admin"}), 3).await;
+    agent.result("m", false, "✓ Squashed and merged pull request #574", 1).await;
+    agent.said("Merged. The deploy remains.", 2).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    assert!(of(&s, Kind::EndlessTask).is_empty(), "{:?}", s.alerts);
+    let task = s.tasks.iter().find(|t| t.branch == "feat/573-watcher").expect("HEAD is the branch checked out");
+    assert_eq!(task.merges.len(), 1, "the agent's merge alone");
+    assert!(task.not_done.is_empty(), "{:?}", task.not_done);
+
+    // A merge call that only offers to merge later merged nothing.
+    let (kernel, _dir, mut agent, _t0) = setup("offered").await;
+    agent.typed("go", 0).await;
+    agent.call("b", "Bash", json!({"command": "git switch -c feat/1-x main"}), 3).await;
+    agent.result("b", false, "", 1).await;
+    agent.call("p", "Bash", json!({"command": "git push -u origin feat/1-x"}), 3).await;
+    agent.result("p", false, "", 1).await;
+    agent.call("m", "Bash", json!({"command": "gh pr merge --squash"}), 3).await;
+    agent.result("m", false, "To have the pull request merged after all the requirements have been met, add the `--auto` flag.", 1).await;
+    agent.call("p2", "Bash", json!({"command": "git push origin feat/1-x"}), 30).await;
+    agent.result("p2", false, "", 1).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    assert!(of(&s, Kind::EndlessTask).is_empty(), "{:?}", s.alerts);
+}
+
+/// A task file in the form the specs write it: two local gates, two door
+/// gates that each expect `exit 0`, what the build owns and what it may not
+/// touch, its verbs forbidden from the checkout and the bucket forbidden.
+const TASK_FILE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<task id="t10" name="stage 8 relationships" jira="ENG-9999" command="python -m kn stage run 8 &lt;archive&gt;; python -m kn stage verify 8 &lt;node&gt;"
+      builds="gryphon-kn/kn/stages/s08_relationships.py gryphon-kn/tests/test_s08_relationships.py">
+  <gates>
+    <gate id="Lint" kind="local" proves="the rules"><cmd>python -m kn.lint --check</cmd><expect>the last line is "0 violations"</expect></gate>
+    <gate id="Writing relationships" kind="door" proves="steps 1 to 6">
+      <cmd>gcloud run jobs execute &lt;door.stage_jobs.8.run&gt; --project &lt;project.gcp_project&gt; --args stage,run,8,&lt;nodes&gt; --wait</cmd>
+      <cmd>gcloud storage cat 'gs://&lt;bucket.root&gt;/runs/&lt;run id&gt;/*.log'</cmd>
+      <expect>one batch log, no finding, and ends with `exit 0`.</expect>
+    </gate>
+    <gate id="Verifying relationships" kind="door" proves="step 7">
+      <cmd>gcloud run jobs execute &lt;door.stage_jobs.8.verify&gt; --project &lt;project.gcp_project&gt; --args stage,verify,8,&lt;nodes&gt; --wait</cmd>
+      <expect>one `&lt;node&gt;: ok` line per node, and ends with `exit 0`.</expect>
+    </gate>
+  </gates>
+  <owns>gryphon-kn/kn/stages/s08_relationships.py; gryphon-kn/kn/core/door.py.</owns>
+  <forbid>gryphon-kn/schema/**; every other file of gryphon-kn/kn/** and of gryphon-kn/tests/**; kn-specs/**. No run of run or verify from the checkout, and no call from it that reaches the bucket: the agent writes, copies and removes nothing in the bucket itself.</forbid>
+</task>"#;
+
+/// A file as Claude Code's Read gives it: each line numbered.
+fn numbered(text: &str) -> String {
+    text.lines().enumerate().map(|(i, l)| format!("{:>6}\t{l}", i + 1)).collect::<Vec<_>>().join("\n")
+}
+
+#[tokio::test]
+async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_keeps_it_is_none() {
+    let (kernel, dir, mut agent, _t0) = setup("build").await;
+    let p = params(&[]);
+    let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+    let door = |args: &str| format!("gcloud run jobs execute kn-s8 --project p --args {args} --wait");
+    agent.typed("Build kn-specs/tasks/ENG-9999.xml", 0).await;
+    agent.call("r", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml")}), 2).await;
+    agent.result("r", false, &numbered(TASK_FILE), 1).await;
+    agent.call("e1", "Edit", json!({"file_path": at("gryphon-kn/kn/stages/s08_relationships.py"), "old_string": "a", "new_string": "b"}), 30).await;
+    agent.result("e1", false, "ok", 1).await;
+    agent.call("e2", "Edit", json!({"file_path": at("gryphon-kn/schema/relationships.sql"), "old_string": "a", "new_string": "b"}), 30).await;
+    agent.result("e2", false, "ok", 1).await;
+    agent.call("s", "Bash", json!({"command": "cd gryphon-kn && sed -i '' 's/a/b/' kn/core/config.py"}), 30).await;
+    agent.result("s", false, "", 1).await;
+    // Python's caches and a script's own text change no file of the repository.
+    agent.call("c1", "Bash", json!({"command": "cd gryphon-kn && rm kn/__pycache__/door.cpython-314.pyc"}), 30).await;
+    agent.result("c1", false, "", 1).await;
+    agent.call("c2", "Bash", json!({"command": "cd gryphon-kn/schema && python3 -I - <<'EOF'\nif len(x) > 3: print(x)\nEOF"}), 30).await;
+    agent.result("c2", false, "", 1).await;
+    // A launch that started no execution ran nothing: its relaunch is the gate's run.
+    agent.call("w0", "Bash", json!({"command": door("stage,run,8,n1")}), 30).await;
+    agent.result("w0", true, "ERROR: (gcloud.run.jobs.execute) There was a problem refreshing your current auth tokens", 1).await;
+    agent.call("w1", "Bash", json!({"command": door("stage,run,8,n1")}), 30).await;
+    agent.result("w1", false, "Creating execution...done\nExecution [kn-x1] has successfully completed.", 600).await;
+    agent.call("w2", "Bash", json!({"command": door("stage,run,8,n1")}), 30).await;
+    agent.result("w2", false, "Creating execution...done\nExecution [kn-x2] has successfully completed.", 600).await;
+    agent.call("v1", "Bash", json!({"command": format!("{} 2>&1 | tail -3", door("stage,verify,8,n1"))}), 30).await;
+    agent.result("v1", false, "Creating execution...done\nERROR: (gcloud.run.jobs.execute) The execution failed.", 300).await;
+    agent.call("e3", "Edit", json!({"file_path": at("gryphon-kn/kn/stages/s08_relationships.py"), "old_string": "b", "new_string": "c"}), 30).await;
+    agent.result("e3", false, "ok", 1).await;
+    agent.typed("fix it", 30).await;
+    agent.call("e4", "Edit", json!({"file_path": at("gryphon-kn/kn/stages/s08_relationships.py"), "old_string": "c", "new_string": "d"}), 30).await;
+    agent.result("e4", false, "ok", 1).await;
+    agent.call("x", "Bash", json!({"command": "python3 -m kn stage run 8 n1 2>&1 | tail -5"}), 30).await;
+    agent.result("x", false, "exit 0", 1).await;
+    agent.call("c", "Bash", json!({"command": "gcloud storage cp out.json gs://bucket/runs/x.json"}), 30).await;
+    agent.result("c", false, "", 1).await;
+    agent.call("l", "Bash", json!({"command": "gcloud storage cat 'gs://bucket/runs/r1/*.log'"}), 30).await;
+    agent.result("l", false, "exit 0", 1).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    let broken: Vec<&str> = of(&s, Kind::TaskFileBroken).iter().map(|a| a.what.as_str()).collect();
+    assert_eq!(broken.len(), 5, "{broken:#?}");
+    assert!(
+        broken.iter().any(|w| w.starts_with("changed 2 files: gryphon-kn/schema/relationships.sql, gryphon-kn/kn/core/config.py, which ENG-9999.xml forbids")),
+        "one alert for its forbidden changes, a shell's from the folder it went to: {broken:#?}"
+    );
+    assert!(broken.iter().any(|w| w.starts_with("launched the door gate «Writing relationships» again")), "{broken:#?}");
+    assert!(
+        broken.iter().any(|w| w.starts_with("went on after the door gate «Verifying relationships» failed: changed gryphon-kn/kn/stages/s08_relationships.py")),
+        "{broken:#?}"
+    );
+    assert!(broken.iter().any(|w| w.starts_with("ran «python -m kn stage run 8» from the checkout")), "{broken:#?}");
+    assert!(broken.iter().any(|w| w.starts_with("wrote to the bucket, which ENG-9999.xml forbids")), "{broken:#?}");
+    assert!(of(&s, Kind::RunAgain).is_empty(), "the gate run again is one alert: {:?}", s.alerts);
+
+    // A build that hands you its turn before it wrote what its task file
+    // builds stopped short, once; the task merged with that file, in the
+    // session that wrote it, is reopened by it.
+    let (kernel, dir, mut spec, t0) = setup("spec-merged").await;
+    spec.typed("write the ENG-9999 task file", 0).await;
+    spec.call("b", "Bash", json!({"command": "git switch -c ENG-9999-task-file origin/sandbox"}), 3).await;
+    spec.result("b", false, "", 1).await;
+    spec.call("p", "Bash", json!({"command": "git push -u origin ENG-9999-task-file"}), 60).await;
+    spec.result("p", false, "", 1).await;
+    spec.typed("merged", 60).await;
+    spec.call("f", "Bash", json!({"command": "git fetch -q origin && git log --oneline -1 origin/sandbox"}), 5).await;
+    spec.result("f", false, "1a347c3 Merged in ENG-9999-task-file (pull request #9)", 1).await;
+    let mut build = Agent::new(&kernel, "build-stopped", &dir, t0 + TimeDelta::hours(1)).await;
+    let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+    build.typed("Build kn-specs/tasks/ENG-9999.xml", 0).await;
+    build.call("r", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml")}), 2).await;
+    build.result("r", false, &numbered(TASK_FILE), 1).await;
+    build.call("e", "Edit", json!({"file_path": at("gryphon-kn/kn/core/door.py"), "old_string": "a", "new_string": "b"}), 300).await;
+    build.result("e", false, "ok", 1).await;
+    build.said("The build stopped on silences in the task file. The branch has step 8 only.", 30).await;
+    build.turn_end(1).await;
+    build.typed("ok", 60).await;
+    build.said("Waiting for the revised file.", 5).await;
+    build.turn_end(1).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, build.at).await;
+    let stopped = of(&s, Kind::BuildStopped);
+    assert_eq!(stopped.len(), 1, "once a build: {:?}", s.alerts);
+    assert_eq!(
+        stopped[0].what,
+        "the build of ENG-9999.xml handed you its turn before it wrote gryphon-kn/kn/stages/s08_relationships.py and gryphon-kn/tests/test_s08_relationships.py, which it builds"
+    );
+    assert!(stopped[0].evidence.first().is_some_and(|e| e.starts_with("The build stopped on silences")), "{:?}", stopped[0].evidence);
+    let endless = of(&s, Kind::EndlessTask);
+    assert_eq!(endless.len(), 1, "{:?}", s.alerts);
+    assert!(endless[0].what.starts_with("ENG-9999 (ENG-9999-task-file) never ends"), "{}", endless[0].what);
+    assert!(endless[0].what.contains("the newest: its build stopped short in"), "{}", endless[0].what);
+
+    // A build waiting on its own job has not stopped.
+    let (kernel, dir, mut agent, _t0) = setup("build-waits").await;
+    let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+    agent.typed("Build kn-specs/tasks/ENG-9999.xml", 0).await;
+    agent.call("r", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml")}), 2).await;
+    agent.result("r", false, &numbered(TASK_FILE), 1).await;
+    agent.job("j", "python -m unittest discover -s tests", 30).await;
+    agent.said("The tests run in the background; I'll pick up when they end.", 2).await;
+    agent.turn_end(1).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    assert!(of(&s, Kind::BuildStopped).is_empty(), "{:?}", s.alerts);
+
+    // A session that writes the task file, not one that builds from it, is
+    // judged by none of it.
+    let (kernel, dir, mut agent, _t0) = setup("spec").await;
+    let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+    agent.typed("write the ENG-9999 task file", 0).await;
+    agent.call("r", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml")}), 2).await;
+    agent.result("r", false, &numbered(TASK_FILE), 1).await;
+    agent.call("e", "Edit", json!({"file_path": at("gryphon-kn/schema/relationships.sql"), "old_string": "a", "new_string": "b"}), 30).await;
+    agent.result("e", false, "ok", 1).await;
+    // The order to build is a session's first message; later it is talk of it.
+    agent.typed("Build kn-specs/tasks/ENG-9999.xml is the line you will give it", 30).await;
+    agent.call("r2", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml")}), 2).await;
+    agent.result("r2", false, &numbered(TASK_FILE), 1).await;
+    agent.call("e2", "Edit", json!({"file_path": at("gryphon-kn/schema/relationships.sql"), "old_string": "b", "new_string": "c"}), 30).await;
+    agent.result("e2", false, "ok", 1).await;
+    agent.said("Done.", 2).await;
+    agent.turn_end(1).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    assert!(of(&s, Kind::TaskFileBroken).is_empty() && of(&s, Kind::BuildStopped).is_empty(), "{:?}", s.alerts);
+
+    // A door gate that gives no command of its own, `G5 repeats G3 on
+    // purpose`, takes one launch of the file's work.
+    let (kernel, dir, mut agent, _t0) = setup("build-repeats").await;
+    let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+    let repeats = TASK_FILE.replace(
+        "</gates>",
+        r#"<gate id="Writing again" kind="door" proves="the run is repeatable"><cmd>diff first.log second.log</cmd><expect>no difference, exit 0</expect></gate></gates>"#,
+    );
+    agent.typed("Build kn-specs/tasks/ENG-9999.xml", 0).await;
+    agent.call("r", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml")}), 2).await;
+    agent.result("r", false, &numbered(&repeats), 1).await;
+    for id in ["w1", "w2"] {
+        agent.call(id, "Bash", json!({"command": door("stage,run,8,n1")}), 30).await;
+        agent.result(id, false, "Creating execution...done\nExecution [kn-x] has successfully completed.", 60).await;
+    }
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    assert!(of(&s, Kind::TaskFileBroken).is_empty(), "{:?}", s.alerts);
 }

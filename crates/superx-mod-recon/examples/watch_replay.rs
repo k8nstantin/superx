@@ -1,20 +1,24 @@
 //! The watcher replayed over transcripts on disk (#573): every line of every
 //! file given, in the order they were written, fed to the watcher as a look
-//! feeds what it reads; then its alerts, runs and measures as JSON. The same
-//! code as the watcher's, with the files in place of the kernel's database.
+//! feeds what it reads; then the watcher's own routes and the tab's page
+//! served over what it found, on 127.0.0.1 at the port given. The same code
+//! as the watcher's, with the files in place of the kernel's database.
 //!
-//! cargo run -p superx-mod-recon --example watch_replay -- <out.json> <transcript.jsonl>...
+//! cargo run -p superx-mod-recon --example watch_replay -- <port> <transcript.jsonl>...
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _, SeekFrom};
 
+use axum::routing::get;
+use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use superx_mod_recon::params::from_values;
-use superx_mod_recon::watcher::{measure, routes, Watcher};
+use superx_mod_recon::watcher::{routes, Watched, Watcher};
 
-fn main() -> Result<(), String> {
+#[tokio::main]
+async fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let out = args.next().ok_or("an output path")?;
+    let port: u16 = args.next().ok_or("a port")?.parse().map_err(|e| format!("the port: {e}"))?;
     let files: Vec<String> = args.collect();
     let p = from_values(&BTreeMap::new()).params;
     // Every line's time, file and place, then all of them in time order.
@@ -46,12 +50,25 @@ fn main() -> Result<(), String> {
         w.feed(&key, &format!("claude_code/{key}"), &key, *t, &line, &p);
     }
     w.settle(last, first, &p);
-    let s = w.snapshot(&p, false);
-    let zone = chrono::FixedOffset::west_opt(4 * 3600).ok_or("zone")?;
-    let (alerts, runs) = (s.alerts.len(), s.runs.len());
-    // What GET /api/watch answers, in the operator's zone (AST).
-    let view = routes::View { models: measure::models(&s), days: measure::days(&s, zone), snapshot: s };
-    std::fs::write(&out, serde_json::to_string_pretty(&view).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    println!("{} lines of {} files: {alerts} alerts, {runs} runs listed", index.len(), files.len());
-    Ok(())
+    let s = w.snapshot();
+    let found = w.found();
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    for a in &s.alerts {
+        *kinds.entry(format!("alert {:?}", a.kind)).or_default() += 1;
+    }
+    for f in &found {
+        *kinds.entry(format!("found {:?}", f.kind)).or_default() += 1;
+    }
+    println!("{} lines of {} files, {first} to {last}: {} tasks", index.len(), files.len(), s.tasks.len());
+    for (k, n) in &kinds {
+        println!("  {n:6} {k}");
+    }
+    let app = Router::new()
+        .merge(routes::router())
+        .route("/api/ping", get(|| async { Json(serde_json::json!({ "module": "recon", "version": "replay", "core_url": null })) }))
+        .fallback(get(superx_mod_recon::ui::asset))
+        .with_state(Watched::new(w));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.map_err(|e| e.to_string())?;
+    println!("serving on http://127.0.0.1:{port}/#watcher");
+    axum::serve(listener, app).await.map_err(|e| e.to_string())
 }
