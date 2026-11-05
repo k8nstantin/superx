@@ -391,19 +391,29 @@ pub fn pr_number(text: &str) -> Option<String> {
     })
 }
 
+/// One merge commit a result names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeCommit {
+    pub branch: String,
+    pub pull: u64,
+    /// The commit, when the line gives it before the message, as
+    /// `git log --oneline` does.
+    pub commit: Option<String>,
+}
+
 /// The merge commits a result names, each as its host writes one:
 /// Bitbucket's `Merged in <branch> (pull request #N)` and GitHub's `Merge
-/// pull request #N from <owner>/<branch>`; each branch with its number.
+/// pull request #N from <owner>/<branch>`.
 #[must_use]
-pub fn merge_commits(text: &str) -> Vec<(String, u64)> {
+pub fn merge_commits(text: &str) -> Vec<MergeCommit> {
     let mut out = Vec::new();
     for (at, word) in text.match_indices("Merged in ") {
         let rest = &text[at + word.len()..];
         let branch: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
         let Some(tail) = rest[branch.len()..].strip_prefix(" (pull request #") else { continue };
         let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
-        if let (false, true, Ok(n)) = (branch.is_empty(), tail[digits.len()..].starts_with(')'), digits.parse()) {
-            out.push((branch, n));
+        if let (false, true, Ok(pull)) = (branch.is_empty(), tail[digits.len()..].starts_with(')'), digits.parse()) {
+            out.push(MergeCommit { branch, pull, commit: commit_before(text, at) });
         }
     }
     for (at, word) in text.match_indices("Merge pull request #") {
@@ -411,13 +421,44 @@ pub fn merge_commits(text: &str) -> Vec<(String, u64)> {
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
         let Some(from) = rest[digits.len()..].strip_prefix(" from ") else { continue };
         let source: String = from.chars().take_while(|c| !c.is_whitespace()).collect();
-        if let (Some((_, branch)), Ok(n)) = (source.split_once('/'), digits.parse()) {
+        if let (Some((_, branch)), Ok(pull)) = (source.split_once('/'), digits.parse()) {
             if !branch.is_empty() {
-                out.push((branch.to_string(), n));
+                out.push(MergeCommit { branch: branch.to_string(), pull, commit: commit_before(text, at) });
             }
         }
     }
     out
+}
+
+/// The commit a line names just before `at`: the word there, when it is
+/// one, 7 to 40 hexadecimal digits.
+fn commit_before(text: &str, at: usize) -> Option<String> {
+    let line = text[..at].rsplit('\n').next().unwrap_or_default();
+    let word = line.split_whitespace().next_back()?;
+    (word.len() >= 7 && word.len() <= 40 && word.chars().all(|c| c.is_ascii_hexdigit())).then(|| word.to_string())
+}
+
+/// Whether two commits, each written whole or cut short, are the same.
+#[must_use]
+pub fn same_commit(a: &str, b: &str) -> bool {
+    let n = a.len().min(b.len());
+    n >= 7 && a[..n].eq_ignore_ascii_case(&b[..n])
+}
+
+/// The branches a push's answer says it moved by force: each branch, the
+/// commit it was and the one it is, from git's ` + <was>...<is> <from> ->
+/// <branch> (forced update)`.
+#[must_use]
+pub fn forced_updates(text: &str) -> Vec<(String, String, String)> {
+    text.lines()
+        .filter(|l| l.contains("(forced update)"))
+        .filter_map(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            let (was, is) = words.iter().find_map(|w| w.split_once("..."))?;
+            let branch = words.iter().position(|w| *w == "->").and_then(|i| words.get(i + 1))?;
+            Some((branch.trim_start_matches("refs/heads/").to_string(), was.to_string(), is.to_string()))
+        })
+        .collect()
 }
 
 /// What a command undoes: `git revert`, `git reset --hard`, and a file put

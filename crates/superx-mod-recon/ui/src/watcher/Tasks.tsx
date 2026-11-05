@@ -12,6 +12,10 @@ import { around, Lines } from './Lines'
 // how often you corrected it and asked how it stood, and the work spent on
 // it after you first merged it. A task that never ends heads the list.
 
+/// A merge as its history says it: its pull request and commit when known.
+export const merged = (m: WatchTask['merges'][number]) =>
+  `merged${m.pull != null ? ` #${m.pull}` : ''}${m.commit ? ` as ${m.commit.slice(0, 8)}` : ''}`
+
 const MARK: Record<string, string> = { reopened: 'red', merged: 'teal', 'not done': 'orange', estimate: 'yellow' }
 
 /// A task's history, oldest first: your message before it, its merges and
@@ -20,7 +24,7 @@ const MARK: Record<string, string> = { reopened: 'red', merged: 'teal', 'not don
 export function History({ t }: { t: WatchTask }) {
   const rows: [string, string, string][] = [
     [t.asked, 'asked', 'your message before it began'] as [string, string, string],
-    ...t.merges.map((m): [string, string, string] => [m, 'merged', 'merged']),
+    ...t.merges.map((m): [string, string, string] => [m.at, 'merged', merged(m)]),
     ...t.reopened.map(([at, how]): [string, string, string] => [at, 'reopened', how]),
     ...t.not_done.map(([at, words]): [string, string, string] => [at, 'not done', `once it read the merge it said: "${words}"`]),
     ...t.estimates.map((e): [string, string, string] => [e.at, 'estimate', `${took(e.secs)}: ${e.words}`]),

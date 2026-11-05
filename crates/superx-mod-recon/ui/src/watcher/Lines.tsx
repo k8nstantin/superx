@@ -88,7 +88,7 @@ export function Lines({ session, from, to, mark, core }: { session: string; from
   if (first.isPending) return <Loader size="xs" />
   if (first.isError) return <Alert color="red" title="The lines did not load">{String(first.error)}</Alert>
   const seen = new Set<string>()
-  // A thought with no words kept says nothing a reader can use.
+  // A thought with no words kept says nothing you can use.
   const lines = [...before, ...first.data.lines].filter((l) => {
     if (l.kind === 'thought' && !l.text.trim()) return false
     const k = key(l)

@@ -28,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use super::alerts::Alerts;
 use super::command::{self, simple_commands};
@@ -60,8 +61,41 @@ struct Slot {
     /// takes any launch once.
     work: Option<String>,
     ends_well: bool,
-    /// The call that took it.
+    /// The call that took it, when it started, and whether its execution
+    /// ended well, once it ended.
     taken: Option<String>,
+    ran: Option<DateTime<Utc>>,
+    ended_well: Option<bool>,
+}
+
+/// A build of a task file, as the page lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuildRow {
+    pub session: String,
+    /// The task file's name, and its ticket.
+    pub file: String,
+    pub ticket: Option<String>,
+    /// When the operator ordered it, and when it handed back its turn short
+    /// of what it builds.
+    pub ordered: DateTime<Utc>,
+    pub stopped: Option<DateTime<Utc>>,
+    /// The files it builds, and those of them it wrote.
+    pub builds: Vec<String>,
+    pub written: Vec<String>,
+    /// The forbidden files it changed.
+    pub forbidden: Vec<String>,
+    /// Each door gate's command, in the file's order, with its run.
+    pub gates: Vec<GateRun>,
+}
+
+/// A door gate's command and its run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GateRun {
+    pub gate: String,
+    /// Whether the gate expects its run to end well (`exit 0`).
+    pub ends_well: bool,
+    pub ran: Option<DateTime<Utc>>,
+    pub ended_well: Option<bool>,
 }
 
 /// What a task file decides, as the session building from it was given it.
@@ -87,8 +121,8 @@ pub struct Contract {
     ordered: DateTime<Utc>,
     /// The forbidden files it changed, in order.
     forbidden: Vec<String>,
-    /// Whether it stopped short already.
-    stopped: bool,
+    /// When it stopped short.
+    stopped: Option<DateTime<Utc>>,
     /// The door gate that failed, and when, until the operator's next
     /// message.
     failed: Option<(String, DateTime<Utc>)>,
@@ -148,9 +182,11 @@ impl Contracts {
         let Some(slot) = c.slots.iter_mut().find(|s| s.taken.as_deref() == Some(run.call.as_str())) else { return };
         if !(EXECUTED.iter().any(|e| text.contains(e)) || (text.trim().is_empty() && !run.failed)) {
             slot.taken = None;
+            slot.ran = None;
             return;
         }
-        if slot.ends_well && (text.contains(EXECUTION_FAILED) || run.failed) {
+        slot.ended_well = Some(!(text.contains(EXECUTION_FAILED) || run.failed));
+        if slot.ends_well && slot.ended_well == Some(false) {
             c.failed = Some((slot.gate.clone(), run.end.unwrap_or(run.start)));
         }
     }
@@ -194,7 +230,10 @@ impl Contracts {
             let ours = c.slots.iter().filter_map(|s| s.work.as_deref()).any(|w| plan::scheduled(w, l, &p.watch_jobs));
             let gates: Vec<usize> = (0..c.slots.len()).filter(|&i| c.slots[i].work.as_deref().map_or(ours, |w| plan::scheduled(w, l, &p.watch_jobs))).collect();
             match gates.iter().find(|&&i| c.slots[i].taken.is_none()) {
-                Some(&free) => c.slots[free].taken = Some(run.call.clone()),
+                Some(&free) => {
+                    c.slots[free].taken = Some(run.call.clone());
+                    c.slots[free].ran = Some(run.start);
+                }
                 None if !gates.is_empty() => {
                     let mut ids: Vec<&str> = gates.iter().map(|&i| c.slots[i].gate.as_str()).collect();
                     ids.dedup();
@@ -228,15 +267,37 @@ impl Contracts {
         let c = self.by_session.get_mut(&t.session)?;
         let missing: Vec<&str> = c.builds.iter().filter(|b| !c.written.contains(*b)).map(String::as_str).collect();
         let waits = t.running().any(|r| r.background && (at - r.start).num_seconds() < UNSEEN_END_SECS);
-        if missing.is_empty() || waits || c.stopped {
+        if missing.is_empty() || waits || c.stopped.is_some() {
             return None;
         }
-        c.stopped = true;
+        c.stopped = Some(at);
         let words = t.steps.iter().rev().find(|s| s.kind == StepKind::Said).map(|s| s.text.chars().take(STOP_WORDS_CHARS).collect::<String>());
         let what = format!("the build of {} handed you its turn before it wrote {}, which it builds", c.file, missing.join(" and "));
         alerts.build_stopped(t, at, c.ordered, what, words);
         let ticket = c.ticket.clone()?;
         Some(Stopped { ticket, at, how: format!("its build stopped short in {}: {} not written", t.name, missing.join(" and ")) })
+    }
+
+    /// Every build read, as the page lists it, the newest ordered first.
+    #[must_use]
+    pub fn rows(&self) -> Vec<BuildRow> {
+        let mut rows: Vec<BuildRow> = self
+            .by_session
+            .iter()
+            .map(|(session, c)| BuildRow {
+                session: session.clone(),
+                file: c.file.clone(),
+                ticket: c.ticket.clone(),
+                ordered: c.ordered,
+                stopped: c.stopped,
+                builds: c.builds.clone(),
+                written: c.builds.iter().filter(|b| c.written.contains(*b)).cloned().collect(),
+                forbidden: c.forbidden.clone(),
+                gates: c.slots.iter().map(|s| GateRun { gate: s.gate.clone(), ends_well: s.ends_well, ran: s.ran, ended_well: s.ended_well }).collect(),
+            })
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.ordered));
+        rows
     }
 
     /// Forget the sessions no longer followed.
@@ -261,10 +322,10 @@ impl Contract {
             let ends_well = expect.contains("exit 0") && !expect.contains("exit 1");
             let launches: Vec<String> = elements(body, "cmd").into_iter().filter_map(|(_, cmd)| plan::launch(&plan::placeholders_whole(&plan::unescape(cmd)), &p.watch_jobs)).collect();
             if launches.is_empty() {
-                slots.push(Slot { gate: gate.clone(), work: None, ends_well, taken: None });
+                slots.push(Slot { gate: gate.clone(), work: None, ends_well, taken: None, ran: None, ended_well: None });
             }
             for l in launches {
-                slots.push(Slot { gate: gate.clone(), work: Some(plan::same_work(&l)), ends_well, taken: None });
+                slots.push(Slot { gate: gate.clone(), work: Some(plan::same_work(&l)), ends_well, taken: None, ran: None, ended_well: None });
             }
         }
         let task = elements(xml, "task").first().map(|(head, _)| *head).unwrap_or_default();
@@ -285,7 +346,7 @@ impl Contract {
             ticket,
             ordered,
             forbidden: Vec::new(),
-            stopped: false,
+            stopped: None,
             file,
             root,
             owns: paths(element(xml, "owns").unwrap_or_default()),

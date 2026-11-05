@@ -78,6 +78,8 @@ pub struct Snapshot {
     pub runs: Vec<RunRow>,
     /// Every task of the window, the newest worked on first.
     pub tasks: Vec<Task>,
+    /// Every build of a task file read in the window, the newest first.
+    pub builds: Vec<contract::BuildRow>,
 }
 
 /// A session as it works.
@@ -438,7 +440,7 @@ impl Watcher {
             tasks: {
                 let mut tasks = self.tasks.list.clone();
                 for task in &mut tasks {
-                    let (Some(first), Some(t)) = (task.merges.first(), self.tracks.get(&task.session)) else { continue };
+                    let (Some(first), Some(t)) = (task.merges.first().map(|m| &m.at), self.tracks.get(&task.session)) else { continue };
                     let (from, to) = (track::hour_of(*first), track::hour_of(task.last));
                     task.after_merge_secs =
                         t.ledger.iter().filter(|(k, _)| k.hour >= from && k.hour <= to).map(|(_, s)| s.split.thinking + s.split.writing + s.split.tools + s.split.jobs).sum();
@@ -446,6 +448,7 @@ impl Watcher {
                 tasks.sort_by_key(|t| std::cmp::Reverse(t.last));
                 tasks
             },
+            builds: self.contracts.rows(),
         }
     }
 

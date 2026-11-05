@@ -590,7 +590,9 @@ export type WatchTask = {
   asked: string
   last: string
   estimates: { at: string; secs: number; words: string }[]
-  merges: string[]
+  /// Each merge: when it was seen, and its pull request and merge commit
+  /// when the answer named them.
+  merges: { at: string; pull: number | null; commit: string | null }[]
   reopened: [string, string][]
   /// The branches made for it after a merge, newest last.
   versions: string[]
@@ -616,6 +618,23 @@ export type Watch = {
   sessions: WatchSessionRow[]
   runs: WatchRun[]
   tasks: WatchTask[]
+  /// Every build of a task file read in the window, the newest first.
+  builds: BuildRow[]
+}
+
+/// A build of a task file: when you ordered it and when it stopped short,
+/// what it builds and wrote, the forbidden files it changed, and each door
+/// gate's run.
+export type BuildRow = {
+  session: string
+  file: string
+  ticket: string | null
+  ordered: string
+  stopped: string | null
+  builds: string[]
+  written: string[]
+  forbidden: string[]
+  gates: { gate: string; ends_well: boolean; ran: string | null; ended_well: boolean | null }[]
 }
 
 /// What the watcher holds at its newest look.

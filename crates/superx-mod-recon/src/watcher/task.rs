@@ -59,6 +59,15 @@ pub struct Estimate {
     pub words: String,
 }
 
+/// One merge of a task: when it was seen, and its pull request and merge
+/// commit when the answer named them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Merge {
+    pub at: DateTime<Utc>,
+    pub pull: Option<u64>,
+    pub commit: Option<String>,
+}
+
 /// One task, as the watcher followed it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Task {
@@ -73,7 +82,7 @@ pub struct Task {
     /// The newest act on it.
     pub last: DateTime<Utc>,
     pub estimates: Vec<Estimate>,
-    pub merges: Vec<DateTime<Utc>>,
+    pub merges: Vec<Merge>,
     /// Each reopening after a merge: when, and what did it.
     pub reopened: Vec<(DateTime<Utc>, String)>,
     pub corrections: u32,
@@ -146,7 +155,7 @@ impl Tasks {
         let version = self.list.iter().rposition(|x| x.session == t.session && !x.merges.is_empty() && stem(&x.branch) == stem(branch));
         if let Some(i) = version {
             self.list[i].versions.push(branch.to_string());
-            let since = self.list[i].merges.last().map_or(0, |&m| (at - m).num_seconds());
+            let since = self.list[i].merges.last().map_or(0, |m| (at - m.at).num_seconds());
             self.reopen(i, at, format!("made {branch}, a new version of it, {} after it was merged", duration(since)), alerts);
             return i;
         }
@@ -224,9 +233,21 @@ impl Tasks {
                 if !push.force {
                     continue;
                 }
-                // A shared branch rewritten undoes what was merged into it.
-                let Some(&i) = self.last_merged.get(&t.session) else { continue };
-                self.reopen(i, at, format!("rewrote the shared branch {}: {}", push.branch, one_line(&run.what)), alerts);
+                // A shared branch rewritten undoes what was merged into it:
+                // the merge whose commit it was, in whatever session it was
+                // read, or else the session's newest merged.
+                let moved = command::forced_updates(text).into_iter().find(|(b, _, _)| *b == push.branch);
+                let undone = moved.as_ref().and_then(|(_, was, _)| self.merged_as(was));
+                match (undone, moved) {
+                    (Some((i, pull)), Some((branch, was, is))) => {
+                        let pull = pull.map(|n| format!(" #{n}")).unwrap_or_default();
+                        self.reopen(i, at, format!("undid its merge{pull}: {branch} put back from {} to {}", short(&was), short(&is)), alerts);
+                    }
+                    _ => {
+                        let Some(&i) = self.last_merged.get(&t.session) else { continue };
+                        self.reopen(i, at, format!("rewrote the shared branch {}: {}", push.branch, one_line(&run.what)), alerts);
+                    }
+                }
                 continue;
             }
             let i = if push.branch.is_empty() {
@@ -244,7 +265,7 @@ impl Tasks {
             // A branch merged and pushed again; a new version's first push
             // is the reopening its making already counted.
             let branch = if push.branch.is_empty() { task.newest().to_string() } else { push.branch.clone() };
-            if let (Some(&m), true) = (task.merges.last(), task.merged.contains(&branch)) {
+            if let (Some(m), true) = (task.merges.last().map(|m| m.at), task.merged.contains(&branch)) {
                 if at > m {
                     let how = format!("pushed {branch} again, {} after it was merged", duration((at - m).num_seconds()));
                     self.reopen(i, at, how, alerts);
@@ -267,36 +288,37 @@ impl Tasks {
             };
             if let Some(branch) = branch {
                 let i = self.task(t, &branch, at, alerts);
-                self.merged(&t.session, i, &branch, at, number, false);
+                self.merged(&t.session, i, &branch, Merge { at, pull: number, commit: None }, false);
             }
         }
         // A merge done outside the session, on the host: the merge commit
         // the agent reads names one of the session's own branches.
-        for (branch, number) in command::merge_commits(text) {
-            if let Some(i) = self.list.iter().position(|x| x.session == t.session && x.holds(&branch)) {
-                self.merged(&t.session, i, &branch, at, Some(number), true);
+        for m in command::merge_commits(text) {
+            if let Some(i) = self.list.iter().position(|x| x.session == t.session && x.holds(&m.branch)) {
+                self.merged(&t.session, i, &m.branch, Merge { at, pull: Some(m.pull), commit: m.commit }, true);
             }
         }
     }
 
-    /// A merge of `branch`, of task `i`, at `at`, by its pull request
-    /// `number` when known; `seen` when the agent read it, done outside the
-    /// session. The same merge read again is one: a number not above the
-    /// newest merged, or, the number unknown, no push since the last merge.
-    fn merged(&mut self, session: &str, i: usize, branch: &str, at: DateTime<Utc>, number: Option<u64>, seen: bool) {
+    /// A merge of `branch`, of task `i`; `seen` when the agent read it, done
+    /// outside the session. The same merge read again is one: a pull request
+    /// not above the newest merged, or, its number unknown, no push since
+    /// the last merge.
+    fn merged(&mut self, session: &str, i: usize, branch: &str, merge: Merge, seen: bool) {
         let task = &mut self.list[i];
-        let same = match (number, task.pull) {
+        let at = merge.at;
+        let same = match (merge.pull, task.pull) {
             (Some(n), Some(p)) => n <= p,
-            _ => task.merges.last().is_some_and(|&m| task.pushed.is_none_or(|p| p <= m)),
+            _ => task.merges.last().is_some_and(|m| task.pushed.is_none_or(|p| p <= m.at)),
         };
         if same {
             return;
         }
-        task.pull = number.or(task.pull);
+        task.pull = merge.pull.or(task.pull);
         if !task.merged.iter().any(|b| b == branch) {
             task.merged.push(branch.to_string());
         }
-        task.merges.push(at);
+        task.merges.push(merge);
         task.last = task.last.max(at);
         self.last_merged.insert(session.to_string(), i);
         if seen {
@@ -304,11 +326,19 @@ impl Tasks {
         }
     }
 
+    /// The task one of whose merges is the commit `commit`, in any session,
+    /// and that merge's pull request.
+    fn merged_as(&self, commit: &str) -> Option<(usize, Option<u64>)> {
+        self.list.iter().enumerate().rev().find_map(|(i, t)| {
+            t.merges.iter().rev().find(|m| m.commit.as_deref().is_some_and(|c| command::same_commit(c, commit))).map(|m| (i, m.pull))
+        })
+    }
+
     /// A build of `ticket`'s task file, in `session`, that stopped short at
     /// `at`: the task of that ticket merged before it in another session,
     /// the newest, was taken for done and is reopened.
     pub fn build_stopped(&mut self, session: &str, ticket: &str, at: DateTime<Utc>, how: String, alerts: &mut Alerts) {
-        let merged = |t: &Task| t.merges.last().copied().filter(|&m| m < at);
+        let merged = |t: &Task| t.merges.last().map(|m| m.at).filter(|&m| m < at);
         let Some(i) = (0..self.list.len())
             .filter(|&i| self.list[i].session != session && self.list[i].tickets.iter().any(|k| k == ticket))
             .filter_map(|i| merged(&self.list[i]).map(|m| (m, i)))
@@ -331,7 +361,7 @@ impl Tasks {
             task.merges.len(),
             task.reopened.len()
         );
-        let from = task.merges.last().copied().unwrap_or(task.asked).min(at);
+        let from = task.merges.last().map_or(task.asked, |m| m.at).min(at);
         alerts.endless(task, "reopened", what, from, at, (at - task.asked).num_seconds());
     }
 
@@ -387,11 +417,18 @@ pub fn has_any(text: &str, words: &[String]) -> bool {
 }
 
 /// The ticket keys a branch's name carries, in order: an upper-case word, a
-/// dash and a number, `ENG-8078`.
+/// dash and a number, `ENG-8078`; or the issue a branch named for one
+/// carries, `feat/573-watcher` its `#573`.
 #[must_use]
 pub fn keys(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<String> = Vec::new();
+    if let Some((kind, rest)) = text.split_once('/') {
+        let issue: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !kind.is_empty() && kind.chars().all(|c| c.is_ascii_lowercase()) && !issue.is_empty() && rest[issue.len()..].starts_with('-') {
+            out.push(format!("#{issue}"));
+        }
+    }
     let mut i = 0;
     while i < chars.len() {
         if !(chars[i].is_ascii_uppercase() && (i == 0 || !chars[i - 1].is_alphanumeric())) {
@@ -489,6 +526,11 @@ fn unit_secs(word: &str) -> Option<i64> {
         "h" | "hr" | "hrs" | "hour" | "hours" => Some(3_600),
         _ => None,
     }
+}
+
+/// A commit written short: its first 8 digits.
+fn short(commit: &str) -> &str {
+    &commit[..commit.len().min(8)]
 }
 
 fn one_line(text: &str) -> String {

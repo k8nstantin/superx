@@ -19,7 +19,7 @@ use superx_mod_recon::instance::Instance;
 use superx_mod_recon::params::{Params, WATCH_PLANS_PARAM};
 use superx_mod_recon::server;
 use superx_mod_recon::watcher::alerts::Kind;
-use superx_mod_recon::watcher::command::{self, Push};
+use superx_mod_recon::watcher::command::{self, MergeCommit, Push};
 use superx_mod_recon::watcher::found::Hidden;
 use superx_mod_recon::watcher::track::Split;
 use superx_mod_recon::watcher::{measure, plan, task, Snapshot, Watched, Watcher};
@@ -570,9 +570,19 @@ fn a_command_is_read_for_its_work_its_sleep_what_it_changes_and_what_it_pushes()
     assert_eq!(command::merges("git status"), None);
     assert_eq!(
         command::merge_commits("3cf1a23 Merged in ENG-8080-annotate-design (pull request #109)\n9a1b2c3 annotate"),
-        [("ENG-8080-annotate-design".to_string(), 109)]
+        [MergeCommit { branch: "ENG-8080-annotate-design".to_string(), pull: 109, commit: Some("3cf1a23".to_string()) }]
     );
-    assert_eq!(command::merge_commits("Merge pull request #12 from k8nstantin/feat/573-x"), [("feat/573-x".to_string(), 12)]);
+    assert_eq!(
+        command::merge_commits("Merge pull request #12 from k8nstantin/feat/573-x"),
+        [MergeCommit { branch: "feat/573-x".to_string(), pull: 12, commit: None }]
+    );
+    assert_eq!(
+        command::forced_updates("lease ok\n + 1a347c3b...3cf1a23a 3cf1a23af13a44865fef27537c6a4aca4c35dbac -> sandbox (forced update)"),
+        [("sandbox".to_string(), "1a347c3b".to_string(), "3cf1a23a".to_string())]
+    );
+    assert!(command::same_commit("1a347c3b628434c0fd1cc41c5910b2a5ef3ed802", "1a347c3b") && !command::same_commit("1a347c3", "1a347c4"));
+    assert_eq!(task::keys("feat/573-watcher-v2-opus-5-5-max"), ["#573"], "a branch named for an issue carries it");
+    assert!(task::keys("fix/view-repeats").is_empty());
     assert!(command::merge_commits("it merged in the end (pull request soon)").is_empty());
     assert!(command::merge_commits("Merged in X (pull request #)").is_empty());
     // A here-document's body is the command's input, not commands.
@@ -598,7 +608,7 @@ fn a_command_is_read_for_its_work_its_sleep_what_it_changes_and_what_it_pushes()
     assert_eq!(task::estimate("pauses within ~2s"), None);
     assert_eq!(task::estimate("At about 20 seconds per call"), None);
     assert_eq!(task::keys("ENG-8078-task-file-v2"), ["ENG-8078"]);
-    assert!(task::keys("feat/573-watcher").is_empty());
+    assert_eq!(task::keys("feat/573-watcher"), ["#573"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -756,6 +766,13 @@ async fn a_task_merged_then_pushed_again_or_made_anew_is_one_alert_kept_up_to_da
     assert!(endless[0].what.contains("reopened 3 times; the newest: made ENG-8080-annotate-design-v2, a new version of it"), "{}", endless[0].what);
     let task = s.tasks.iter().find(|t| t.branch == "ENG-8080-annotate-design").expect("the task");
     assert_eq!(task.versions, ["ENG-8080-annotate-design-v2"]);
+    assert_eq!((task.merges[1].pull, task.merges[1].commit.as_deref()), (Some(109), Some("77aa001")));
+    // The shared branch put back from a merge's commit undid that merge.
+    agent.call("u", "Bash", json!({"command": "git push --force-with-lease=refs/heads/sandbox:77aa001 origin 3cf1a23:refs/heads/sandbox"}), 60).await;
+    agent.result("u", false, " + 77aa001...3cf1a23 3cf1a23 -> sandbox (forced update)", 1).await;
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    let endless = of(&s, Kind::EndlessTask);
+    assert!(endless[0].what.contains("the newest: undid its merge #109: sandbox put back from 77aa001 to 3cf1a23"), "{}", endless[0].what);
 
     // Your word alone is no merge: the merge you speak of may be another
     // session's. Nor is what comes after the agent's own merge a reopening.
@@ -881,6 +898,12 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     assert!(broken.iter().any(|w| w.starts_with("ran «python -m kn stage run 8» from the checkout")), "{broken:#?}");
     assert!(broken.iter().any(|w| w.starts_with("wrote to the bucket, which ENG-9999.xml forbids")), "{broken:#?}");
     assert!(of(&s, Kind::RunAgain).is_empty(), "the gate run again is one alert: {:?}", s.alerts);
+    let build = s.builds.first().expect("the build, as the page lists it");
+    assert_eq!((build.file.as_str(), build.ticket.as_deref(), build.stopped), ("ENG-9999.xml", Some("ENG-9999"), None));
+    assert_eq!(build.forbidden, ["gryphon-kn/schema/relationships.sql", "gryphon-kn/kn/core/config.py"]);
+    assert_eq!(build.written, ["gryphon-kn/kn/stages/s08_relationships.py"]);
+    let gates: Vec<(&str, Option<bool>)> = build.gates.iter().map(|g| (g.gate.as_str(), g.ended_well)).collect();
+    assert_eq!(gates, [("Writing relationships", Some(true)), ("Verifying relationships", Some(false))]);
 
     // A build that hands you its turn before it wrote what its task file
     // builds stopped short, once; the task merged with that file, in the
@@ -915,6 +938,7 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
         "the build of ENG-9999.xml handed you its turn before it wrote gryphon-kn/kn/stages/s08_relationships.py and gryphon-kn/tests/test_s08_relationships.py, which it builds"
     );
     assert!(stopped[0].evidence.first().is_some_and(|e| e.starts_with("The build stopped on silences")), "{:?}", stopped[0].evidence);
+    assert!(s.builds.iter().any(|b| b.stopped == Some(stopped[0].at)), "{:?}", s.builds);
     let endless = of(&s, Kind::EndlessTask);
     assert_eq!(endless.len(), 1, "{:?}", s.alerts);
     assert!(endless[0].what.starts_with("ENG-9999 (ENG-9999-task-file) never ends"), "{}", endless[0].what);
