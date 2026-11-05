@@ -23,6 +23,15 @@
 //!   whose task file changed in its session with no spec gate passed since
 //!   (operator, 2026-11-05: "merge = done"; every redo of that day followed
 //!   one, and no merge a gate passed was undone).
+//! - **No answer from the API** ([`super::track::Unanswered`]): a stretch
+//!   with no answer that ended the agent's turn on Claude Code giving up, or
+//!   that went `attr_recon_watch_api_wait_secs` with its request sent again;
+//!   the stretches that follow within that span are the same alert, said
+//!   again as it grows, with the other sessions the API left without an
+//!   answer in the same minutes (2026-11-05: an outage held three sessions,
+//!   one a build the operator watched "thinking" for twenty minutes). A long
+//!   answer with nothing sent again is the model at work: the session's
+//!   card shows it as it waits, and no alert.
 //!
 //! Each alert names the call it is about and the time its cause starts
 //! from, for the page to read the session's lines between; and the alert
@@ -39,7 +48,7 @@ use super::command::ITS_OWN;
 use super::line::FILE_TOOLS;
 use super::plan::{self, Repeat};
 use super::task::Task;
-use super::track::{Run, Track};
+use super::track::{Run, Track, Unanswered};
 use crate::params::Params;
 
 /// How long after a stop an act still counts as not following it.
@@ -63,6 +72,7 @@ pub enum Kind {
     TaskFileBroken,
     BuildStopped,
     UnprovenMerge,
+    ApiStalled,
 }
 
 /// One alert.
@@ -95,6 +105,20 @@ pub struct Alert {
     pub repeats: Vec<Repeat>,
     /// The alert that caused this one, by its id.
     pub cause: Option<String>,
+    /// The stretches the API did not answer, for its alert.
+    pub stretches: Vec<Unanswered>,
+    /// The other sessions the API left without an answer in the same
+    /// minutes, for its alert.
+    pub alongside: Vec<Alongside>,
+}
+
+/// Another session the API left without an answer in the same minutes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Alongside {
+    pub session: String,
+    pub name: String,
+    pub since: DateTime<Utc>,
+    pub until: DateTime<Utc>,
 }
 
 /// Every alert raised in the window, each once.
@@ -148,6 +172,8 @@ impl Alerts {
             launch: Some(launch.to_string()),
             repeats: Vec::new(),
             cause: None,
+            stretches: Vec::new(),
+            alongside: Vec::new(),
         });
     }
 
@@ -193,6 +219,8 @@ impl Alerts {
                     launch: run.launch.clone(),
                     repeats: Vec::new(),
                     cause: None,
+                    stretches: Vec::new(),
+                    alongside: Vec::new(),
                 });
             }
         }
@@ -219,6 +247,8 @@ impl Alerts {
             launch: run.launch.clone(),
             repeats: Vec::new(),
             cause: None,
+            stretches: Vec::new(),
+            alongside: Vec::new(),
         });
     }
 
@@ -248,6 +278,8 @@ impl Alerts {
             launch: run.launch.clone(),
             repeats: Vec::new(),
             cause: None,
+            stretches: Vec::new(),
+            alongside: Vec::new(),
         });
     }
 
@@ -269,6 +301,8 @@ impl Alerts {
             launch: None,
             repeats: Vec::new(),
             cause: None,
+            stretches: Vec::new(),
+            alongside: Vec::new(),
         });
     }
 
@@ -291,6 +325,8 @@ impl Alerts {
             launch: None,
             repeats: Vec::new(),
             cause: None,
+            stretches: Vec::new(),
+            alongside: Vec::new(),
         });
     }
 
@@ -330,6 +366,8 @@ impl Alerts {
             launch: None,
             repeats,
             cause: None,
+            stretches: Vec::new(),
+            alongside: Vec::new(),
         });
     }
 
@@ -358,10 +396,84 @@ impl Alerts {
             launch: None,
             repeats: Vec::new(),
             cause: None,
+            stretches: Vec::new(),
+            alongside: Vec::new(),
         });
     }
 
     /// Forget alerts before `from`.
+    /// A stretch the API did not answer, as it stands at `at`: an alert once
+    /// Claude Code giving up ended the agent's turn, or once it went
+    /// `attr_recon_watch_api_wait_secs` with its request sent again. A
+    /// stretch that starts within that span of the session's alert of the
+    /// API's ending is that alert's.
+    pub fn api(&mut self, track: &Track, u: &Unanswered, at: DateTime<Utc>, p: &Params) {
+        let span = secs(p.watch_api_wait_secs);
+        let theirs = |a: &Alert| a.kind == Kind::ApiStalled && a.session == track.session;
+        let i = if let Some(i) = self.list.iter().position(|a| theirs(a) && a.stretches.iter().any(|s| s.since == u.since)) {
+            i
+        } else if u.turn_ended.is_none() && (u.resent == 0 || u.secs(at) < span) {
+            return;
+        } else if let Some(i) = self.list.iter().rposition(|a| theirs(a) && (u.since - a.at).num_seconds() <= span) {
+            self.list[i].stretches.push(u.clone());
+            i
+        } else {
+            self.raise(Alert {
+                id: format!("{}/api_stalled/{}", track.session, u.since.timestamp_millis()),
+                session: track.session.clone(),
+                name: track.name.clone(),
+                kind: Kind::ApiStalled,
+                at: u.end(at),
+                what: unanswered(std::slice::from_ref(u), at, 0),
+                since: Some(u.since),
+                cost_secs: Some(u.secs(at)),
+                evidence: u.error.iter().cloned().collect(),
+                call: None,
+                from: u.since,
+                launch: None,
+                repeats: Vec::new(),
+                cause: None,
+                stretches: vec![u.clone()],
+                alongside: Vec::new(),
+            });
+            return;
+        };
+        let a = &mut self.list[i];
+        if let Some(s) = a.stretches.iter_mut().find(|s| s.since == u.since) {
+            *s = u.clone();
+        }
+        a.at = a.at.max(u.end(at));
+        a.cost_secs = Some(a.stretches.iter().map(|s| s.secs(a.at)).sum());
+        a.evidence = a.stretches.iter().rev().find_map(|s| s.error.clone()).into_iter().collect();
+        a.what = unanswered(&a.stretches, a.at, a.alongside.len());
+    }
+
+    /// The requests of `tracks` still waiting on the API at `now`, each as it
+    /// stands.
+    pub fn api_waits<'a>(&mut self, tracks: impl Iterator<Item = &'a Track>, now: DateTime<Utc>, p: &Params) {
+        for t in tracks {
+            if let Some(u) = t.unanswered.as_ref().filter(|u| u.waits(now)) {
+                self.api(t, u, now, p);
+            }
+        }
+    }
+
+    /// Each alert of the API's with the other sessions it left without an
+    /// answer in the same minutes.
+    pub fn api_alongside(&mut self) {
+        let span = |a: &Alert| Some((a.stretches.first()?.since, a.stretches.last()?.end(a.at)));
+        let spans: Vec<Alongside> = self
+            .list
+            .iter()
+            .filter_map(|a| span(a).map(|(since, until)| Alongside { session: a.session.clone(), name: a.name.clone(), since, until }))
+            .collect();
+        for a in &mut self.list {
+            let Some((from, to)) = span(a) else { continue };
+            a.alongside = spans.iter().filter(|o| o.session != a.session && o.since <= to && o.until >= from).cloned().collect();
+            a.what = unanswered(&a.stretches, a.at, a.alongside.len());
+        }
+    }
+
     pub fn trim(&mut self, from: DateTime<Utc>) {
         self.list.retain(|a| a.at >= from);
     }
@@ -426,6 +538,45 @@ fn secs(n: u64) -> i64 {
 
 /// A duration in words: `1 h 04 min`, `12 min`, `40 s`.
 #[must_use]
+/// One sentence of the stretches the API did not answer, as they stand at
+/// `at`, and how many other sessions it left without an answer in the same
+/// minutes.
+fn unanswered(stretches: &[Unanswered], at: DateTime<Utc>, others: usize) -> String {
+    let (Some(first), Some(newest)) = (stretches.first(), stretches.last()) else { return String::new() };
+    let times = |n: u32| if n == 1 { "time" } else { "times" };
+    let resent: u32 = stretches.iter().map(|s| s.resent).sum();
+    let gave_up: u32 = stretches.iter().map(|s| s.failures).sum();
+    let mut parts = Vec::new();
+    if resent > 0 {
+        parts.push(format!("Claude Code sent its request again {resent} {}", times(resent)));
+    }
+    if stretches.iter().any(|s| s.interrupted.is_some()) {
+        parts.push("you interrupted it".to_string());
+    }
+    if let Some(e) = stretches.iter().rev().find_map(|s| s.error.as_ref()) {
+        parts.push(if gave_up > 1 { format!("Claude Code gave up {gave_up} times, the last: «{e}»") } else { format!("Claude Code gave up: «{e}»") });
+    }
+    let took = duration((newest.end(at) - first.since).num_seconds().max(0));
+    let mut s = match stretches.len() {
+        1 => format!("No answer from the API for {took}"),
+        n => format!("No answer from the API {n} times in {took}"),
+    };
+    if !parts.is_empty() {
+        s.push_str(": ");
+        s.push_str(&parts.join(", "));
+    }
+    s.push_str(match () {
+        () if newest.answered.is_some() => "; then the answer came.",
+        () if newest.waiting() => "; none yet.",
+        () => ".",
+    });
+    if others > 0 {
+        let whom = if others == 1 { "session" } else { "sessions" };
+        s.push_str(&format!(" {others} other {whom} had no answer in the same minutes: the connection or the API, not the agent."));
+    }
+    s
+}
+
 pub fn duration(secs: i64) -> String {
     match secs {
         s if s >= 3600 => format!("{} h {:02} min", s / 3600, (s % 3600) / 60),

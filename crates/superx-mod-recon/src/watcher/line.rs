@@ -2,9 +2,10 @@
 //! captured it (`crates/superx-kernel/src/adapters/claude_code.rs`): the
 //! operator's words and how they came, the model thinking and writing and
 //! the words of each, every call with what it was called on and what it
-//! works on, how each call ended, a background job's end and a turn's end.
-//! Lines of a subagent's own thread are set aside: its work shows as the
-//! call that started it.
+//! works on, how each call ended, a background job's end and a turn's end;
+//! each request Claude Code sends the API, and its giving up when the API
+//! fails it. Lines of a subagent's own thread are set aside: its work shows
+//! as the call that started it.
 
 use serde::Serialize;
 use serde_json::Value as Json;
@@ -81,6 +82,11 @@ pub enum Happened {
     /// A background job ended, as Claude Code's task notification says, and
     /// its summary.
     JobEnded { call: Option<String>, status: Option<String>, summary: Option<String> },
+    /// A request sent to the API: sent again unchanged when it adds nothing
+    /// to the request it builds on; the model and the effort it asks for.
+    Asked { resent: bool, model: Option<String>, effort: Option<String> },
+    /// Claude Code giving up on the API, in its own words.
+    ApiFailed { error: String },
     TurnEnded,
     /// The context compacted: what the agent held is now a summary of it.
     Compacted,
@@ -107,6 +113,7 @@ pub fn read(line: &Json) -> Reading {
         Some("assistant") => assistant(line, &mut r),
         Some("system") if text(line, &["subtype"]) == Some("turn_duration") => r.happened.push(Happened::TurnEnded),
         Some("attachment") => queued(line, &mut r),
+        Some("api-request") => asked(line, &mut r),
         _ => {}
     }
     r
@@ -185,7 +192,24 @@ fn queued(line: &Json, r: &mut Reading) {
     r.happened.push(Happened::Prompt { came, text: kept(&message) });
 }
 
+/// A request to the API, as Claude Code writes it before it sends one: the
+/// request it builds on (`base`) and the messages it adds (`tail`). One that
+/// adds none sends its base again: the API did not answer it.
+fn asked(line: &Json, r: &mut Reading) {
+    let resent = text(line, &["base"]).is_some() && at(line, &["tail"]).and_then(Json::as_array).is_some_and(Vec::is_empty);
+    r.happened.push(Happened::Asked {
+        resent,
+        model: text(line, &["params", "model"]).map(str::to_string),
+        effort: text(line, &["params", "output_config", "effort"]).map(str::to_string),
+    });
+}
+
 fn assistant(line: &Json, r: &mut Reading) {
+    // Claude Code's own line when it gave up on the API: no model wrote it.
+    if flag(line, "isApiErrorMessage") {
+        r.happened.push(Happened::ApiFailed { error: kept(&all_text(at(line, &["message", "content"]))) });
+        return;
+    }
     r.model = text(line, &["message", "model"]).filter(|m| !m.starts_with('<')).map(str::to_string);
     let Some(Json::Array(blocks)) = at(line, &["message", "content"]) else { return };
     for b in blocks {

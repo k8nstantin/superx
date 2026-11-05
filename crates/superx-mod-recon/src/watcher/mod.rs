@@ -90,9 +90,12 @@ pub struct Now {
     pub model: Option<String>,
     pub folder: Option<String>,
     pub newest: DateTime<Utc>,
-    /// `working`, `job running`, `waiting on you`, `waiting on your
-    /// approval` or `idle`.
+    /// `working`, `waiting on the API`, `job running`, `waiting on you`,
+    /// `waiting on your approval` or `idle`.
     pub state: &'static str,
+    /// The request the API has not answered, once it waited
+    /// `attr_recon_watch_api_wait_secs` or was sent again.
+    pub api: Option<track::Unanswered>,
     /// The call it is in, when one runs in the foreground.
     pub doing: Option<Doing>,
     /// Its background jobs running.
@@ -289,6 +292,8 @@ impl Watcher {
     /// the window from `window_from` forgotten.
     pub fn settle(&mut self, now: DateTime<Utc>, window_from: DateTime<Utc>, p: &Params) {
         self.alerts.long_runs(self.tracks.values(), now, p);
+        self.alerts.api_waits(self.tracks.values().filter(|t| live(t, now)), now, p);
+        self.alerts.api_alongside();
         for t in self.tracks.values_mut() {
             t.trim(window_from);
         }
@@ -349,6 +354,7 @@ impl Watcher {
             }
             Fed::Said(text) => tasks.said(track, at, &text, p),
             Fed::Compacted => finds.compacted(track, at),
+            Fed::Unanswered(u) | Fed::Answered(u) => alerts.api(track, &u, at, p),
             Fed::TurnEnded => {
                 if let Some(stopped) = contracts.turn_ended(track, at, alerts) {
                     tasks.build_stopped(session, &stopped.ticket, stopped.at, stopped.how, alerts);
@@ -388,9 +394,11 @@ impl Watcher {
             .map(|t| {
                 let fore = t.running().find(|r| !r.background).filter(|_| live(t, now));
                 let jobs: Vec<Doing> = t.running().filter(|r| r.background && job_seen(r, now)).map(doing).collect();
+                let api = t.unanswered.as_ref().filter(|u| u.waits(now) && (u.resent > 0 || u.secs(now) >= secs(p.watch_api_wait_secs).num_seconds()));
                 let state = match fore {
                     Some(r) if r.secs(now) > FOREGROUND_LIMIT_SECS => "waiting on your approval",
                     Some(_) => "working",
+                    None if api.is_some() => "waiting on the API",
                     None if !jobs.is_empty() => "job running",
                     None if t.turn_over => "waiting on you",
                     None if now - t.newest > TimeDelta::minutes(30) => "idle",
@@ -403,6 +411,7 @@ impl Watcher {
                     folder: t.folder.clone(),
                     newest: t.newest,
                     state,
+                    api: api.cloned(),
                     doing: fore.map(doing),
                     jobs,
                 }

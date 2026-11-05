@@ -15,6 +15,12 @@
 //! operator's: a permission prompt, or a machine that slept. A reply does
 //! not take a quarter of an hour, so a longer gap before one is a session
 //! left, and also the operator's.
+//!
+//! A request to the API with no answer after it is the API's time: from
+//! the line before it to the request sent again unchanged, to the
+//! operator's message, or to Claude Code giving up; past the quarter hour
+//! Claude Code was not running, and the time is the operator's. An answer,
+//! however long it took, was the model's.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -46,6 +52,7 @@ pub const WORDS: &str = "(its words)";
 pub const YOUR_MESSAGE: &str = "(your next message)";
 pub const THINKING: &str = "(thinking, nothing after)";
 pub const EARLIER_CALL: &str = "(a call before the window)";
+pub const NO_ANSWER: &str = "(no answer from the API)";
 
 /// Where a session's time went, in seconds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -60,6 +67,8 @@ pub struct Split {
     pub operator: i64,
     /// Waiting on the operator's approval of a call.
     pub approval: i64,
+    /// Waiting on the API for answers that never came.
+    pub api: i64,
 }
 
 impl Split {
@@ -70,6 +79,7 @@ impl Split {
         self.jobs += o.jobs;
         self.operator += o.operator;
         self.approval += o.approval;
+        self.api += o.api;
     }
 
     fn add(&mut self, spent: Spent, secs: i64) {
@@ -80,6 +90,7 @@ impl Split {
             Spent::Jobs => self.jobs += secs,
             Spent::Operator => self.operator += secs,
             Spent::Approval => self.approval += secs,
+            Spent::Api => self.api += secs,
         }
     }
 }
@@ -92,6 +103,7 @@ enum Spent {
     Jobs,
     Operator,
     Approval,
+    Api,
 }
 
 /// What a stretch of a session's time went on: the tool, and what it was
@@ -207,6 +219,9 @@ pub enum StepKind {
     /// A background job's notice that it ended.
     JobEnded,
     Compacted,
+    /// The API not answering: a request sent again, or Claude Code giving
+    /// up.
+    Api,
 }
 
 /// One line of a session, kept for the window: what it was, and its words.
@@ -218,6 +233,90 @@ pub struct Step {
     pub tool: Option<String>,
     /// The call it is or ends, by which the page shows the run.
     pub call: Option<String>,
+}
+
+/// The API not answering a session: from the first request with no answer
+/// after it to the answer that ended the wait, if one came. The operator's
+/// interrupt and Claude Code giving up end the waiting, not the stretch: the
+/// requests after them wait on the same API. A request past the quarter hour
+/// with no line starts a stretch of its own: Claude Code was not running, or
+/// the session was left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unanswered {
+    pub since: DateTime<Utc>,
+    /// The newest request sent.
+    pub last: DateTime<Utc>,
+    /// The requests sent, and of them the ones sent again unchanged.
+    pub sent: u32,
+    pub resent: u32,
+    pub first_resent: Option<DateTime<Utc>>,
+    /// The model and the effort the newest request asked for.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// The operator's newest interrupt while it waited.
+    pub interrupted: Option<DateTime<Utc>>,
+    /// Claude Code's newest giving up, its words, how many times it gave up,
+    /// and when its giving up ended the agent's turn.
+    pub failed_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+    pub failures: u32,
+    pub turn_ended: Option<DateTime<Utc>>,
+    pub answered: Option<DateTime<Utc>>,
+}
+
+impl Unanswered {
+    fn new(at: DateTime<Utc>) -> Self {
+        Self {
+            since: at,
+            last: at,
+            sent: 0,
+            resent: 0,
+            first_resent: None,
+            model: None,
+            effort: None,
+            interrupted: None,
+            failed_at: None,
+            error: None,
+            failures: 0,
+            turn_ended: None,
+            answered: None,
+        }
+    }
+
+    /// Whether a request still waits: no answer, and neither the operator's
+    /// interrupt nor Claude Code giving up since the newest request.
+    #[must_use]
+    pub fn waiting(&self) -> bool {
+        // A request is written after the interrupt that comes in the same instant.
+        self.answered.is_none() && self.failed_at.is_none_or(|f| f < self.last) && self.interrupted.is_none_or(|i| i <= self.last)
+    }
+
+    /// Whether it waits at `now` as a running Claude Code waits: within the
+    /// quarter hour of its newest request, past which Claude Code sends it
+    /// again or was not running.
+    #[must_use]
+    pub fn waits(&self, now: DateTime<Utc>) -> bool {
+        self.waiting() && !left(self, now)
+    }
+
+    /// Where the wait ends: the answer, the interrupt or the giving up after
+    /// the newest request, else `now`.
+    #[must_use]
+    pub fn end(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        if let Some(a) = self.answered {
+            return a;
+        }
+        if self.waiting() {
+            return now.max(self.last);
+        }
+        self.failed_at.into_iter().chain(self.interrupted).filter(|t| *t >= self.last).max().unwrap_or(self.last)
+    }
+
+    /// How long it went with no answer, by `now`.
+    #[must_use]
+    pub fn secs(&self, now: DateTime<Utc>) -> i64 {
+        (self.end(now) - self.since).num_seconds().max(0)
+    }
 }
 
 /// What feeding a line told the watcher.
@@ -234,6 +333,11 @@ pub enum Fed {
     Prompt { came: Came, stop: bool, text: String, previous: Option<DateTime<Utc>> },
     Said(String),
     Compacted,
+    /// The API's silence grew: a request sent again, the operator's message
+    /// while it waited, or Claude Code giving up.
+    Unanswered(Unanswered),
+    /// An answer ended a wait on the API.
+    Answered(Unanswered),
     /// The agent's turn ended: the operator is to answer.
     TurnEnded,
 }
@@ -277,6 +381,11 @@ pub struct Track {
     pub asked: String,
     /// The agent's words since the operator's newest message, lowercase.
     turn_words: String,
+    /// The request the API has not answered yet, from the first with no
+    /// answer after it.
+    pub unanswered: Option<Unanswered>,
+    /// Claude Code gave up on the API in the turn ending now.
+    api_ended: bool,
 }
 
 impl Track {
@@ -304,6 +413,8 @@ impl Track {
             acting: false,
             asked: String::new(),
             turn_words: String::new(),
+            unanswered: None,
+            api_ended: false,
         }
     }
 
@@ -322,11 +433,13 @@ impl Track {
                 Happened::Thought { text } => {
                     self.acting = true;
                     self.spend(at, Spent::Thinking, On::bare(THINKING));
+                    self.answered(at, &mut fed);
                     self.step(at, StepKind::Thought, text, None, None);
                 }
                 Happened::Said { text } => {
                     self.acting = true;
                     self.spend(at, Spent::Writing, On::bare(WORDS));
+                    self.answered(at, &mut fed);
                     self.settle_thinking(&On::bare(WORDS));
                     self.stop = None;
                     self.heard(&text);
@@ -365,6 +478,7 @@ impl Track {
                     };
                     let on = On::of(&run);
                     self.spend(at, Spent::Writing, on.clone());
+                    self.answered(at, &mut fed);
                     self.settle_thinking(&on);
                     // A job stopped by the agent ended there.
                     if let Some(i) = stops.as_ref().and_then(|j| self.jobs.get(j)).copied() {
@@ -457,6 +571,19 @@ impl Track {
                         .filter(|r| r.background)
                         .map(|r| (r.start, r.end.unwrap_or(r.start + TimeDelta::seconds(UNSEEN_END_SECS)), On::of(r)))
                         .collect();
+                    // A message while the API had not answered ends a wait
+                    // that was the API's.
+                    if self.unanswered.as_ref().is_some_and(Unanswered::waiting) {
+                        self.spend(at, Spent::Api, On::bare(NO_ANSWER));
+                        if self.unanswered.as_ref().is_some_and(|u| left(u, at)) {
+                            self.unanswered = None;
+                        } else if let Some(u) = self.unanswered.as_mut() {
+                            if came == Came::Interrupt {
+                                u.interrupted = Some(at);
+                            }
+                            fed.push(Fed::Unanswered(u.clone()));
+                        }
+                    }
                     self.spend_waiting(at, running);
                     self.settle_thinking(&On::bare(THINKING));
                     self.step(at, StepKind::You, text.clone(), None, None);
@@ -471,10 +598,44 @@ impl Track {
                     let previous = self.last_prompt.replace(at);
                     fed.push(Fed::Prompt { came, stop, text, previous });
                 }
+                Happened::Asked { resent, model, effort } => {
+                    // A request sent again: the API did not answer the one before.
+                    if resent && self.unanswered.is_some() {
+                        self.spend(at, Spent::Api, On::bare(NO_ANSWER));
+                        self.step(at, StepKind::Api, "sent again: no answer".to_string(), None, None);
+                    }
+                    let u = self.unanswered_at(at);
+                    u.sent += 1;
+                    u.last = at;
+                    u.model = model;
+                    u.effort = effort;
+                    if resent {
+                        u.resent += 1;
+                        u.first_resent.get_or_insert(at);
+                        fed.push(Fed::Unanswered(u.clone()));
+                    }
+                }
+                Happened::ApiFailed { error } => {
+                    self.spend(at, Spent::Api, On::bare(NO_ANSWER));
+                    self.step(at, StepKind::Api, error.clone(), None, None);
+                    self.api_ended = true;
+                    let u = self.unanswered_at(at);
+                    u.failed_at = Some(at);
+                    u.error = Some(error);
+                    u.failures += 1;
+                    fed.push(Fed::Unanswered(u.clone()));
+                }
                 Happened::TurnEnded => {
                     self.settle_thinking(&On::bare(THINKING));
-                    if std::mem::take(&mut self.acting) {
+                    // A turn Claude Code ended when it gave up on the API was
+                    // not the agent's to end.
+                    let by_api = std::mem::take(&mut self.api_ended);
+                    if std::mem::take(&mut self.acting) && !by_api {
                         fed.push(Fed::TurnEnded);
+                    }
+                    if let Some(u) = self.unanswered.as_mut().filter(|_| by_api) {
+                        u.turn_ended = Some(at);
+                        fed.push(Fed::Unanswered(u.clone()));
                     }
                     self.turn_over = true;
                 }
@@ -485,6 +646,24 @@ impl Track {
             }
         }
         fed
+    }
+
+    /// The stretch the API has not answered at `at`: the open one, or one
+    /// from `at` when none is open or the open one was left.
+    fn unanswered_at(&mut self, at: DateTime<Utc>) -> &mut Unanswered {
+        if self.unanswered.as_ref().is_some_and(|u| left(u, at)) {
+            self.unanswered = None;
+        }
+        self.unanswered.get_or_insert_with(|| Unanswered::new(at))
+    }
+
+    /// An answer of the model's: the wait on the API, if any, ends.
+    fn answered(&mut self, at: DateTime<Utc>, fed: &mut Vec<Fed>) {
+        self.api_ended = false;
+        if let Some(mut u) = self.unanswered.take() {
+            u.answered = Some(at);
+            fed.push(Fed::Answered(u));
+        }
     }
 
     fn step(&mut self, at: DateTime<Utc>, kind: StepKind, text: String, tool: Option<String>, call: Option<String>) {
@@ -502,7 +681,9 @@ impl Track {
     }
 
     /// The gap since the line before, given to what ended it. Thinking waits
-    /// for what the agent does after it.
+    /// for what the agent does after it. An answer to a request the API was
+    /// still on is the model's, however long it took; a silence of the API's
+    /// past the quarter hour was Claude Code not running.
     fn spend(&mut self, at: DateTime<Utc>, spent: Spent, on: On) {
         let Some(prev) = self.prev else {
             self.prev = Some(at);
@@ -510,7 +691,7 @@ impl Track {
         };
         if at > prev {
             let gap = (at - prev).num_seconds();
-            let (spent, on) = if matches!(spent, Spent::Thinking | Spent::Writing) && gap > REPLY_LIMIT_SECS {
+            let (spent, on) = if gap > REPLY_LIMIT_SECS && (spent == Spent::Api || (matches!(spent, Spent::Thinking | Spent::Writing) && self.unanswered.is_none())) {
                 (Spent::Operator, On::bare(YOUR_MESSAGE))
             } else {
                 (spent, on)
@@ -599,6 +780,13 @@ impl Track {
         self.open = self.open.iter().filter_map(|(c, i)| index.get(i).map(|j| (c.clone(), *j))).collect();
         self.jobs = self.jobs.iter().filter_map(|(c, i)| index.get(i).map(|j| (c.clone(), *j))).collect();
     }
+}
+
+/// Whether a stretch the API did not answer was left by `at`: past the
+/// quarter hour of its newest request, Claude Code was not running, or the
+/// session was left.
+fn left(u: &Unanswered, at: DateTime<Utc>) -> bool {
+    (at - u.last).num_seconds() > REPLY_LIMIT_SECS
 }
 
 /// The hour `at` falls in.

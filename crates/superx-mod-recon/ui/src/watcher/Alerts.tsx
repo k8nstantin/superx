@@ -1,9 +1,9 @@
 import { Fragment, useState } from 'react'
 import { Badge, Button, Group, Paper, Stack, Table, Text } from '@mantine/core'
-import type { Watch, WatchAlert, WatchTask } from '../api'
+import type { Alongside, Unanswered, Watch, WatchAlert, WatchTask } from '../api'
 import { EChart, FAIL, MONO, type Clicked } from '../EChart'
 import { category, grid, legend, stacked, tip, value } from '../results/charts'
-import { day } from '../time'
+import { clock, day, since } from '../time'
 import { dayOf, KIND, short, took, type Focus } from './data'
 import { around, Lines } from './Lines'
 import { History } from './Tasks'
@@ -18,6 +18,51 @@ import { History } from './Tasks'
 function taskOf(a: WatchAlert, tasks: WatchTask[]): WatchTask | undefined {
   const branch = a.id.split('/endless_task/')[1]?.split('/').slice(0, -1).join('/')
   return tasks.find((t) => t.session === a.session && t.branch === branch)
+}
+
+/// The stretches the API did not answer, step by step in your time, and the
+/// other sessions it left without an answer in the same minutes.
+function NoAnswer({ stretches, alongside, pick }: { stretches: Unanswered[]; alongside: Alongside[]; pick: (session: string) => void }) {
+  const steps: [string, string | null][] = stretches.flatMap((u, i): [string, string | null][] => [
+    [`${stretches.length > 1 ? `${i + 1}. ` : ''}first request with no answer${u.model ? `, ${u.model}${u.effort ? ` at effort ${u.effort}` : ''}` : ''}`, u.since],
+    [`sent again ${u.resent} ${u.resent === 1 ? 'time' : 'times'}, the first`, u.resent ? u.first_resent : null],
+    ['you interrupted it', u.interrupted],
+    [`Claude Code gave up${u.failures > 1 ? ` (${u.failures} times)` : ''}${u.error ? `: ${u.error}` : ''}`, u.failed_at],
+    ['its turn ended there', u.turn_ended],
+    [`the newest of ${u.sent} requests sent`, u.last],
+    ['the answer came', u.answered],
+  ])
+  return (
+    <Paper withBorder p={6} radius="sm">
+      <Stack gap={2}>
+        {steps
+          .filter(([, at]) => at)
+          .sort((x, y) => (x[1] ?? '').localeCompare(y[1] ?? ''))
+          .map(([what, at], i) => (
+            <Group key={`${i}-${what}`} gap="xs" wrap="nowrap" align="flex-start">
+              <Text fz="xs" ff={MONO} c="dimmed" w={64} style={{ flex: 'none' }}>{clock(at)}</Text>
+              <Text fz="xs" style={{ overflowWrap: 'anywhere' }}>{what}</Text>
+            </Group>
+          ))}
+        {alongside.length > 0 && (
+          <Text fz="xs" fw={600} mt={4}>
+            The API left {alongside.length} other {alongside.length === 1 ? 'session' : 'sessions'} without an answer in the same minutes:
+          </Text>
+        )}
+        {alongside.map((o) => (
+          <Group key={o.session + o.since} gap="xs" wrap="nowrap">
+            <Text fz="xs" ff={MONO} c="dimmed" w={130} style={{ flex: 'none' }}>
+              {clock(o.since)}–{clock(o.until)}
+            </Text>
+            <Text fz="xs" ff={MONO} td="underline" style={{ cursor: 'pointer', overflowWrap: 'anywhere' }} onClick={() => pick(o.session)}>
+              {o.name}
+            </Text>
+            <Text fz="xs" c="dimmed">{since(o.since, o.until)}</Text>
+          </Group>
+        ))}
+      </Stack>
+    </Paper>
+  )
 }
 
 function Cause({ a, w, open, core }: { a: WatchAlert; w: Watch; open: (id: string) => void; core: string | null }) {
@@ -65,6 +110,7 @@ function Cause({ a, w, open, core }: { a: WatchAlert; w: Watch; open: (id: strin
         </Paper>
       ))}
       {task && <History t={task} />}
+      {a.stretches.length > 0 && <NoAnswer stretches={a.stretches} alongside={a.alongside} pick={(s) => open(w.alerts.find((x) => x.session === s && x.kind === 'api_stalled')?.id ?? a.id)} />}
       {a.kind !== 'endless_task' && a.evidence.length > 0 && (
         <Stack gap={2}>
           {a.evidence.map((e, i) => (
@@ -111,7 +157,7 @@ export function Alerts({ w, focus, setFocus, core }: { w: Watch; focus: Focus; s
         {alerts.length} critical alerts{focus.day ? ` on ${focus.day}` : ''}: {alerts.filter((a) => a.kind === 'endless_task').length} tasks that never end,{' '}
         {alerts.filter((a) => a.kind === 'run_again').length} finished runs launched again ({took(lost)} run twice), {alerts.filter((a) => a.kind === 'long_run').length} runs gone long,{' '}
         {alerts.filter((a) => a.kind === 'plan_repeats').length} plans that repeat, {alerts.filter((a) => a.kind === 'stop_not_followed').length} stops not followed,{' '}
-        {alerts.filter((a) => a.kind === 'task_file_broken').length} task files broken, {alerts.filter((a) => a.kind === 'build_stopped').length} builds stopped short, {alerts.filter((a) => a.kind === 'unproven_merge').length} task files merged unproven. Click a row for its cause.
+        {alerts.filter((a) => a.kind === 'task_file_broken').length} task files broken, {alerts.filter((a) => a.kind === 'build_stopped').length} builds stopped short, {alerts.filter((a) => a.kind === 'unproven_merge').length} task files merged unproven, {alerts.filter((a) => a.kind === 'api_stalled').length} stretches with no answer from the API. Click a row for its cause.
       </Text>
       {chart.days.length > 0 && (
         <Paper withBorder radius="md" p="sm">

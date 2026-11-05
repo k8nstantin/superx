@@ -12,7 +12,16 @@
 //!   going on before the operator's next message: a file of the checkout
 //!   changed, a job launched, a commit or a push; a failed gate stops it;
 //! - when its `<forbid>` names the checkout, its verbs (the task's `command`)
-//!   run from the checkout; when it names the bucket, a write to a bucket.
+//!   run from the checkout; when it names the bucket, a write to a bucket;
+//! - against its `<start>`: a branch cut other than the one it names (`Cut
+//!   the branch ENG-8080-…-v2-<model>-<effort>`), a commit whose message
+//!   does not start with its word or carries an attribution trailer it
+//!   forbids, and a pull request opened or merged by the agent where the
+//!   file has the operator open it.
+//!
+//! Each of its local gates is followed too, by the gate's own command: when
+//! it ran and whether its expected last line came, for the page to show a
+//! build against its file as it goes.
 //!
 //! And a build that hands the operator its turn, no job of its own running,
 //! before it wrote every file the task's `builds` names has stopped short:
@@ -68,6 +77,48 @@ struct Slot {
     ended_well: Option<bool>,
 }
 
+/// One local gate: its command's words, the last line it expects, and its
+/// newest run.
+#[derive(Debug, Clone)]
+struct Local {
+    gate: String,
+    words: Vec<String>,
+    last_line: Option<String>,
+    call: Option<String>,
+    ran: Option<DateTime<Utc>>,
+    passed: Option<bool>,
+}
+
+/// What a task file's `<start>` decides of the build's git.
+#[derive(Debug, Clone, Default)]
+struct Rules {
+    /// The branch it cuts, its placeholders whole: `ENG-8080-…-v2-<model>-<effort>`.
+    branch: Option<String>,
+    /// The word every commit message starts with.
+    prefix: Option<String>,
+    /// Whether a commit may carry no attribution trailer.
+    no_trailer: bool,
+    /// Whether the operator opens the pull request.
+    pull_is_yours: bool,
+}
+
+/// A commit of the build: when, its first line, and whether it keeps the
+/// file's rules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommitRow {
+    pub at: DateTime<Utc>,
+    pub line: String,
+    pub ok: bool,
+}
+
+/// A local gate and its newest run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalRun {
+    pub gate: String,
+    pub ran: Option<DateTime<Utc>>,
+    pub passed: Option<bool>,
+}
+
 /// A build of a task file, as the page lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BuildRow {
@@ -86,6 +137,15 @@ pub struct BuildRow {
     pub forbidden: Vec<String>,
     /// Each door gate's command, in the file's order, with its run.
     pub gates: Vec<GateRun>,
+    /// Each local gate with its newest run.
+    pub locals: Vec<LocalRun>,
+    /// What the file owns and forbids, as it names them.
+    pub owns: Vec<String>,
+    pub forbid: Vec<String>,
+    /// The branch the file names, the one cut, and the commits made.
+    pub branch_rule: Option<String>,
+    pub branch: Option<String>,
+    pub commits: Vec<CommitRow>,
 }
 
 /// A door gate's command and its run.
@@ -123,6 +183,10 @@ pub struct Contract {
     forbidden: Vec<String>,
     /// When it stopped short.
     stopped: Option<DateTime<Utc>>,
+    locals: Vec<Local>,
+    rules: Rules,
+    branch: Option<String>,
+    commits: Vec<CommitRow>,
     /// The door gate that failed, and when, until the operator's next
     /// message.
     failed: Option<(String, DateTime<Utc>)>,
@@ -135,6 +199,8 @@ pub struct Contracts {
     /// The task file each session was told to build, until it reads it:
     /// its path, the checkout and when.
     ordered: HashMap<String, (String, String, DateTime<Utc>)>,
+    /// What of it each session read so far, when it read it in parts.
+    parts: HashMap<String, String>,
 }
 
 /// A build that stopped short: its ticket, when, and how it reads.
@@ -171,14 +237,27 @@ impl Contracts {
         if run.tool == "Read" {
             let read = run.path.as_deref().unwrap_or_default();
             if let Some((path, root, at)) = self.ordered.get(&t.session).filter(|(path, _, _)| read.ends_with(path.as_str())) {
+                // A file read in parts is whole once its parts hold its
+                // task's head and its end.
+                let whole = self.parts.remove(&t.session).unwrap_or_default() + &super::numbers_set_aside(text) + "\n";
+                if !(whole.contains("<task") && whole.contains("</task>")) {
+                    self.parts.insert(t.session.clone(), whole);
+                    return;
+                }
                 let file = path.rsplit('/').next().unwrap_or(path).to_string();
-                let contract = Contract::of(&super::numbers_set_aside(text), file, root.clone(), *at, p);
+                let contract = Contract::of(&whole, file, root.clone(), *at, p);
                 self.by_session.insert(t.session.clone(), contract);
                 self.ordered.remove(&t.session);
             }
             return;
         }
         let Some(c) = self.by_session.get_mut(&t.session) else { return };
+        // A local gate passed when its expected last line came and nothing
+        // failed: one command may run several gates.
+        let failed = run.failed || text.lines().any(|l| ["FAILED", "ERROR", "Traceback"].iter().any(|w| l.trim_start().starts_with(w)));
+        for l in c.locals.iter_mut().filter(|l| l.call.as_deref() == Some(run.call.as_str())) {
+            l.passed = Some(!failed && l.last_line.as_deref().is_none_or(|want| text.lines().any(|line| line.trim() == want)));
+        }
         let Some(slot) = c.slots.iter_mut().find(|s| s.taken.as_deref() == Some(run.call.as_str())) else { return };
         if !(EXECUTED.iter().any(|e| text.contains(e)) || (text.trim().is_empty() && !run.failed)) {
             slot.taken = None;
@@ -199,6 +278,20 @@ impl Contracts {
         c.written.extend(changed.iter().cloned());
         let launch = (run.tool == "Bash").then(|| plan::launch(&run.what, &p.watch_jobs)).flatten();
         let mut again = false;
+        if run.tool == "Bash" {
+            c.git(t, run, alerts);
+            for simple in simple_commands(&run.what) {
+                let words: Vec<String> = simple.split_whitespace().map(|w| w.trim_matches(['\'', '"']).replace("python3", "python")).collect();
+                let best = (0..c.locals.len())
+                    .filter(|&i| !c.locals[i].words.is_empty() && c.locals[i].words.iter().all(|w| words.contains(w)))
+                    .max_by_key(|&i| c.locals[i].words.len());
+                if let Some(i) = best {
+                    c.locals[i].call = Some(run.call.clone());
+                    c.locals[i].ran = Some(run.start);
+                    c.locals[i].passed = None;
+                }
+            }
+        }
         let forbidden: Vec<&String> = changed.iter().filter(|rel| !c.owns.contains(rel) && c.forbid.iter().any(|g| within(rel, g))).collect();
         if !forbidden.is_empty() {
             for rel in forbidden {
@@ -294,6 +387,12 @@ impl Contracts {
                 written: c.builds.iter().filter(|b| c.written.contains(*b)).cloned().collect(),
                 forbidden: c.forbidden.clone(),
                 gates: c.slots.iter().map(|s| GateRun { gate: s.gate.clone(), ends_well: s.ends_well, ran: s.ran, ended_well: s.ended_well }).collect(),
+                locals: c.locals.iter().map(|l| LocalRun { gate: l.gate.clone(), ran: l.ran, passed: l.passed }).collect(),
+                owns: c.owns.clone(),
+                forbid: c.forbid.clone(),
+                branch_rule: c.rules.branch.clone(),
+                branch: c.branch.clone(),
+                commits: c.commits.clone(),
             })
             .collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.ordered));
@@ -304,6 +403,7 @@ impl Contracts {
     pub fn trim(&mut self, sessions: &std::collections::HashSet<&String>) {
         self.by_session.retain(|s, _| sessions.contains(s));
         self.ordered.retain(|s, _| sessions.contains(s));
+        self.parts.retain(|s, _| sessions.contains(s));
     }
 }
 
@@ -328,6 +428,26 @@ impl Contract {
                 slots.push(Slot { gate: gate.clone(), work: Some(plan::same_work(&l)), ends_well, taken: None, ran: None, ended_well: None });
             }
         }
+        let mut locals = Vec::new();
+        for (head, body) in elements(xml, "gate") {
+            if plan::attribute(head, "kind").as_deref() != Some("local") {
+                continue;
+            }
+            let expect = plan::unescape(element(body, "expect").unwrap_or_default());
+            let last_line = expect.split_once("the last line is \"").and_then(|(_, rest)| rest.split_once('"')).map(|(line, _)| line.to_string());
+            if let Some((_, cmd)) = elements(body, "cmd").first() {
+                let words = plan::unescape(cmd).split_whitespace().filter(|w| *w != "-v").map(|w| w.replace("python3", "python")).collect();
+                locals.push(Local { gate: plan::attribute(head, "id").unwrap_or_default(), words, last_line, call: None, ran: None, passed: None });
+            }
+        }
+        let start = plan::unescape(&element(xml, "start").unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" "));
+        let after = |phrase: &str| start.split_once(phrase).and_then(|(_, rest)| rest.split_whitespace().next()).map(|w| w.trim_end_matches(['.', ',', ';']).to_string());
+        let rules = Rules {
+            branch: after("Cut the branch "),
+            prefix: after("Every commit message starts with "),
+            no_trailer: start.contains("no attribution trailer"),
+            pull_is_yours: start.contains("the operator opens the PR"),
+        };
         let task = elements(xml, "task").first().map(|(head, _)| *head).unwrap_or_default();
         let verbs = if forbid_text.contains("checkout") {
             plan::attribute(task, "command")
@@ -347,6 +467,10 @@ impl Contract {
             ordered,
             forbidden: Vec::new(),
             stopped: None,
+            locals,
+            rules,
+            branch: None,
+            commits: Vec::new(),
             file,
             root,
             owns: paths(element(xml, "owns").unwrap_or_default()),
@@ -355,6 +479,34 @@ impl Contract {
             verbs,
             bucket: forbid_text.contains("bucket"),
             failed: None,
+        }
+    }
+
+    /// A command of the build judged against the git its file's start
+    /// decides: the branch cut, each commit's message, a pull request.
+    fn git(&mut self, t: &Track, run: &Run, alerts: &mut Alerts) {
+        if let Some(branch) = command::new_branch(&run.what) {
+            if let Some(rule) = self.rules.branch.as_deref().filter(|rule| !named(&branch, rule)) {
+                let what = format!("cut the branch {branch}, not the one {} names: {rule}", self.file);
+                alerts.task_file(t, run, "branch", what, run.start);
+            }
+            self.branch = Some(branch);
+        }
+        if let Some(message) = commit_message(&run.what) {
+            let line = message.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim().to_string();
+            let unprefixed = self.rules.prefix.as_deref().is_some_and(|p| !line.starts_with(p));
+            let lower = message.to_lowercase();
+            let trailer = self.rules.no_trailer && (lower.contains("co-authored-by:") || lower.contains("generated with"));
+            if unprefixed || trailer {
+                let why = if trailer { "carries an attribution trailer" } else { "does not start with its ticket" };
+                let what = format!("a commit whose message {why}, which {} forbids: {line}", self.file);
+                alerts.task_file(t, run, "commit", what, run.start);
+            }
+            self.commits.push(CommitRow { at: run.start, line: line.chars().take(200).collect(), ok: !(unprefixed || trailer) });
+        }
+        if self.rules.pull_is_yours && (command::opens_pull(&run.what) || command::merges(&run.what).is_some()) {
+            let what = format!("opened or merged a pull request itself: {} has you open it", self.file);
+            alerts.task_file(t, run, "pull", what, run.start);
         }
     }
 
@@ -385,6 +537,67 @@ impl Contract {
     }
 }
 
+/// Whether `branch` is the one `rule` names: its words as written, each
+/// placeholder (`<model>`) any word of letters, digits, dots and dashes.
+fn named(branch: &str, rule: &str) -> bool {
+    let mut rest = branch;
+    let mut parts = rule.split('<').enumerate().peekable();
+    while let Some((i, part)) = parts.next() {
+        let (placeholder, literal) = if i == 0 { (false, part) } else { part.split_once('>').map_or((false, part), |(_, lit)| (true, lit)) };
+        if placeholder {
+            // A placeholder takes what comes before the next literal part.
+            let taken = if literal.is_empty() && parts.peek().is_none() {
+                rest.len()
+            } else if literal.is_empty() {
+                rest.find('-').unwrap_or(rest.len())
+            } else {
+                match rest.find(literal) {
+                    Some(at) => at,
+                    None => return false,
+                }
+            };
+            if taken == 0 || !rest[..taken].chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+                return false;
+            }
+            rest = &rest[taken..];
+        }
+        match rest.strip_prefix(literal) {
+            Some(r) => rest = r,
+            None => return false,
+        }
+    }
+    rest.is_empty()
+}
+
+/// A `git commit`'s message: its `-m` values, or the here-document `-F -`
+/// reads.
+fn commit_message(command: &str) -> Option<String> {
+    let at = command.find("git commit")?;
+    let tail = &command[at..];
+    if let Some(start) = tail.find("<<") {
+        let word: String = tail[start + 2..].trim_start_matches('-').trim_start().chars().take_while(|c| !c.is_whitespace()).collect();
+        let word = word.trim_matches(['\'', '"']).to_string();
+        let body = tail[start..].split_once('\n').map(|(_, b)| b).unwrap_or_default();
+        let lines: Vec<&str> = body.lines().take_while(|l| l.trim() != word).collect();
+        if !lines.is_empty() {
+            return Some(lines.join("\n"));
+        }
+    }
+    let mut out = Vec::new();
+    let mut rest = tail;
+    while let Some(i) = rest.find("-m ").or_else(|| rest.find("--message=")) {
+        let after = rest[i..].split_once([' ', '=']).map(|(_, a)| a.trim_start()).unwrap_or_default();
+        let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let value: String = match quote {
+            Some(q) => after[1..].chars().take_while(|c| *c != q).collect(),
+            None => after.chars().take_while(|c| !c.is_whitespace()).collect(),
+        };
+        out.push(value);
+        rest = &after[after.len().min(1)..];
+    }
+    (!out.is_empty()).then(|| out.join("\n\n"))
+}
+
 /// Whether `rel` is `glob`: a path, or anything under a folder written
 /// `<folder>/**`.
 fn within(rel: &str, glob: &str) -> bool {
@@ -394,14 +607,16 @@ fn within(rel: &str, glob: &str) -> bool {
     }
 }
 
-/// The paths a text names: its words with a slash, the punctuation after
-/// them set aside.
+/// The paths a text names, each once: its words with a slash, the
+/// punctuation after them set aside.
 fn paths(text: &str) -> Vec<String> {
-    text.split(|c: char| c.is_whitespace() || c == ';' || c == ',')
-        .map(|w| w.trim_end_matches(['.', ':', ')']).trim_start_matches('('))
-        .filter(|w| w.contains('/') && !w.contains("://"))
-        .map(str::to_string)
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    for w in text.split(|c: char| c.is_whitespace() || c == ';' || c == ',').map(|w| w.trim_end_matches(['.', ':', ')']).trim_start_matches('(')) {
+        if w.contains('/') && !w.contains("://") && !out.iter().any(|o| o == w) {
+            out.push(w.to_string());
+        }
+    }
+    out
 }
 
 /// `path` from the folder `cwd`, `.` and `..` resolved.

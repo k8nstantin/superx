@@ -525,10 +525,40 @@ export const fetchCommit = (repo: string, hash: string) =>
   fetch(`/api/results/commit?${new URLSearchParams({ repo, hash })}`).then((r) => answer<CommitDetail>(r))
 
 /// Where a session's time went, in seconds (src/watcher/track.rs).
-export type Split = { thinking: number; writing: number; tools: number; jobs: number; operator: number; approval: number }
+export type Split = { thinking: number; writing: number; tools: number; jobs: number; operator: number; approval: number; api: number }
 export type Counts = { prompts: number; calls: number; launches: number }
 
-export type AlertKind = 'run_again' | 'long_run' | 'stop_not_followed' | 'plan_repeats' | 'endless_task' | 'task_file_broken' | 'build_stopped' | 'unproven_merge'
+export type AlertKind =
+  | 'run_again'
+  | 'long_run'
+  | 'stop_not_followed'
+  | 'plan_repeats'
+  | 'endless_task'
+  | 'task_file_broken'
+  | 'build_stopped'
+  | 'unproven_merge'
+  | 'api_stalled'
+
+/// A stretch the API did not answer a session (src/watcher/track.rs): from
+/// its first request with no answer to the answer, if one came.
+export type Unanswered = {
+  since: string
+  last: string
+  sent: number
+  resent: number
+  first_resent: string | null
+  model: string | null
+  effort: string | null
+  interrupted: string | null
+  failed_at: string | null
+  error: string | null
+  failures: number
+  turn_ended: string | null
+  answered: string | null
+}
+
+/// Another session the API left without an answer in the same minutes.
+export type Alongside = { session: string; name: string; since: string; until: string }
 
 /// One of the watcher's alerts: the critical ones alone (#573), each with
 /// where its cause starts and the alert that caused it.
@@ -547,6 +577,8 @@ export type WatchAlert = {
   launch: string | null
   repeats: { job: string; times: number; by: string[] }[]
   cause: string | null
+  stretches: Unanswered[]
+  alongside: Alongside[]
 }
 
 export type Doing = { tool: string; what: string; since: string; expected_end: string | null }
@@ -557,7 +589,8 @@ export type WatchNow = {
   model: string | null
   folder: string | null
   newest: string
-  state: 'working' | 'job running' | 'waiting on you' | 'waiting on your approval' | 'idle'
+  state: 'working' | 'waiting on the API' | 'job running' | 'waiting on you' | 'waiting on your approval' | 'idle'
+  api: Unanswered | null
   doing: Doing | null
   jobs: Doing[]
 }
@@ -636,6 +669,15 @@ export type BuildRow = {
   written: string[]
   forbidden: string[]
   gates: { gate: string; ends_well: boolean; ran: string | null; ended_well: boolean | null }[]
+  /// Each local gate with its newest run.
+  locals: { gate: string; ran: string | null; passed: boolean | null }[]
+  /// What the file owns and forbids, as it names them.
+  owns: string[]
+  forbid: string[]
+  /// The branch the file names, the one cut, and the commits made.
+  branch_rule: string | null
+  branch: string | null
+  commits: { at: string; line: string; ok: boolean }[]
 }
 
 /// What the watcher holds at its newest look.
@@ -685,7 +727,7 @@ export const fetchFound = () => fetch('/api/watch/found').then((r) => answer<Fou
 /// One line of a session as a drill shows it; a call with how it ended.
 export type LineRow = {
   at: string
-  kind: 'you' | 'thought' | 'said' | 'call' | 'failed' | 'job_ended' | 'compacted'
+  kind: 'you' | 'thought' | 'said' | 'call' | 'failed' | 'job_ended' | 'compacted' | 'api'
   text: string
   tool: string | null
   call: string | null

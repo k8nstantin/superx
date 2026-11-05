@@ -27,7 +27,7 @@ const series = (keys: (keyof Split)[], data: (k: keyof Split) => number[], stack
 
 const ALL: (keyof Split)[] = TIME.map(([k]) => k)
 const WORK: (keyof Split)[] = ['thinking', 'writing', 'tools', 'jobs']
-const HELD: (keyof Split)[] = ['jobs', 'approval']
+const HELD: (keyof Split)[] = ['jobs', 'approval', 'api']
 
 const hourTip = tip({ valueFormatter: (v: number) => `${v} h` })
 
@@ -187,7 +187,7 @@ export function Time({ time, focus, setFocus, core }: { time: WatchTime; focus: 
   const work = atWork(total)
   const pickDay = (i: number) => days[i] && setFocus({ ...focus, day: days[i][0] })
   const answer = work
-    ? `${hours(work)} h at work: ${pct(total.thinking, work)}% thinking, ${pct(total.writing, work)}% writing, ${pct(total.tools, work)}% running tools, ${pct(total.jobs, work)}% waiting on its own jobs; ${hours(total.operator)} h waiting on you, ${hours(total.approval)} h on your approval`
+    ? `${hours(work)} h at work: ${pct(total.thinking, work)}% thinking, ${pct(total.writing, work)}% writing, ${pct(total.tools, work)}% running tools, ${pct(total.jobs, work)}% waiting on its own jobs; ${hours(total.operator)} h waiting on you, ${hours(total.approval)} h on your approval, ${hours(total.api)} h on the API's answers that never came`
     : 'No time in view'
 
   const cards: Card[] = [
@@ -389,7 +389,7 @@ export function Time({ time, focus, setFocus, core }: { time: WatchTime; focus: 
     },
     {
       i: 'held',
-      title: `What held the work up · ${hours(total.jobs)} h on their own jobs, ${hours(total.approval)} h on your approval`,
+      title: `What held the work up · ${hours(total.jobs)} h on their own jobs, ${hours(total.approval)} h on your approval, ${hours(total.api)} h on the API`,
       note: `the hours the work stood still, by day; besides, ${hours(total.operator)} h the agents waited on your next message · click a day`,
       w: 6,
       h: 10,
@@ -404,7 +404,7 @@ export function Time({ time, focus, setFocus, core }: { time: WatchTime; focus: 
     {
       i: 'holdups',
       title: holdups.length ? `The biggest hold-ups · ${holdups[0][0].slice(0, 60)}` : 'The biggest hold-ups',
-      note: 'the jobs it waited on and the calls held on your approval, by hours',
+      note: 'the jobs it waited on, the calls held on your approval and the API not answering, by hours',
       w: 6,
       h: 10,
       render: (height) => {
@@ -418,7 +418,7 @@ export function Time({ time, focus, setFocus, core }: { time: WatchTime; focus: 
               tooltip: tip({ valueFormatter: (v: number) => `${v} h` }),
               xAxis: value((v) => `${v} h`),
               yAxis: category(shown.map(([k]) => (k.length > 52 ? `${k.slice(0, 51)}…` : k)), { axisLabel: { color: INK_MUTED, fontSize: 10, fontFamily: MONO } }),
-              series: series(['jobs', 'approval'], (k) => shown.map(([, s]) => Number(hours(s[k]))), 'h', { barMaxWidth: 14 }),
+              series: series(HELD, (k) => shown.map(([, s]) => Number(hours(s[k]))), 'h', { barMaxWidth: 14 }),
             }}
           />
         )

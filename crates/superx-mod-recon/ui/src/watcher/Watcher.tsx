@@ -5,6 +5,7 @@ import { fetchFound, fetchPing, fetchWatch, fetchWatchTime, type WatchSessionRow
 import { OK } from '../EChart'
 import { clock, day } from '../time'
 import { Alerts } from './Alerts'
+import { Builds } from './Builds'
 import { atWork, dayOf, focusWords, keepFound, plus, took, zero, type Focus } from './data'
 import { Found } from './Found'
 import { Issues } from './Issues'
@@ -18,7 +19,8 @@ import { Time } from './Time'
 // shows nowhere while it happens. The critical alerts alone, each read back
 // to its cause; what it found; where every second went, traced to the tools,
 // the commands and the code; every task from your order to its merge and
-// past it; every ticket across the sessions that worked on it; every run,
+// past it; every ticket across the sessions that worked on it; every build
+// held to its task file as it goes; every run,
 // long ones first in mind; and every session as it works. A click on a
 // model, a day or a session narrows every view to it.
 
@@ -29,6 +31,7 @@ export const WATCH_VIEWS: [string, string][] = [
   ['time', 'Time'],
   ['tasks', 'Tasks'],
   ['tickets', 'Tickets'],
+  ['builds', 'Builds'],
   ['runs', 'Runs'],
   ['now', 'Now'],
 ]
@@ -40,6 +43,7 @@ const QUESTION: Record<string, string> = {
   time: "Where does the agents' time go, and what holds them up?",
   tasks: 'Which tasks never end?',
   tickets: 'Which tickets go round and round, across which sessions?',
+  builds: 'What is each build doing against its task file?',
   runs: 'Which runs ran long?',
   now: 'What is every session doing now?',
 }
@@ -65,7 +69,7 @@ export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void })
   }
   const stopped = w?.alerts.filter((a) => a.kind === 'build_stopped').length ?? 0
   const answer = w
-    ? `${w.alerts.length} critical alerts, ${endless} of them tasks that never end and ${stopped} builds stopped short; ${found.data?.length ?? '…'} things found; ${took(atWork(total))} at work, ${took(total.operator)} waiting on you, ${took(total.approval)} on your approval.`
+    ? `${w.alerts.length} critical alerts, ${endless} of them tasks that never end and ${stopped} builds stopped short; ${found.data?.length ?? '…'} things found; ${took(atWork(total))} at work, ${took(total.operator)} waiting on you, ${took(total.approval)} on your approval, ${took(total.api)} on the API.`
     : null
   return (
     <Stack gap="md">
@@ -129,6 +133,7 @@ export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void })
       {view === 'time' && (time.data ? <Time time={time.data} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
       {w && view === 'tasks' && <Tasks tasks={w.tasks} focus={focus} setFocus={setFocus} core={core} />}
       {w && view === 'tickets' && <Tickets w={w} hours={time.data?.hours ?? []} core={core} />}
+      {w && view === 'builds' && <Builds w={w} core={core} />}
       {w && view === 'runs' && <Runs w={w} focus={focus} core={core} />}
       {w && view === 'now' && <Now now={w.now} pick={pick} />}
       {found.isError && <Alert color="red" title="What was found did not load">{String(found.error)}</Alert>}

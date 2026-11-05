@@ -147,6 +147,12 @@ const DEFAULT_WATCH_REPEAT_SECS: u64 = 600; // skill-allow: §9-const — bootst
 pub const WATCH_LONG_SECS_PARAM: &str = "attr_recon_watch_long_secs";
 const DEFAULT_WATCH_LONG_SECS: u64 = 3_600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_long_secs
 
+/// A request the API leaves without an answer this many seconds is an alert
+/// (#573): an answer starts within 197 s in 999 of 1,000 (ten days to
+/// 2026-11-05), and the outage of that day held three sessions for minutes.
+pub const WATCH_API_WAIT_SECS_PARAM: &str = "attr_recon_watch_api_wait_secs";
+const DEFAULT_WATCH_API_WAIT_SECS: u64 = 300; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_api_wait_secs
+
 /// The commands that launch jobs: a simple command starting with one of
 /// them is a launch, and the words after it name the job and its input
 /// (#573).
@@ -285,6 +291,7 @@ pub struct Params {
     pub watch_shared_branches: Vec<String>,
     pub watch_not_done_words: Vec<String>,
     pub watch_spec_passed: Vec<String>,
+    pub watch_api_wait_secs: u64,
 }
 
 impl Params {
@@ -338,7 +345,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 38] = [
+pub const NAMES: [&str; 39] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -377,6 +384,7 @@ pub const NAMES: [&str; 38] = [
     WATCH_SHARED_BRANCHES_PARAM,
     WATCH_NOT_DONE_WORDS_PARAM,
     WATCH_SPEC_PASSED_PARAM,
+    WATCH_API_WAIT_SECS_PARAM,
 ];
 
 /// What a parameter is for, as the tab shows it (#539): when the crawler
@@ -432,6 +440,7 @@ pub fn about(name: &str) -> Option<About> {
         WATCH_SHARED_BRANCHES_PARAM => ("watches", "list", "Branches others build on: a push that rewrites one is listed, and reopens the task."),
         WATCH_NOT_DONE_WORDS_PARAM => ("watches", "list", "Words of the agent's saying work is not done: after it reads a task's merge, before your next message, they reopen the task."),
         WATCH_SPEC_PASSED_PARAM => ("watches", "list", "The line a spec's gate prints when it passes: a task file merged with no such line after its last change was merged unproven."),
+        WATCH_API_WAIT_SECS_PARAM => ("watches", "number", "A request the API leaves without an answer this many seconds is an alert: the agent waits on the API, not on its work."),
         _ => return None,
     };
     Some(About { group, decides, input })
@@ -507,6 +516,7 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         watch_shared_branches: r.strings(WATCH_SHARED_BRANCHES_PARAM, DEFAULT_WATCH_SHARED_BRANCHES),
         watch_not_done_words: r.strings(WATCH_NOT_DONE_WORDS_PARAM, DEFAULT_WATCH_NOT_DONE_WORDS),
         watch_spec_passed: r.strings(WATCH_SPEC_PASSED_PARAM, DEFAULT_WATCH_SPEC_PASSED),
+        watch_api_wait_secs: r.count(WATCH_API_WAIT_SECS_PARAM, 1, DEFAULT_WATCH_API_WAIT_SECS),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -674,7 +684,7 @@ mod tests {
 
     /// The parameters before the rename, as `superx-performance` named them,
     /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 38] = [
+    const TODAY: [(&str, &str); 39] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -730,6 +740,7 @@ mod tests {
              left to do, your steps, before you start, before you hand",
         ),
         ("watch_spec_passed", "GATE: PASSED"),
+        ("watch_api_wait_secs", "300"),
     ];
 
     #[test]

@@ -21,7 +21,7 @@ use superx_mod_recon::server;
 use superx_mod_recon::watcher::alerts::Kind;
 use superx_mod_recon::watcher::command::{self, MergeCommit, Push};
 use superx_mod_recon::watcher::found::Hidden;
-use superx_mod_recon::watcher::track::Split;
+use superx_mod_recon::watcher::track::{Split, StepKind};
 use superx_mod_recon::watcher::{measure, plan, task, Snapshot, Watched, Watcher};
 use tower::ServiceExt as _;
 
@@ -156,6 +156,22 @@ impl Agent {
     async fn notified(&mut self, call: &str, status: &str, after: i64) -> DateTime<Utc> {
         let text = format!("<task-notification>\n<task-id>b{call}</task-id>\n<tool-use-id>{call}</tool-use-id>\n<status>{status}</status>\n</task-notification>");
         self.message(json!({"type": "user", "origin": {"kind": "task-notification"}, "message": {"role": "user", "content": text}}), after).await
+    }
+
+    /// A request Claude Code sends the API: building on `base` and adding
+    /// a message, or sending `base` again with nothing added.
+    async fn asked(&mut self, id: &str, base: Option<&str>, again: bool, after: i64) -> DateTime<Utc> {
+        let tail: Vec<&str> = if again { Vec::new() } else { vec!["blob"] };
+        let json = json!({"type": "api-request", "id": id, "base": base, "keep": 3, "tail": tail,
+            "params": {"model": "claude-sonnet-5-5", "output_config": {"effort": "max"}}});
+        self.event(json, after).await
+    }
+
+    /// Claude Code giving up on the API.
+    async fn api_error(&mut self, text: &str, after: i64) -> DateTime<Utc> {
+        let json = json!({"type": "assistant", "isApiErrorMessage": true, "apiError": "connection_failed", "error": "server_error",
+            "message": {"model": "<synthetic>", "stop_reason": "stop_sequence", "content": [{"type": "text", "text": text}]}});
+        self.message(json, after).await
     }
 
     async fn turn_end(&mut self, after: i64) -> DateTime<Utc> {
@@ -821,6 +837,7 @@ async fn a_task_merged_then_pushed_again_or_made_anew_is_one_alert_kept_up_to_da
 const TASK_FILE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <task id="t10" name="stage 8 relationships" jira="ENG-9999" command="python -m kn stage run 8 &lt;archive&gt;; python -m kn stage verify 8 &lt;node&gt;"
       builds="gryphon-kn/kn/stages/s08_relationships.py gryphon-kn/tests/test_s08_relationships.py">
+  <start>Cut the branch ENG-9999-stage-8-v0-&lt;model&gt;-&lt;effort&gt; from the head of sandbox. Every commit message starts with ENG-9999 and carries no attribution trailer. Build what this file says, run its gates, push the branch, and hand the operator the PR into sandbox; origin is Bitbucket, and the operator opens the PR.</start>
   <gates>
     <gate id="Lint" kind="local" proves="the rules"><cmd>python -m kn.lint --check</cmd><expect>the last line is "0 violations"</expect></gate>
     <gate id="Writing relationships" kind="door" proves="steps 1 to 6">
@@ -851,6 +868,19 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     agent.typed("Build kn-specs/tasks/ENG-9999.xml", 0).await;
     agent.call("r", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml")}), 2).await;
     agent.result("r", false, &numbered(TASK_FILE), 1).await;
+    // Its start's git: the branch it names, its commits, the PR yours.
+    agent.call("g1", "Bash", json!({"command": "git switch -c ENG-9999-stage-8-v0-sonnet-5-5-max"}), 5).await;
+    agent.result("g1", false, "", 1).await;
+    agent.call("g2", "Bash", json!({"command": "python -m kn.lint --check; echo exit=$?"}), 5).await;
+    agent.result("g2", false, "0 violations\nexit=0", 1).await;
+    agent.call("g3", "Bash", json!({"command": "git commit -q -m 'fix the door'"}), 5).await;
+    agent.result("g3", false, "", 1).await;
+    agent.call("g4", "Bash", json!({"command": "git commit -q -F - <<'EOF'\nENG-9999 step 8\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF"}), 5).await;
+    agent.result("g4", false, "", 1).await;
+    agent.call("g5", "Bash", json!({"command": "gh pr create --base sandbox --title x"}), 5).await;
+    agent.result("g5", false, "https://bitbucket.org/x/y/pull-requests/7", 1).await;
+    agent.call("g6", "Bash", json!({"command": "git switch -c fix/door"}), 5).await;
+    agent.result("g6", false, "", 1).await;
     agent.call("e1", "Edit", json!({"file_path": at("gryphon-kn/kn/stages/s08_relationships.py"), "old_string": "a", "new_string": "b"}), 30).await;
     agent.result("e1", false, "ok", 1).await;
     agent.call("e2", "Edit", json!({"file_path": at("gryphon-kn/schema/relationships.sql"), "old_string": "a", "new_string": "b"}), 30).await;
@@ -885,7 +915,10 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     let mut w = Watcher::new();
     let s = look(&mut w, &kernel, &p, agent.at).await;
     let broken: Vec<&str> = of(&s, Kind::TaskFileBroken).iter().map(|a| a.what.as_str()).collect();
-    assert_eq!(broken.len(), 5, "{broken:#?}");
+    assert_eq!(broken.len(), 8, "{broken:#?}");
+    assert!(broken.iter().any(|w| w.starts_with("cut the branch fix/door, not the one ENG-9999.xml names: ENG-9999-stage-8-v0-<model>-<effort>")), "{broken:#?}");
+    assert!(broken.iter().any(|w| w.starts_with("a commit whose message carries an attribution trailer")), "the newest commit's break, one alert: {broken:#?}");
+    assert!(broken.iter().any(|w| w.starts_with("opened or merged a pull request itself")), "{broken:#?}");
     assert!(
         broken.iter().any(|w| w.starts_with("changed 2 files: gryphon-kn/schema/relationships.sql, gryphon-kn/kn/core/config.py, which ENG-9999.xml forbids")),
         "one alert for its forbidden changes, a shell's from the folder it went to: {broken:#?}"
@@ -904,6 +937,11 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     assert_eq!(build.written, ["gryphon-kn/kn/stages/s08_relationships.py"]);
     let gates: Vec<(&str, Option<bool>)> = build.gates.iter().map(|g| (g.gate.as_str(), g.ended_well)).collect();
     assert_eq!(gates, [("Writing relationships", Some(true)), ("Verifying relationships", Some(false))]);
+    let locals: Vec<(&str, Option<bool>)> = build.locals.iter().map(|g| (g.gate.as_str(), g.passed)).collect();
+    assert_eq!(locals, [("Lint", Some(true))]);
+    assert_eq!(build.branch.as_deref(), Some("fix/door"));
+    let commits: Vec<(&str, bool)> = build.commits.iter().map(|c| (c.line.as_str(), c.ok)).collect();
+    assert_eq!(commits, [("fix the door", false), ("ENG-9999 step 8", false)]);
 
     // A build that hands you its turn before it wrote what its task file
     // builds stopped short, once; the task merged with that file, in the
@@ -971,6 +1009,26 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     let task = s.tasks.iter().find(|t| t.branch == "ENG-9998-task-file").expect("the spec's task");
     assert_eq!(task.merges[0].proven, Some(true));
 
+    // A task file read in parts makes its contract once the parts are whole.
+    let (kernel, dir, mut agent, _t0) = setup("build-parts").await;
+    let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+    let lines: Vec<&str> = TASK_FILE.lines().collect();
+    let half = lines.len() / 2;
+    let number = |from: usize, part: &[&str]| part.iter().enumerate().map(|(i, l)| format!("{:>6}\t{l}", from + i + 1)).collect::<Vec<_>>().join("\n");
+    agent.typed("Build kn-specs/tasks/ENG-9999.xml", 0).await;
+    agent.call("r1", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml"), "limit": half}), 2).await;
+    agent.result("r1", false, &number(0, &lines[..half]), 1).await;
+    agent.call("r2", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml"), "offset": half}), 2).await;
+    agent.result("r2", false, &number(half - 1, &lines[half - 1..]), 1).await;
+    agent.call("e", "Edit", json!({"file_path": at("gryphon-kn/schema/relationships.sql"), "old_string": "a", "new_string": "b"}), 30).await;
+    agent.result("e", false, "ok", 1).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    assert_eq!(of(&s, Kind::TaskFileBroken).len(), 1, "its forbid, from the second part: {:?}", s.alerts);
+    let build = s.builds.first().expect("the build");
+    assert_eq!(build.builds.len(), 2, "its head, from the first part: {build:?}");
+    assert_eq!(build.owns, ["gryphon-kn/kn/stages/s08_relationships.py", "gryphon-kn/kn/core/door.py"], "a line both parts hold, once");
+
     // A build waiting on its own job has not stopped.
     let (kernel, dir, mut agent, _t0) = setup("build-waits").await;
     let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
@@ -1023,4 +1081,139 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     let mut w = Watcher::new();
     let s = look(&mut w, &kernel, &p, agent.at).await;
     assert!(of(&s, Kind::TaskFileBroken).is_empty(), "{:?}", s.alerts);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_api_leaving_a_session_without_an_answer_is_one_alert_that_says_it_all_and_its_time_is_the_apis() {
+    // 2026-11-05: a build waiting on one answer the operator watched as
+    // "thinking"; the network went, the request was sent again, the
+    // operator interrupted and asked again, and Claude Code gave up.
+    let p = params(&[]);
+    let (kernel, dir, mut build, t0) = setup("api-build").await;
+    let error = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+    build.typed("Build it", 0).await;
+    build.asked("r1", None, false, 1).await;
+    build.call("c1", "Read", json!({"file_path": "/x/a.py"}), 5).await;
+    build.result("c1", false, "a", 1).await;
+    build.asked("r2", Some("r1"), false, 1).await;
+    // Six minutes on one answer with nothing sent again is the model at work:
+    // its card says so, and no alert.
+    build.wait(360);
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, build.at).await;
+    assert!(of(&s, Kind::ApiStalled).is_empty(), "{:?}", s.alerts);
+    let now = s.now.iter().find(|n| n.name == "claude_code/api-build").expect("the build, now");
+    assert_eq!(now.state, "waiting on the API");
+    let waits = now.api.as_ref().expect("its wait");
+    assert_eq!((waits.resent, waits.model.as_deref(), waits.effort.as_deref()), (0, Some("claude-sonnet-5-5"), Some("max")));
+    // The connection gone: sent again, the operator's stop and question,
+    // sent again, and Claude Code gives up.
+    build.wait(300);
+    build.asked("r3", Some("r2"), true, 0).await;
+    build.asked("r4", Some("r3"), true, 75).await;
+    build.message(json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}}), 21).await;
+    build.typed("status", 0).await;
+    build.asked("r5", Some("r4"), false, 1).await;
+    build.asked("r6", Some("r5"), true, 75).await;
+    build.asked("r7", Some("r6"), true, 30).await;
+    build.api_error(error, 40).await;
+    build.turn_end(1).await;
+    // Another session the API left without an answer in the same minutes.
+    let mut other = Agent::new(&kernel, "api-other", &dir, t0 + TimeDelta::seconds(700)).await;
+    other.typed("go on", 0).await;
+    other.asked("o1", None, false, 1).await;
+    other.asked("o2", Some("o1"), true, 75).await;
+    other.api_error(error, 60).await;
+    other.turn_end(1).await;
+    // A long answer with nothing sent again was the model's work, and its
+    // time thinking, past the quarter hour a reply is trusted to take.
+    let mut long = Agent::new(&kernel, "api-long", &dir, t0 + TimeDelta::hours(2)).await;
+    long.typed("think hard", 0).await;
+    long.asked("l1", None, false, 1).await;
+    long.thought(16 * 60).await;
+    long.said("Here.", 5).await;
+    long.turn_end(0).await;
+    // A request sent again at once and answered: no alert.
+    let mut blip = Agent::new(&kernel, "api-blip", &dir, t0 + TimeDelta::hours(3)).await;
+    blip.typed("go", 0).await;
+    blip.asked("b1", None, false, 1).await;
+    blip.asked("b2", Some("b1"), true, 3).await;
+    blip.said("Done.", 4).await;
+    blip.turn_end(0).await;
+    // Claude Code giving up twice within minutes, an answer between: one alert.
+    let login = "Login expired · Please run /login";
+    let mut twice = Agent::new(&kernel, "api-twice", &dir, t0 + TimeDelta::hours(4)).await;
+    twice.typed("go", 0).await;
+    twice.asked("t1", None, false, 1).await;
+    twice.api_error(login, 2).await;
+    twice.turn_end(1).await;
+    twice.typed("again", 20).await;
+    twice.asked("t2", Some("t1"), false, 1).await;
+    twice.said("On it.", 3).await;
+    twice.turn_end(0).await;
+    twice.typed("more", 30).await;
+    twice.asked("t3", Some("t2"), false, 1).await;
+    twice.api_error(login, 2).await;
+    twice.turn_end(1).await;
+    // A request sent again two hours on: Claude Code was not running (the
+    // machine slept), the time is the operator's and the silence starts over.
+    let mut slept = Agent::new(&kernel, "api-slept", &dir, t0 + TimeDelta::hours(5)).await;
+    slept.typed("go", 0).await;
+    slept.asked("z1", None, false, 1).await;
+    slept.asked("z2", Some("z1"), true, 7200).await;
+    slept.said("Done.", 5).await;
+    slept.turn_end(0).await;
+    // A request sent again at once and then nothing for two hours: the
+    // session was left; the request after starts over and is answered.
+    let mut left = Agent::new(&kernel, "api-left", &dir, t0 + TimeDelta::hours(6)).await;
+    left.typed("look", 0).await;
+    left.asked("y1", None, false, 1).await;
+    left.asked("y2", Some("y1"), true, 1).await;
+    left.typed("Ok lets build", 7200).await;
+    left.asked("y3", Some("y2"), false, 1).await;
+    left.said("Building.", 15).await;
+    left.turn_end(1).await;
+    let end = left.at;
+    let s = look(&mut w, &kernel, &p, end).await;
+    let api = of(&s, Kind::ApiStalled);
+    let named = |n: &str| api.iter().filter(|a| a.name == n).copied().collect::<Vec<_>>();
+    let b = named("claude_code/api-build");
+    assert_eq!(b.len(), 1, "one alert for the stretch: {api:?}");
+    assert_eq!(
+        b[0].what,
+        format!(
+            "No answer from the API for 15 min: Claude Code sent its request again 4 times, you interrupted it, Claude Code gave up: «{error}». \
+             1 other session had no answer in the same minutes: the connection or the API, not the agent."
+        )
+    );
+    assert_eq!(b[0].evidence, [error]);
+    let u = &b[0].stretches[..];
+    assert_eq!(u.len(), 1);
+    assert_eq!((u[0].sent, u[0].resent, u[0].failures), (6, 4, 1), "every request of the stretch, the ones sent again, the giving up");
+    assert!(u[0].interrupted.is_some() && u[0].turn_ended.is_some() && u[0].answered.is_none(), "{:?}", u[0]);
+    assert_eq!(b[0].alongside.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["claude_code/api-other"]);
+    let o = named("claude_code/api-other");
+    assert!(o.len() == 1 && o[0].what.contains("1 other session had no answer in the same minutes"), "{o:?}");
+    for quiet in ["claude_code/api-long", "claude_code/api-blip", "claude_code/api-slept", "claude_code/api-left"] {
+        assert!(named(quiet).is_empty(), "{quiet}: {api:?}");
+    }
+    let t = named("claude_code/api-twice");
+    assert_eq!(t.len(), 1, "{api:?}");
+    assert_eq!(t[0].stretches.len(), 2);
+    assert_eq!(t[0].what, format!("No answer from the API 2 times in 1 min: Claude Code gave up 2 times, the last: «{login}»."));
+    assert!(of(&s, Kind::BuildStopped).is_empty(), "a turn the API ended is not the agent stopping: {:?}", s.alerts);
+    // The build's wait was the API's, not the operator's; the long answer
+    // was thinking; the machine asleep was the operator's.
+    let session = |name: &str| s.sessions.iter().find(|t| t.name == name).map(|t| t.id.clone()).expect("a session");
+    let (build_split, _) = total(&w, |r| r.session == session("claude_code/api-build"));
+    assert_eq!(build_split.api, 903, "from the line before the wait to Claude Code giving up: {build_split:?}");
+    assert_eq!(build_split.operator, 0, "{build_split:?}");
+    let (long_split, _) = total(&w, |r| r.session == session("claude_code/api-long"));
+    assert_eq!((long_split.thinking, long_split.operator, long_split.api), (16 * 60 + 1, 0, 0), "{long_split:?}");
+    let (slept_split, _) = total(&w, |r| r.session == session("claude_code/api-slept"));
+    assert_eq!((slept_split.api, slept_split.operator), (0, 7201), "{slept_split:?}");
+    let (left_split, _) = total(&w, |r| r.session == session("claude_code/api-left"));
+    assert_eq!((left_split.api, left_split.operator), (2, 7200), "the two seconds to its request sent again, then yours: {left_split:?}");
+    let steps = w.lines(&session("claude_code/api-build"), t0, end).expect("its lines");
+    assert_eq!(steps.lines.iter().filter(|l| l.step.kind == StepKind::Api).count(), 5, "four sent again and the giving up");
 }

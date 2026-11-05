@@ -20,6 +20,7 @@ const WHO: Record<LineRow['kind'], [string, string]> = {
   failed: ['failed', FAIL],
   job_ended: ['job', CANCEL],
   compacted: ['context', CANCEL],
+  api: ['API', FAIL],
 }
 
 const key = (l: LineRow) => `${l.at}|${l.kind}|${l.call ?? ''}|${l.text.slice(0, 40)}`

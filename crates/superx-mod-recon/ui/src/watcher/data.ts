@@ -7,8 +7,9 @@ import { span } from '../time'
 // operator's days; and the focus a click on any chart sets for every view.
 
 /// Where an agent's time goes, in the one order of the colours: validated on
-/// the card surface #2A1235, every adjacent pair clear under colour-blind
-/// and normal vision (dataviz validator, 2026-11-05).
+/// the card surface #2A1235 and on white, every adjacent pair clear under
+/// colour-blind and normal vision (dataviz validator, 2026-11-05, seven
+/// colours with the API's).
 export const TIME: [keyof Split, string, string][] = [
   ['thinking', 'thinking', '#B833E8'],
   ['writing', 'writing', '#199e70'],
@@ -16,17 +17,27 @@ export const TIME: [keyof Split, string, string][] = [
   ['jobs', 'waiting on its jobs', '#c98500'],
   ['operator', 'waiting on you', '#d55181'],
   ['approval', 'waiting on your approval', '#008300'],
+  ['api', 'waiting on the API', '#6f7ef0'],
 ]
 
 /// The time the agent spent at work, waiting on its own jobs included.
 export const atWork = (s: Split) => s.thinking + s.writing + s.tools + s.jobs
-/// The time it was held: waiting on its jobs, on you, on your approval.
-export const heldUp = (s: Split) => s.jobs + s.operator + s.approval
-export const every = (s: Split) => atWork(s) + s.operator + s.approval
+/// The time it was held: waiting on its jobs, on you, on your approval, on
+/// the API's answers that never came.
+export const heldUp = (s: Split) => s.jobs + s.operator + s.approval + s.api
+export const every = (s: Split) => atWork(s) + s.operator + s.approval + s.api
 
-export const zero = (): Split => ({ thinking: 0, writing: 0, tools: 0, jobs: 0, operator: 0, approval: 0 })
+export const zero = (): Split => ({ thinking: 0, writing: 0, tools: 0, jobs: 0, operator: 0, approval: 0, api: 0 })
 export function plus(a: Split, b: Split): Split {
-  return { thinking: a.thinking + b.thinking, writing: a.writing + b.writing, tools: a.tools + b.tools, jobs: a.jobs + b.jobs, operator: a.operator + b.operator, approval: a.approval + b.approval }
+  return {
+    thinking: a.thinking + b.thinking,
+    writing: a.writing + b.writing,
+    tools: a.tools + b.tools,
+    jobs: a.jobs + b.jobs,
+    operator: a.operator + b.operator,
+    approval: a.approval + b.approval,
+    api: a.api + b.api,
+  }
 }
 
 export const hours = (secs: number) => (secs / 3600).toFixed(1)
@@ -43,6 +54,7 @@ export const KIND: Record<AlertKind, [string, string]> = {
   task_file_broken: ['Its task file broken', FAIL],
   build_stopped: ['A build stopped short', FAIL],
   unproven_merge: ['A task file merged unproven', FAIL],
+  api_stalled: ['No answer from the API', FAIL],
 }
 
 /// What each finding is, in the words the page uses, and what it shows

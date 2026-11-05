@@ -9,6 +9,7 @@ import { clock, since } from '../time'
 
 const STATE: Record<WatchNow['state'], string> = {
   working: OK,
+  'waiting on the API': CANCEL,
   'job running': CANCEL,
   'waiting on you': INK_MUTED,
   'waiting on your approval': FAIL,
@@ -27,8 +28,19 @@ export function Now({ now, pick }: { now: WatchNow[]; pick: (session: string) =>
                 <Text fw={700} ff={MONO} fz="sm" style={{ overflowWrap: 'anywhere' }}>{s.name}</Text>
                 <Text fz="xs" c="dimmed" style={{ overflowWrap: 'anywhere' }}>{[s.model, s.folder].filter(Boolean).join(' · ')}</Text>
               </Stack>
-              <Badge color={STATE[s.state]} variant="light">{s.state}</Badge>
+              <Badge color={s.api?.resent ? FAIL : STATE[s.state]} variant="light">{s.state}</Badge>
             </Group>
+            {s.api && (
+              <Text fz="sm" style={{ overflowWrap: 'anywhere' }}>
+                no answer since {clock(s.api.since)}{' '}
+                <Text span c="dimmed" fz="xs">
+                  · {since(s.api.since)}
+                  {s.api.resent
+                    ? ` · its request sent again ${s.api.resent} ${s.api.resent === 1 ? 'time' : 'times'}, first at ${clock(s.api.first_resent)}`
+                    : ` · nothing sent again: ${s.api.model ?? 'the model'}${s.api.effort ? ` at effort ${s.api.effort}` : ''} is at work on one answer, and its thinking shows when the answer lands`}
+                </Text>
+              </Text>
+            )}
             {s.doing && (
               <Text fz="sm" style={{ overflowWrap: 'anywhere' }}>
                 {s.doing.tool}: {s.doing.what} <Text span c="dimmed" fz="xs">· {since(s.doing.since)}</Text>
