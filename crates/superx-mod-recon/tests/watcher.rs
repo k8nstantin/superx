@@ -581,6 +581,11 @@ fn a_command_is_read_for_its_work_its_sleep_what_it_changes_and_what_it_pushes()
     assert_eq!(command::pushes("git push 2>&1 | tail -1")[0].branch, "");
     assert_eq!(command::pushes("git push -u origin HEAD")[0].branch, "", "HEAD is the branch checked out");
     assert_eq!(command::new_branch("git switch -c ENG-8078-task-file-v2 origin/sandbox 2>&1 | tail -1").as_deref(), Some("ENG-8078-task-file-v2"));
+    assert_eq!(command::new_branch("git -C /r switch -c feat/1-a main").as_deref(), Some("feat/1-a"), "the folder of -C is no branch");
+    assert_eq!(command::new_branch("git -C /r checkout -B ENG-1-x").as_deref(), Some("ENG-1-x"));
+    assert_eq!(command::new_branch("git -C /r status"), None);
+    assert_eq!(command::git_subcommand("git -C /r -c core.pager=cat commit -m x").as_deref(), Some("commit"));
+    assert_eq!(command::label("git -C /r commit -m x"), "git commit");
     assert_eq!(command::merges("gh pr merge 449 --squash --admin"), Some(Some("449".to_string())));
     assert_eq!(command::merges("gh pr merge --squash"), Some(None));
     assert_eq!(command::merges("git status"), None);
@@ -873,13 +878,14 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     agent.result("g1", false, "", 1).await;
     agent.call("g2", "Bash", json!({"command": "python -m kn.lint --check; echo exit=$?"}), 5).await;
     agent.result("g2", false, "0 violations\nexit=0", 1).await;
-    agent.call("g3", "Bash", json!({"command": "git commit -q -m 'fix the door'"}), 5).await;
+    // Auto mode refuses `cd <dir> && git …`, so builds write `git -C <dir> …`.
+    agent.call("g3", "Bash", json!({"command": format!("git -C {} commit -q -m 'fix the door'", dir.display())}), 5).await;
     agent.result("g3", false, "", 1).await;
     agent.call("g4", "Bash", json!({"command": "git commit -q -F - <<'EOF'\nENG-9999 step 8\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF"}), 5).await;
     agent.result("g4", false, "", 1).await;
     agent.call("g5", "Bash", json!({"command": "gh pr create --base sandbox --title x"}), 5).await;
     agent.result("g5", false, "https://bitbucket.org/x/y/pull-requests/7", 1).await;
-    agent.call("g6", "Bash", json!({"command": "git switch -c fix/door"}), 5).await;
+    agent.call("g6", "Bash", json!({"command": format!("git -C {} switch -c fix/door", dir.display())}), 5).await;
     agent.result("g6", false, "", 1).await;
     agent.call("e1", "Edit", json!({"file_path": at("gryphon-kn/kn/stages/s08_relationships.py"), "old_string": "a", "new_string": "b"}), 30).await;
     agent.result("e1", false, "ok", 1).await;

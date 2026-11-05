@@ -202,17 +202,7 @@ pub fn label(command: &str) -> String {
         }
         // `git -C <folder> status`: a folder or a setting given to a flag
         // names no work.
-        let mut rest = args.iter().copied();
-        let mut sub = None;
-        while let Some(a) = rest.next() {
-            if a == "-C" || a == "-c" {
-                rest.next();
-            } else if !a.starts_with('-') {
-                sub = Some(a);
-                break;
-            }
-        }
-        return match sub {
+        return match subcommand(&args).map(|i| args[i]) {
             Some(sub) if plain(sub) => format!("{prog} {sub}"),
             _ => prog,
         };
@@ -299,21 +289,8 @@ pub fn pushes(command: &str) -> Vec<Push> {
             continue;
         }
         let args = without_redirections(words[1..].iter().map(String::as_str));
-        // `git -C <dir> push`: the folder's value is no subcommand.
-        let mut rest = args.iter().copied().peekable();
-        let mut sub = None;
-        while let Some(a) = rest.next() {
-            if a == "-C" || a == "-c" {
-                rest.next();
-            } else if !a.starts_with('-') {
-                sub = Some(a);
-                break;
-            }
-        }
-        if sub != Some("push") {
-            continue;
-        }
-        let after: Vec<&str> = rest.collect();
+        let Some(at) = subcommand(&args).filter(|&i| args[i] == "push") else { continue };
+        let after = &args[at + 1..];
         // A push that deletes a branch pushes no work.
         if after.iter().any(|a| *a == "--delete" || *a == "-d" || (a.starts_with(':') && a.len() > 1)) {
             continue;
@@ -334,7 +311,7 @@ pub fn pushes(command: &str) -> Vec<Push> {
 }
 
 /// The branch a command makes and checks out: `git switch -c <b>`,
-/// `git checkout -b <b>`.
+/// `git checkout -b <b>`, `git -C <dir> switch -c <b>`.
 #[must_use]
 pub fn new_branch(command: &str) -> Option<String> {
     simple_commands(command).into_iter().find_map(|simple| {
@@ -342,10 +319,40 @@ pub fn new_branch(command: &str) -> Option<String> {
         if words.first().map(|w| program(w)).as_deref() != Some("git") {
             return None;
         }
-        let at = words.iter().position(|w| w == "-c" || w == "-b" || w == "-B" || w == "-C")?;
-        let sub = words.iter().skip(1).find(|w| !w.starts_with('-'))?;
-        (sub == "switch" || sub == "checkout").then(|| words.get(at + 1).map(|b| b.trim_matches(['\'', '"']).to_string())).flatten()
+        let args = without_redirections(words[1..].iter().map(String::as_str));
+        let at = subcommand(&args).filter(|&i| args[i] == "switch" || args[i] == "checkout")?;
+        let flag = args[at + 1..].iter().position(|w| matches!(*w, "-c" | "-b" | "-B" | "-C"))?;
+        args.get(at + flag + 2).map(|b| b.trim_matches(['\'', '"']).to_string())
     })
+}
+
+/// The git subcommand a simple command runs: `commit` for `git commit` and
+/// for `git -C <dir> commit`.
+#[must_use]
+pub fn git_subcommand(simple: &str) -> Option<String> {
+    let words = from_program(simple);
+    if words.first().map(|w| program(w)).as_deref() != Some("git") {
+        return None;
+    }
+    let args = without_redirections(words[1..].iter().map(String::as_str));
+    subcommand(&args).map(|i| args[i].to_string())
+}
+
+/// Where a program's subcommand is among its arguments: the first plain
+/// word past its flags, the folder of `-C` and the setting of `-c` set
+/// aside (`git -C <dir> push`).
+pub(super) fn subcommand(args: &[&str]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        if *a == "-C" || *a == "-c" {
+            i += 2;
+        } else if a.starts_with('-') {
+            i += 1;
+        } else {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// The pull request a command merges: `gh pr merge <number, link or

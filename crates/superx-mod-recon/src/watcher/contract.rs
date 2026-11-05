@@ -569,10 +569,14 @@ fn named(branch: &str, rule: &str) -> bool {
     rest.is_empty()
 }
 
-/// A `git commit`'s message: its `-m` values, or the here-document `-F -`
-/// reads.
+/// A `git commit`'s message, `git -C <dir> commit` too: its `-m` values, or
+/// the here-document `-F -` reads.
 fn commit_message(command: &str) -> Option<String> {
-    let at = command.find("git commit")?;
+    let at = command.match_indices("git ").map(|(i, _)| i).find(|&i| {
+        let whole = command[..i].chars().last().is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '-'));
+        let words: Vec<&str> = command[i + 4..].split_whitespace().take(8).collect();
+        whole && command::subcommand(&words).map(|j| words[j]) == Some("commit")
+    })?;
     let tail = &command[at..];
     if let Some(start) = tail.find("<<") {
         let word: String = tail[start + 2..].trim_start_matches('-').trim_start().chars().take_while(|c| !c.is_whitespace()).collect();
@@ -652,11 +656,7 @@ fn writes_bucket(words: &[String]) -> bool {
 
 /// Whether a command commits or pushes.
 fn commits(command: &str) -> bool {
-    !command::pushes(command).is_empty()
-        || simple_commands(command).iter().any(|s| {
-            let words = command::from_program(s);
-            words.first().map(|w| command::program(w)).as_deref() == Some("git") && words.iter().skip(1).find(|w| !w.starts_with('-')).is_some_and(|w| w == "commit")
-        })
+    !command::pushes(command).is_empty() || simple_commands(command).iter().any(|s| command::git_subcommand(s).as_deref() == Some("commit"))
 }
 
 /// The first `<tag>` of `xml`: its text.
