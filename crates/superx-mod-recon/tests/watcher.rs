@@ -912,6 +912,8 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     spec.typed("write the ENG-9999 task file", 0).await;
     spec.call("b", "Bash", json!({"command": "git switch -c ENG-9999-task-file origin/sandbox"}), 3).await;
     spec.result("b", false, "", 1).await;
+    spec.call("w", "Write", json!({"file_path": dir.join("kn-specs/tasks/ENG-9999.xml").to_string_lossy(), "content": TASK_FILE}), 30).await;
+    spec.result("w", false, "File created", 1).await;
     spec.call("p", "Bash", json!({"command": "git push -u origin ENG-9999-task-file"}), 60).await;
     spec.result("p", false, "", 1).await;
     spec.typed("merged", 60).await;
@@ -943,6 +945,31 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     assert_eq!(endless.len(), 1, "{:?}", s.alerts);
     assert!(endless[0].what.starts_with("ENG-9999 (ENG-9999-task-file) never ends"), "{}", endless[0].what);
     assert!(endless[0].what.contains("the newest: its build stopped short in"), "{}", endless[0].what);
+    // Its task file changed and no gate passed after: merged unproven.
+    let unproven = of(&s, Kind::UnprovenMerge);
+    assert_eq!(unproven.len(), 1, "{:?}", s.alerts);
+    assert!(unproven[0].what.starts_with("merged #9 of ENG-9999 (ENG-9999-task-file) after its task file changed"), "{}", unproven[0].what);
+    let task = s.tasks.iter().find(|t| t.branch == "ENG-9999-task-file").expect("the spec's task");
+    assert_eq!(task.merges[0].proven, Some(false));
+
+    // A gate that passed after the change proves the merge.
+    let (kernel, _dir, mut spec, _t0) = setup("spec-proven").await;
+    spec.typed("write the ENG-9998 task file", 0).await;
+    spec.call("b", "Bash", json!({"command": "git switch -c ENG-9998-task-file origin/sandbox"}), 3).await;
+    spec.result("b", false, "", 1).await;
+    spec.call("e", "Bash", json!({"command": "python3 -I fix.py && git add kn-specs/tasks/ENG-9998.xml && git commit -q -m 'ENG-9998 v1'"}), 30).await;
+    spec.result("e", false, "", 1).await;
+    spec.call("h", "Bash", json!({"command": "python3 ~/models_run/harness/ledger23.py check . 7d9f01a0 | tail -2"}), 600).await;
+    spec.result("h", false, "1707 rows, 193 cases, 0 open, 0 defects\nGATE: PASSED", 1).await;
+    spec.call("p", "Bash", json!({"command": "git push -u origin ENG-9998-task-file"}), 30).await;
+    spec.result("p", false, "", 1).await;
+    spec.call("f", "Bash", json!({"command": "git fetch -q origin && git log --oneline -1 origin/sandbox"}), 600).await;
+    spec.result("f", false, "7d9f01a Merged in ENG-9998-task-file (pull request #12)", 1).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, spec.at).await;
+    assert!(of(&s, Kind::UnprovenMerge).is_empty(), "{:?}", s.alerts);
+    let task = s.tasks.iter().find(|t| t.branch == "ENG-9998-task-file").expect("the spec's task");
+    assert_eq!(task.merges[0].proven, Some(true));
 
     // A build waiting on its own job has not stopped.
     let (kernel, dir, mut agent, _t0) = setup("build-waits").await;

@@ -17,12 +17,13 @@ import { merged } from './Tasks'
 // the most come first: a task merged, undone, built, stopped and merged
 // again is one row here, however many sessions it took.
 
-type Kind = 'asked' | 'merged' | 'reopened' | 'not done' | 'ordered' | 'gate' | 'gate failed' | 'stopped' | 'broke its file'
+type Kind = 'asked' | 'merged' | 'merged unproven' | 'reopened' | 'not done' | 'ordered' | 'gate' | 'gate failed' | 'stopped' | 'broke its file'
 
 /// Each kind's colour and shape: the shape tells them apart without colour.
 const MARK: Record<Kind, [string, string]> = {
   asked: [INK_MUTED, 'circle'],
   merged: [OK, 'diamond'],
+  'merged unproven': [FAIL, 'diamond'],
   reopened: [FAIL, 'triangle'],
   'not done': [CANCEL, 'circle'],
   ordered: ['#3987e5', 'rect'],
@@ -99,7 +100,7 @@ function timeline(t: Ticket, w: Watch, names: Map<string, string>) {
     const lane = lanes.length
     lanes.push({ label: `${[x.branch, ...x.versions].join(' → ')} · ${shortName(x.name)}`, session: x.session, from: x.asked, to: x.last })
     events.push({ at: x.asked, lane, kind: 'asked', words: 'your message before it began', session: x.session })
-    for (const m of x.merges) events.push({ at: m.at, lane, kind: 'merged', words: merged(m), session: x.session })
+    for (const m of x.merges) events.push({ at: m.at, lane, kind: m.proven === false ? 'merged unproven' : 'merged', words: merged(m), session: x.session })
     for (const [at, how] of x.reopened) events.push({ at, lane, kind: 'reopened', words: how, session: x.session })
     for (const [at, words] of x.not_done) events.push({ at, lane, kind: 'not done', words: `once it read the merge it said: "${words}"`, session: x.session })
   }

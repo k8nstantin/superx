@@ -528,7 +528,7 @@ export const fetchCommit = (repo: string, hash: string) =>
 export type Split = { thinking: number; writing: number; tools: number; jobs: number; operator: number; approval: number }
 export type Counts = { prompts: number; calls: number; launches: number }
 
-export type AlertKind = 'run_again' | 'long_run' | 'stop_not_followed' | 'plan_repeats' | 'endless_task' | 'task_file_broken' | 'build_stopped'
+export type AlertKind = 'run_again' | 'long_run' | 'stop_not_followed' | 'plan_repeats' | 'endless_task' | 'task_file_broken' | 'build_stopped' | 'unproven_merge'
 
 /// One of the watcher's alerts: the critical ones alone (#573), each with
 /// where its cause starts and the alert that caused it.
@@ -590,9 +590,10 @@ export type WatchTask = {
   asked: string
   last: string
   estimates: { at: string; secs: number; words: string }[]
-  /// Each merge: when it was seen, and its pull request and merge commit
-  /// when the answer named them.
-  merges: { at: string; pull: number | null; commit: string | null }[]
+  /// Each merge: when it was seen, its pull request and merge commit when
+  /// the answer named them, and whether a spec gate passed after its task
+  /// file's last change (null when the session changed no task file).
+  merges: { at: string; pull: number | null; commit: string | null; proven: boolean | null }[]
   reopened: [string, string][]
   /// The branches made for it after a merge, newest last.
   versions: string[]

@@ -19,6 +19,10 @@
 //! - **A build stopped short** ([`super::contract`]): a session building from
 //!   a task file handed the operator its turn before it wrote every file the
 //!   file builds.
+//! - **A task file merged unproven** ([`super::task`]): a merge of a branch
+//!   whose task file changed in its session with no spec gate passed since
+//!   (operator, 2026-11-05: "merge = done"; every redo of that day followed
+//!   one, and no merge a gate passed was undone).
 //!
 //! Each alert names the call it is about and the time its cause starts
 //! from, for the page to read the session's lines between; and the alert
@@ -58,6 +62,7 @@ pub enum Kind {
     EndlessTask,
     TaskFileBroken,
     BuildStopped,
+    UnprovenMerge,
 }
 
 /// One alert.
@@ -241,6 +246,27 @@ impl Alerts {
             call: Some(run.call.clone()),
             from,
             launch: run.launch.clone(),
+            repeats: Vec::new(),
+            cause: None,
+        });
+    }
+
+    /// A merge of `task` at `at` whose task file changed at `changed` with no
+    /// spec gate passed since; `key` names the merge.
+    pub fn unproven(&mut self, task: &Task, key: &str, what: String, changed: DateTime<Utc>, at: DateTime<Utc>) {
+        self.raise(Alert {
+            id: format!("{}/unproven_merge/{}/{key}", task.session, task.branch),
+            session: task.session.clone(),
+            name: task.name.clone(),
+            kind: Kind::UnprovenMerge,
+            at,
+            what,
+            since: Some(changed),
+            cost_secs: None,
+            evidence: Vec::new(),
+            call: None,
+            from: changed,
+            launch: None,
             repeats: Vec::new(),
             cause: None,
         });

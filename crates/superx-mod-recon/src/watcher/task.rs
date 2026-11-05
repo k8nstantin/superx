@@ -29,6 +29,7 @@ use serde::Serialize;
 
 use super::alerts::{duration, Alerts};
 use super::command;
+use super::line;
 use super::track::{Run, Track};
 use crate::params::Params;
 
@@ -59,13 +60,23 @@ pub struct Estimate {
     pub words: String,
 }
 
-/// One merge of a task: when it was seen, and its pull request and merge
-/// commit when the answer named them.
+/// One merge of a task: when it was seen, its pull request and merge commit
+/// when the answer named them, and whether it was proven: when the session
+/// changed a task file, whether a spec's gate passed after that change
+/// (`attr_recon_watch_spec_passed`); none when it changed no task file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Merge {
     pub at: DateTime<Utc>,
     pub pull: Option<u64>,
     pub commit: Option<String>,
+    pub proven: Option<bool>,
+}
+
+/// A session's newest change to a task file, and its newest gate passed.
+#[derive(Debug, Clone, Copy)]
+struct Spec {
+    changed: DateTime<Utc>,
+    passed: Option<DateTime<Utc>>,
 }
 
 /// One task, as the watcher followed it.
@@ -143,6 +154,8 @@ pub struct Tasks {
     /// The task each session's agent just read was merged outside the
     /// session, until the operator's next message: the agent's words after.
     after_merge: HashMap<String, usize>,
+    /// Each session's task files: its newest change and gate passed.
+    specs: HashMap<String, Spec>,
 }
 
 impl Tasks {
@@ -220,6 +233,23 @@ impl Tasks {
         if let Some(&i) = self.current.get(&t.session) {
             self.list[i].last = self.list[i].last.max(at);
         }
+        // A task file changed, by a file tool or a command; a spec's gate
+        // passed: what a merge after them is proven by.
+        let task_file = |path: &str| path.ends_with(".xml") && p.watch_plans.iter().any(|m| !m.is_empty() && path.contains(m.as_str()));
+        let wrote = if run.tool == "Bash" {
+            command::changed(&run.what).iter().any(|c| task_file(c))
+        } else {
+            line::FILE_TOOLS.contains(&run.tool.as_str()) && run.tool != "Read" && run.path.as_deref().is_some_and(task_file)
+        };
+        if wrote {
+            let spec = self.specs.entry(t.session.clone()).or_insert(Spec { changed: at, passed: None });
+            spec.changed = spec.changed.max(at);
+        }
+        if text.lines().any(|l| p.watch_spec_passed.iter().any(|w| !w.trim().is_empty() && l.trim_start().starts_with(w.trim()))) {
+            if let Some(spec) = self.specs.get_mut(&t.session) {
+                spec.passed = Some(run.end.unwrap_or(at));
+            }
+        }
         if run.tool != "Bash" {
             return;
         }
@@ -288,14 +318,14 @@ impl Tasks {
             };
             if let Some(branch) = branch {
                 let i = self.task(t, &branch, at, alerts);
-                self.merged(&t.session, i, &branch, Merge { at, pull: number, commit: None }, false);
+                self.merged(&t.session, i, &branch, Merge { at, pull: number, commit: None, proven: None }, false, alerts);
             }
         }
         // A merge done outside the session, on the host: the merge commit
         // the agent reads names one of the session's own branches.
         for m in command::merge_commits(text) {
             if let Some(i) = self.list.iter().position(|x| x.session == t.session && x.holds(&m.branch)) {
-                self.merged(&t.session, i, &m.branch, Merge { at, pull: Some(m.pull), commit: m.commit }, true);
+                self.merged(&t.session, i, &m.branch, Merge { at, pull: Some(m.pull), commit: m.commit, proven: None }, true, alerts);
             }
         }
     }
@@ -304,7 +334,8 @@ impl Tasks {
     /// outside the session. The same merge read again is one: a pull request
     /// not above the newest merged, or, its number unknown, no push since
     /// the last merge.
-    fn merged(&mut self, session: &str, i: usize, branch: &str, merge: Merge, seen: bool) {
+    fn merged(&mut self, session: &str, i: usize, branch: &str, mut merge: Merge, seen: bool, alerts: &mut Alerts) {
+        let spec = self.specs.get(session).copied();
         let task = &mut self.list[i];
         let at = merge.at;
         let same = match (merge.pull, task.pull) {
@@ -317,6 +348,12 @@ impl Tasks {
         task.pull = merge.pull.or(task.pull);
         if !task.merged.iter().any(|b| b == branch) {
             task.merged.push(branch.to_string());
+        }
+        merge.proven = spec.map(|s| s.passed.is_some_and(|p| p > s.changed));
+        if let (Some(false), Some(s)) = (merge.proven, spec) {
+            let pull = merge.pull.map(|n| format!(" #{n}")).unwrap_or_default();
+            let what = format!("merged{pull} of {} after its task file changed, and no spec gate passed since that change", task.title());
+            alerts.unproven(task, &format!("{pull}{}", merge.at.timestamp()), what, s.changed, at);
         }
         task.merges.push(merge);
         task.last = task.last.max(at);

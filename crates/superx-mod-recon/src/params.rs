@@ -239,6 +239,11 @@ const DEFAULT_WATCH_NOT_DONE_WORDS: &[&str] = &[
     "before you hand",
 ];
 
+/// The line a spec's gate prints when it passes (#573): a task file merged
+/// with no such line after its last change was merged unproven.
+pub const WATCH_SPEC_PASSED_PARAM: &str = "attr_recon_watch_spec_passed";
+const DEFAULT_WATCH_SPEC_PASSED: &[&str] = &["GATE: PASSED"];
+
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -279,6 +284,7 @@ pub struct Params {
     pub watch_protected: Vec<String>,
     pub watch_shared_branches: Vec<String>,
     pub watch_not_done_words: Vec<String>,
+    pub watch_spec_passed: Vec<String>,
 }
 
 impl Params {
@@ -332,7 +338,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 37] = [
+pub const NAMES: [&str; 38] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -370,6 +376,7 @@ pub const NAMES: [&str; 37] = [
     WATCH_PROTECTED_PARAM,
     WATCH_SHARED_BRANCHES_PARAM,
     WATCH_NOT_DONE_WORDS_PARAM,
+    WATCH_SPEC_PASSED_PARAM,
 ];
 
 /// What a parameter is for, as the tab shows it (#539): when the crawler
@@ -424,6 +431,7 @@ pub fn about(name: &str) -> Option<About> {
         WATCH_PROTECTED_PARAM => ("watches", "list", "Protected places, each `pattern = words`: a change there your message did not name is listed."),
         WATCH_SHARED_BRANCHES_PARAM => ("watches", "list", "Branches others build on: a push that rewrites one is listed, and reopens the task."),
         WATCH_NOT_DONE_WORDS_PARAM => ("watches", "list", "Words of the agent's saying work is not done: after it reads a task's merge, before your next message, they reopen the task."),
+        WATCH_SPEC_PASSED_PARAM => ("watches", "list", "The line a spec's gate prints when it passes: a task file merged with no such line after its last change was merged unproven."),
         _ => return None,
     };
     Some(About { group, decides, input })
@@ -498,6 +506,7 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         watch_protected: r.strings(WATCH_PROTECTED_PARAM, DEFAULT_WATCH_PROTECTED),
         watch_shared_branches: r.strings(WATCH_SHARED_BRANCHES_PARAM, DEFAULT_WATCH_SHARED_BRANCHES),
         watch_not_done_words: r.strings(WATCH_NOT_DONE_WORDS_PARAM, DEFAULT_WATCH_NOT_DONE_WORDS),
+        watch_spec_passed: r.strings(WATCH_SPEC_PASSED_PARAM, DEFAULT_WATCH_SPEC_PASSED),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -665,7 +674,7 @@ mod tests {
 
     /// The parameters before the rename, as `superx-performance` named them,
     /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 37] = [
+    const TODAY: [(&str, &str); 38] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -720,6 +729,7 @@ mod tests {
             "not done, not run, not finished, not verified, not checked, wasn't checked, isn't done, remains, still needs, still has to, \
              left to do, your steps, before you start, before you hand",
         ),
+        ("watch_spec_passed", "GATE: PASSED"),
     ];
 
     #[test]

@@ -14,7 +14,9 @@ import { around, Lines } from './Lines'
 
 /// A merge as its history says it: its pull request and commit when known.
 export const merged = (m: WatchTask['merges'][number]) =>
-  `merged${m.pull != null ? ` #${m.pull}` : ''}${m.commit ? ` as ${m.commit.slice(0, 8)}` : ''}`
+  `merged${m.pull != null ? ` #${m.pull}` : ''}${m.commit ? ` as ${m.commit.slice(0, 8)}` : ''}${
+    m.proven === false ? ', unproven: no spec gate passed after its task file changed' : m.proven ? ', a spec gate passed first' : ''
+  }`
 
 const MARK: Record<string, string> = { reopened: 'red', merged: 'teal', 'not done': 'orange', estimate: 'yellow' }
 

@@ -111,7 +111,7 @@ export function Alerts({ w, focus, setFocus, core }: { w: Watch; focus: Focus; s
         {alerts.length} critical alerts{focus.day ? ` on ${focus.day}` : ''}: {alerts.filter((a) => a.kind === 'endless_task').length} tasks that never end,{' '}
         {alerts.filter((a) => a.kind === 'run_again').length} finished runs launched again ({took(lost)} run twice), {alerts.filter((a) => a.kind === 'long_run').length} runs gone long,{' '}
         {alerts.filter((a) => a.kind === 'plan_repeats').length} plans that repeat, {alerts.filter((a) => a.kind === 'stop_not_followed').length} stops not followed,{' '}
-        {alerts.filter((a) => a.kind === 'task_file_broken').length} task files broken, {alerts.filter((a) => a.kind === 'build_stopped').length} builds stopped short. Click a row for its cause.
+        {alerts.filter((a) => a.kind === 'task_file_broken').length} task files broken, {alerts.filter((a) => a.kind === 'build_stopped').length} builds stopped short, {alerts.filter((a) => a.kind === 'unproven_merge').length} task files merged unproven. Click a row for its cause.
       </Text>
       {chart.days.length > 0 && (
         <Paper withBorder radius="md" p="sm">

@@ -42,6 +42,7 @@ export const KIND: Record<AlertKind, [string, string]> = {
   endless_task: ['A task that never ends', FAIL],
   task_file_broken: ['Its task file broken', FAIL],
   build_stopped: ['A build stopped short', FAIL],
+  unproven_merge: ['A task file merged unproven', FAIL],
 }
 
 /// What each finding is, in the words the page uses, and what it shows
