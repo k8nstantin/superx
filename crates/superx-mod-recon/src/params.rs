@@ -127,223 +127,6 @@ const DEFAULT_ESCALATION_WORDS: &[&str] = &["fuck", "shit", "wtf", "damn", "usel
 pub const SNAPSHOT_WORDS_PARAM: &str = "attr_recon_snapshot_words";
 const DEFAULT_SNAPSHOT_WORDS: &[&str] = &["savepoint", "not for merge"];
 
-/// How often the watcher looks at the lines captured since its last look,
-/// in seconds; 0 pauses it (#573).
-pub const WATCH_SECS_PARAM: &str = "attr_recon_watch_secs";
-const DEFAULT_WATCH_SECS: u64 = 5; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_secs
-
-/// How far back the watcher reads when it starts, in seconds: its measures
-/// and its alerts cover this window (#573).
-pub const WATCH_WINDOW_SECS_PARAM: &str = "attr_recon_watch_window_secs";
-const DEFAULT_WATCH_WINDOW_SECS: u64 = 604_800; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_window_secs
-
-/// A launch the same as one that ran to its end in at least this many
-/// seconds is finished work run again (#573).
-pub const WATCH_REPEAT_SECS_PARAM: &str = "attr_recon_watch_repeat_secs";
-const DEFAULT_WATCH_REPEAT_SECS: u64 = 600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_repeat_secs
-
-/// A background job running past this many seconds is a run going long
-/// (#573): long running means problems (operator, 2026-11-05).
-pub const WATCH_LONG_SECS_PARAM: &str = "attr_recon_watch_long_secs";
-const DEFAULT_WATCH_LONG_SECS: u64 = 3_600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_long_secs
-
-/// A request the API leaves without an answer this many seconds is an alert
-/// (#573): an answer starts within 197 s in 999 of 1,000 (ten days to
-/// 2026-11-05), and the outage of that day held three sessions for minutes.
-pub const WATCH_API_WAIT_SECS_PARAM: &str = "attr_recon_watch_api_wait_secs";
-const DEFAULT_WATCH_API_WAIT_SECS: u64 = 300; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_api_wait_secs
-
-/// The commands that launch jobs: a simple command starting with one of
-/// them is a launch, and the words after it name the job and its input
-/// (#573).
-pub const WATCH_JOBS_PARAM: &str = "attr_recon_watch_jobs";
-const DEFAULT_WATCH_JOBS: &[&str] = &[
-    "gcloud run jobs execute",
-    "gcloud dataproc batches submit",
-    "gcloud builds submit",
-    "gcloud dataflow jobs run",
-    "terraform apply",
-    "bq query",
-    "kubectl apply",
-    "spark-submit",
-];
-
-/// The words your message starts with when you stop the agent (#573).
-pub const WATCH_STOP_WORDS_PARAM: &str = "attr_recon_watch_stop_words";
-const DEFAULT_WATCH_STOP_WORDS: &[&str] = &["stop", "halt", "cancel", "abort", "don't", "dont", "do not"];
-
-/// The files that hold a plan of runs: a path holding one of these is read
-/// for jobs launched more than once (#573).
-pub const WATCH_PLANS_PARAM: &str = "attr_recon_watch_plans";
-const DEFAULT_WATCH_PLANS: &[&str] = &["/tasks/"];
-
-/// A command run in the foreground that sleeps, and runs this many seconds
-/// or more, is an agent asleep: deaf to you while it waits (#573).
-pub const WATCH_SLEEP_SECS_PARAM: &str = "attr_recon_watch_sleep_secs";
-const DEFAULT_WATCH_SLEEP_SECS: u64 = 60; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_sleep_secs
-
-/// A file edited this many times within `attr_recon_watch_thrash_secs` is
-/// edited over and over: trial and error (#573).
-pub const WATCH_THRASH_EDITS_PARAM: &str = "attr_recon_watch_thrash_edits";
-const DEFAULT_WATCH_THRASH_EDITS: u64 = 10; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_thrash_edits
-
-/// The span within which `attr_recon_watch_thrash_edits` edits of one file
-/// are edits over and over, in seconds (#573).
-pub const WATCH_THRASH_SECS_PARAM: &str = "attr_recon_watch_thrash_secs";
-const DEFAULT_WATCH_THRASH_SECS: u64 = 3_600; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_thrash_secs
-
-/// A call's result this many characters long or longer floods the agent's
-/// context (#573).
-pub const WATCH_FLOOD_CHARS_PARAM: &str = "attr_recon_watch_flood_chars";
-const DEFAULT_WATCH_FLOOD_CHARS: u64 = 40_000; // skill-allow: §9-const — bootstrap fallback, overridable by attr_recon_watch_flood_chars
-
-/// The words your message starts with when you ask how the work stands
-/// (#573): asked while a job runs, the agent had not told you.
-pub const WATCH_STATUS_WORDS_PARAM: &str = "attr_recon_watch_status_words";
-const DEFAULT_WATCH_STATUS_WORDS: &[&str] = &["status", "update", "eta", "progress", "where are we", "how long", "what's going on", "whats going on", "is it done", "is it ready"];
-
-/// The protected places, each `pattern = words`: a change to a path holding
-/// the pattern, made when neither your message nor the agent's words you
-/// answered named one of the words, is listed (#573).
-pub const WATCH_PROTECTED_PARAM: &str = "attr_recon_watch_protected";
-const DEFAULT_WATCH_PROTECTED: &[&str] = &[
-    "/schema = schema",
-    ".sql = schema table ddl",
-    ".surql = schema",
-    "superx-kernel/ = kernel",
-    "terraform = terraform infrastructure",
-    ".tf = terraform infrastructure",
-    "/migrations/ = migration",
-    ".claude/skills/ = skill",
-    "BLUEPRINT.md = blueprint",
-    "DDL: = table schema column alter drop",
-];
-
-/// The branches others build on: a push that rewrites one undoes what was
-/// merged into it (#573).
-pub const WATCH_SHARED_BRANCHES_PARAM: &str = "attr_recon_watch_shared_branches";
-const DEFAULT_WATCH_SHARED_BRANCHES: &[&str] = &["main", "master", "sandbox", "develop", "dev", "staging", "production", "release"];
-
-/// Words of the agent's that say work is not done (#573): said after it read
-/// the merge of a task's branch and before your next message, the task you
-/// took for done was not.
-pub const WATCH_NOT_DONE_WORDS_PARAM: &str = "attr_recon_watch_not_done_words";
-const DEFAULT_WATCH_NOT_DONE_WORDS: &[&str] = &[
-    "not done",
-    "not run",
-    "not finished",
-    "not verified",
-    "not checked",
-    "wasn't checked",
-    "isn't done",
-    "remains",
-    "still needs",
-    "still has to",
-    "left to do",
-    "your steps",
-    "before you start",
-    "before you hand",
-];
-
-/// The line a spec's gate prints when it passes (#573): a task file merged
-/// with no such line after its last change was merged unproven.
-pub const WATCH_SPEC_PASSED_PARAM: &str = "attr_recon_watch_spec_passed";
-const DEFAULT_WATCH_SPEC_PASSED: &[&str] = &["GATE: PASSED"];
-
-/// The agent's own words that it acted without the operator (#573): whole
-/// words, `…` any words between. Measured on all history to 2026-11-06.
-pub const WATCH_ALONE_WORDS_PARAM: &str = "attr_recon_watch_alone_words";
-const DEFAULT_WATCH_ALONE_WORDS: &[&str] = &[
-    "without your approval",
-    "without your answer",
-    "without your ok",
-    "i changed … without asking",
-    "i added … without asking",
-    "i merged … without asking",
-    "i made … without asking",
-    "i moved … without asking",
-    "i did … without asking",
-    "i changed … on my own",
-    "i made … on my own",
-    "i did … on my own",
-    "i added … on my own",
-    "what i did on my own",
-    "what i added on my own",
-    "i made that call",
-    "i decided … on my own",
-    "i took it upon myself",
-    "was my addition",
-];
-
-/// The agent's own words that what it said was not so (#573).
-pub const WATCH_FALSE_WORDS_PARAM: &str = "attr_recon_watch_false_words";
-const DEFAULT_WATCH_FALSE_WORDS: &[&str] =
-    &["the reason i gave was false", "what i said was false", "what i told you was false", "i lied", "wasn't true", "was not true", "i never committed"];
-
-/// The agent's own words that it got something wrong (#573).
-pub const WATCH_WRONG_WORDS_PARAM: &str = "attr_recon_watch_wrong_words";
-const DEFAULT_WATCH_WRONG_WORDS: &[&str] = &[
-    "i should have",
-    "i shouldn't have",
-    "i should not have",
-    "that's on me",
-    "that is on me",
-    "my mistake",
-    "my fault",
-    "i got it wrong",
-    "i got that wrong",
-    "i got two things wrong",
-    "i was wrong",
-    "that was wrong",
-    "i misread",
-];
-
-/// Words that make a sentence of the agent's no admission (#573): a
-/// promise, a condition, a refusal, or another meaning of the same words.
-pub const WATCH_NO_ADMIT_WORDS_PARAM: &str = "attr_recon_watch_no_admit_words";
-const DEFAULT_WATCH_NO_ADMIT_WORDS: &[&str] =
-    &["won't", "will not", "can't", "cannot", "rather than", "instead of", "waiting on my own", "if i", "unless i"];
-
-/// Words that make a count one the agent found broken: `724 damaged
-/// routines` (#573).
-pub const WATCH_FOUND_WORDS_PARAM: &str = "attr_recon_watch_found_words";
-const DEFAULT_WATCH_FOUND_WORDS: &[&str] = &["damaged", "broken", "unreadable", "failing", "corrupt", "corrupted", "affected", "bad", "wrong"];
-
-/// Words that make a count one the agent's fix covers: `723 routines …
-/// takes their own row's body` (#573).
-pub const WATCH_COVER_WORDS_PARAM: &str = "attr_recon_watch_cover_words";
-const DEFAULT_WATCH_COVER_WORDS: &[&str] = &[
-    "change", "changes", "fix", "fixes", "repair", "repairs", "restore", "restores", "update", "updates", "takes", "cover", "covers", "rewrite",
-    "rewrites",
-];
-
-/// Words that make a sentence a report of work finished, held against no
-/// count: `down from 189` (#573).
-pub const WATCH_DONE_WORDS_PARAM: &str = "attr_recon_watch_done_words";
-const DEFAULT_WATCH_DONE_WORDS: &[&str] = &["fixed", "repaired", "restored", "corrected", "already", "down from", "no longer"];
-
-/// The kinds of thing a count is of, in the singular (#573).
-pub const WATCH_UNITS_PARAM: &str = "attr_recon_watch_units";
-const DEFAULT_WATCH_UNITS: &[&str] = &[
-    "routine", "procedure", "function", "trigger", "definition", "row", "table", "object", "node", "file", "archive", "view", "event", "test",
-    "job", "batch", "record", "column", "body",
-];
-
-/// Words of the agent's that ask the operator to merge (#573): with its
-/// task file changed and no spec gate passed since, the merge it asks for is
-/// unproven before it is made.
-pub const WATCH_HANDOFF_WORDS_PARAM: &str = "attr_recon_watch_handoff_words";
-const DEFAULT_WATCH_HANDOFF_WORDS: &[&str] =
-    &["pull-requests/new?source=", "/pull/new/", "ready for your merge", "ready to merge", "open the pr", "merge it", "please merge"];
-
-/// The alerts that are alarms, by kind (#573): the operator, 2026-11-06,
-/// "sooner or later the alarms will flood and the operator will ignore
-/// them … have to be some alarms but very defined and critical". Every
-/// other alert is charted with what the watcher found, never raised.
-pub const WATCH_ALARMS_PARAM: &str = "attr_recon_watch_alarms";
-const DEFAULT_WATCH_ALARMS: &[&str] =
-    &["run_again", "plan_repeats", "stop_not_followed", "endless_task", "task_file_broken", "build_stopped", "unproven_merge", "count_gap"];
-
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -369,33 +152,6 @@ pub struct Params {
     pub correction_words: Vec<String>,
     pub escalation_words: Vec<String>,
     pub snapshot_words: Vec<String>,
-    pub watch_secs: u64,
-    pub watch_window_secs: u64,
-    pub watch_repeat_secs: u64,
-    pub watch_long_secs: u64,
-    pub watch_jobs: Vec<String>,
-    pub watch_stop_words: Vec<String>,
-    pub watch_plans: Vec<String>,
-    pub watch_sleep_secs: u64,
-    pub watch_thrash_edits: u64,
-    pub watch_thrash_secs: u64,
-    pub watch_flood_chars: u64,
-    pub watch_status_words: Vec<String>,
-    pub watch_protected: Vec<String>,
-    pub watch_shared_branches: Vec<String>,
-    pub watch_not_done_words: Vec<String>,
-    pub watch_spec_passed: Vec<String>,
-    pub watch_api_wait_secs: u64,
-    pub watch_alone_words: Vec<String>,
-    pub watch_false_words: Vec<String>,
-    pub watch_wrong_words: Vec<String>,
-    pub watch_no_admit_words: Vec<String>,
-    pub watch_found_words: Vec<String>,
-    pub watch_cover_words: Vec<String>,
-    pub watch_done_words: Vec<String>,
-    pub watch_units: Vec<String>,
-    pub watch_handoff_words: Vec<String>,
-    pub watch_alarms: Vec<String>,
 }
 
 impl Params {
@@ -449,7 +205,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 49] = [
+pub const NAMES: [&str; 22] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -472,33 +228,6 @@ pub const NAMES: [&str; 49] = [
     CORRECTION_WORDS_PARAM,
     ESCALATION_WORDS_PARAM,
     SNAPSHOT_WORDS_PARAM,
-    WATCH_SECS_PARAM,
-    WATCH_WINDOW_SECS_PARAM,
-    WATCH_REPEAT_SECS_PARAM,
-    WATCH_LONG_SECS_PARAM,
-    WATCH_JOBS_PARAM,
-    WATCH_STOP_WORDS_PARAM,
-    WATCH_PLANS_PARAM,
-    WATCH_SLEEP_SECS_PARAM,
-    WATCH_THRASH_EDITS_PARAM,
-    WATCH_THRASH_SECS_PARAM,
-    WATCH_FLOOD_CHARS_PARAM,
-    WATCH_STATUS_WORDS_PARAM,
-    WATCH_PROTECTED_PARAM,
-    WATCH_SHARED_BRANCHES_PARAM,
-    WATCH_NOT_DONE_WORDS_PARAM,
-    WATCH_SPEC_PASSED_PARAM,
-    WATCH_API_WAIT_SECS_PARAM,
-    WATCH_ALONE_WORDS_PARAM,
-    WATCH_FALSE_WORDS_PARAM,
-    WATCH_WRONG_WORDS_PARAM,
-    WATCH_NO_ADMIT_WORDS_PARAM,
-    WATCH_FOUND_WORDS_PARAM,
-    WATCH_COVER_WORDS_PARAM,
-    WATCH_DONE_WORDS_PARAM,
-    WATCH_UNITS_PARAM,
-    WATCH_HANDOFF_WORDS_PARAM,
-    WATCH_ALARMS_PARAM,
 ];
 
 /// What a parameter is for, as the tab shows it (#539): when the crawler
@@ -538,33 +267,6 @@ pub fn about(name: &str) -> Option<About> {
         CORRECTION_WORDS_PARAM => ("measures", "list", "Whole words in your prompt that correct the agent."),
         ESCALATION_WORDS_PARAM => ("measures", "list", "Words in your prompt, at a word's start, that escalate."),
         SNAPSHOT_WORDS_PARAM => ("measures", "list", "Words in a commit's subject that make it a snapshot, not work: it counts nowhere."),
-        WATCH_SECS_PARAM => ("watches", "number", "How often the watcher looks at the newest lines, in seconds; 0 pauses it."),
-        WATCH_WINDOW_SECS_PARAM => ("watches", "number", "How far back the watcher reads when it starts, in seconds: its measures and alerts cover this."),
-        WATCH_REPEAT_SECS_PARAM => ("watches", "number", "A launch the same as one that ran to its end in at least this many seconds is an alert."),
-        WATCH_LONG_SECS_PARAM => ("watches", "number", "A background job running past this many seconds is an alert."),
-        WATCH_JOBS_PARAM => ("watches", "list", "Commands that launch jobs: the words after one name the job and its input."),
-        WATCH_STOP_WORDS_PARAM => ("watches", "list", "Words your message starts with when you stop the agent."),
-        WATCH_PLANS_PARAM => ("watches", "list", "Files holding a plan of runs: a path holding one of these is read for repeated launches."),
-        WATCH_SLEEP_SECS_PARAM => ("watches", "number", "A foreground command that sleeps and runs this many seconds or more is the agent asleep, deaf to you."),
-        WATCH_THRASH_EDITS_PARAM => ("watches", "number", "A file edited this many times within the span below is edited over and over."),
-        WATCH_THRASH_SECS_PARAM => ("watches", "number", "The span, in seconds, within which those edits of one file are edits over and over."),
-        WATCH_FLOOD_CHARS_PARAM => ("watches", "number", "A call's result this many characters long or longer floods the agent's context."),
-        WATCH_STATUS_WORDS_PARAM => ("watches", "list", "Words your message starts with when you ask how the work stands."),
-        WATCH_PROTECTED_PARAM => ("watches", "list", "Protected places, each `pattern = words`: a change there your message did not name is listed."),
-        WATCH_SHARED_BRANCHES_PARAM => ("watches", "list", "Branches others build on: a push that rewrites one is listed, and reopens the task."),
-        WATCH_NOT_DONE_WORDS_PARAM => ("watches", "list", "Words of the agent's saying work is not done: after it reads a task's merge, before your next message, they reopen the task."),
-        WATCH_SPEC_PASSED_PARAM => ("watches", "list", "The line a spec's gate prints when it passes: a task file merged with no such line after its last change was merged unproven."),
-        WATCH_API_WAIT_SECS_PARAM => ("watches", "number", "A request the API leaves without an answer this many seconds is an alert: the agent waits on the API, not on its work."),
-        WATCH_ALONE_WORDS_PARAM => ("watches", "list", "The agent's words that it acted on its own, without you: each sentence charted. `…` is any words between."),
-        WATCH_FALSE_WORDS_PARAM => ("watches", "list", "The agent's words that what it said was not so: each sentence charted. `…` is any words between."),
-        WATCH_WRONG_WORDS_PARAM => ("watches", "list", "The agent's words that it got something wrong: each sentence charted. `…` is any words between."),
-        WATCH_NO_ADMIT_WORDS_PARAM => ("watches", "list", "Words that make a sentence of the agent's no admission: a promise, a condition, a refusal."),
-        WATCH_FOUND_WORDS_PARAM => ("watches", "list", "Words that make a count one the agent found broken: \"724 damaged routines\"."),
-        WATCH_COVER_WORDS_PARAM => ("watches", "list", "Words that make a count one the agent's fix covers: fewer than it found is an alert."),
-        WATCH_DONE_WORDS_PARAM => ("watches", "list", "Words that make a sentence a report of finished work, held against no count."),
-        WATCH_UNITS_PARAM => ("watches", "list", "The kinds of thing a count is of, in the singular: routine, table, row, node, file…"),
-        WATCH_HANDOFF_WORDS_PARAM => ("watches", "list", "The agent's words that ask you to merge: with its task file changed and no spec gate passed since, an alert before you merge."),
-        WATCH_ALARMS_PARAM => ("watches", "list", "The alerts that are alarms, by kind; every other alert is charted, never raised. Kinds: run_again, long_run, stop_not_followed, plan_repeats, endless_task, task_file_broken, build_stopped, unproven_merge, api_stalled, count_gap, acted_alone, said_false, got_wrong."),
         _ => return None,
     };
     Some(About { group, decides, input })
@@ -624,33 +326,6 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         correction_words: r.strings(CORRECTION_WORDS_PARAM, DEFAULT_CORRECTION_WORDS),
         escalation_words: r.strings(ESCALATION_WORDS_PARAM, DEFAULT_ESCALATION_WORDS),
         snapshot_words: r.strings(SNAPSHOT_WORDS_PARAM, DEFAULT_SNAPSHOT_WORDS),
-        watch_secs: r.count(WATCH_SECS_PARAM, 0, DEFAULT_WATCH_SECS),
-        watch_window_secs: r.count(WATCH_WINDOW_SECS_PARAM, 1, DEFAULT_WATCH_WINDOW_SECS),
-        watch_repeat_secs: r.count(WATCH_REPEAT_SECS_PARAM, 1, DEFAULT_WATCH_REPEAT_SECS),
-        watch_long_secs: r.count(WATCH_LONG_SECS_PARAM, 1, DEFAULT_WATCH_LONG_SECS),
-        watch_jobs: r.strings(WATCH_JOBS_PARAM, DEFAULT_WATCH_JOBS),
-        watch_stop_words: r.strings(WATCH_STOP_WORDS_PARAM, DEFAULT_WATCH_STOP_WORDS),
-        watch_plans: r.strings(WATCH_PLANS_PARAM, DEFAULT_WATCH_PLANS),
-        watch_sleep_secs: r.count(WATCH_SLEEP_SECS_PARAM, 1, DEFAULT_WATCH_SLEEP_SECS),
-        watch_thrash_edits: r.count(WATCH_THRASH_EDITS_PARAM, 1, DEFAULT_WATCH_THRASH_EDITS),
-        watch_thrash_secs: r.count(WATCH_THRASH_SECS_PARAM, 1, DEFAULT_WATCH_THRASH_SECS),
-        watch_flood_chars: r.count(WATCH_FLOOD_CHARS_PARAM, 1, DEFAULT_WATCH_FLOOD_CHARS),
-        watch_status_words: r.strings(WATCH_STATUS_WORDS_PARAM, DEFAULT_WATCH_STATUS_WORDS),
-        watch_protected: r.strings(WATCH_PROTECTED_PARAM, DEFAULT_WATCH_PROTECTED),
-        watch_shared_branches: r.strings(WATCH_SHARED_BRANCHES_PARAM, DEFAULT_WATCH_SHARED_BRANCHES),
-        watch_not_done_words: r.strings(WATCH_NOT_DONE_WORDS_PARAM, DEFAULT_WATCH_NOT_DONE_WORDS),
-        watch_spec_passed: r.strings(WATCH_SPEC_PASSED_PARAM, DEFAULT_WATCH_SPEC_PASSED),
-        watch_api_wait_secs: r.count(WATCH_API_WAIT_SECS_PARAM, 1, DEFAULT_WATCH_API_WAIT_SECS),
-        watch_alone_words: r.strings(WATCH_ALONE_WORDS_PARAM, DEFAULT_WATCH_ALONE_WORDS),
-        watch_false_words: r.strings(WATCH_FALSE_WORDS_PARAM, DEFAULT_WATCH_FALSE_WORDS),
-        watch_wrong_words: r.strings(WATCH_WRONG_WORDS_PARAM, DEFAULT_WATCH_WRONG_WORDS),
-        watch_no_admit_words: r.strings(WATCH_NO_ADMIT_WORDS_PARAM, DEFAULT_WATCH_NO_ADMIT_WORDS),
-        watch_found_words: r.strings(WATCH_FOUND_WORDS_PARAM, DEFAULT_WATCH_FOUND_WORDS),
-        watch_cover_words: r.strings(WATCH_COVER_WORDS_PARAM, DEFAULT_WATCH_COVER_WORDS),
-        watch_done_words: r.strings(WATCH_DONE_WORDS_PARAM, DEFAULT_WATCH_DONE_WORDS),
-        watch_units: r.strings(WATCH_UNITS_PARAM, DEFAULT_WATCH_UNITS),
-        watch_handoff_words: r.strings(WATCH_HANDOFF_WORDS_PARAM, DEFAULT_WATCH_HANDOFF_WORDS),
-        watch_alarms: r.strings(WATCH_ALARMS_PARAM, DEFAULT_WATCH_ALARMS),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -818,7 +493,7 @@ mod tests {
 
     /// The parameters before the rename, as `superx-performance` named them,
     /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 49] = [
+    const TODAY: [(&str, &str); 22] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -845,69 +520,6 @@ mod tests {
         ),
         ("escalation_words", "fuck, shit, wtf, damn, useless, garbage"),
         ("snapshot_words", "savepoint, not for merge"),
-        ("watch_secs", "5"),
-        ("watch_window_secs", "604800"),
-        ("watch_repeat_secs", "600"),
-        ("watch_long_secs", "3600"),
-        (
-            "watch_jobs",
-            "gcloud run jobs execute, gcloud dataproc batches submit, gcloud builds submit, gcloud dataflow jobs run, terraform apply, \
-             bq query, kubectl apply, spark-submit",
-        ),
-        ("watch_stop_words", "stop, halt, cancel, abort, don't, dont, do not"),
-        ("watch_plans", "/tasks/"),
-        ("watch_sleep_secs", "60"),
-        ("watch_thrash_edits", "10"),
-        ("watch_thrash_secs", "3600"),
-        ("watch_flood_chars", "40000"),
-        ("watch_status_words", "status, update, eta, progress, where are we, how long, what's going on, whats going on, is it done, is it ready"),
-        (
-            "watch_protected",
-            "/schema = schema, .sql = schema table ddl, .surql = schema, superx-kernel/ = kernel, terraform = terraform infrastructure, \
-             .tf = terraform infrastructure, /migrations/ = migration, .claude/skills/ = skill, BLUEPRINT.md = blueprint, \
-             DDL: = table schema column alter drop",
-        ),
-        ("watch_shared_branches", "main, master, sandbox, develop, dev, staging, production, release"),
-        (
-            "watch_not_done_words",
-            "not done, not run, not finished, not verified, not checked, wasn't checked, isn't done, remains, still needs, still has to, \
-             left to do, your steps, before you start, before you hand",
-        ),
-        ("watch_spec_passed", "GATE: PASSED"),
-        ("watch_api_wait_secs", "300"),
-        (
-            "watch_alone_words",
-            "without your approval, without your answer, without your ok, i changed … without asking, i added … without asking, \
-             i merged … without asking, i made … without asking, i moved … without asking, i did … without asking, \
-             i changed … on my own, i made … on my own, i did … on my own, i added … on my own, what i did on my own, \
-             what i added on my own, i made that call, i decided … on my own, i took it upon myself, was my addition",
-        ),
-        (
-            "watch_false_words",
-            "the reason i gave was false, what i said was false, what i told you was false, i lied, wasn't true, was not true, i never committed",
-        ),
-        (
-            "watch_wrong_words",
-            "i should have, i shouldn't have, i should not have, that's on me, that is on me, my mistake, my fault, i got it wrong, \
-             i got that wrong, i got two things wrong, i was wrong, that was wrong, i misread",
-        ),
-        ("watch_no_admit_words", "won't, will not, can't, cannot, rather than, instead of, waiting on my own, if i, unless i"),
-        ("watch_found_words", "damaged, broken, unreadable, failing, corrupt, corrupted, affected, bad, wrong"),
-        (
-            "watch_cover_words",
-            "change, changes, fix, fixes, repair, repairs, restore, restores, update, updates, takes, cover, covers, rewrite, rewrites",
-        ),
-        ("watch_done_words", "fixed, repaired, restored, corrected, already, down from, no longer"),
-        (
-            "watch_units",
-            "routine, procedure, function, trigger, definition, row, table, object, node, file, archive, view, event, test, job, batch, \
-             record, column, body",
-        ),
-        ("watch_handoff_words", "pull-requests/new?source=, /pull/new/, ready for your merge, ready to merge, open the pr, merge it, please merge"),
-        (
-            "watch_alarms",
-            "run_again, plan_repeats, stop_not_followed, endless_task, task_file_broken, build_stopped, unproven_merge, count_gap",
-        ),
     ];
 
     #[test]
@@ -1058,7 +670,7 @@ mod tests {
     fn every_parameter_says_what_it_is_for() {
         for name in NAMES {
             let about = about(name).expect(name);
-            assert!(["when", "where", "how much", "listens", "measures", "watches"].contains(&about.group), "{name}: {about:?}");
+            assert!(["when", "where", "how much", "listens", "measures"].contains(&about.group), "{name}: {about:?}");
             assert!(["number", "number or all", "list", "refs"].contains(&about.input), "{name}: {about:?}");
             assert!(!about.decides.is_empty(), "{name}");
         }
