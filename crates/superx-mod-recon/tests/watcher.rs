@@ -16,7 +16,7 @@ use serde_json::{json, Value as Json};
 use superx_kernel::types::{Object, RecordId, Value};
 use superx_kernel::Kernel;
 use superx_mod_recon::instance::Instance;
-use superx_mod_recon::params::{Params, WATCH_PLANS_PARAM};
+use superx_mod_recon::params::{Params, WATCH_ALARMS_PARAM, WATCH_PLANS_PARAM};
 use superx_mod_recon::server;
 use superx_mod_recon::watcher::alerts::Kind;
 use superx_mod_recon::watcher::command::{self, MergeCommit, Push};
@@ -1302,6 +1302,9 @@ async fn the_agent_is_held_to_its_own_words_a_fix_short_of_what_it_found_its_adm
     agent.said("I won't do step 2 on my own. Still waiting on my own checks.", 600).await;
     let admitted = agent.said("You're right. I made that call on my own, and the reason I gave was false.\n\nThe first plan you saw covered all 724 routines.", 60).await;
     agent.turn_end(1).await;
+    // Two kinds in one message: each its own alert.
+    let split = agent.said("Then I split ENG-9453 in two without your answer. That's on me, I should have asked first.", 60).await;
+    agent.turn_end(1).await;
     let mut w = Watcher::new();
     let s = look(&mut w, &kernel, &p, agent.at).await;
     let gaps = of(&s, Kind::CountGap);
@@ -1309,10 +1312,21 @@ async fn the_agent_is_held_to_its_own_words_a_fix_short_of_what_it_found_its_adm
     assert_eq!(gaps[0].at, planned);
     assert!(gaps[0].what.starts_with("its fix covers 723 of the 724 routines it found: «- **723 routines:** `definition` takes their own row's"), "{}", gaps[0].what);
     assert_eq!(gaps[0].evidence[0], "724 damaged routines");
-    let admits = of(&s, Kind::Admitted);
-    assert_eq!(admits.len(), 1, "{:?}", s.alerts);
-    // The admission is the sentence that holds it.
-    assert_eq!((admits[0].at, admits[0].what.as_str()), (admitted, "it admits: «I made that call on my own, and the reason I gave was false.»"));
+    // The admission is the sentence that holds it; what was not so comes
+    // before acting on its own.
+    let false_words = of(&s, Kind::SaidFalse);
+    assert_eq!(false_words.len(), 1, "{:?}", s.alerts);
+    assert_eq!((false_words[0].at, false_words[0].what.as_str()), (admitted, "it admits: «I made that call on my own, and the reason I gave was false.»"));
+    let alone = of(&s, Kind::ActedAlone);
+    assert_eq!(alone.len(), 1, "{:?}", s.alerts);
+    assert_eq!((alone[0].at, alone[0].what.as_str()), (split, "it admits: «Then I split ENG-9453 in two without your answer.»"));
+    let wrong = of(&s, Kind::GotWrong);
+    assert_eq!(wrong.len(), 1, "{:?}", s.alerts);
+    assert_eq!((wrong[0].at, wrong[0].what.as_str()), (split, "it admits: «That's on me, I should have asked first.»"));
+    // Of these, only the count gap and the merge asked for unproven are
+    // alarms; the admissions are charted.
+    let alarms = [Kind::RunAgain, Kind::PlanRepeats, Kind::StopNotFollowed, Kind::EndlessTask, Kind::TaskFileBroken, Kind::BuildStopped, Kind::UnprovenMerge, Kind::CountGap];
+    assert_eq!((s.alarms.as_slice(), s.not_kinds.len()), (alarms.as_slice(), 0));
     let unproven = of(&s, Kind::UnprovenMerge);
     assert_eq!(unproven.len(), 1, "{:?}", s.alerts);
     assert_eq!(unproven[0].at, asked);
@@ -1331,5 +1345,12 @@ async fn the_agent_is_held_to_its_own_words_a_fix_short_of_what_it_found_its_adm
     agent.turn_end(1).await;
     let mut w = Watcher::new();
     let s = look(&mut w, &kernel, &p, agent.at).await;
-    assert!(of(&s, Kind::UnprovenMerge).is_empty() && of(&s, Kind::CountGap).is_empty() && of(&s, Kind::Admitted).is_empty(), "{:?}", s.alerts);
+    assert!(s.alerts.is_empty(), "{:?}", s.alerts);
+
+    // The alarms are the kinds the parameter names; a word that names none
+    // is shown, never dropped unseen.
+    let p = params(&[(WATCH_ALARMS_PARAM, Value::Array(vec![Value::String("said_false".to_string()), Value::String(" count_gap ".to_string()), Value::String("admitted".to_string())].into()))]);
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    assert_eq!((s.alarms.as_slice(), s.not_kinds.as_slice()), ([Kind::SaidFalse, Kind::CountGap].as_slice(), ["admitted".to_string()].as_slice()));
+    assert_eq!((Kind::named("unproven_merge"), Kind::named("It admits")), (Some(Kind::UnprovenMerge), None));
 }

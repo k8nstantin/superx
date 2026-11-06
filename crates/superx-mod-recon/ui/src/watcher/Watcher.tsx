@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query'
 import { fetchFound, fetchPing, fetchWatch, fetchWatchTime, type WatchSessionRow } from '../api'
 import { OK } from '../EChart'
 import { clock, day } from '../time'
-import { Alerts } from './Alerts'
+import { Alarms } from './Alarms'
 import { Builds } from './Builds'
 import { atWork, dayOf, focusWords, keepFound, plus, took, zero, type Focus } from './data'
 import { Found } from './Found'
@@ -14,9 +14,12 @@ import { Runs } from './Runs'
 import { Tasks } from './Tasks'
 import { Tickets } from './Tickets'
 import { Time } from './Time'
+import { Trends } from './Trends'
 
 // The Watcher (#573): it follows every session as it works and digs out what
-// shows nowhere while it happens. The critical alerts alone, each read back
+// shows nowhere while it happens. What the agents do wrong, over time, as
+// charts first (operator, 2026-11-06: "charts are better … have to be some
+// alarms but very defined and critical"); the alarms alone, each read back
 // to its cause; what it found; where every second went, traced to the tools,
 // the commands and the code; every task from your order to its merge and
 // past it; every ticket across the sessions that worked on it; every build
@@ -25,7 +28,8 @@ import { Time } from './Time'
 // model, a day or a session narrows every view to it.
 
 export const WATCH_VIEWS: [string, string][] = [
-  ['alerts', 'Alerts'],
+  ['trends', 'Trends'],
+  ['alarms', 'Alarms'],
   ['issues', 'Issues'],
   ['found', 'Found'],
   ['time', 'Time'],
@@ -37,7 +41,8 @@ export const WATCH_VIEWS: [string, string][] = [
 ]
 
 const QUESTION: Record<string, string> = {
-  alerts: 'What went critically wrong, and what caused it?',
+  trends: 'What do the agents do wrong, and is it getting better or worse?',
+  alarms: 'What went critically wrong, and what caused it?',
   issues: 'Which issues does every repository, session and model have, and how often?',
   found: 'What cost time and showed nowhere while it happened?',
   time: "Where does the agents' time go, and what holds them up?",
@@ -49,7 +54,7 @@ const QUESTION: Record<string, string> = {
 }
 
 export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void }) {
-  const view = WATCH_VIEWS.some(([k]) => k === sub) ? sub : 'alerts'
+  const view = WATCH_VIEWS.some(([k]) => k === sub) ? sub : 'trends'
   const watch = useQuery({ queryKey: ['watch'], queryFn: fetchWatch, refetchInterval: 10_000 })
   const time = useQuery({ queryKey: ['watch-time'], queryFn: fetchWatchTime, refetchInterval: 60_000 })
   const found = useQuery({ queryKey: ['watch-found'], queryFn: fetchFound, refetchInterval: 30_000 })
@@ -62,14 +67,15 @@ export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void })
   const foundInView = useMemo(() => (found.data ?? []).filter(keepFound(focus, models)), [found.data, focus, models])
   const total = useMemo(() => (time.data?.rows ?? []).reduce((s, r) => plus(s, r.split), zero()), [time.data])
   const words = focusWords(focus, sessions)
-  const endless = w?.alerts.filter((a) => a.kind === 'endless_task').length ?? 0
+  const alarms = w?.alerts.filter((a) => w.alarms.includes(a.kind)) ?? []
+  const endless = alarms.filter((a) => a.kind === 'endless_task').length
   const pick = (session: string) => {
     setFocus({ ...focus, session })
     go('time')
   }
-  const stopped = w?.alerts.filter((a) => a.kind === 'build_stopped').length ?? 0
+  const stopped = alarms.filter((a) => a.kind === 'build_stopped').length
   const answer = w
-    ? `${w.alerts.length} critical alerts, ${endless} of them tasks that never end and ${stopped} builds stopped short; ${found.data?.length ?? '…'} things found; ${took(atWork(total))} at work, ${took(total.operator)} waiting on you, ${took(total.approval)} on your approval, ${took(total.api)} on the API.`
+    ? `${alarms.length} alarms, ${endless} of them tasks that never end and ${stopped} builds stopped short; ${(w.alerts.length - alarms.length + (found.data?.length ?? 0)).toLocaleString('en-US')} more things charted; ${took(atWork(total))} at work, ${took(total.operator)} waiting on you, ${took(total.approval)} on your approval, ${took(total.api)} on the API.`
     : null
   return (
     <Stack gap="md">
@@ -79,8 +85,8 @@ export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void })
         data={WATCH_VIEWS.map(([value, label]) => ({
           value,
           label:
-            value === 'alerts' && w
-              ? `Alerts · ${w.alerts.length}`
+            value === 'alarms' && w
+              ? `Alarms · ${alarms.length}`
               : value === 'found' && found.data
                 ? `Found · ${found.data.length}`
                 : value === 'tasks' && w
@@ -127,7 +133,8 @@ export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void })
       {watch.isError && <Alert color="red" title="The watcher could not be asked">{String(watch.error)}</Alert>}
       {!w && watch.isPending && <Loader size="sm" />}
       {w && w.looked_at == null && !w.paused && <Text c="dimmed">The watcher is reading the window back; its first look comes within a minute.</Text>}
-      {w && view === 'alerts' && <Alerts w={w} focus={focus} setFocus={setFocus} core={core} />}
+      {w && view === 'trends' && (found.data ? <Trends w={w} found={found.data} time={time.data} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
+      {w && view === 'alarms' && <Alarms w={w} focus={focus} setFocus={setFocus} core={core} />}
       {w && view === 'issues' && (found.data ? <Issues w={w} found={found.data} time={time.data} focus={focus} core={core} /> : <Loader size="sm" />)}
       {view === 'found' && (found.data ? <Found found={foundInView} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
       {view === 'time' && (time.data ? <Time time={time.data} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
@@ -138,7 +145,7 @@ export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void })
       {w && view === 'now' && <Now now={w.now} pick={pick} />}
       {found.isError && <Alert color="red" title="What was found did not load">{String(found.error)}</Alert>}
       {time.isError && <Alert color="red" title="The time did not load">{String(time.error)}</Alert>}
-      {focus.day && w && <Text fz="xs" c="dimmed">{w.alerts.filter((a) => dayOf(a.at) === focus.day).length} alerts on {focus.day}</Text>}
+      {focus.day && w && <Text fz="xs" c="dimmed">{alarms.filter((a) => dayOf(a.at) === focus.day).length} alarms on {focus.day}</Text>}
     </Stack>
   )
 }

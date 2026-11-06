@@ -4,7 +4,7 @@ import type { Found as FoundRow, Hidden } from '../api'
 import { CANCEL, EChart, INK, MONO, PELICAN, type Clicked } from '../EChart'
 import { category, grid, tip, value } from '../results/charts'
 import { day } from '../time'
-import { dayOf, HIDDEN, HIDDEN_ORDER, n, short, took, type Focus } from './data'
+import { costOf, dayOf, HIDDEN, HIDDEN_ORDER, n, short, took, type Focus } from './data'
 import { around, Lines } from './Lines'
 
 // What the watcher dug out: what cost the agents' time, or yours, and showed
@@ -13,14 +13,6 @@ import { around, Lines } from './Lines'
 // each opening on the session's lines that caused it.
 
 const PAGE = 100
-
-/// What a finding cost, in its own measure.
-function cost(f: FoundRow): string {
-  if (f.secs != null) return took(f.secs)
-  if (f.chars != null) return `${n(f.chars)} chars`
-  if (f.times > 1) return `${f.times} times`
-  return '—'
-}
 
 function Card({ kind, rows, picked, pick }: { kind: Hidden; rows: FoundRow[]; picked: boolean; pick: () => void }) {
   const [name, about] = HIDDEN[kind]
@@ -118,7 +110,7 @@ export function Found({ found, focus, setFocus, core }: { found: FoundRow[]; foc
                         {f.name}
                       </Text>
                     </Table.Td>
-                    <Table.Td style={{ whiteSpace: 'nowrap' }}>{cost(f)}</Table.Td>
+                    <Table.Td style={{ whiteSpace: 'nowrap' }}>{costOf(f)}</Table.Td>
                   </Table.Tr>
                   {opened === f.id && (
                     <Table.Tr>
@@ -146,7 +138,7 @@ export function Found({ found, focus, setFocus, core }: { found: FoundRow[]; foc
 
 /// The span a finding's lines are read over: from where its cause starts,
 /// a few minutes ahead, to a little past it, and to its end when it ran.
-function span(f: FoundRow): { from: string; to: string } {
+export function span(f: FoundRow): { from: string; to: string } {
   const end = f.secs != null && f.kind !== 'corrected' && f.kind !== 'asked' ? new Date(new Date(f.at).getTime() + f.secs * 1000).toISOString() : f.at
   const [from, to] = around(f.from, end, 300, 180)
   return { from, to }

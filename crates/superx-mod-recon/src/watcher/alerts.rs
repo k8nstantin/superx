@@ -28,9 +28,9 @@
 //!   counted N of a kind of thing broken, then planned or reported a fix of
 //!   fewer of the same kind (2026-11-06: 724 damaged routines, 723 fixed, one
 //!   left out on the agent's own call with a false reason).
-//! - **It admits** ([`super::claims`]): the agent's own sentence that it acted
-//!   without the operator or said what was not so, each one an alert, so
-//!   none is lost in a long message (operator, 2026-11-06: "the agent
+//! - **In its own words** ([`super::claims`]): the agent's own sentence that
+//!   it acted on its own, without the operator; that what it said was not
+//!   so; or that it got something wrong (operator, 2026-11-06: "the agent
 //!   constantly lies").
 //! - **No answer from the API** ([`super::track::Unanswered`]): a stretch
 //!   with no answer that ended the agent's turn on Claude Code giving up, or
@@ -42,6 +42,10 @@
 //!   answer with nothing sent again is the model at work: the session's
 //!   card shows it as it waits, and no alert.
 //!
+//! Only the kinds `attr_recon_watch_alarms` names are alarms; the page charts
+//! every other one with what the watcher found (operator, 2026-11-06: "the
+//! alarms will flood and the operator will ignore them").
+//!
 //! Each alert names the call it is about and the time its cause starts
 //! from, for the page to read the session's lines between; and the alert
 //! that caused it, when one did: the plan that launches a job run again, the
@@ -51,7 +55,8 @@ use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use chrono::{DateTime, TimeDelta, Utc};
-use serde::Serialize;
+use serde::de::{value, IntoDeserializer as _};
+use serde::{Deserialize, Serialize};
 
 use super::command::ITS_OWN;
 use super::line::FILE_TOOLS;
@@ -71,7 +76,7 @@ const OPEN_HORIZON: i64 = 4; // skill-allow: §9-const — past it an unseen end
 const GIT_CHANGES: [&str; 7] = ["commit", "push", "merge", "reset", "rebase", "checkout", "branch"];
 
 /// What an alert is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     RunAgain,
@@ -84,7 +89,18 @@ pub enum Kind {
     UnprovenMerge,
     ApiStalled,
     CountGap,
-    Admitted,
+    ActedAlone,
+    SaidFalse,
+    GotWrong,
+}
+
+impl Kind {
+    /// The kind a word names, as the page and `attr_recon_watch_alarms`
+    /// name it: `count_gap`.
+    #[must_use]
+    pub fn named(word: &str) -> Option<Self> {
+        Self::deserialize(word.trim().into_deserializer()).map_err(|_: value::Error| ()).ok()
+    }
 }
 
 /// One alert.
@@ -493,14 +509,20 @@ impl Alerts {
         });
     }
 
-    /// The agent's own sentence that it acted without the operator or said
-    /// what was not so; its cause starts at the operator's message before.
-    pub fn admitted(&mut self, track: &Track, at: DateTime<Utc>, words: &str) {
+    /// The agent's own sentence of `kind`: that it acted on its own, said
+    /// what was not so, or got something wrong; its cause starts at the
+    /// operator's message before.
+    pub fn admitted(&mut self, track: &Track, at: DateTime<Utc>, kind: Kind, words: &str) {
+        let name = match kind {
+            Kind::SaidFalse => "said_false",
+            Kind::ActedAlone => "acted_alone",
+            _ => "got_wrong",
+        };
         self.raise(Alert {
-            id: format!("{}/admitted/{}", track.session, at.timestamp_millis()),
+            id: format!("{}/{name}/{}", track.session, at.timestamp_millis()),
             session: track.session.clone(),
             name: track.name.clone(),
-            kind: Kind::Admitted,
+            kind,
             at,
             what: format!("it admits: «{}»", cut(words)),
             since: None,

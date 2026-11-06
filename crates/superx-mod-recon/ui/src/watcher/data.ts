@@ -1,4 +1,4 @@
-import type { AlertKind, Found, Hidden, Split, TimeRow, WatchSessionRow } from '../api'
+import type { AlertKind, Found, Hidden, Split, TimeRow, WatchAlert, WatchSessionRow } from '../api'
 import { CANCEL, FAIL } from '../EChart'
 import { span } from '../time'
 
@@ -56,7 +56,9 @@ export const KIND: Record<AlertKind, [string, string]> = {
   unproven_merge: ['A task file merged unproven', FAIL],
   api_stalled: ['No answer from the API', FAIL],
   count_gap: ['Its fix covers less than it found', FAIL],
-  admitted: ['It admits', FAIL],
+  acted_alone: ['It acted on its own', CANCEL],
+  said_false: ['It said what was not so', CANCEL],
+  got_wrong: ['It got it wrong', CANCEL],
 }
 
 /// What each finding is, in the words the page uses, and what it shows
@@ -125,3 +127,89 @@ export const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'MultiEdit', 'Notebo
 
 /// Time no call held, as the tool it is counted under.
 export const unheld = (tool: string) => tool.startsWith('(')
+
+/// Everything the watcher knows of: its alerts and its findings.
+export type Kind = AlertKind | Hidden
+
+/// A kind's name in the words the page uses.
+export const kindName = (k: Kind) => (k in KIND ? KIND[k as AlertKind][0] : HIDDEN[k as Hidden][0])
+
+/// What the agents do, in families the operator's own words name, the
+/// worst first (2026-11-06: "redo redo redo", "constantly lies", "took
+/// upon itself", "blows away instruction"). The first six are what an agent
+/// did wrong, each in its own colour; the rest are what it cost.
+export type Family = { key: string; name: string; did: string; about: string; kinds: Kind[]; colour: string | null }
+
+/// The six colours of what an agent did wrong, in the one order of them
+/// that passes every check: validated on the card surface #2A1235 and on
+/// white, every adjacent pair clear under colour-blind and normal vision
+/// (dataviz validator, 2026-11-06, worst ΔE 9.4 deutan).
+export const WRONG_COLOURS = ['#B833E8', '#c98500', '#d55181', '#3987e5', '#d95926', '#199e70']
+
+export const FAMILIES: Family[] = [
+  { key: 'redone', name: 'Work redone', did: 'redid work', about: 'a merged task reopened, a finished job run again, a plan that runs one job twice, work thrown away', kinds: ['endless_task', 'run_again', 'plan_repeats', 'undone'], colour: WRONG_COLOURS[0] },
+  { key: 'false', name: 'Said what was not so', did: 'said what was not so', about: 'a fix that covers less than it found, and its own word that what it said was not so', kinds: ['count_gap', 'said_false'], colour: WRONG_COLOURS[1] },
+  { key: 'alone', name: 'Acted on its own', did: 'acted on their own', about: 'its own word that it acted without you, and a protected place changed when nothing you said named it', kinds: ['acted_alone', 'protected'], colour: WRONG_COLOURS[2] },
+  { key: 'orders', name: 'Broke your orders', did: 'broke your orders', about: 'your stop not followed, and its task file broken', kinds: ['stop_not_followed', 'task_file_broken'], colour: WRONG_COLOURS[3] },
+  { key: 'unproven', name: 'Merged unproven', did: 'had a task file merged unproven', about: 'a task file merged, or asked to be, with no spec gate passed since it changed', kinds: ['unproven_merge'], colour: WRONG_COLOURS[4] },
+  { key: 'stopped', name: 'Stopped short', did: 'stopped short', about: 'a build that handed you its turn before it wrote what it builds', kinds: ['build_stopped'], colour: WRONG_COLOURS[5] },
+  { key: 'wrong', name: 'Got it wrong', did: 'got it wrong', about: 'its own word that it got something wrong', kinds: ['got_wrong'], colour: null },
+  { key: 'you', name: 'You stepped in', did: 'had you step in', about: 'your corrections, your stops, your asks for how it stands', kinds: ['corrected', 'interrupted', 'asked'], colour: null },
+  { key: 'held', name: 'Held up', did: 'were held up', about: 'no answer from the API, runs gone long, held on your approval, asleep in the foreground', kinds: ['api_stalled', 'long_run', 'held', 'slept'], colour: null },
+  { key: 'waste', name: 'Effort wasted', did: 'wasted effort', about: 'edited over and over, read again, refused and tried again, flooded, context lost', kinds: ['thrash', 'reread', 'refused', 'flood', 'compacted'], colour: null },
+]
+
+/// The families of what an agent did wrong.
+export const WRONG = FAMILIES.filter((f) => f.colour)
+export const familyOf = (k: Kind) => FAMILIES.find((f) => f.kinds.includes(k))
+
+/// One case of anything the watcher knows: an alert or a finding, as one row.
+export type Case = { id: string; kind: Kind; name: string; session: string; at: string; from: string; what: string; call: string | null; cost: string; alert: WatchAlert | null; found: Found | null }
+
+/// What a finding cost, in its own measure.
+export function costOf(f: Found): string {
+  if (f.secs != null) return took(f.secs)
+  if (f.chars != null) return `${n(f.chars)} chars`
+  if (f.times > 1) return `${f.times} times`
+  return '—'
+}
+
+/// Every alert and every finding as cases.
+export const casesOf = (alerts: WatchAlert[], found: Found[]): Case[] => [
+  ...alerts.map((a) => ({ id: a.id, kind: a.kind, name: a.name, session: a.session, at: a.at, from: a.from, what: a.what, call: a.call, cost: a.cost_secs != null ? took(a.cost_secs) : '—', alert: a, found: null })),
+  ...found.map((f) => ({ id: f.id, kind: f.kind, name: f.name, session: f.session, at: f.at, from: f.from, what: f.what, call: f.call, cost: costOf(f), alert: null, found: f })),
+]
+
+/// The day after a day, both as `2026-11-04`.
+function next(day: string): string {
+  const d = new Date(`${day}T12:00:00`)
+  d.setDate(d.getDate() + 1)
+  return dayOf(d.toISOString())
+}
+
+/// Every day from `first` to `last`, quiet ones included: a trend reads
+/// nothing into a day with no case only if the day is there.
+export function daysFrom(first: string, last: string): string[] {
+  const out: string[] = []
+  for (let d = first; d <= last && out.length < 4000; d = next(d)) out.push(d)
+  return out
+}
+
+/// The Monday of a day's week, as `2026-11-02`.
+export function mondayOf(day: string): string {
+  const d = new Date(`${day}T12:00:00`)
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7))
+  return dayOf(d.toISOString())
+}
+
+/// A week by its first and last day, so a week's bar is never read as its
+/// Monday alone: `11-02–08`, `10-26–11-01`; the week still going ends today,
+/// `11-02–06 so far`.
+export function weekName(monday: string, today: string): string {
+  const d = new Date(`${monday}T12:00:00`)
+  d.setDate(d.getDate() + 6)
+  const sunday = dayOf(d.toISOString())
+  const end = sunday > today ? today : sunday
+  const tail = end.slice(5, 7) === monday.slice(5, 7) ? end.slice(8) : end.slice(5)
+  return `${monday.slice(5)}–${tail}${sunday > today ? ' so far' : ''}`
+}

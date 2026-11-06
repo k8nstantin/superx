@@ -4,15 +4,18 @@ import type { Alongside, Unanswered, Watch, WatchAlert, WatchTask } from '../api
 import { EChart, FAIL, MONO, type Clicked } from '../EChart'
 import { category, grid, legend, stacked, tip, value } from '../results/charts'
 import { clock, day, since } from '../time'
-import { dayOf, KIND, short, took, type Focus } from './data'
+import { dayOf, KIND, short, took, WRONG, type Focus } from './data'
 import { around, Lines } from './Lines'
 import { History } from './Tasks'
 
-// The critical alerts, in one table, newest first: each opens on its cause.
-// What it is about and what it cost; the alert that caused it and the ones
-// it led to; for a plan, the gates that launch the same job; for a task that
-// never ends, its merges, reopenings and estimates; and the session's own
-// lines from where its cause starts to the alert.
+// The alarms: the critical alerts alone, the kinds attr_recon_watch_alarms
+// names (operator, 2026-11-06: "sooner or later the alarms will flood and
+// the operator will ignore them … very defined and critical"); every other
+// alert is charted in Trends. One table, newest first: each opens on its
+// cause. What it is about and what it cost; the alert that caused it and the
+// ones it led to; for a plan, the gates that launch the same job; for a task
+// that never ends, its merges, reopenings and estimates; and the session's
+// own lines from where its cause starts to the alert.
 
 /// The task an alert of a task that never ends is about.
 function taskOf(a: WatchAlert, tasks: WatchTask[]): WatchTask | undefined {
@@ -65,7 +68,7 @@ function NoAnswer({ stretches, alongside, pick }: { stretches: Unanswered[]; alo
   )
 }
 
-function Cause({ a, w, open, core }: { a: WatchAlert; w: Watch; open: (id: string) => void; core: string | null }) {
+export function Cause({ a, w, open, core }: { a: WatchAlert; w: Watch; open: (id: string) => void; core: string | null }) {
   const caused = a.cause ? w.alerts.find((x) => x.id === a.cause) : undefined
   const led = w.alerts.filter((x) => x.cause === a.id)
   const task = a.kind === 'endless_task' ? taskOf(a, w.tasks) : undefined
@@ -125,10 +128,11 @@ function Cause({ a, w, open, core }: { a: WatchAlert; w: Watch; open: (id: strin
   )
 }
 
-/// The alerts per day, by kind: when things went wrong.
+/// The alarms per day, by the family of what went wrong, in the colours
+/// Trends gives the families.
 function perDay(alerts: WatchAlert[]) {
   const days = [...new Set(alerts.map((a) => dayOf(a.at)))].sort()
-  const kinds = (Object.keys(KIND) as (keyof typeof KIND)[]).filter((k) => alerts.some((a) => a.kind === k))
+  const families = WRONG.filter((f) => alerts.some((a) => f.kinds.includes(a.kind)))
   return {
     days,
     option: {
@@ -137,34 +141,38 @@ function perDay(alerts: WatchAlert[]) {
       tooltip: tip(),
       xAxis: category(days.map(short)),
       yAxis: value(),
-      series: kinds.map((k) => stacked(KIND[k][0], days.map((d) => alerts.filter((a) => a.kind === k && dayOf(a.at) === d).length), KIND[k][1], 'a', { barMaxWidth: 26 })),
+      series: families.map((f) => stacked(f.name, days.map((d) => alerts.filter((a) => f.kinds.includes(a.kind) && dayOf(a.at) === d).length), f.colour ?? FAIL, 'a', { barMaxWidth: 26 })),
     },
   }
 }
 
-export function Alerts({ w, focus, setFocus, core }: { w: Watch; focus: Focus; setFocus: (f: Focus) => void; core: string | null }) {
+export function Alarms({ w, focus, setFocus, core }: { w: Watch; focus: Focus; setFocus: (f: Focus) => void; core: string | null }) {
   const [opened, setOpened] = useState<string | null>(null)
-  const alerts = w.alerts.filter((a) => (!focus.session || a.session === focus.session) && (!focus.day || dayOf(a.at) === focus.day))
-  const chart = perDay(w.alerts.filter((a) => !focus.session || a.session === focus.session))
+  const raised = w.alerts.filter((a) => w.alarms.includes(a.kind))
+  const alerts = raised.filter((a) => (!focus.session || a.session === focus.session) && (!focus.day || dayOf(a.at) === focus.day))
+  const chart = perDay(raised.filter((a) => !focus.session || a.session === focus.session))
   const open = (id: string) => {
     setOpened(id)
     requestAnimationFrame(() => document.getElementById(`alert-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
   }
-  const lost = alerts.filter((a) => a.kind === 'run_again').reduce((t, a) => t + (a.cost_secs ?? 0), 0)
+  const charted = w.alerts.length - raised.length
   return (
     <Stack gap="md">
-      <Text fz="sm" c="dimmed">
-        {alerts.length} critical alerts{focus.day ? ` on ${focus.day}` : ''}: {alerts.filter((a) => a.kind === 'endless_task').length} tasks that never end,{' '}
-        {alerts.filter((a) => a.kind === 'run_again').length} finished runs launched again ({took(lost)} run twice), {alerts.filter((a) => a.kind === 'long_run').length} runs gone long,{' '}
-        {alerts.filter((a) => a.kind === 'plan_repeats').length} plans that repeat, {alerts.filter((a) => a.kind === 'stop_not_followed').length} stops not followed,{' '}
-        {alerts.filter((a) => a.kind === 'task_file_broken').length} task files broken, {alerts.filter((a) => a.kind === 'build_stopped').length} builds stopped short, {alerts.filter((a) => a.kind === 'unproven_merge').length} task files merged unproven, {alerts.filter((a) => a.kind === 'api_stalled').length} stretches with no answer from the API,{' '}
-        {alerts.filter((a) => a.kind === 'count_gap').length} fixes that cover less than the agent found, {alerts.filter((a) => a.kind === 'admitted').length} things the agent
-        admits it did without you or said that were not so. Click a row for its cause.
+      <Text fz="sm" c="dimmed" maw={1000}>
+        {alerts.length} {alerts.length === 1 ? 'alarm' : 'alarms'}
+        {focus.day ? ` on ${focus.day}` : ''}:{' '}
+        {w.alarms.map((k) => `${KIND[k][0].toLowerCase()} ${alerts.filter((a) => a.kind === k).length}`).join(' · ')}. Only these kinds raise an alarm; the{' '}
+        {charted} other alerts are charted in Trends with everything found. Click a row for its cause.
       </Text>
+      {w.not_kinds.length > 0 && (
+        <Text fz="xs" c={FAIL}>
+          attr_recon_watch_alarms names no kind of alert: {w.not_kinds.join(', ')}
+        </Text>
+      )}
       {chart.days.length > 0 && (
         <Paper withBorder radius="md" p="sm">
-          <Text fw={600} fz="sm">The alerts, day by day</Text>
-          <Text fz="xs" c="dimmed">click a day to see only its alerts, here and in every view</Text>
+          <Text fw={600} fz="sm">The alarms, day by day</Text>
+          <Text fz="xs" c="dimmed">click a day to see only its alarms, here and in every view</Text>
           <EChart height={220} option={chart.option} onClick={(p: Clicked) => p.dataIndex != null && setFocus({ ...focus, day: chart.days[p.dataIndex] })} />
         </Paper>
       )}
@@ -174,7 +182,7 @@ export function Alerts({ w, focus, setFocus, core }: { w: Watch; focus: Focus; s
             <Table.Thead>
               <Table.Tr>
                 <Table.Th>When</Table.Th>
-                <Table.Th>Alert</Table.Th>
+                <Table.Th>Alarm</Table.Th>
                 <Table.Th>What</Table.Th>
                 <Table.Th>Session</Table.Th>
                 <Table.Th>At stake</Table.Th>
@@ -184,7 +192,7 @@ export function Alerts({ w, focus, setFocus, core }: { w: Watch; focus: Focus; s
               {alerts.length === 0 && (
                 <Table.Tr>
                   <Table.Td colSpan={5}>
-                    <Text c="dimmed" fz="sm">No critical alert here.</Text>
+                    <Text c="dimmed" fz="sm">No alarm here.</Text>
                   </Table.Td>
                 </Table.Tr>
               )}

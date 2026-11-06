@@ -35,7 +35,7 @@ use superx_kernel::Kernel;
 use tokio::sync::watch as signal;
 
 use crate::params::{self, Params};
-use alerts::{Alert, Alerts};
+use alerts::{Alert, Alerts, Kind};
 use follow::{Captured, Follow, Unread};
 use found::{Finds, Found};
 use task::{Task, Tasks};
@@ -70,6 +70,11 @@ pub struct Snapshot {
     pub repeat_secs: u64,
     /// Every alert, newest first.
     pub alerts: Vec<Alert>,
+    /// The kinds of alert that are alarms (`attr_recon_watch_alarms`): the
+    /// page raises these, and charts every other one.
+    pub alarms: Vec<Kind>,
+    /// The words of `attr_recon_watch_alarms` that name no kind of alert.
+    pub not_kinds: Vec<String>,
     /// The sessions working now, newest first.
     pub now: Vec<Now>,
     /// Every session in the window.
@@ -451,6 +456,8 @@ impl Watcher {
             long_secs: p.watch_long_secs,
             repeat_secs: p.watch_repeat_secs,
             alerts: self.alerts.newest_first(&p.watch_jobs),
+            alarms: p.watch_alarms.iter().filter_map(|w| Kind::named(w)).collect(),
+            not_kinds: p.watch_alarms.iter().filter(|w| !w.trim().is_empty() && Kind::named(w).is_none()).cloned().collect(),
             now: now_rows,
             sessions,
             runs,

@@ -1,6 +1,7 @@
 //! The agent held to its own words (#573): a fix that covers fewer of a kind
 //! of thing than the agent found broken, and the agent's own word that it
-//! acted without the operator or said what was not so.
+//! acted on its own, without the operator; that what it said was not so; or
+//! that it got something wrong.
 //!
 //! The operator, 2026-11-06: "the agent constantly lies". That morning, in
 //! one session, the agent counted 724 damaged routines, planned "723
@@ -8,13 +9,15 @@
 //! reads fine", had the fix merged, and, asked, said "I made that call on my
 //! own, and the reason I gave was false". Over all history the count rule
 //! raises two alerts, that one and one other where the agent's own numbers
-//! disagree; every admission it raises is the agent's own sentence.
+//! disagree. Of the 141 admissions, 3 say what it said was not so, 19 that
+//! it acted on its own and 119 that it got something wrong; each is the
+//! agent's own sentence, charted, never an alarm.
 
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
-use super::alerts::Alerts;
+use super::alerts::{Alerts, Kind};
 use super::task::has_any;
 use super::track::Track;
 use crate::params::Params;
@@ -45,15 +48,14 @@ pub struct Claims {
 impl Claims {
     /// The agent's words to the operator in `t`, at `at`: a count found
     /// broken is kept; a fix of fewer of the same kind raises its alert; the
-    /// first sentence that admits acting without the operator, or saying
-    /// what was not so, raises its own.
+    /// first sentence of each kind of admission raises its own.
     pub fn said(&mut self, t: &Track, at: DateTime<Utc>, text: &str, alerts: &mut Alerts, p: &Params) {
         let found = self.found.entry(t.session.clone()).or_default();
-        let mut admitted: Option<&str> = None;
+        let mut admitted: Vec<(Kind, &str)> = Vec::new();
         for sentence in sentences(text) {
             let lower = sentence.to_lowercase();
-            if admitted.is_none() && admits(&lower, &p.watch_admit_words) {
-                admitted = Some(sentence);
+            if let Some(kind) = admits(&lower, p).filter(|k| admitted.iter().all(|(a, _)| a != k)) {
+                admitted.push((kind, sentence));
             }
             if has_any(&lower, &p.watch_done_words) {
                 continue;
@@ -70,8 +72,8 @@ impl Claims {
                 }
             }
         }
-        if let Some(sentence) = admitted {
-            alerts.admitted(t, at, sentence);
+        for (kind, sentence) in admitted {
+            alerts.admitted(t, at, kind, sentence);
         }
     }
 
@@ -132,15 +134,24 @@ pub fn plural(unit: &str) -> String {
     }
 }
 
-/// Whether a lowercase sentence admits, as one of `phrases` says it: each
-/// phrase's parts in order, whole words, `…` any words between; a phrase
-/// that starts with `!` makes a sentence that has it no admission.
-fn admits(lower: &str, phrases: &[String]) -> bool {
-    let phrases: Vec<String> = phrases.iter().map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect();
-    if phrases.iter().filter_map(|p| p.strip_prefix('!')).any(|not| find(lower, not.trim(), 0).is_some()) {
-        return false;
+/// What a lowercase sentence admits, if anything: that what the agent said
+/// was not so, before that it acted on its own, before that it got
+/// something wrong. A sentence with one of `attr_recon_watch_no_admit_words`
+/// admits nothing.
+fn admits(lower: &str, p: &Params) -> Option<Kind> {
+    if p.watch_no_admit_words.iter().map(|w| w.trim().to_lowercase()).any(|w| !w.is_empty() && find(lower, &w, 0).is_some()) {
+        return None;
     }
-    phrases.iter().filter(|p| !p.starts_with('!')).any(|phrase| {
+    [(Kind::SaidFalse, &p.watch_false_words), (Kind::ActedAlone, &p.watch_alone_words), (Kind::GotWrong, &p.watch_wrong_words)]
+        .into_iter()
+        .find(|(_, phrases)| says(lower, phrases))
+        .map(|(kind, _)| kind)
+}
+
+/// Whether a lowercase sentence says one of `phrases`: each phrase's parts
+/// in order, whole words, `…` any words between.
+fn says(lower: &str, phrases: &[String]) -> bool {
+    phrases.iter().map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).any(|phrase| {
         let mut from = 0;
         phrase.split('…').map(str::trim).filter(|part| !part.is_empty()).all(|part| match find(lower, part, from) {
             Some(end) => {

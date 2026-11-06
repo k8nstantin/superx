@@ -539,7 +539,9 @@ export type AlertKind =
   | 'unproven_merge'
   | 'api_stalled'
   | 'count_gap'
-  | 'admitted'
+  | 'acted_alone'
+  | 'said_false'
+  | 'got_wrong'
 
 /// A stretch the API did not answer a session (src/watcher/track.rs): from
 /// its first request with no answer to the answer, if one came.
@@ -562,8 +564,8 @@ export type Unanswered = {
 /// Another session the API left without an answer in the same minutes.
 export type Alongside = { session: string; name: string; since: string; until: string }
 
-/// One of the watcher's alerts: the critical ones alone (#573), each with
-/// where its cause starts and the alert that caused it.
+/// One of the watcher's alerts (#573), each with where its cause starts and
+/// the alert that caused it; the alarms are the kinds `alarms` names.
 export type WatchAlert = {
   id: string
   session: string
@@ -650,6 +652,11 @@ export type Watch = {
   long_secs: number
   repeat_secs: number
   alerts: WatchAlert[]
+  /// The kinds of alert that are alarms (attr_recon_watch_alarms); every
+  /// other one is charted, never raised.
+  alarms: AlertKind[]
+  /// The words of attr_recon_watch_alarms that name no kind of alert.
+  not_kinds: string[]
   now: WatchNow[]
   sessions: WatchSessionRow[]
   runs: WatchRun[]

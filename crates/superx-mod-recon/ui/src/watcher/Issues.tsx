@@ -1,10 +1,10 @@
 import { Fragment, useMemo, useState } from 'react'
 import { Badge, Group, Paper, SegmentedControl, Stack, Table, Text } from '@mantine/core'
 import type { Found, Watch, WatchTime } from '../api'
-import { EChart, GRID_LINE, HEAT, INK, INK_MUTED, MONO, TOOLTIP, type Clicked } from '../EChart'
+import { AXIS, EChart, GRID_LINE, HEAT, INK, INK_MUTED, MONO, TOOLTIP, type Clicked } from '../EChart'
 import { category, grid, tip, value } from '../results/charts'
 import { day } from '../time'
-import { atWork, HIDDEN, HIDDEN_ORDER, KIND, n, took, type Focus } from './data'
+import { atWork, casesOf, dayOf, HIDDEN, HIDDEN_ORDER, KIND, mondayOf, n, weekName, type Case, type Focus } from './data'
 import { around, Lines } from './Lines'
 
 // The mold: every issue the watcher knows, cast the same way over every
@@ -15,9 +15,6 @@ import { around, Lines } from './Lines'
 // it; and the issue picked, week by week, says whether it is getting better.
 
 type By = 'repo' | 'session' | 'model'
-
-/// One case of an issue: an alert or a finding, as one row.
-type Case = { id: string; kind: string; name: string; session: string; at: string; from: string; what: string; call: string | null; cost: string }
 
 const ISSUES: [string, string][] = [
   ...(Object.keys(KIND) as (keyof typeof KIND)[]).map((k): [string, string] => [k, KIND[k][0]]),
@@ -34,13 +31,6 @@ export function repoOf(folder: string | null): string {
   return under.slice(0, 2).join('/') || '(no folder)'
 }
 
-/// The Monday of a time's week, as `11-02`.
-function weekOf(iso: string): string {
-  const d = new Date(iso)
-  d.setDate(d.getDate() - ((d.getDay() + 6) % 7))
-  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
-
 export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found[]; time: WatchTime | undefined; focus: Focus; core: string | null }) {
   const [by, setBy] = useState<By>('repo')
   const [cell, setCell] = useState<{ issue: string; column: string } | null>(null)
@@ -53,20 +43,7 @@ export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found
     return s?.name ?? session
   }
   const cases: Case[] = useMemo(
-    () => [
-      ...w.alerts.map((a) => ({ id: a.id, kind: a.kind, name: a.name, session: a.session, at: a.at, from: a.from, what: a.what, call: a.call, cost: a.cost_secs != null ? took(a.cost_secs) : '—' })),
-      ...found.map((f) => ({
-        id: f.id,
-        kind: f.kind,
-        name: f.name,
-        session: f.session,
-        at: f.at,
-        from: f.from,
-        what: f.what,
-        call: f.call,
-        cost: f.secs != null ? took(f.secs) : f.chars != null ? `${n(f.chars)} chars` : '—',
-      })),
-    ].filter((c) => (!focus.session || c.session === focus.session) && (!focus.model || (sessions.get(c.session)?.model ?? 'unknown') === focus.model)),
+    () => casesOf(w.alerts, found).filter((c) => (!focus.session || c.session === focus.session) && (!focus.model || (sessions.get(c.session)?.model ?? 'unknown') === focus.model)),
     [w, found, focus, sessions],
   )
   // Hours at work in each column: the yardstick a count is read against.
@@ -90,6 +67,8 @@ export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found
   const top = Math.max(1, ...cells.map((c) => c[2] as number))
   const picked = cell ? cases.filter((c) => c.kind === cell.issue && columnOf(c.session) === cell.column).sort((a, b) => b.at.localeCompare(a.at)) : []
   const trendCases = cell ? cases.filter((c) => c.kind === cell.issue) : cases
+  const today = dayOf(new Date().toISOString())
+  const weekOf = (iso: string) => mondayOf(dayOf(iso))
   const weeks = [...new Set(trendCases.map((c) => weekOf(c.at)))].sort((a, b) => (a < b ? -1 : 1))
   const label = (k: string) => ISSUES.find(([x]) => x === k)?.[1] ?? k
   const worst = columns.length && rows.length ? columns.map((col) => [col, totals.get(col) ?? 0, (worked.get(col) ?? 0) / 3600] as [string, number, number]) : []
@@ -152,7 +131,7 @@ export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found
           option={{
             grid: grid(),
             tooltip: tip(),
-            xAxis: category(weeks.map((wk) => `wk ${wk}`)),
+            xAxis: category(weeks.map((wk) => weekName(wk, today)), { axisLabel: { ...AXIS.axisLabel, showMaxLabel: true, alignMaxLabel: 'right', hideOverlap: true } }),
             yAxis: value(),
             series: [{ type: 'bar', barMaxWidth: 26, itemStyle: { color: HEAT[3], borderRadius: [3, 3, 0, 0] }, data: weeks.map((wk) => trendCases.filter((c) => weekOf(c.at) === wk).length) }],
           }}
