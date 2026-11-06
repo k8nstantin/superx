@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Alert, Badge, Button, Group, Loader, SegmentedControl, Stack, Text, Title } from '@mantine/core'
 import { useQuery } from '@tanstack/react-query'
-import { fetchFound, fetchPing, fetchWatch, fetchWatchTime, type WatchSessionRow } from '../api'
+import { fetchFound, fetchPing, fetchWaste, fetchWatch, fetchWatchTime, type WatchSessionRow } from '../api'
 import { OK } from '../EChart'
 import { clock, day } from '../time'
 import { Alarms } from './Alarms'
@@ -41,7 +41,7 @@ export const WATCH_VIEWS: [string, string][] = [
 ]
 
 const QUESTION: Record<string, string> = {
-  trends: 'What do the agents do wrong, and is it getting better or worse?',
+  trends: 'How much of the agents\' work goes to waste, on what, and is it getting better or worse?',
   alarms: 'What went critically wrong, and what caused it?',
   issues: 'Which issues does every repository, session and model have, and how often?',
   found: 'What cost time and showed nowhere while it happened?',
@@ -59,6 +59,7 @@ export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void })
   const time = useQuery({ queryKey: ['watch-time'], queryFn: fetchWatchTime, refetchInterval: 60_000 })
   const found = useQuery({ queryKey: ['watch-found'], queryFn: fetchFound, refetchInterval: 30_000 })
   const ping = useQuery({ queryKey: ['ping'], queryFn: fetchPing, staleTime: Infinity })
+  const waste = useQuery({ queryKey: ['watch-waste'], queryFn: fetchWaste, refetchInterval: 60_000 })
   const [focus, setFocus] = useState<Focus>({})
   const w = watch.data
   const core = ping.data?.core_url ?? null
@@ -133,8 +134,8 @@ export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void })
       {watch.isError && <Alert color="red" title="The watcher could not be asked">{String(watch.error)}</Alert>}
       {!w && watch.isPending && <Loader size="sm" />}
       {w && w.looked_at == null && !w.paused && <Text c="dimmed">The watcher is reading the window back; its first look comes within a minute.</Text>}
-      {w && view === 'trends' && (found.data ? <Trends w={w} found={found.data} time={time.data} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
-      {w && view === 'alarms' && <Alarms w={w} focus={focus} setFocus={setFocus} core={core} />}
+      {w && view === 'trends' && (found.data ? <Trends w={w} found={found.data} time={time.data} waste={waste.data} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
+      {w && view === 'alarms' && <Alarms w={w} waste={waste.data} focus={focus} setFocus={setFocus} core={core} />}
       {w && view === 'issues' && (found.data ? <Issues w={w} found={found.data} time={time.data} focus={focus} core={core} /> : <Loader size="sm" />)}
       {view === 'found' && (found.data ? <Found found={foundInView} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
       {view === 'time' && (time.data ? <Time time={time.data} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
@@ -145,6 +146,7 @@ export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void })
       {w && view === 'now' && <Now now={w.now} pick={pick} />}
       {found.isError && <Alert color="red" title="What was found did not load">{String(found.error)}</Alert>}
       {time.isError && <Alert color="red" title="The time did not load">{String(time.error)}</Alert>}
+      {waste.isError && <Alert color="red" title="The waste did not load">{String(waste.error)}</Alert>}
       {focus.day && w && <Text fz="xs" c="dimmed">{alarms.filter((a) => dayOf(a.at) === focus.day).length} alarms on {focus.day}</Text>}
     </Stack>
   )

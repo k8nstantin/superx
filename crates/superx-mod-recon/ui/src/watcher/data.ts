@@ -1,4 +1,4 @@
-import type { AlertKind, Found, Hidden, Split, TimeRow, WatchAlert, WatchSessionRow } from '../api'
+import type { AlertKind, Cost, Found, Hidden, Split, TimeRow, WatchAlert, WatchSessionRow } from '../api'
 import { CANCEL, FAIL } from '../EChart'
 import { span } from '../time'
 
@@ -212,4 +212,59 @@ export function weekName(monday: string, today: string): string {
   const end = sunday > today ? today : sunday
   const tail = end.slice(5, 7) === monday.slice(5, 7) ? end.slice(8) : end.slice(5)
   return `${monday.slice(5)}–${tail}${sunday > today ? ' so far' : ''}`
+}
+
+/// What a chart measures: lines the agents wrote, tokens they generated or
+/// read, or how many cases.
+export type Measure = 'lines' | 'generated' | 'read' | 'cases'
+export const MEASURES: [Measure, string, string][] = [
+  ['lines', 'lines written', 'lines of code the agents wrote'],
+  ['generated', 'tokens generated', 'tokens the agents generated: thinking, words and calls'],
+  ['read', 'tokens read', 'tokens the agents read: their whole context, from the cache too'],
+  ['cases', 'cases', 'how many cases'],
+]
+export const measureName = (m: Measure) => MEASURES.find(([k]) => k === m)?.[1] ?? m
+
+/// A cost in a measure: lines written (added), tokens generated or read.
+export function amount(c: Cost | undefined, m: Measure): number {
+  if (!c) return 0
+  if (m === 'lines') return c.added
+  if (m === 'generated') return c.tokens.generated
+  return c.tokens.fresh + c.tokens.cache_written + c.tokens.cache_read
+}
+export const zeroCost = (): Cost => ({ tokens: { generated: 0, fresh: 0, cache_written: 0, cache_read: 0 }, added: 0, removed: 0 })
+export function addCost(a: Cost, b: Cost | undefined): Cost {
+  if (!b) return a
+  return {
+    tokens: {
+      generated: a.tokens.generated + b.tokens.generated,
+      fresh: a.tokens.fresh + b.tokens.fresh,
+      cache_written: a.tokens.cache_written + b.tokens.cache_written,
+      cache_read: a.tokens.cache_read + b.tokens.cache_read,
+    },
+    added: a.added + b.added,
+    removed: a.removed + b.removed,
+  }
+}
+
+/// A count as the page writes a large one: `1,234`, `56k`, `7.8 M`, `9.1 B`.
+export function big(v: number): string {
+  const a = Math.abs(v)
+  if (a >= 1e9) return `${(v / 1e9).toFixed(1)} B`
+  if (a >= 1e6) return `${(v / 1e6).toFixed(1)} M`
+  if (a >= 1e5) return `${Math.round(v / 1e3)}k`
+  return n(Math.round(v))
+}
+
+/// A cost in words: `1,240 lines · 3.4 M tokens generated · 812 M read`.
+export const costWords = (c: Cost) =>
+  `${n(c.added)} lines written${c.removed ? `, ${n(c.removed)} removed` : ''} · ${big(c.tokens.generated)} tokens generated · ${big(c.tokens.fresh + c.tokens.cache_written + c.tokens.cache_read)} read`
+
+/// An axis tick: `900`, `12k`, `3.4M`, `1.2B`.
+export function tick(v: number): string {
+  const a = Math.abs(v)
+  if (a >= 1e9) return `${+(v / 1e9).toFixed(1)}B`
+  if (a >= 1e6) return `${+(v / 1e6).toFixed(1)}M`
+  if (a >= 1e3) return `${+(v / 1e3).toFixed(1)}k`
+  return String(v)
 }

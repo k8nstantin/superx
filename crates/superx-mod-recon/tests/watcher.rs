@@ -1385,3 +1385,50 @@ async fn the_agent_is_held_to_its_own_words_a_fix_short_of_what_it_found_its_adm
     assert_eq!((s.alarms.as_slice(), s.not_kinds.as_slice()), ([Kind::SaidFalse, Kind::CountGap].as_slice(), ["admitted".to_string()].as_slice()));
     assert_eq!((Kind::named("unproven_merge"), Kind::named("It admits")), (Some(Kind::UnprovenMerge), None));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_waste_is_the_lines_and_tokens_of_work_gone_wrong_each_counted_once() {
+    // 2026-11-06, the operator: "I want the waste highlighted in all charts:
+    // lines, tokens". A message's tokens count once, however many of its
+    // lines say them; a call's lines are its patch's; the turn you
+    // corrected went to waste, the turn after it did not.
+    let p = params(&[]);
+    let (kernel, dir, mut agent, t0) = setup("waste").await;
+    let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+    let usage = |out: u64, read: u64| json!({"input_tokens": 3, "output_tokens": out, "cache_creation_input_tokens": 0, "cache_read_input_tokens": read});
+    let line = |id: &str, block: Json, u: Json| json!({"type": "assistant", "message": {"id": id, "model": "claude-opus-5-5", "content": [block], "usage": u}});
+    let done = |call: &str, result: Json| json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call, "content": "ok"}]}, "toolUseResult": result});
+    agent.typed("add the parser", 0).await;
+    // One message on two lines: its usage on both, the newest the larger.
+    agent.message(line("m1", json!({"type": "thinking", "thinking": "plan"}), usage(100, 5_000)), 5).await;
+    agent.message(line("m1", json!({"type": "tool_use", "id": "w1", "name": "Write", "input": {"file_path": at("src/p.rs"), "content": "a\nb\nc\n"}}), usage(120, 5_000)), 1).await;
+    agent.message(done("w1", json!({"type": "create", "filePath": at("src/p.rs"), "content": "a\nb\nc\n", "structuredPatch": []})), 1).await;
+    agent.message(line("m2", json!({"type": "text", "text": "The parser is in."}), usage(30, 6_000)), 5).await;
+    agent.turn_end(1).await;
+    // Your correction: the turn before it went to waste.
+    agent.typed("no, that is not what I asked", 60).await;
+    agent.message(line("m3", json!({"type": "tool_use", "id": "e1", "name": "Edit", "input": {"file_path": at("src/p.rs"), "old_string": "b", "new_string": "B\nC"}}), usage(40, 7_000)), 5).await;
+    let patch = json!([{"oldStart": 1, "oldLines": 3, "newStart": 1, "newLines": 4, "lines": [" a", "-b", "+B", "+C", " c"]}]);
+    agent.message(done("e1", json!({"filePath": at("src/p.rs"), "oldString": "b", "newString": "B\nC", "structuredPatch": patch})), 1).await;
+    agent.message(line("m4", json!({"type": "text", "text": "Fixed it."}), usage(10, 7_100)), 5).await;
+    agent.turn_end(1).await;
+    let mut w = Watcher::new();
+    let s = look(&mut w, &kernel, &p, agent.at).await;
+    let waste = w.waste(FixedOffset::east_opt(0).expect("UTC"));
+    let all = waste.days.iter().fold((0, 0, 0), |(g, a, r), d| (g + d.all.tokens.generated, a + d.all.added, r + d.all.removed));
+    let wasted = waste.days.iter().fold((0, 0, 0), |(g, a, r), d| (g + d.wasted.tokens.generated, a + d.wasted.added, r + d.wasted.removed));
+    assert_eq!((all, wasted), ((200, 5, 1), (150, 3, 0)), "{:?}", waste.days);
+    assert_eq!(waste.days.iter().filter_map(|d| d.families.get("you")).map(|c| c.tokens.generated).sum::<u64>(), 150);
+    let read: u64 = waste.days.iter().map(|d| d.all.tokens.fresh + d.all.tokens.cache_read).sum();
+    assert_eq!(read, 4 * 3 + 5_000 + 6_000 + 7_000 + 7_100, "every message's context once");
+    let corrected = waste.cases.values().find(|c| c.family == "you").expect("the correction");
+    assert!(corrected.waste);
+    assert_eq!((corrected.cost.tokens.generated, corrected.cost.added), (150, 3));
+    // The drill shows each message's tokens on its first line, and each
+    // call's lines.
+    let lines = w.lines(&s.sessions[0].id, t0, agent.at).expect("the session");
+    let tokens: Vec<u64> = lines.lines.iter().filter_map(|l| l.tokens.map(|t| t.generated)).collect();
+    assert_eq!(tokens, [120, 30, 40, 10]);
+    let wrote: Vec<(u32, u32)> = lines.lines.iter().filter_map(|l| l.wrote).collect();
+    assert_eq!(wrote, [(3, 0), (2, 1)]);
+}

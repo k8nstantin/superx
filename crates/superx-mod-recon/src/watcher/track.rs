@@ -28,7 +28,7 @@ use chrono::{DateTime, DurationRound as _, TimeDelta, Utc};
 use serde::Serialize;
 
 use super::command;
-use super::line::{Came, Happened, Reading, ASK_TOOLS};
+use super::line::{Came, Happened, Reading, Tokens, ASK_TOOLS};
 use super::plan;
 use crate::params::Params;
 
@@ -344,6 +344,26 @@ pub enum Fed {
     TurnEnded,
 }
 
+/// One message of the model's, by its tokens: counted once, at its first
+/// line, under the model at work.
+#[derive(Debug, Clone)]
+pub struct Use {
+    pub at: DateTime<Utc>,
+    pub model: Option<String>,
+    pub tokens: Tokens,
+}
+
+/// The lines one call wrote to a file.
+#[derive(Debug, Clone)]
+pub struct Wrote {
+    pub at: DateTime<Utc>,
+    pub model: Option<String>,
+    pub call: String,
+    pub path: String,
+    pub added: u32,
+    pub removed: u32,
+}
+
 /// One session, as the watcher follows it.
 #[derive(Debug, Clone)]
 pub struct Track {
@@ -388,6 +408,11 @@ pub struct Track {
     pub unanswered: Option<Unanswered>,
     /// Claude Code gave up on the API in the turn ending now.
     api_ended: bool,
+    /// Its messages' tokens, oldest first, each message once.
+    pub used: Vec<Use>,
+    used_ids: HashMap<String, usize>,
+    /// The lines its calls wrote, oldest first.
+    pub wrote: Vec<Wrote>,
 }
 
 impl Track {
@@ -417,6 +442,9 @@ impl Track {
             turn_words: String::new(),
             unanswered: None,
             api_ended: false,
+            used: Vec::new(),
+            used_ids: HashMap::new(),
+            wrote: Vec::new(),
         }
     }
 
@@ -642,6 +670,24 @@ impl Track {
                     }
                     self.turn_over = true;
                 }
+                Happened::Used { message, tokens } => match self.used_ids.get(&message) {
+                    Some(&i) => self.used[i].tokens = self.used[i].tokens.most(tokens),
+                    None => {
+                        // In time order, though a line come late.
+                        let i = self.used.partition_point(|u| u.at <= at);
+                        for n in self.used_ids.values_mut().filter(|n| **n >= i) {
+                            *n += 1;
+                        }
+                        self.used_ids.insert(message, i);
+                        self.used.insert(i, Use { at, model: self.model.clone(), tokens });
+                    }
+                },
+                // A call's result read twice wrote once.
+                Happened::Wrote { call, path, added, removed } if !self.wrote.iter().any(|w| w.call == call) => {
+                    let i = self.wrote.partition_point(|w| w.at <= at);
+                    self.wrote.insert(i, Wrote { at, model: self.model.clone(), call, path, added, removed });
+                }
+                Happened::Wrote { .. } => {}
                 Happened::Compacted => {
                     self.step(at, StepKind::Compacted, String::new(), None, None);
                     fed.push(Fed::Compacted);

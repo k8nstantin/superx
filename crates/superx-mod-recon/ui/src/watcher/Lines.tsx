@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query'
 import { fetchLines, type LineRow } from '../api'
 import { CANCEL, FAIL, INK_MUTED, MONO, OK } from '../EChart'
 import { clock, day } from '../time'
-import { took } from './data'
+import { big, took } from './data'
 
 // A session's own lines over a span: how anything the watcher raised or
 // found is read back to its cause. The operator's words, the agent's words
@@ -49,6 +49,17 @@ function Line({ l, mark }: { l: LineRow; mark: boolean }) {
         {label}
       </Badge>
       <Stack gap={2} style={{ minWidth: 0, flex: 1 }}>
+        {(l.tokens || l.wrote) && (
+          <Text fz={10} ff={MONO} c="dimmed">
+            {l.tokens ? `${big(l.tokens.generated)} tokens generated · ${big(l.tokens.fresh + l.tokens.cache_written + l.tokens.cache_read)} read` : ''}
+            {l.tokens && l.wrote ? ' · ' : ''}
+            {l.wrote ? (
+              <Text span fz={10} ff={MONO} c={FAIL}>
+                +{l.wrote[0]} −{l.wrote[1]} lines
+              </Text>
+            ) : null}
+          </Text>
+        )}
         {l.kind === 'call' && (
           <Text fz="xs" fw={600}>
             {l.tool}

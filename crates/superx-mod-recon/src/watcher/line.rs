@@ -51,6 +51,43 @@ pub enum Came {
     Command,
 }
 
+/// The tokens one message of the model's used, as its usage says them:
+/// what it generated (its thinking, words and calls), and what it read:
+/// fresh, written to the cache, and read from the cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Tokens {
+    pub generated: u64,
+    pub fresh: u64,
+    pub cache_written: u64,
+    pub cache_read: u64,
+}
+
+impl Tokens {
+    /// Everything it read: its whole context.
+    #[must_use]
+    pub const fn read(&self) -> u64 {
+        self.fresh + self.cache_written + self.cache_read
+    }
+
+    /// Two counts summed.
+    #[must_use]
+    pub const fn plus(self, o: Self) -> Self {
+        Self { generated: self.generated + o.generated, fresh: self.fresh + o.fresh, cache_written: self.cache_written + o.cache_written, cache_read: self.cache_read + o.cache_read }
+    }
+
+    /// The larger of each count: a message's usage, said on each of its
+    /// lines, as its last says it.
+    #[must_use]
+    pub fn most(self, o: Self) -> Self {
+        Self {
+            generated: self.generated.max(o.generated),
+            fresh: self.fresh.max(o.fresh),
+            cache_written: self.cache_written.max(o.cache_written),
+            cache_read: self.cache_read.max(o.cache_read),
+        }
+    }
+}
+
 /// One thing a line says happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Happened {
@@ -90,6 +127,12 @@ pub enum Happened {
     TurnEnded,
     /// The context compacted: what the agent held is now a summary of it.
     Compacted,
+    /// The tokens a message of the model's used: every line of the message
+    /// says them again, so a message counts once, by its id.
+    Used { message: String, tokens: Tokens },
+    /// The lines a call wrote to a file, as Claude Code's patch of it says:
+    /// added and removed; a file made is every line of it added.
+    Wrote { call: String, path: String, added: u32, removed: u32 },
 }
 
 /// One line, as the watcher reads it.
@@ -123,7 +166,13 @@ fn user(line: &Json, r: &mut Reading) {
     let message = match at(line, &["message", "content"]) {
         Some(Json::String(s)) => s.clone(),
         Some(Json::Array(blocks)) => {
-            for b in blocks.iter().filter(|b| text(b, &["type"]) == Some("tool_result")) {
+            let results: Vec<&Json> = blocks.iter().filter(|b| text(b, &["type"]) == Some("tool_result")).collect();
+            if let ([b], Some(done)) = (results.as_slice(), at(line, &["toolUseResult"])) {
+                if let Some((path, added, removed)) = wrote(done) {
+                    r.happened.push(Happened::Wrote { call: text(b, &["tool_use_id"]).unwrap_or_default().to_string(), path, added, removed });
+                }
+            }
+            for b in results {
                 let whole = all_text(at(b, &["content"]));
                 let head: String = whole.chars().take(RESULT_HEAD_CHARS).collect();
                 r.happened.push(Happened::Result {
@@ -211,6 +260,18 @@ fn assistant(line: &Json, r: &mut Reading) {
         return;
     }
     r.model = text(line, &["message", "model"]).filter(|m| !m.starts_with('<')).map(str::to_string);
+    if let (Some(message), Some(usage)) = (text(line, &["message", "id"]), at(line, &["message", "usage"])) {
+        let n = |path: &[&str]| at(usage, path).and_then(Json::as_u64).unwrap_or(0);
+        r.happened.push(Happened::Used {
+            message: message.to_string(),
+            tokens: Tokens {
+                generated: n(&["output_tokens"]),
+                fresh: n(&["input_tokens"]),
+                cache_written: n(&["cache_creation_input_tokens"]),
+                cache_read: n(&["cache_read_input_tokens"]),
+            },
+        });
+    }
     let Some(Json::Array(blocks)) = at(line, &["message", "content"]) else { return };
     for b in blocks {
         match text(b, &["type"]) {
@@ -255,6 +316,24 @@ fn assistant(line: &Json, r: &mut Reading) {
     if text(line, &["message", "stop_reason"]) == Some("end_turn") && r.happened.iter().any(|h| matches!(h, Happened::Said { .. })) {
         r.happened.push(Happened::TurnEnded);
     }
+}
+
+/// The lines a call's result says it wrote: the file, and its patch's
+/// lines added and removed; a file made has every line of it added.
+fn wrote(done: &Json) -> Option<(String, u32, u32)> {
+    let path = text(done, &["filePath"])?.to_string();
+    let hunks = at(done, &["structuredPatch"]).and_then(Json::as_array);
+    let count = |sign: char| -> u32 {
+        let n = hunks.into_iter().flatten().filter_map(|h| h.get("lines").and_then(Json::as_array)).flatten().filter_map(Json::as_str).filter(|l| l.starts_with(sign)).count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    };
+    let (added, removed) = match text(done, &["type"]) {
+        Some("create") if hunks.is_none_or(Vec::is_empty) => {
+            (u32::try_from(text(done, &["content"]).unwrap_or_default().lines().count()).unwrap_or(u32::MAX), 0)
+        }
+        _ => (count('+'), count('-')),
+    };
+    (added + removed > 0).then_some((path, added, removed))
 }
 
 /// What a call was called on: the first its input holds of these keys,

@@ -6,6 +6,7 @@
 //! - `GET /api/watch`
 //! - `GET /api/watch/time?offset=<minutes east of UTC>`
 //! - `GET /api/watch/found`
+//! - `GET /api/watch/waste?offset=<minutes east of UTC>`
 //! - `GET /api/watch/lines?session=<id>&from=<time>&to=<time>`
 //! - `GET /api/watch/calls?session=&tool=&target=&under=&from=&to=`
 
@@ -29,6 +30,7 @@ where
         .route("/api/watch", get(watch))
         .route("/api/watch/time", get(time))
         .route("/api/watch/found", get(found))
+        .route("/api/watch/waste", get(waste))
         .route("/api/watch/lines", get(lines))
         .route("/api/watch/calls", get(calls))
 }
@@ -56,6 +58,16 @@ pub async fn time(State(watched): State<Watched>, Query(q): Query<Zone>) -> Resp
         return refused(format!("offset wants minutes east of UTC within a day, not {minutes}"));
     };
     Json(watched.with(|w| measure::time(w.tracks(), zone))).into_response()
+}
+
+/// What went to waste: each case's cost, and every day's, in the
+/// operator's days.
+pub async fn waste(State(watched): State<Watched>, Query(q): Query<Zone>) -> Response {
+    let minutes = q.offset.unwrap_or(0);
+    let Some(zone) = minutes.checked_mul(60).and_then(FixedOffset::east_opt) else {
+        return refused(format!("offset wants minutes east of UTC within a day, not {minutes}"));
+    };
+    Json(watched.with(|w| w.waste(zone))).into_response()
 }
 
 /// Everything the watcher dug out, newest first.

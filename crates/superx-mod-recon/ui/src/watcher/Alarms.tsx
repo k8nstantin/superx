@@ -1,10 +1,10 @@
 import { Fragment, useState } from 'react'
 import { Badge, Button, Group, Paper, Stack, Table, Text } from '@mantine/core'
-import type { Alongside, Unanswered, Watch, WatchAlert, WatchTask } from '../api'
+import type { Alongside, Unanswered, Waste, Watch, WatchAlert, WatchTask } from '../api'
 import { EChart, FAIL, MONO, type Clicked } from '../EChart'
 import { category, grid, legend, stacked, tip, value } from '../results/charts'
 import { clock, day, since } from '../time'
-import { dayOf, KIND, short, took, WRONG, type Focus } from './data'
+import { big, costWords, dayOf, KIND, n, short, took, WRONG, type Focus } from './data'
 import { around, Lines } from './Lines'
 import { History } from './Tasks'
 
@@ -146,7 +146,7 @@ function perDay(alerts: WatchAlert[]) {
   }
 }
 
-export function Alarms({ w, focus, setFocus, core }: { w: Watch; focus: Focus; setFocus: (f: Focus) => void; core: string | null }) {
+export function Alarms({ w, waste, focus, setFocus, core }: { w: Watch; waste: Waste | undefined; focus: Focus; setFocus: (f: Focus) => void; core: string | null }) {
   const [opened, setOpened] = useState<string | null>(null)
   const raised = w.alerts.filter((a) => w.alarms.includes(a.kind))
   const alerts = raised.filter((a) => (!focus.session || a.session === focus.session) && (!focus.day || dayOf(a.at) === focus.day))
@@ -186,12 +186,13 @@ export function Alarms({ w, focus, setFocus, core }: { w: Watch; focus: Focus; s
                 <Table.Th>What</Table.Th>
                 <Table.Th>Session</Table.Th>
                 <Table.Th>At stake</Table.Th>
+                <Table.Th>Its work</Table.Th>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
               {alerts.length === 0 && (
                 <Table.Tr>
-                  <Table.Td colSpan={5}>
+                  <Table.Td colSpan={6}>
                     <Text c="dimmed" fz="sm">No alarm here.</Text>
                   </Table.Td>
                 </Table.Tr>
@@ -215,10 +216,23 @@ export function Alarms({ w, focus, setFocus, core }: { w: Watch; focus: Focus; s
                       </Text>
                     </Table.Td>
                     <Table.Td style={{ whiteSpace: 'nowrap' }}>{a.cost_secs != null ? took(a.cost_secs) : '—'}</Table.Td>
+                    <Table.Td style={{ whiteSpace: 'nowrap' }}>
+                      {waste?.cases[a.id] ? (
+                        <Stack gap={0}>
+                          <Text fz="xs" fw={700} c={waste.cases[a.id].waste ? FAIL : undefined}>
+                            {n(waste.cases[a.id].cost.added)} lines · {big(waste.cases[a.id].cost.tokens.generated)} tokens
+                          </Text>
+                          <Text fz={10} c="dimmed">{waste.cases[a.id].waste ? 'went to waste' : 'spent in its span'}</Text>
+                        </Stack>
+                      ) : (
+                        '—'
+                      )}
+                    </Table.Td>
                   </Table.Tr>
                   {opened === a.id && (
                     <Table.Tr>
-                      <Table.Td colSpan={5} bg="dark.7">
+                      <Table.Td colSpan={6} bg="dark.7">
+                        {waste?.cases[a.id] && <Text fz="xs" c={waste.cases[a.id].waste ? FAIL : 'dimmed'} mb={4}>{waste.cases[a.id].waste ? 'went to waste in its span' : 'spent in its span'}: {costWords(waste.cases[a.id].cost)}</Text>}
                         <Cause a={a} w={w} open={open} core={core} />
                       </Table.Td>
                     </Table.Tr>

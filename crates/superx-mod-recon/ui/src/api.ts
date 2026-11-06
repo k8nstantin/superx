@@ -746,7 +746,25 @@ export type LineRow = {
   failed: boolean | null
   status: string | null
   background: boolean | null
+  /// The tokens of the message whose first line this is.
+  tokens: Tokens | null
+  /// The lines a call wrote: added, removed.
+  wrote: [number, number] | null
 }
+
+/// The tokens a message used (src/watcher/line.rs): generated, and read
+/// fresh, written to the cache, read from it.
+export type Tokens = { generated: number; fresh: number; cache_written: number; cache_read: number }
+/// What a span cost: tokens, and the lines written (src/watcher/waste.rs).
+export type Cost = { tokens: Tokens; added: number; removed: number }
+export type CaseCost = { cost: Cost; family: string; waste: boolean }
+/// One day of one session under one model: all it cost, what of it went to
+/// waste, and that by family.
+export type WasteDay = { day: string; session: string; model: string | null; all: Cost; wasted: Cost; families: Record<string, Cost> }
+export type Waste = { cases: Record<string, CaseCost>; days: WasteDay[] }
+
+/// What went to waste, in the operator's own days.
+export const fetchWaste = () => fetch(`/api/watch/waste?offset=${-new Date().getTimezoneOffset()}`).then((r) => answer<Waste>(r))
 
 export type Lines = { lines: LineRow[]; earlier: boolean }
 

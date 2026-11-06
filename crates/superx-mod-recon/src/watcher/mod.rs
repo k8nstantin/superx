@@ -23,6 +23,7 @@ pub mod plan;
 pub mod routes;
 pub mod task;
 pub mod track;
+pub mod waste;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -162,6 +163,10 @@ pub struct LineRow {
     pub failed: Option<bool>,
     pub status: Option<String>,
     pub background: Option<bool>,
+    /// The tokens of the message whose first line this is.
+    pub tokens: Option<line::Tokens>,
+    /// The lines a call wrote: added and removed.
+    pub wrote: Option<(u32, u32)>,
 }
 
 /// A session's lines in a span: the newest [`LINES_PAGE`] of them, and
@@ -487,6 +492,12 @@ impl Watcher {
         self.finds.newest_first()
     }
 
+    /// What went to waste, its days in `zone`.
+    #[must_use]
+    pub fn waste(&self, zone: chrono::FixedOffset) -> waste::Waste {
+        waste::waste(self.tracks.values(), &self.alerts.list, &self.finds.newest_first(), &self.tasks.list, zone)
+    }
+
     /// A session's lines from `from` to `to`: the newest [`LINES_PAGE`],
     /// oldest first, each call with how it ended. `None` for a session not
     /// followed.
@@ -496,11 +507,22 @@ impl Watcher {
         let now = self.looked_at.unwrap_or_else(Utc::now);
         let span: Vec<&Step> = t.steps.iter().filter(|s| s.at >= from && s.at <= to).collect();
         let earlier = span.len() > LINES_PAGE;
+        // A message's tokens go on its first line shown; a call's lines on it.
+        let mut told: std::collections::HashSet<DateTime<Utc>> = std::collections::HashSet::new();
         let lines = span[span.len().saturating_sub(LINES_PAGE)..]
             .iter()
             .map(|s| {
                 let run = (s.kind == StepKind::Call).then(|| s.call.as_deref().and_then(|c| t.run_of(c))).flatten();
+                let tokens = if matches!(s.kind, StepKind::Thought | StepKind::Said | StepKind::Call) && told.insert(s.at) {
+                    let i = t.used.partition_point(|u| u.at < s.at);
+                    t.used.get(i).filter(|u| u.at == s.at).map(|u| u.tokens)
+                } else {
+                    None
+                };
+                let wrote = s.call.as_deref().and_then(|c| t.wrote.iter().find(|w| w.call == c)).map(|w| (w.added, w.removed));
                 LineRow {
+                    tokens,
+                    wrote,
                     step: (*s).clone(),
                     target: run.map(|r| r.target.clone()),
                     end: run.and_then(|r| r.end),
