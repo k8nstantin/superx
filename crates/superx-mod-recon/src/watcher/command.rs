@@ -241,7 +241,7 @@ pub fn changed(command: &str) -> Vec<String> {
         let named = || args.iter().filter(|a| !a.starts_with('-')).map(|a| (*a).to_string()).collect::<Vec<_>>();
         match program(head).as_str() {
             "git" => {
-                let Some(at) = args.iter().position(|a| !a.starts_with('-')) else { continue };
+                let Some(at) = subcommand(&args) else { continue };
                 let after: Vec<String> = args[at + 1..].iter().filter(|a| !a.starts_with('-')).map(|a| (*a).to_string()).collect();
                 match args[at] {
                     "add" | "rm" | "mv" | "restore" => out.extend(after),
@@ -324,6 +324,62 @@ pub fn new_branch(command: &str) -> Option<String> {
         let flag = args[at + 1..].iter().position(|w| matches!(*w, "-c" | "-b" | "-B" | "-C"))?;
         args.get(at + flag + 2).map(|b| b.trim_matches(['\'', '"']).to_string())
     })
+}
+
+/// The files a program written into a command writes: a path it opens to
+/// write, `open("x.xml", "w")`, `Path("x.xml").write_text(`, or by the name
+/// it holds it under, `p = "x.xml"` or `p = Path("x.xml")`, then `open(p,
+/// "w")`, `p.write_text(` or `Path(p).write_text(`. A program that only
+/// reads a file changes none (2026-11-05: a task file edited this way, then
+/// staged by its folder, was a change no other reading saw).
+#[must_use]
+pub fn program_writes(command: &str) -> Vec<String> {
+    // Every quoted text a name is given: `p = "kn-specs/tasks/x.xml"`.
+    let mut named: Vec<(String, String)> = Vec::new();
+    for (i, _) in command.match_indices('=') {
+        let name: String = command[..i].trim_end().chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>().chars().rev().collect();
+        let value = command[i + 1..].trim_start();
+        let value = value.strip_prefix("Path(").unwrap_or(value);
+        let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
+        let Some(end) = value[1..].find(quote) else { continue };
+        if !name.is_empty() && !command[..i].ends_with(['=', '!', '<', '>']) {
+            named.push((name, value[1..=end].to_string()));
+        }
+    }
+    let mut out = Vec::new();
+    for (i, _) in command.match_indices("open(") {
+        let call: String = command[i + 5..].chars().take_while(|c| *c != ')').collect();
+        let mut args = call.splitn(2, ',');
+        let (Some(first), Some(rest)) = (args.next(), args.next()) else { continue };
+        let mode = rest.trim_start().trim_start_matches("mode=");
+        if !(mode.starts_with("\"w") || mode.starts_with("'w") || mode.starts_with("\"a") || mode.starts_with("'a")) {
+            continue;
+        }
+        let first = first.trim();
+        match first.chars().next() {
+            Some('"' | '\'') => out.push(first.trim_matches(['"', '\'']).to_string()),
+            _ => out.extend(named.iter().filter(|(n, _)| n == first).map(|(_, v)| v.clone())),
+        }
+    }
+    for write in [".write_text(", ".write_bytes("] {
+        for (name, value) in &named {
+            if command.contains(&format!("{name}{write}")) || command.contains(&format!("Path({name}){write}")) {
+                out.push(value.clone());
+            }
+        }
+        for (i, _) in command.match_indices(&format!("){write}")) {
+            let head = &command[..i];
+            if let Some(open) = head.rfind("Path(") {
+                let path = head[open + 5..].trim();
+                if path.starts_with(['"', '\'']) {
+                    out.push(path.trim_matches(['"', '\'']).to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The git subcommand a simple command runs: `commit` for `git commit` and

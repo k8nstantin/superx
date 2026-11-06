@@ -22,7 +22,16 @@
 //! - **A task file merged unproven** ([`super::task`]): a merge of a branch
 //!   whose task file changed in its session with no spec gate passed since
 //!   (operator, 2026-11-05: "merge = done"; every redo of that day followed
-//!   one, and no merge a gate passed was undone).
+//!   one, and no merge a gate passed was undone). Raised already when the
+//!   agent asks for that merge, before it is made; one alert for each change.
+//! - **Its fix covers less than it found** ([`super::claims`]): the agent
+//!   counted N of a kind of thing broken, then planned or reported a fix of
+//!   fewer of the same kind (2026-11-06: 724 damaged routines, 723 fixed, one
+//!   left out on the agent's own call with a false reason).
+//! - **It admits** ([`super::claims`]): the agent's own sentence that it acted
+//!   without the operator or said what was not so, each one an alert, so
+//!   none is lost in a long message (operator, 2026-11-06: "the agent
+//!   constantly lies").
 //! - **No answer from the API** ([`super::track::Unanswered`]): a stretch
 //!   with no answer that ended the agent's turn on Claude Code giving up, or
 //!   that went `attr_recon_watch_api_wait_secs` with its request sent again;
@@ -48,6 +57,7 @@ use super::command::ITS_OWN;
 use super::line::FILE_TOOLS;
 use super::plan::{self, Repeat};
 use super::task::Task;
+use super::claims::plural;
 use super::track::{Run, Track, Unanswered};
 use crate::params::Params;
 
@@ -73,6 +83,8 @@ pub enum Kind {
     BuildStopped,
     UnprovenMerge,
     ApiStalled,
+    CountGap,
+    Admitted,
 }
 
 /// One alert.
@@ -285,11 +297,20 @@ impl Alerts {
 
     /// A merge of `task` at `at` whose task file changed at `changed` with no
     /// spec gate passed since; `key` names the merge.
-    pub fn unproven(&mut self, task: &Task, key: &str, what: String, changed: DateTime<Utc>, at: DateTime<Utc>) {
+    /// A merge, or the agent's ask for one, after a task file changed in
+    /// `session` with no spec gate passed since: one alert for each change,
+    /// said again at each merge.
+    pub fn unproven(&mut self, session: &str, name: &str, what: String, changed: DateTime<Utc>, at: DateTime<Utc>) {
+        let id = format!("{session}/unproven_merge/{}", changed.timestamp_millis());
+        if let Some(a) = self.list.iter_mut().find(|a| a.id == id) {
+            a.what = what;
+            a.at = a.at.max(at);
+            return;
+        }
         self.raise(Alert {
-            id: format!("{}/unproven_merge/{}/{key}", task.session, task.branch),
-            session: task.session.clone(),
-            name: task.name.clone(),
+            id,
+            session: session.to_string(),
+            name: name.to_string(),
             kind: Kind::UnprovenMerge,
             at,
             what,
@@ -448,6 +469,53 @@ impl Alerts {
         a.what = unanswered(&a.stretches, a.at, a.alongside.len());
     }
 
+    /// A fix the agent plans or reports for `covers` of `unit`, after it
+    /// found more of them broken: the count, when and in which words.
+    pub fn count_gap(&mut self, track: &Track, at: DateTime<Utc>, unit: &str, found: (u64, DateTime<Utc>, &str), covers: (u64, &str)) {
+        let ((n, found_at, found_words), (m, words)) = (found, covers);
+        self.raise(Alert {
+            id: format!("{}/count_gap/{unit}/{}/{m}", track.session, found_at.timestamp()),
+            session: track.session.clone(),
+            name: track.name.clone(),
+            kind: Kind::CountGap,
+            at,
+            what: format!("its fix covers {m} of the {n} {} it found: «{}», after «{}»", plural(unit), cut(words), cut(found_words)),
+            since: Some(found_at),
+            cost_secs: None,
+            evidence: vec![found_words.to_string(), words.to_string()],
+            call: None,
+            from: found_at,
+            launch: None,
+            repeats: Vec::new(),
+            cause: None,
+            stretches: Vec::new(),
+            alongside: Vec::new(),
+        });
+    }
+
+    /// The agent's own sentence that it acted without the operator or said
+    /// what was not so; its cause starts at the operator's message before.
+    pub fn admitted(&mut self, track: &Track, at: DateTime<Utc>, words: &str) {
+        self.raise(Alert {
+            id: format!("{}/admitted/{}", track.session, at.timestamp_millis()),
+            session: track.session.clone(),
+            name: track.name.clone(),
+            kind: Kind::Admitted,
+            at,
+            what: format!("it admits: «{}»", cut(words)),
+            since: None,
+            cost_secs: None,
+            evidence: vec![words.to_string()],
+            call: None,
+            from: track.last_prompt.filter(|p| *p <= at).unwrap_or(at),
+            launch: None,
+            repeats: Vec::new(),
+            cause: None,
+            stretches: Vec::new(),
+            alongside: Vec::new(),
+        });
+    }
+
     /// The requests of `tracks` still waiting on the API at `now`, each as it
     /// stands.
     pub fn api_waits<'a>(&mut self, tracks: impl Iterator<Item = &'a Track>, now: DateTime<Utc>, p: &Params) {
@@ -575,6 +643,18 @@ fn unanswered(stretches: &[Unanswered], at: DateTime<Utc>, others: usize) -> Str
         s.push_str(&format!(" {others} other {whom} had no answer in the same minutes: the connection or the API, not the agent."));
     }
     s
+}
+
+/// The agent's words as an alert quotes them: whole, or cut at a word.
+fn cut(words: &str) -> String {
+    const QUOTED_CHARS: usize = 220; // skill-allow: §9-const — length of a quote in an alert's sentence, not a policy tunable
+    let words = words.trim();
+    if words.chars().count() <= QUOTED_CHARS {
+        return words.to_string();
+    }
+    let head: String = words.chars().take(QUOTED_CHARS).collect();
+    let at = head.rfind(' ').unwrap_or(head.len());
+    format!("{}…", &head[..at])
 }
 
 pub fn duration(secs: i64) -> String {

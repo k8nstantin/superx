@@ -445,7 +445,7 @@ impl Track {
                     self.settle_thinking(&On::bare(WORDS));
                     self.stop = None;
                     self.heard(&text);
-                    self.step(at, StepKind::Said, text.clone(), None, None);
+                    self.step(at, StepKind::Said, super::line::kept(&text), None, None);
                     fed.push(Fed::Said(text));
                 }
                 Happened::Call { id, tool, what, about, path, target, part, background, content, stops } => {

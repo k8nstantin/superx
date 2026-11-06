@@ -57,7 +57,7 @@ pub enum Happened {
     Prompt { came: Came, text: String },
     /// The model thinking, in its words when the line keeps them.
     Thought { text: String },
-    /// The model's words to the operator.
+    /// The model's words to the operator, whole.
     Said { text: String },
     /// A call: what it was called on, the file it names, what it works on
     /// ([`target`]), whether it runs in the background, and the whole text
@@ -216,7 +216,9 @@ fn assistant(line: &Json, r: &mut Reading) {
         match text(b, &["type"]) {
             Some("thinking" | "redacted_thinking") => r.happened.push(Happened::Thought { text: kept(text(b, &["thinking"]).unwrap_or_default()) }),
             Some("text") if text(b, &["text"]).is_some_and(|t| !t.trim().is_empty()) => {
-                r.happened.push(Happened::Said { text: kept(text(b, &["text"]).unwrap_or_default()) });
+                // Whole: an admission or a count may sit deep in a long
+                // message; a line keeps the head of it.
+                r.happened.push(Happened::Said { text: text(b, &["text"]).unwrap_or_default().to_string() });
             }
             Some("tool_use") => {
                 let tool = text(b, &["name"]).unwrap_or_default().to_string();

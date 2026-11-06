@@ -12,6 +12,7 @@
 //! anywhere.
 
 pub mod alerts;
+pub mod claims;
 pub mod command;
 pub mod contract;
 pub mod follow;
@@ -227,6 +228,7 @@ pub struct Watcher {
     finds: Finds,
     tasks: Tasks,
     contracts: contract::Contracts,
+    claims: claims::Claims,
     looked_at: Option<DateTime<Utc>>,
     /// The parameters of the newest look, and whether it is paused.
     params: Option<Params>,
@@ -303,6 +305,7 @@ impl Watcher {
         self.finds.trim(window_from, &sessions);
         self.tasks.trim(window_from, &sessions);
         self.contracts.trim(&sessions);
+        self.claims.trim(&sessions);
         self.window_from = Some(window_from);
         self.looked_at = Some(now);
         self.params = Some(p.clone());
@@ -310,7 +313,8 @@ impl Watcher {
     }
 
     fn judge(&mut self, session: &str, at: DateTime<Utc>, fed: Fed, p: &Params) {
-        let (tracks, alerts, finds, tasks, contracts) = (&self.tracks, &mut self.alerts, &mut self.finds, &mut self.tasks, &mut self.contracts);
+        let (tracks, alerts, finds, tasks, contracts, claims) =
+            (&self.tracks, &mut self.alerts, &mut self.finds, &mut self.tasks, &mut self.contracts, &mut self.claims);
         let Some(track) = tracks.get(session) else { return };
         match fed {
             Fed::Started(i) => {
@@ -352,7 +356,10 @@ impl Watcher {
                 tasks.prompt(track, &text, p);
                 contracts.prompt(track, at, &text, previous.is_none(), p);
             }
-            Fed::Said(text) => tasks.said(track, at, &text, p),
+            Fed::Said(text) => {
+                tasks.said(track, at, &text, alerts, p);
+                claims.said(track, at, &text, alerts, p);
+            }
             Fed::Compacted => finds.compacted(track, at),
             Fed::Unanswered(u) | Fed::Answered(u) => alerts.api(track, &u, at, p),
             Fed::Running(i) => contracts.running(track, &track.runs[i], alerts),

@@ -55,6 +55,8 @@ export const KIND: Record<AlertKind, [string, string]> = {
   build_stopped: ['A build stopped short', FAIL],
   unproven_merge: ['A task file merged unproven', FAIL],
   api_stalled: ['No answer from the API', FAIL],
+  count_gap: ['Its fix covers less than it found', FAIL],
+  admitted: ['It admits', FAIL],
 }
 
 /// What each finding is, in the words the page uses, and what it shows

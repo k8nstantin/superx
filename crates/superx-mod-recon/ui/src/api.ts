@@ -538,6 +538,8 @@ export type AlertKind =
   | 'build_stopped'
   | 'unproven_merge'
   | 'api_stalled'
+  | 'count_gap'
+  | 'admitted'
 
 /// A stretch the API did not answer a session (src/watcher/track.rs): from
 /// its first request with no answer to the answer, if one came.

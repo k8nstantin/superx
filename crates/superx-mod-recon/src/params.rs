@@ -250,6 +250,93 @@ const DEFAULT_WATCH_NOT_DONE_WORDS: &[&str] = &[
 pub const WATCH_SPEC_PASSED_PARAM: &str = "attr_recon_watch_spec_passed";
 const DEFAULT_WATCH_SPEC_PASSED: &[&str] = &["GATE: PASSED"];
 
+/// The agent's own words that it acted without the operator or said what
+/// was not so (#573): whole words, `…` any words between, `!` a phrase that
+/// makes a sentence no admission. Measured on all history to 2026-11-06.
+pub const WATCH_ADMIT_WORDS_PARAM: &str = "attr_recon_watch_admit_words";
+const DEFAULT_WATCH_ADMIT_WORDS: &[&str] = &[
+    "without your approval",
+    "without your answer",
+    "without your ok",
+    "i changed … without asking",
+    "i added … without asking",
+    "i merged … without asking",
+    "i made … without asking",
+    "i moved … without asking",
+    "i did … without asking",
+    "i changed … on my own",
+    "i made … on my own",
+    "i did … on my own",
+    "i added … on my own",
+    "what i did on my own",
+    "what i added on my own",
+    "i made that call",
+    "i decided … on my own",
+    "i took it upon myself",
+    "the reason i gave was false",
+    "what i said was false",
+    "what i told you was false",
+    "i lied",
+    "wasn't true",
+    "was not true",
+    "i should have",
+    "i shouldn't have",
+    "i should not have",
+    "that's on me",
+    "that is on me",
+    "my mistake",
+    "my fault",
+    "i got it wrong",
+    "i got that wrong",
+    "i got two things wrong",
+    "i was wrong",
+    "that was wrong",
+    "i never committed",
+    "i misread",
+    "was my addition",
+    "!won't",
+    "!will not",
+    "!can't",
+    "!cannot",
+    "!rather than",
+    "!instead of",
+    "!waiting on my own",
+    "!if i",
+    "!unless i",
+];
+
+/// Words that make a count one the agent found broken: `724 damaged
+/// routines` (#573).
+pub const WATCH_FOUND_WORDS_PARAM: &str = "attr_recon_watch_found_words";
+const DEFAULT_WATCH_FOUND_WORDS: &[&str] = &["damaged", "broken", "unreadable", "failing", "corrupt", "corrupted", "affected", "bad", "wrong"];
+
+/// Words that make a count one the agent's fix covers: `723 routines …
+/// takes their own row's body` (#573).
+pub const WATCH_COVER_WORDS_PARAM: &str = "attr_recon_watch_cover_words";
+const DEFAULT_WATCH_COVER_WORDS: &[&str] = &[
+    "change", "changes", "fix", "fixes", "repair", "repairs", "restore", "restores", "update", "updates", "takes", "cover", "covers", "rewrite",
+    "rewrites",
+];
+
+/// Words that make a sentence a report of work finished, held against no
+/// count: `down from 189` (#573).
+pub const WATCH_DONE_WORDS_PARAM: &str = "attr_recon_watch_done_words";
+const DEFAULT_WATCH_DONE_WORDS: &[&str] = &["fixed", "repaired", "restored", "corrected", "already", "down from", "no longer"];
+
+/// The kinds of thing a count is of, in the singular (#573).
+pub const WATCH_UNITS_PARAM: &str = "attr_recon_watch_units";
+const DEFAULT_WATCH_UNITS: &[&str] = &[
+    "routine", "procedure", "function", "trigger", "definition", "row", "table", "object", "node", "file", "archive", "view", "event", "test",
+    "job", "batch", "record", "column", "body",
+];
+
+/// Words of the agent's that ask the operator to merge (#573): with its
+/// task file changed and no spec gate passed since, the merge it asks for is
+/// unproven before it is made.
+pub const WATCH_HANDOFF_WORDS_PARAM: &str = "attr_recon_watch_handoff_words";
+const DEFAULT_WATCH_HANDOFF_WORDS: &[&str] =
+    &["pull-requests/new?source=", "/pull/new/", "ready for your merge", "ready to merge", "open the pr", "merge it", "please merge"];
+
 /// The parameters in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -292,6 +379,12 @@ pub struct Params {
     pub watch_not_done_words: Vec<String>,
     pub watch_spec_passed: Vec<String>,
     pub watch_api_wait_secs: u64,
+    pub watch_admit_words: Vec<String>,
+    pub watch_found_words: Vec<String>,
+    pub watch_cover_words: Vec<String>,
+    pub watch_done_words: Vec<String>,
+    pub watch_units: Vec<String>,
+    pub watch_handoff_words: Vec<String>,
 }
 
 impl Params {
@@ -345,7 +438,7 @@ pub struct Resolved {
 }
 
 /// Every parameter's name, in the order `status` lists them.
-pub const NAMES: [&str; 39] = [
+pub const NAMES: [&str; 45] = [
     PORT_PARAM,
     READ_SECS_PARAM,
     INCLUDE_PARAM,
@@ -385,6 +478,12 @@ pub const NAMES: [&str; 39] = [
     WATCH_NOT_DONE_WORDS_PARAM,
     WATCH_SPEC_PASSED_PARAM,
     WATCH_API_WAIT_SECS_PARAM,
+    WATCH_ADMIT_WORDS_PARAM,
+    WATCH_FOUND_WORDS_PARAM,
+    WATCH_COVER_WORDS_PARAM,
+    WATCH_DONE_WORDS_PARAM,
+    WATCH_UNITS_PARAM,
+    WATCH_HANDOFF_WORDS_PARAM,
 ];
 
 /// What a parameter is for, as the tab shows it (#539): when the crawler
@@ -441,6 +540,12 @@ pub fn about(name: &str) -> Option<About> {
         WATCH_NOT_DONE_WORDS_PARAM => ("watches", "list", "Words of the agent's saying work is not done: after it reads a task's merge, before your next message, they reopen the task."),
         WATCH_SPEC_PASSED_PARAM => ("watches", "list", "The line a spec's gate prints when it passes: a task file merged with no such line after its last change was merged unproven."),
         WATCH_API_WAIT_SECS_PARAM => ("watches", "number", "A request the API leaves without an answer this many seconds is an alert: the agent waits on the API, not on its work."),
+        WATCH_ADMIT_WORDS_PARAM => ("watches", "list", "The agent's words that it acted without you or said what was not so: each one an alert. `…` is any words between; `!` makes a sentence no admission."),
+        WATCH_FOUND_WORDS_PARAM => ("watches", "list", "Words that make a count one the agent found broken: \"724 damaged routines\"."),
+        WATCH_COVER_WORDS_PARAM => ("watches", "list", "Words that make a count one the agent's fix covers: fewer than it found is an alert."),
+        WATCH_DONE_WORDS_PARAM => ("watches", "list", "Words that make a sentence a report of finished work, held against no count."),
+        WATCH_UNITS_PARAM => ("watches", "list", "The kinds of thing a count is of, in the singular: routine, table, row, node, file…"),
+        WATCH_HANDOFF_WORDS_PARAM => ("watches", "list", "The agent's words that ask you to merge: with its task file changed and no spec gate passed since, an alert before you merge."),
         _ => return None,
     };
     Some(About { group, decides, input })
@@ -517,6 +622,12 @@ pub fn from_values(values: &BTreeMap<&'static str, Value>) -> Resolved {
         watch_not_done_words: r.strings(WATCH_NOT_DONE_WORDS_PARAM, DEFAULT_WATCH_NOT_DONE_WORDS),
         watch_spec_passed: r.strings(WATCH_SPEC_PASSED_PARAM, DEFAULT_WATCH_SPEC_PASSED),
         watch_api_wait_secs: r.count(WATCH_API_WAIT_SECS_PARAM, 1, DEFAULT_WATCH_API_WAIT_SECS),
+        watch_admit_words: r.strings(WATCH_ADMIT_WORDS_PARAM, DEFAULT_WATCH_ADMIT_WORDS),
+        watch_found_words: r.strings(WATCH_FOUND_WORDS_PARAM, DEFAULT_WATCH_FOUND_WORDS),
+        watch_cover_words: r.strings(WATCH_COVER_WORDS_PARAM, DEFAULT_WATCH_COVER_WORDS),
+        watch_done_words: r.strings(WATCH_DONE_WORDS_PARAM, DEFAULT_WATCH_DONE_WORDS),
+        watch_units: r.strings(WATCH_UNITS_PARAM, DEFAULT_WATCH_UNITS),
+        watch_handoff_words: r.strings(WATCH_HANDOFF_WORDS_PARAM, DEFAULT_WATCH_HANDOFF_WORDS),
     };
     Resolved { params, settings: r.settings, problems: r.problems }
 }
@@ -684,7 +795,7 @@ mod tests {
 
     /// The parameters before the rename, as `superx-performance` named them,
     /// in their order, with the fallback each ran on.
-    const TODAY: [(&str, &str); 39] = [
+    const TODAY: [(&str, &str); 45] = [
         ("port", "5153"),
         ("read_secs", "15"),
         ("include", "none"),
@@ -741,6 +852,29 @@ mod tests {
         ),
         ("watch_spec_passed", "GATE: PASSED"),
         ("watch_api_wait_secs", "300"),
+        (
+            "watch_admit_words",
+            "without your approval, without your answer, without your ok, i changed … without asking, i added … without asking, \
+             i merged … without asking, i made … without asking, i moved … without asking, i did … without asking, \
+             i changed … on my own, i made … on my own, i did … on my own, i added … on my own, what i did on my own, \
+             what i added on my own, i made that call, i decided … on my own, i took it upon myself, the reason i gave was false, \
+             what i said was false, what i told you was false, i lied, wasn't true, was not true, i should have, i shouldn't have, \
+             i should not have, that's on me, that is on me, my mistake, my fault, i got it wrong, i got that wrong, \
+             i got two things wrong, i was wrong, that was wrong, i never committed, i misread, was my addition, !won't, !will not, !can't, !cannot, \
+             !rather than, !instead of, !waiting on my own, !if i, !unless i",
+        ),
+        ("watch_found_words", "damaged, broken, unreadable, failing, corrupt, corrupted, affected, bad, wrong"),
+        (
+            "watch_cover_words",
+            "change, changes, fix, fixes, repair, repairs, restore, restores, update, updates, takes, cover, covers, rewrite, rewrites",
+        ),
+        ("watch_done_words", "fixed, repaired, restored, corrected, already, down from, no longer"),
+        (
+            "watch_units",
+            "routine, procedure, function, trigger, definition, row, table, object, node, file, archive, view, event, test, job, batch, \
+             record, column, body",
+        ),
+        ("watch_handoff_words", "pull-requests/new?source=, /pull/new/, ready for your merge, ready to merge, open the pr, merge it, please merge"),
     ];
 
     #[test]
