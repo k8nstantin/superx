@@ -8,16 +8,12 @@ import { Repos } from './panels/Repos'
 import { Stats } from './panels/Stats'
 import { Params } from './panels/Params'
 import { RESULT_VIEWS, Results } from './results/Results'
-import { WATCH_VIEWS, Watcher } from './watcher/Watcher'
 
-// The tab, in three: the Crawler (what it does, has and runs on), the
-// Results (what it gathers them for, a view per question under results/)
-// and the Watcher (#573: the sessions and their jobs as they work, the
-// critical alerts and their causes, what it found, where the agents' time
-// goes). The open one is kept in the address: #crawler, #results/<view> or
-// #watcher/<view>. Above it, the header's trail (#562): SuperX, the module,
-// the tab and the view.
-const VIEWS = ['crawler', 'results', 'watcher']
+// The tab, in two: the Crawler (what it does, has and runs on) and the
+// Results (what it gathers them for, a view per question under results/).
+// The open one is kept in the address: #crawler, or #results/<view>. Above
+// it, the header's trail (#562): SuperX, the module, the tab and the view.
+const VIEWS = ['crawler', 'results']
 
 function opened(): [string, string] {
   const [view, sub] = window.location.hash.slice(1).split('/')
@@ -35,9 +31,6 @@ function trail(core: string | null | undefined, view: string, sub: string): Crum
   if (view === 'results') {
     const [, label] = RESULT_VIEWS.find(([k]) => k === sub) ?? RESULT_VIEWS[0]
     crumbs.push({ label: 'Results', href: '#results' }, { label })
-  } else if (view === 'watcher') {
-    const [, label] = WATCH_VIEWS.find(([k]) => k === sub) ?? WATCH_VIEWS[0]
-    crumbs.push({ label: 'Watcher', href: '#watcher' }, { label })
   } else {
     crumbs.push({ label: 'Crawler' })
   }
@@ -73,18 +66,17 @@ export default function App() {
             <Stack gap={2}>
               <Title order={2}>Recon</Title>
               <Text c="dimmed" size="sm">
-                The crawler, and what it gathers: the models, the agents and the repositories they worked in, measured over time. The watcher, as they work.
+                The crawler, and what it gathers: the models, the agents and the repositories they worked in, measured over time.
               </Text>
             </Stack>
             <Tabs
               value={view}
-              onChange={(v) => v && go(v, v === view ? sub : '')}
+              onChange={(v) => v && go(v, v === 'results' ? sub : '')}
               keepMounted={false}
             >
               <Tabs.List>
                 <Tabs.Tab value="crawler">Crawler</Tabs.Tab>
                 <Tabs.Tab value="results">Results</Tabs.Tab>
-                <Tabs.Tab value="watcher">Watcher</Tabs.Tab>
               </Tabs.List>
               <Tabs.Panel value="crawler" pt="lg">
                 <Stack gap="xl">
@@ -96,9 +88,6 @@ export default function App() {
               </Tabs.Panel>
               <Tabs.Panel value="results" pt="lg">
                 <Results sub={sub} go={(s) => go('results', s)} />
-              </Tabs.Panel>
-              <Tabs.Panel value="watcher" pt="lg">
-                <Watcher sub={sub} go={(s) => go('watcher', s)} />
               </Tabs.Panel>
             </Tabs>
           </Stack>

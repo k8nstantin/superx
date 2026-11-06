@@ -38,7 +38,7 @@ fn reporting(kernel: &superx_kernel::Kernel, progress: Progress) -> axum::Router
         data_dir: home.join("db"),
         log_filter: "info".to_string(),
     };
-    server::app(kernel.clone(), instance, PORT, progress, superx_mod_recon::watcher::Watched::default())
+    server::app(kernel.clone(), instance, PORT, progress)
 }
 
 /// One request to the module's routes, addressed to it by `host`: the status
