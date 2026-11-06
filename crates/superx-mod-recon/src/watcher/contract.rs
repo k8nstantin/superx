@@ -61,6 +61,29 @@ const STOP_WORDS_CHARS: usize = 600; // skill-allow: §9-const — the evidence'
 /// The programs that write a bucket, by the word after them.
 const BUCKET_WRITES: [&str; 4] = ["cp", "mv", "rm", "rsync"];
 
+/// The executions of `job` a text names, each once: the job's name, a dash
+/// and the id gcloud gave the execution, `kn-s8-rvxmh` of `kn-s8`; never a
+/// longer name the job's starts, `kn-s8-run` of `kn`.
+fn executions(text: &str, job: &str) -> Vec<String> {
+    let mark = format!("{job}-");
+    let mut out: Vec<String> = Vec::new();
+    for (i, _) in text.match_indices(&mark) {
+        if text[..i].chars().next_back().is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            continue;
+        }
+        let rest = &text[i + mark.len()..];
+        let id: String = rest.chars().take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).collect();
+        if id.is_empty() || rest[id.len()..].starts_with('-') {
+            continue;
+        }
+        let execution = format!("{mark}{id}");
+        if !out.contains(&execution) {
+            out.push(execution);
+        }
+    }
+    out
+}
+
 /// One door gate's command: the gate it is of, the work it launches, and
 /// whether the gate expects its run to end well.
 #[derive(Debug, Clone)]
@@ -80,6 +103,9 @@ struct Slot {
     /// background: its end is then read where the agent reads it.
     job: Option<String>,
     background: bool,
+    /// The execution its launch started (`kn-s8-rvxmh`), once a result
+    /// named it: no other gate's end is read from it.
+    execution: Option<String>,
 }
 
 /// One local gate: its command's words, the last line it expects, and its
@@ -267,8 +293,9 @@ impl Contracts {
                 let contract = Contract::of(&whole, file, root.clone(), *at, p);
                 self.by_session.insert(t.session.clone(), contract);
                 self.ordered.remove(&t.session);
+                return;
             }
-            return;
+            // Any other file read may be a background gate's output.
         }
         let Some(c) = self.by_session.get_mut(&t.session) else { return };
         c.answered(t, run, alerts);
@@ -283,17 +310,27 @@ impl Contracts {
             l.passed = Some(!failed && l.last_line.as_deref().is_none_or(|want| text.lines().any(|line| line.trim() == want)));
         }
         // A door gate run in the background ends where the agent reads its
-        // execution's end, in any result that names the execution
-        // (`<job>-<id>`): ended well, or failed.
+        // execution's end: a result, not another gate's own, that names one
+        // execution of its job (`<job>-<id>`) no other gate started, and
+        // says it ended well or failed (2026-10-13, ENG-8071: a gate that
+        // expects to fail was read as the end of the one before it).
         let (succeeded, failed) = (text.contains(EXECUTION_SUCCEEDED), text.contains(EXECUTION_FAILED));
-        if EXECUTED.iter().any(|e| text.contains(e)) && succeeded != failed {
+        let own = c.slots.iter().any(|s| s.taken.as_deref() == Some(run.call.as_str()));
+        if !own && EXECUTED.iter().any(|e| text.contains(e)) && succeeded != failed {
             let at = run.end.unwrap_or(run.start);
-            for slot in c.slots.iter_mut().filter(|s| s.background && s.taken.is_some() && s.ended_well.is_none()) {
-                if slot.job.as_deref().is_some_and(|job| text.contains(&format!("{job}-"))) {
-                    slot.ended_well = Some(succeeded);
-                    if slot.ends_well && failed {
-                        c.failed = Some((slot.gate.clone(), at));
-                    }
+            let started: HashSet<String> = c.slots.iter().filter_map(|s| s.execution.clone()).collect();
+            if let Some((i, execution)) = c.slots.iter().enumerate().filter(|(_, s)| s.background && s.taken.is_some() && s.ended_well.is_none()).find_map(|(i, s)| {
+                let named: Vec<String> = executions(text, s.job.as_deref()?).into_iter().filter(|e| !started.contains(e)).collect();
+                match named.as_slice() {
+                    [one] => Some((i, one.clone())),
+                    _ => None,
+                }
+            }) {
+                let slot = &mut c.slots[i];
+                slot.execution = Some(execution);
+                slot.ended_well = Some(succeeded);
+                if slot.ends_well && failed {
+                    c.failed = Some((slot.gate.clone(), at));
                 }
             }
         }
@@ -303,6 +340,7 @@ impl Contracts {
             slot.ran = None;
             return;
         }
+        slot.execution = slot.job.as_deref().and_then(|job| executions(text, job).into_iter().next());
         slot.ended_well = Some(!(text.contains(EXECUTION_FAILED) || run.failed));
         if slot.ends_well && slot.ended_well == Some(false) {
             c.failed = Some((slot.gate.clone(), run.end.unwrap_or(run.start)));
@@ -466,7 +504,7 @@ impl Contract {
             let ends_well = expect.contains("exit 0") && !expect.contains("exit 1");
             let launches: Vec<String> = elements(body, "cmd").into_iter().filter_map(|(_, cmd)| plan::launch(&plan::placeholders_whole(&plan::unescape(cmd)), &p.watch_jobs)).collect();
             if launches.is_empty() {
-                slots.push(Slot { gate: gate.clone(), work: None, ends_well, taken: None, ran: None, ended_well: None, job: None, background: false });
+                slots.push(Slot { gate: gate.clone(), work: None, ends_well, taken: None, ran: None, ended_well: None, job: None, background: false, execution: None });
             }
             for l in launches {
                 slots.push(Slot {
@@ -478,6 +516,7 @@ impl Contract {
                     ended_well: None,
                     job: None,
                     background: false,
+                    execution: None,
                 });
             }
         }

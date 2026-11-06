@@ -1128,6 +1128,37 @@ async fn a_build_that_breaks_its_task_file_is_one_alert_per_break_and_one_that_k
     let build = s.builds.first().expect("the build");
     assert_eq!(build.gates.first().map(|g| (g.gate.as_str(), g.ended_well)), Some(("Writing relationships", Some(false))));
     assert!(build.commits.is_empty(), "{:?}", build.commits);
+
+    // A gate that expects to fail is no end of the background one before it
+    // (2026-10-13, ENG-8071: G4, an archive that is not there, failed as it
+    // should while G3's end was not read yet); the end the agent reads with
+    // the Read tool is that gate's.
+    let absent = TASK_FILE.replace(
+        "</gates>",
+        r#"<gate id="An archive not there" kind="door" proves="a missing archive is a finding"><cmd>gcloud run jobs execute &lt;door.stage_jobs.8.run&gt; --project &lt;project.gcp_project&gt; --args stage,run,8,absent --wait</cmd><expect>one finding, and ends with `exit 1`.</expect></gate></gates>"#,
+    );
+    for read in [false, true] {
+        let (kernel, dir, mut agent, _t0) = setup(if read { "build-expects-failure-read" } else { "build-expects-failure" }).await;
+        let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+        agent.typed("Build kn-specs/tasks/ENG-9999.xml", 0).await;
+        agent.call("r", "Read", json!({"file_path": at("kn-specs/tasks/ENG-9999.xml")}), 2).await;
+        agent.result("r", false, &numbered(&absent), 1).await;
+        agent.job("w1", &door("stage,run,8,n1"), 30).await;
+        agent.notified("w1", "completed", 240).await;
+        if read {
+            agent.call("o", "Read", json!({"file_path": "/tmp/w1.output"}), 5).await;
+            agent.result("o", false, &numbered("Creating execution...done\nExecution [kn-s8-wr8xc] has successfully completed."), 1).await;
+        }
+        agent.call("a", "Bash", json!({"command": door("stage,run,8,absent")}), 30).await;
+        agent.result("a", true, "Creating execution...done\nExecution [kn-s8-4cx57] failed\nERROR: (gcloud.run.jobs.execute) The execution failed.", 180).await;
+        agent.call("v", "Bash", json!({"command": door("stage,verify,8,n1")}), 30).await;
+        agent.result("v", false, "Creating execution...done\nExecution [kn-s8-q2w3e] has successfully completed.", 120).await;
+        let mut w = Watcher::new();
+        let s = look(&mut w, &kernel, &p, agent.at).await;
+        assert!(of(&s, Kind::TaskFileBroken).is_empty(), "read {read}: {:?}", s.alerts);
+        let gates: Vec<(&str, Option<bool>)> = s.builds[0].gates.iter().map(|g| (g.gate.as_str(), g.ended_well)).collect();
+        assert_eq!(gates, [("Writing relationships", read.then_some(true)), ("Verifying relationships", Some(true)), ("An archive not there", Some(false))], "read {read}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
