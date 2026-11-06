@@ -1,10 +1,10 @@
 import { Fragment, useState } from 'react'
 import { Badge, Button, Group, Paper, SimpleGrid, Stack, Table, Text, UnstyledButton } from '@mantine/core'
-import type { Found as FoundRow, Hidden } from '../api'
-import { CANCEL, EChart, INK, MONO, PELICAN, type Clicked } from '../EChart'
+import type { Found as FoundRow, Hidden, Waste } from '../api'
+import { CANCEL, EChart, FAIL, INK, MONO, PELICAN, type Clicked } from '../EChart'
 import { category, grid, tip, value } from '../results/charts'
 import { day } from '../time'
-import { costOf, dayOf, HIDDEN, HIDDEN_ORDER, n, short, took, type Focus } from './data'
+import { addCost, big, costOf, dayOf, HIDDEN, HIDDEN_ORDER, n, short, took, zeroCost, type Focus } from './data'
 import { around, Lines } from './Lines'
 
 // What the watcher dug out: what cost the agents' time, or yours, and showed
@@ -14,8 +14,10 @@ import { around, Lines } from './Lines'
 
 const PAGE = 100
 
-function Card({ kind, rows, picked, pick }: { kind: Hidden; rows: FoundRow[]; picked: boolean; pick: () => void }) {
+function Card({ kind, rows, picked, pick, waste }: { kind: Hidden; rows: FoundRow[]; picked: boolean; pick: () => void; waste: Waste | undefined }) {
   const [name, about] = HIDDEN[kind]
+  // The work its cases' spans threw away, when its spans are waste.
+  const lost = rows.reduce((c, f) => (waste?.cases[f.id]?.waste ? addCost(c, waste.cases[f.id].cost) : c), zeroCost())
   const secs = rows.reduce((t, f) => t + (f.secs ?? 0), 0)
   const chars = rows.reduce((t, f) => t + (f.chars ?? 0), 0)
   const sessions = new Set(rows.map((f) => f.session)).size
@@ -32,13 +34,18 @@ function Card({ kind, rows, picked, pick }: { kind: Hidden; rows: FoundRow[]; pi
             {sessions} sessions{secs ? ` · ${took(secs)}` : ''}
             {chars ? ` · ${n(chars)} chars` : ''}
           </Text>
+          {lost.added + lost.tokens.generated > 0 && (
+            <Text fz="xs" fw={700} c={FAIL}>
+              went to waste: {n(lost.added)} lines · {big(lost.tokens.generated)} tokens
+            </Text>
+          )}
         </Stack>
       </Paper>
     </UnstyledButton>
   )
 }
 
-export function Found({ found, focus, setFocus, core }: { found: FoundRow[]; focus: Focus; setFocus: (f: Focus) => void; core: string | null }) {
+export function Found({ found, waste, focus, setFocus, core }: { found: FoundRow[]; waste: Waste | undefined; focus: Focus; setFocus: (f: Focus) => void; core: string | null }) {
   const [kind, setKind] = useState<Hidden | null>(null)
   const [opened, setOpened] = useState<string | null>(null)
   const [shown, setShown] = useState(PAGE)
@@ -65,7 +72,7 @@ export function Found({ found, focus, setFocus, core }: { found: FoundRow[]; foc
     <Stack gap="md">
       <SimpleGrid cols={{ base: 1, sm: 2, lg: 4, xl: 6 }} spacing="sm">
         {HIDDEN_ORDER.map((k) => (
-          <Card key={k} kind={k} rows={ofKind(k)} picked={kind === k} pick={() => { setKind(kind === k ? null : k); setShown(PAGE) }} />
+          <Card key={k} kind={k} rows={ofKind(k)} waste={waste} picked={kind === k} pick={() => { setKind(kind === k ? null : k); setShown(PAGE) }} />
         ))}
       </SimpleGrid>
       <Paper withBorder radius="md" p="sm">

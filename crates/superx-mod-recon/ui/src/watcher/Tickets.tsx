@@ -1,9 +1,9 @@
 import { Fragment, useMemo, useState } from 'react'
 import { Badge, Group, Paper, SegmentedControl, Stack, Table, Text } from '@mantine/core'
-import type { BuildRow, HourRow, Watch, WatchTask } from '../api'
+import type { BuildRow, Cost, HourRow, Waste, Watch, WatchTask } from '../api'
 import { CANCEL, EChart, FAIL, GRID_LINE, INK, INK_MUTED, MONO, OK, TOOLTIP, type Clicked } from '../EChart'
 import { day } from '../time'
-import { atWork, took } from './data'
+import { addCost, atWork, big, costWords, n, took, zeroCost } from './data'
 import { around, Lines } from './Lines'
 import { merged } from './Tasks'
 
@@ -204,17 +204,47 @@ function Story({ ticket, w, names, core }: { ticket: Ticket; w: Watch; names: Ma
 
 type Shown = 'round' | 'merged' | 'all'
 
-export function Tickets({ w, hours, core }: { w: Watch; hours: HourRow[]; core: string | null }) {
+/// What a ticket threw away: the lines and tokens of its tasks that never
+/// end (from your order to the newest reopening), its builds stopped short
+/// and its builds that broke their file.
+function wasted(t: Ticket, w: Watch, waste: Waste | undefined): Cost {
+  if (!waste) return zeroCost()
+  const builds = new Set(t.builds.map((b) => b.session))
+  return w.alerts
+    .filter(
+      (a) =>
+        (a.kind === 'endless_task' && t.tasks.some((x) => a.id.startsWith(`${x.session}/endless_task/${x.branch}/`))) ||
+        ((a.kind === 'build_stopped' || a.kind === 'task_file_broken') && builds.has(a.session)),
+    )
+    .reduce((c, a) => addCost(c, waste.cases[a.id]?.cost), zeroCost())
+}
+
+export function Tickets({ w, hours, waste, core }: { w: Watch; hours: HourRow[]; waste: Waste | undefined; core: string | null }) {
   const [shown, setShown] = useState<Shown>('round')
   const [opened, setOpened] = useState<string | null>(null)
   const names = useMemo(() => new Map(w.sessions.map((s) => [s.id, s.name])), [w])
-  const all = useMemo(() => group(w).map((t) => ({ t, m: measure(t, hours) })), [w, hours])
+  const all = useMemo(() => group(w).map((t) => ({ t, m: measure(t, hours), x: wasted(t, w, waste) })), [w, hours, waste])
   const rows = all
     .filter(({ m }) => (shown === 'round' ? m.round > 0 : shown === 'merged' ? m.merges > 0 : true))
-    .sort((a, b) => b.m.round - a.m.round || (b.m.last ?? '').localeCompare(a.m.last ?? ''))
+    .sort((a, b) => b.x.tokens.generated - a.x.tokens.generated || b.m.round - a.m.round || (b.m.last ?? '').localeCompare(a.m.last ?? ''))
   const round = all.filter(({ m }) => m.round > 0)
+  const thrown = round.reduce((c, { x }) => addCost(c, x), zeroCost())
   return (
     <Stack gap="md">
+      {waste && (
+        <Paper withBorder radius="md" p="sm" style={{ borderColor: FAIL }}>
+          <Text fz="lg" fw={700} style={{ textWrap: 'balance' }}>
+            {round.length} tickets went round and threw away{' '}
+            <Text span inherit c={FAIL}>
+              {n(thrown.added)} lines and {big(thrown.tokens.generated)} tokens
+            </Text>
+            {round.length ? `; the most, ${rows[0]?.t.key}: ${n(rows[0]?.x.added ?? 0)} lines and ${big(rows[0]?.x.tokens.generated ?? 0)} tokens.` : '.'}
+          </Text>
+          <Text fz="xs" c="dimmed" mt={4}>
+            Thrown away: the work of a task from your order to its newest reopening, a build stopped short, a build that broke its file. {costWords(thrown)}.
+          </Text>
+        </Paper>
+      )}
       <Group justify="space-between" align="flex-end">
         <Text fz="sm" c="dimmed" maw={900}>
           {all.length} tickets; {round.length} went round: reopened after a merge, built again or stopped short; {round.reduce((s, { m }) => s + m.undone, 0)} of their
@@ -233,7 +263,7 @@ export function Tickets({ w, hours, core }: { w: Watch; hours: HourRow[]; core: 
         />
       </Group>
       <Paper withBorder radius="md">
-        <Table.ScrollContainer minWidth={1100}>
+        <Table.ScrollContainer minWidth={1240}>
           <Table fz="sm" verticalSpacing={4} highlightOnHover>
             <Table.Thead>
               <Table.Tr>
@@ -248,17 +278,18 @@ export function Tickets({ w, hours, core }: { w: Watch; hours: HourRow[]; core: 
                 <Table.Th>Span</Table.Th>
                 <Table.Th>At work</Table.Th>
                 <Table.Th>Waiting on you</Table.Th>
+                <Table.Th>Thrown away</Table.Th>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
               {rows.length === 0 && (
                 <Table.Tr>
-                  <Table.Td colSpan={11}>
+                  <Table.Td colSpan={12}>
                     <Text c="dimmed" fz="sm">No ticket here.</Text>
                   </Table.Td>
                 </Table.Tr>
               )}
-              {rows.map(({ t, m }) => (
+              {rows.map(({ t, m, x }) => (
                 <Fragment key={t.key}>
                   <Table.Tr style={{ cursor: 'pointer' }} onClick={() => setOpened(opened === t.key ? null : t.key)}>
                     <Table.Td>
@@ -279,10 +310,20 @@ export function Tickets({ w, hours, core }: { w: Watch; hours: HourRow[]; core: 
                     <Table.Td style={{ whiteSpace: 'nowrap' }}>{m.first && m.last ? took((new Date(m.last).getTime() - new Date(m.first).getTime()) / 1000) : '—'}</Table.Td>
                     <Table.Td style={{ whiteSpace: 'nowrap' }}>{m.work ? `about ${took(m.work)}` : '—'}</Table.Td>
                     <Table.Td style={{ whiteSpace: 'nowrap' }}>{m.you ? `about ${took(m.you)}` : '—'}</Table.Td>
+                    <Table.Td style={{ whiteSpace: 'nowrap' }}>
+                      {x.added || x.tokens.generated ? (
+                        <Text fz="xs" fw={700} c={FAIL}>
+                          {n(x.added)} lines · {big(x.tokens.generated)} tokens
+                        </Text>
+                      ) : (
+                        '—'
+                      )}
+                    </Table.Td>
                   </Table.Tr>
                   {opened === t.key && (
                     <Table.Tr>
-                      <Table.Td colSpan={11} bg="dark.7">
+                      <Table.Td colSpan={12} bg="dark.7">
+                        {x.added || x.tokens.generated ? <Text fz="xs" c={FAIL} mb={4}>thrown away: {costWords(x)}</Text> : null}
                         <Story ticket={t} w={w} names={names} core={core} />
                       </Table.Td>
                     </Table.Tr>

@@ -136,12 +136,12 @@ export function Watcher({ sub, go }: { sub: string; go: (sub: string) => void })
       {w && w.looked_at == null && !w.paused && <Text c="dimmed">The watcher is reading the window back; its first look comes within a minute.</Text>}
       {w && view === 'trends' && (found.data ? <Trends w={w} found={found.data} time={time.data} waste={waste.data} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
       {w && view === 'alarms' && <Alarms w={w} waste={waste.data} focus={focus} setFocus={setFocus} core={core} />}
-      {w && view === 'issues' && (found.data ? <Issues w={w} found={found.data} time={time.data} focus={focus} core={core} /> : <Loader size="sm" />)}
-      {view === 'found' && (found.data ? <Found found={foundInView} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
+      {w && view === 'issues' && (found.data ? <Issues w={w} found={found.data} time={time.data} waste={waste.data} focus={focus} core={core} /> : <Loader size="sm" />)}
+      {view === 'found' && (found.data ? <Found found={foundInView} waste={waste.data} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
       {view === 'time' && (time.data ? <Time time={time.data} focus={focus} setFocus={setFocus} core={core} /> : <Loader size="sm" />)}
       {w && view === 'tasks' && <Tasks tasks={w.tasks} focus={focus} setFocus={setFocus} core={core} />}
-      {w && view === 'tickets' && <Tickets w={w} hours={time.data?.hours ?? []} core={core} />}
-      {w && view === 'builds' && <Builds w={w} core={core} />}
+      {w && view === 'tickets' && <Tickets w={w} hours={time.data?.hours ?? []} waste={waste.data} core={core} />}
+      {w && view === 'builds' && <Builds w={w} waste={waste.data} core={core} />}
       {w && view === 'runs' && <Runs w={w} focus={focus} core={core} />}
       {w && view === 'now' && <Now now={w.now} pick={pick} />}
       {found.isError && <Alert color="red" title="What was found did not load">{String(found.error)}</Alert>}

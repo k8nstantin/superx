@@ -1,8 +1,9 @@
 import { Fragment, useState } from 'react'
 import { Badge, Group, Paper, SimpleGrid, Stack, Table, Text } from '@mantine/core'
-import type { BuildRow, Watch, WatchAlert } from '../api'
+import type { BuildRow, Waste, Watch, WatchAlert } from '../api'
 import { CANCEL, FAIL, MONO, OK, UNKNOWN } from '../EChart'
 import { day } from '../time'
+import { addCost, big, n, zeroCost } from './data'
 import { around, Lines } from './Lines'
 
 // Builds (#573): every build of a task file, held to what its file decides,
@@ -109,7 +110,9 @@ function Plan({ b, breaks, core }: { b: BuildRow; breaks: WatchAlert[]; core: st
   )
 }
 
-export function Builds({ w, core }: { w: Watch; core: string | null }) {
+export function Builds({ w, waste, core }: { w: Watch; waste: Waste | undefined; core: string | null }) {
+  // A build's whole work, and what of it went to waste.
+  const spent = (session: string) => (waste?.days ?? []).filter((d) => d.session === session).reduce((c, d) => [addCost(c[0], d.all), addCost(c[1], d.wasted)], [zeroCost(), zeroCost()])
   const [opened, setOpened] = useState<string | null>(w.builds[0]?.session ?? null)
   const names = new Map(w.sessions.map((s) => [s.id, s.name]))
   const breaksOf = (b: BuildRow) => w.alerts.filter((a) => a.session === b.session && (a.kind === 'task_file_broken' || a.kind === 'build_stopped'))
@@ -121,7 +124,7 @@ export function Builds({ w, core }: { w: Watch; core: string | null }) {
         its gates, its git, and its lines.
       </Text>
       <Paper withBorder radius="md">
-        <Table.ScrollContainer minWidth={1050}>
+        <Table.ScrollContainer minWidth={1240}>
           <Table fz="sm" verticalSpacing={4} highlightOnHover>
             <Table.Thead>
               <Table.Tr>
@@ -133,12 +136,14 @@ export function Builds({ w, core }: { w: Watch; core: string | null }) {
                 <Table.Th>Local gates</Table.Th>
                 <Table.Th>Door gates</Table.Th>
                 <Table.Th>Commits</Table.Th>
+                <Table.Th>Its work</Table.Th>
+                <Table.Th>Went to waste</Table.Th>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
               {w.builds.length === 0 && (
                 <Table.Tr>
-                  <Table.Td colSpan={8}>
+                  <Table.Td colSpan={10}>
                     <Text c="dimmed" fz="sm">No build of a task file in the window.</Text>
                   </Table.Td>
                 </Table.Tr>
@@ -149,6 +154,7 @@ export function Builds({ w, core }: { w: Watch; core: string | null }) {
                 const passed = b.locals.filter((l) => l.passed).length
                 const doors = b.gates.filter((g) => g.ran && g.ended_well === g.ends_well).length
                 const bad = b.commits.filter((c) => !c.ok).length
+                const [work, lost] = spent(b.session)
                 return (
                   <Fragment key={b.session}>
                     <Table.Tr style={{ cursor: 'pointer' }} onClick={() => setOpened(opened === b.session ? null : b.session)}>
@@ -167,10 +173,20 @@ export function Builds({ w, core }: { w: Watch; core: string | null }) {
                       <Table.Td>{`${passed} of ${b.locals.length} passed`}</Table.Td>
                       <Table.Td>{`${doors} of ${b.gates.length}`}</Table.Td>
                       <Table.Td c={bad ? FAIL : undefined}>{bad ? `${b.commits.length}, ${bad} against its rules` : b.commits.length}</Table.Td>
+                      <Table.Td style={{ whiteSpace: 'nowrap' }} fz="xs">{waste ? `${n(work.added)} lines · ${big(work.tokens.generated)} tokens` : '…'}</Table.Td>
+                      <Table.Td style={{ whiteSpace: 'nowrap' }}>
+                        {lost.added || lost.tokens.generated ? (
+                          <Text fz="xs" fw={700} c={FAIL}>
+                            {n(lost.added)} lines · {big(lost.tokens.generated)} tokens
+                          </Text>
+                        ) : (
+                          <Text fz="xs" c="dimmed">none</Text>
+                        )}
+                      </Table.Td>
                     </Table.Tr>
                     {opened === b.session && (
                       <Table.Tr>
-                        <Table.Td colSpan={8} bg="dark.7">
+                        <Table.Td colSpan={10} bg="dark.7">
                           <Plan b={b} breaks={breaks} core={core} />
                         </Table.Td>
                       </Table.Tr>

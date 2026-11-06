@@ -1,10 +1,10 @@
 import { Fragment, useMemo, useState } from 'react'
 import { Badge, Group, Paper, SegmentedControl, Stack, Table, Text } from '@mantine/core'
-import type { Found, Watch, WatchTime } from '../api'
-import { AXIS, EChart, GRID_LINE, HEAT, INK, INK_MUTED, MONO, TOOLTIP, type Clicked } from '../EChart'
+import type { Found, Waste, Watch, WatchTime } from '../api'
+import { AXIS, EChart, FAIL, GRID_LINE, HEAT, INK, INK_MUTED, MONO, TOOLTIP, type Clicked } from '../EChart'
 import { category, grid, tip, value } from '../results/charts'
 import { day } from '../time'
-import { atWork, casesOf, dayOf, HIDDEN, HIDDEN_ORDER, KIND, mondayOf, n, weekName, type Case, type Focus } from './data'
+import { amount, atWork, big, casesOf, dayOf, HIDDEN, HIDDEN_ORDER, KIND, mondayOf, n, weekName, type Case, type Focus, type Measure } from './data'
 import { around, Lines } from './Lines'
 
 // The mold: every issue the watcher knows, cast the same way over every
@@ -31,8 +31,13 @@ export function repoOf(folder: string | null): string {
   return under.slice(0, 2).join('/') || '(no folder)'
 }
 
-export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found[]; time: WatchTime | undefined; focus: Focus; core: string | null }) {
+export function Issues({ w, found, time, waste, focus, core }: { w: Watch; found: Found[]; time: WatchTime | undefined; waste: Waste | undefined; focus: Focus; core: string | null }) {
   const [by, setBy] = useState<By>('repo')
+  const [measure, setMeasure] = useState<Measure>('lines')
+  const counting = measure === 'cases' || !waste
+  /// What a case adds to its cell: one, or the lines or tokens of its span
+  /// that went to waste.
+  const valueOf = (c: Case) => (counting ? 1 : waste?.cases[c.id]?.waste ? amount(waste.cases[c.id].cost, measure) : 0)
   const [cell, setCell] = useState<{ issue: string; column: string } | null>(null)
   const [opened, setOpened] = useState<string | null>(null)
   const sessions = useMemo(() => new Map(w.sessions.map((s) => [s.id, s])), [w])
@@ -54,12 +59,13 @@ export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [time, by, sessions])
   const counts = new Map<string, number>()
-  for (const c of cases) counts.set(`${c.kind}\u0000${columnOf(c.session)}`, (counts.get(`${c.kind}\u0000${columnOf(c.session)}`) ?? 0) + 1)
+  for (const c of cases) counts.set(`${c.kind}\u0000${columnOf(c.session)}`, (counts.get(`${c.kind}\u0000${columnOf(c.session)}`) ?? 0) + valueOf(c))
   const totals = new Map<string, number>()
-  for (const c of cases) totals.set(columnOf(c.session), (totals.get(columnOf(c.session)) ?? 0) + 1)
-  const columns = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, COLUMNS).map(([k]) => k)
-  const rows = ISSUES.filter(([k]) => cases.some((c) => c.kind === k))
+  for (const c of cases) totals.set(columnOf(c.session), (totals.get(columnOf(c.session)) ?? 0) + valueOf(c))
+  const columns = [...totals.entries()].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, COLUMNS).map(([k]) => k)
+  const rows = ISSUES.filter(([k]) => cases.some((c) => c.kind === k && valueOf(c) > 0))
   const rate = (count: number, column: string) => {
+    if (!counting) return count
     const h = (worked.get(column) ?? 0) / 3600
     return h > 0 ? (10 * count) / h : 0
   }
@@ -76,12 +82,23 @@ export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found
     <Stack gap="md">
       <Group justify="space-between" align="flex-end">
         <Text fz="sm" c="dimmed" maw={900}>
-          The same issues, cast over every {by}: {n(cases.length)} cases of {rows.length} kinds.
-          {worst.length > 0 &&
-            ` Most in ${worst[0][0]}: ${n(worst[0][1])} cases over ${worst[0][2].toFixed(0)} h at work.`}{' '}
-          A cell counts the cases; its colour is how many per 10 hours at work there. Click one for every case.
+          {counting ? (
+            <>
+              The same issues, cast over every {by}: {n(cases.length)} cases of {rows.length} kinds.
+              {worst.length > 0 && ` Most in ${worst[0][0]}: ${n(worst[0][1])} cases over ${worst[0][2].toFixed(0)} h at work.`} A cell counts the cases; its colour is how
+              many per 10 hours at work there. Click one for every case.
+            </>
+          ) : (
+            <>
+              The {measure === 'lines' ? 'lines written' : 'tokens generated'} that went to waste, by issue and {by}.
+              {worst.length > 0 && ` Most in ${worst[0][0]}: ${big(worst[0][1])}.`} A cell sums the waste of its cases. Click one for every case.
+            </>
+          )}
         </Text>
-        <SegmentedControl size="xs" value={by} onChange={(v) => { setBy(v as By); setCell(null) }} data={[{ value: 'repo', label: 'by repository' }, { value: 'session', label: 'by session' }, { value: 'model', label: 'by model' }]} />
+        <Group gap="xs">
+          <SegmentedControl size="xs" value={measure} onChange={(v) => { setMeasure(v as Measure); setCell(null) }} data={[{ value: 'lines', label: 'lines wasted' }, { value: 'generated', label: 'tokens wasted' }, { value: 'cases', label: 'cases' }]} />
+          <SegmentedControl size="xs" value={by} onChange={(v) => { setBy(v as By); setCell(null) }} data={[{ value: 'repo', label: 'by repository' }, { value: 'session', label: 'by session' }, { value: 'model', label: 'by model' }]} />
+        </Group>
       </Group>
       <Paper withBorder radius="md" p="sm">
         <EChart
@@ -98,7 +115,9 @@ export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found
               ...TOOLTIP,
               formatter: (p: { data: number[] }) => {
                 const [x, y, r, c] = p.data
-                return `<b>${label(rows[y][0])}</b> in ${columns[x]}<br/>${n(c)} cases · ${r} per 10 h at work (${((worked.get(columns[x]) ?? 0) / 3600).toFixed(1)} h)`
+                return counting
+                  ? `<b>${label(rows[y][0])}</b> in ${columns[x]}<br/>${n(c)} cases · ${r} per 10 h at work (${((worked.get(columns[x]) ?? 0) / 3600).toFixed(1)} h)`
+                  : `<b>${label(rows[y][0])}</b> in ${columns[x]}<br/>${big(c)} ${measure === 'lines' ? 'lines' : 'tokens'} went to waste`
               },
             },
             xAxis: {
@@ -115,7 +134,7 @@ export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found
               {
                 type: 'heatmap',
                 data: cells,
-                label: { show: true, color: '#fff', fontSize: 10, formatter: (p: { data: number[] }) => (p.data[3] ? String(p.data[3]) : '') },
+                label: { show: true, color: '#fff', fontSize: 10, formatter: (p: { data: number[] }) => (p.data[3] ? big(p.data[3]) : '') },
                 itemStyle: { borderColor: '#150420', borderWidth: 1 },
                 emphasis: { itemStyle: { borderColor: '#fff', borderWidth: 1 } },
               },
@@ -124,7 +143,7 @@ export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found
         />
       </Paper>
       <Paper withBorder radius="md" p="sm">
-        <Text fw={600} fz="sm">{cell ? `${label(cell.issue)}, week by week` : 'Every issue, week by week'}</Text>
+        <Text fw={600} fz="sm">{`${cell ? label(cell.issue) : counting ? 'Every issue' : 'The waste of every issue'}, week by week${counting ? '' : measure === 'lines' ? ': lines written that went to waste' : ': tokens generated that went to waste'}`}</Text>
         <Text fz="xs" c="dimmed">{cell ? 'the issue picked, in every column' : 'click a cell above to follow one issue'}</Text>
         <EChart
           height={180}
@@ -133,7 +152,7 @@ export function Issues({ w, found, time, focus, core }: { w: Watch; found: Found
             tooltip: tip(),
             xAxis: category(weeks.map((wk) => weekName(wk, today)), { axisLabel: { ...AXIS.axisLabel, showMaxLabel: true, alignMaxLabel: 'right', hideOverlap: true } }),
             yAxis: value(),
-            series: [{ type: 'bar', barMaxWidth: 26, itemStyle: { color: HEAT[3], borderRadius: [3, 3, 0, 0] }, data: weeks.map((wk) => trendCases.filter((c) => weekOf(c.at) === wk).length) }],
+            series: [{ type: 'bar', barMaxWidth: 26, itemStyle: { color: counting ? HEAT[3] : FAIL, borderRadius: [3, 3, 0, 0] }, data: weeks.map((wk) => trendCases.filter((c) => weekOf(c.at) === wk).reduce((t, c) => t + valueOf(c), 0)) }],
           }}
         />
       </Paper>
