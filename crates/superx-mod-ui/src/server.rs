@@ -38,6 +38,11 @@ const SSE_BATCH: u32 = 200; // skill-allow: §9-const — poll page bound
 #[derive(Clone)]
 struct AppState {
     kernel: Kernel,
+    /// The capture lamp's, the status's and the live events' own socket
+    /// (#576): never behind a recompute on the page's.
+    live: Kernel,
+    /// The sessions list, kept as a running tally (#576).
+    tally: std::sync::Arc<tokio::sync::Mutex<crate::tally::Tally>>,
     events: broadcast::Sender<String>,
     answers: Answers,
     /// What the completeness check has counted of each watched transcript,
@@ -98,9 +103,20 @@ impl Answers {
         }
     }
 
-    /// The answer for `key`: from the cache, else from the computation
-    /// already under way, else from `work`, started on its own task so it
-    /// finishes, and is kept, whether or not this request waits for it.
+    /// The newest answer for `key` however old, while caching is on.
+    fn stale(&self, key: &str, ttl: u64) -> Option<String> {
+        if ttl == 0 {
+            return None;
+        }
+        self.cache.lock().ok()?.get(key).map(|(_, body)| body.clone())
+    }
+
+    /// The answer for `key`: from the cache; else, when an older answer is
+    /// held, that one at once while its successor is computed behind it
+    /// (#576: the Status page waited 27 s for each recompute); else from the
+    /// computation already under way, else from `work`, started on its own
+    /// task so it finishes, and is kept, whether or not this request waits
+    /// for it.
     async fn computed<F>(&self, key: &str, ttl: u64, work: F) -> std::result::Result<String, String>
     where
         F: std::future::Future<Output = std::result::Result<String, String>> + Send + 'static,
@@ -108,6 +124,7 @@ impl Answers {
         if let Some(body) = self.cached(key, ttl) {
             return Ok(body);
         }
+        let stale = self.stale(key, ttl);
         let mut pending = {
             let Ok(mut map) = self.inflight.lock() else { return work.await };
             if let Some(pending) = map.get(key) {
@@ -133,6 +150,9 @@ impl Answers {
                 pending
             }
         };
+        if let Some(body) = stale {
+            return Ok(body);
+        }
         loop {
             if let Some(answer) = pending.borrow_and_update().clone() {
                 return answer;
@@ -195,15 +215,26 @@ async fn bounded(
     }
 }
 
-/// Bind and spawn the server + the single SSE poller task.
-pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
+/// Bind and spawn the server + the single SSE poller task. `kernel` is the
+/// page's socket, `live` the lamp's and the live events'.
+pub async fn spawn(kernel: Kernel, live: Kernel, port: u16) -> Result<()> {
     let (events, _) = broadcast::channel(1024);
     let state = AppState {
         kernel: kernel.clone(),
+        live: live.clone(),
+        tally: std::sync::Arc::default(),
         events: events.clone(),
         answers: Answers::default(),
         capture_watch: std::sync::Arc::default(),
     };
+    // The tally reads all history once, now, so the first visit to the
+    // sessions list finds it read.
+    let (tally, reader) = (state.tally.clone(), kernel.clone());
+    tokio::spawn(async move {
+        if let Err(e) = tally.lock().await.refresh(&reader).await {
+            tracing::warn!(target: "ui", error = %e, "the sessions tally could not read history yet; the list reads it when asked");
+        }
+    });
     // Read once, here: resolving it per request would itself await the
     // substrate that might not answer.
     let secs = crate::resolved_read_timeout_secs(&kernel).await;
@@ -250,7 +281,7 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
             tracing::info!(target: "ui", "ui server closed");
         }
     });
-    tokio::spawn(sse_poller(kernel, events, poller_stop));
+    tokio::spawn(sse_poller(live, events, poller_stop));
     Ok(())
 }
 
@@ -359,7 +390,7 @@ fn names_a_file(path: &str) -> bool {
 /// Is every transcript line captured (#489)? Cached like the session list:
 /// the answer moves slowly.
 async fn api_capture(State(state): State<AppState>) -> axum::response::Response {
-    let kernel = &state.kernel;
+    let kernel = &state.live;
     let ttl = crate::resolved_cache_secs(kernel).await;
     if let Some(body) = state.cached("capture", ttl) {
         return json_body(body);
@@ -380,7 +411,7 @@ async fn api_capture(State(state): State<AppState>) -> axum::response::Response 
 }
 
 async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
-    let kernel = &state.kernel;
+    let kernel = &state.live;
     let mut modules = Vec::new();
     for kind in [NodeKind::KernelModule, NodeKind::Adapter] {
         if let Ok(list) = crate::answered("module list", || kernel.list_with_status(kind)).await {
@@ -481,9 +512,9 @@ async fn api_sessions(
     Query(q): Query<SessionsQuery>,
 ) -> axum::response::Response {
     let kernel = &state.kernel;
-    // Three substrate round-trips per session (#380), the action counts
-    // one read per agent (#530); until it is one query, at least two
-    // pollers share the cost (#390).
+    // Every session's figures come from the running tally (#576), read up
+    // to the newest row: four reads for each session, one after another,
+    // took 31 s. Two pollers within the cache bound share one answer (#390).
     let ttl = crate::resolved_cache_secs(kernel).await;
     let key = format!("sessions:{}", q.agent.clone().unwrap_or_default());
     if let Some(body) = state.cached(&key, ttl) {
@@ -535,7 +566,11 @@ async fn api_sessions(
             (s.entity_id.clone(), scope)
         })
         .collect();
-    let actions = crate::activity::action_counts(kernel, &scopes).await.unwrap_or_default();
+    let mut tally = state.tally.lock().await;
+    if let Err(e) = tally.refresh(kernel).await {
+        tracing::warn!(target: "ui", error = %e, "the sessions tally could not read the newest rows; the list shows what it holds");
+    }
+    let actions = tally.actions(&scopes);
     for s in sessions {
         let name = match &s.payload {
             superx_kernel::types::Value::Object(o) => match o.get("name") {
@@ -554,25 +589,13 @@ async fn api_sessions(
         // TOTAL activity — messages + the session's action events
         // (issue #187: the list counts everything the feed shows).
         let uuid = superx_ops::record_uuid(&s.entity_id);
-        let count = crate::answered("session messages", || kernel.session_message_count(s.entity_id.clone()))
-            .await
-            .unwrap_or(0)
-            + actions.get(&uuid).copied().unwrap_or(0);
-        let last_active = crate::activity::session_last_emitted(kernel, s.entity_id.clone())
-            .await
-            .ok()
-            .flatten()
-            .map(|t| t.to_rfc3339());
-        // Token telemetry from the captured raw events (issue #200);
-        // best-effort — a session with no usage data shows nothing.
-        let (context_tokens, output_tokens) =
-            crate::activity::session_token_stats(kernel, s.entity_id.clone())
-                .await
-                .unwrap_or((None, None));
+        let count = tally.lines(&uuid) + actions.get(&uuid).copied().unwrap_or(0);
+        let last_active = tally.last_active(&uuid).map(|t| t.to_rfc3339());
+        // Token telemetry from the captured raw events (issue #200): a
+        // session with no usage data shows nothing.
+        let (context_tokens, output_tokens) = tally.tokens(&uuid);
         let context_pct = context_tokens.map(|c| ((c * 100) / window).clamp(0, 100));
-        let (model, effort) = crate::activity::session_model_effort(kernel, s.entity_id.clone())
-            .await
-            .unwrap_or((None, None));
+        let (model, effort) = tally.model_effort(&uuid);
         out.push(SessionView {
             identity: format!("{agent}/{uuid}"),
             short_id: short.get(&uuid).cloned().unwrap_or_else(|| uuid.clone()),
@@ -811,58 +834,48 @@ async fn api_insights(State(state): State<AppState>, Query(q): Query<ClockQuery>
 
 /// Model comparison (#406): the switches, and whether each model
 /// stayed on the objective. Same cache lifetime and same reason as
-/// [`THROWN_CACHE_SECS`] — it walks git, not the message stream.
+/// [`THROWN_CACHE_SECS`] — it walks git, not the message stream. Computed
+/// once however many ask, and an older answer served while the next is
+/// computed (#576: a miss took 97 s).
 async fn api_compare(State(state): State<AppState>) -> axum::response::Response {
-    const KEY: &str = "compare";
-    if let Some(body) = state.cached(KEY, THROWN_CACHE_SECS) {
-        return json_body(body);
-    }
-    let runs = match crate::thrown::model_runs(&state.kernel).await {
-        Ok(r) => r,
+    let kernel = state.kernel.clone();
+    let work = async move {
+        let runs = crate::thrown::model_runs(&kernel).await.map_err(|e| e.to_string())?;
+        let mainlines = crate::resolved_mainline_refs(&kernel).await;
+        let c = crate::compare::compare(&runs, &mainlines).await;
+        let summary = crate::api::CompareSummary {
+            handoffs: c.handoffs,
+            deviations: c.deviations,
+            repos: c.repos,
+            unjudged: c.unjudged,
+            computed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        serde_json::to_string(&summary).map_err(|e| e.to_string())
+    };
+    match state.answers.computed("compare", THROWN_CACHE_SECS, work).await {
+        Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", error = %e, "model comparison read failed");
-            return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string())));
+            json_body(format!("{{\"error\":{}}}", json_str(&e)))
         }
-    };
-    let mainlines = crate::resolved_mainline_refs(&state.kernel).await;
-    let c = crate::compare::compare(&runs, &mainlines).await;
-    let summary = crate::api::CompareSummary {
-        handoffs: c.handoffs,
-        deviations: c.deviations,
-        repos: c.repos,
-        unjudged: c.unjudged,
-        computed_at: chrono::Utc::now().to_rfc3339(),
-    };
-    match serde_json::to_string(&summary) {
-        Ok(body) => {
-            state.remember(KEY, &body);
-            json_body(body)
-        }
-        Err(e) => json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
     }
 }
 
 /// The join (#434): every task, every commit matched to it, and the
 /// operator's sittings. Cached for [`THROWN_CACHE_SECS`], as the comparison
-/// is: it walks git and every session.
+/// is, and computed the same way: it walks git and every session.
 async fn api_tasks(State(state): State<AppState>) -> axum::response::Response {
-    const KEY: &str = "tasks";
-    if let Some(body) = state.cached(KEY, THROWN_CACHE_SECS) {
-        return json_body(body);
-    }
-    let summary = match crate::tasks::tasks(&state.kernel).await {
-        Ok(s) => s,
+    let kernel = state.kernel.clone();
+    let work = async move {
+        let summary = crate::tasks::tasks(&kernel).await.map_err(|e| e.to_string())?;
+        serde_json::to_string(&summary).map_err(|e| e.to_string())
+    };
+    match state.answers.computed("tasks", THROWN_CACHE_SECS, work).await {
+        Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", error = %e, "task join read failed");
-            return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string())));
+            json_body(format!("{{\"error\":{}}}", json_str(&e)))
         }
-    };
-    match serde_json::to_string(&summary) {
-        Ok(body) => {
-            state.remember(KEY, &body);
-            json_body(body)
-        }
-        Err(e) => json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
     }
 }
 
@@ -1138,6 +1151,36 @@ mod tests {
         let cached = answers.computed("k", 60, slow(runs.clone())).await;
         assert_eq!(cached.as_deref(), Ok("body"));
         assert_eq!(runs.load(Ordering::SeqCst), 1, "and then from the cache");
+    }
+
+    /// An older answer is served at once while the next is computed behind
+    /// it (#576): the Status page waited 27 s on every recompute. Computed
+    /// once however many ask meanwhile; with the cache off, nothing older is
+    /// served.
+    #[tokio::test]
+    async fn an_older_answer_is_served_at_once_while_the_next_is_computed() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const STEP: Duration = Duration::from_millis(60); // skill-allow: §9-duration — test fixture, not a policy
+        const AGE: Duration = Duration::from_secs(120); // skill-allow: §9-duration — test fixture, not a policy
+        let answers = Answers::default();
+        let long_ago = std::time::Instant::now().checked_sub(AGE).expect("a clock past two minutes");
+        answers.cache.lock().expect("cache").insert("k".to_string(), (long_ago, "old".to_string()));
+        let runs = std::sync::Arc::new(AtomicU32::new(0));
+        let slow = |runs: std::sync::Arc<AtomicU32>| async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(STEP).await;
+            Ok::<_, String>("new".to_string())
+        };
+        let at_once = tokio::time::timeout(STEP / 4, answers.computed("k", 60, slow(runs.clone()))).await;
+        assert_eq!(at_once.expect("served without waiting").as_deref(), Ok("old"));
+        let meanwhile = answers.computed("k", 60, slow(runs.clone())).await;
+        assert_eq!(meanwhile.as_deref(), Ok("old"), "still the older while the next is computed");
+        tokio::time::sleep(STEP * 3).await;
+        let fresh = answers.computed("k", 60, slow(runs.clone())).await;
+        assert_eq!(fresh.as_deref(), Ok("new"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "computed once");
+        let off = answers.computed("k", 0, slow(runs.clone())).await;
+        assert_eq!((off.as_deref(), runs.load(Ordering::SeqCst)), (Ok("new"), 2), "with the cache off, computed and awaited");
     }
 
     async fn get(path: &str) -> axum::response::Response {

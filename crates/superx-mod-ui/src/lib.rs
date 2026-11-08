@@ -31,6 +31,7 @@ pub mod models;
 mod parsed;
 mod server;
 pub mod stats;
+pub mod tally;
 pub mod tasks;
 pub mod thrown;
 
@@ -342,7 +343,16 @@ impl KernelModule for UiModule {
                 kernel.clone()
             }
         };
-        server::spawn(page, port).await?;
+        // The capture lamp and the status read over another (#576): a
+        // one-kilobyte answer waited 9.6 s behind the Status page's recompute.
+        let live = match kernel.fork().await {
+            Ok(own) => own,
+            Err(e) => {
+                tracing::warn!(target: "ui", error = %e, "the lamp reads over the page's socket: it could not open its own");
+                page.clone()
+            }
+        };
+        server::spawn(page, live, port).await?;
         let url = format!("http://127.0.0.1:{port}");
         tracing::info!(target: "ui", %url, "ui module serving");
         let mut payload = superx_kernel::types::Object::new();

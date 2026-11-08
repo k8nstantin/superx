@@ -88,8 +88,20 @@ export default function StatusPage() {
   })
   const insights = useQuery({ queryKey: ['insights'], queryFn: fetchInsights, refetchInterval: 60000 })
   // Read from git, cached server-side for minutes: it moves when
-  // commits land, not when the page polls.
-  const compare = useQuery({ queryKey: ['compare'], queryFn: fetchCompare, refetchInterval: 300000 })
+  // commits land, not when the page polls. It walks every repository's git
+  // (97 s on a miss, #576), so it is asked for only once its section comes
+  // near the screen.
+  const [wantCompare, setWantCompare] = useState(false)
+  useEffect(() => {
+    const el = document.getElementById('models')
+    if (!el || wantCompare) return
+    const obs = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) setWantCompare(true)
+    }, { rootMargin: '800px 0px' })
+    obs.observe(el)
+    return () => obs.disconnect()
+  }, [wantCompare])
+  const compare = useQuery({ queryKey: ['compare'], queryFn: fetchCompare, refetchInterval: 300000, enabled: wantCompare })
 
   const s = stats.data
   const i = insights.data
