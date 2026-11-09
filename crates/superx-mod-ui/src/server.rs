@@ -587,7 +587,6 @@ async fn api_sessions(
     State(state): State<AppState>,
     Query(q): Query<SessionsQuery>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
     // The small reads, the entity lists and the parameters, go over the
     // lamp's socket; every session's figures come from the running tally
     // (#576), kept by its own task: four reads for each session, one after
@@ -610,15 +609,17 @@ async fn api_sessions(
         )),
     };
     if let Some(output) = unread {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "output": output, "is_error": true })))
-            .into_response();
+        return not_answered(StatusCode::SERVICE_UNAVAILABLE, &output);
     }
     let mut out = Vec::new();
-    let Ok(sessions) =
-        crate::answered("sessions", || kernel.list_named_entities("node_session", "attr_session_descriptor")).await
-    else {
-        return json_body(serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string()));
-    };
+    let sessions =
+        match crate::answered("sessions", || kernel.list_named_entities("node_session", "attr_session_descriptor")).await {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::warn!(target: "ui", error = %e, "sessions read failed");
+                return not_answered(StatusCode::BAD_GATEWAY, &format!("the sessions could not be listed: {e}"));
+            }
+        };
     // The context bar's denominator — resolved once per request.
     let window = crate::resolved_context_window(kernel).await;
     // Each label is told apart from EVERY session, whatever the filter, so
@@ -630,14 +631,20 @@ async fn api_sessions(
     // re-resolving agents per row (review finding, issue #187).
     let mut agent_ids: std::collections::HashMap<String, superx_kernel::types::RecordId> =
         std::collections::HashMap::new();
-    if let Ok(agents) =
-        crate::answered("agents", || kernel.list_named_entities("node_agent", "attr_agent_descriptor")).await
-    {
-        for a in &agents {
-            if let superx_kernel::types::Value::Object(o) = &a.payload {
-                if let Some(superx_kernel::types::Value::String(n)) = o.get("name") {
-                    agent_ids.insert(n.clone(), a.entity_id.clone());
-                }
+    // Without them no session's events are matched by its source key: every
+    // count would fall short, unsaid.
+    let agents =
+        match crate::answered("agents", || kernel.list_named_entities("node_agent", "attr_agent_descriptor")).await {
+            Ok(agents) => agents,
+            Err(e) => {
+                tracing::warn!(target: "ui", error = %e, "agents read failed");
+                return not_answered(StatusCode::BAD_GATEWAY, &format!("the agents could not be listed: {e}"));
+            }
+        };
+    for a in &agents {
+        if let superx_kernel::types::Value::Object(o) = &a.payload {
+            if let Some(superx_kernel::types::Value::String(n)) = o.get("name") {
+                agent_ids.insert(n.clone(), a.entity_id.clone());
             }
         }
     }
@@ -707,7 +714,7 @@ async fn api_sessions(
             state.remember(&key, &body);
             json_body(body)
         }
-        Err(_) => json_body("[]".to_string()),
+        Err(e) => not_answered(StatusCode::INTERNAL_SERVER_ERROR, &format!("the sessions could not be written out: {e}")),
     }
 }
 
@@ -867,7 +874,6 @@ async fn api_stats(
     State(state): State<AppState>,
     Query(q): Query<RangeQuery>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
     // The parameters over the lamp's socket: the page's may be busy with
     // the very recompute an older answer stands in for (#576).
     let kernel = &state.live;
@@ -895,7 +901,7 @@ async fn api_stats(
         Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", range = %range, error = %e, "stats read failed");
-            err_response(&e).into_response()
+            not_answered(StatusCode::BAD_GATEWAY, &e)
         }
     }
 }
@@ -904,7 +910,6 @@ async fn api_stats(
 /// the engine. Separate from `/api/stats` so the live tiles keep their
 /// fast refresh while these poll lazily.
 async fn api_insights(State(state): State<AppState>, Query(q): Query<ClockQuery>) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
     // Whole-history, and seconds to compute (#415 review): held for the
     // same while as the Status page's own figures, so two pilots — or two
     // tabs — pay for it once.
@@ -920,7 +925,7 @@ async fn api_insights(State(state): State<AppState>, Query(q): Query<ClockQuery>
         Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", error = %e, "insights read failed");
-            err_response(&e).into_response()
+            not_answered(StatusCode::BAD_GATEWAY, &e)
         }
     }
 }
@@ -931,7 +936,6 @@ async fn api_insights(State(state): State<AppState>, Query(q): Query<ClockQuery>
 /// once however many ask, and an older answer served while the next is
 /// computed (#576: a miss took 97 s).
 async fn api_compare(State(state): State<AppState>) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
     let kernel = state.kernel.clone();
     let work = async move {
         let runs = crate::thrown::model_runs(&kernel).await.map_err(|e| e.to_string())?;
@@ -950,7 +954,7 @@ async fn api_compare(State(state): State<AppState>) -> axum::response::Response 
         Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", error = %e, "model comparison read failed");
-            err_response(&e).into_response()
+            not_answered(StatusCode::BAD_GATEWAY, &e)
         }
     }
 }
@@ -959,7 +963,6 @@ async fn api_compare(State(state): State<AppState>) -> axum::response::Response 
 /// operator's sittings. Cached for [`THROWN_CACHE_SECS`], as the comparison
 /// is, and computed the same way: it walks git and every session.
 async fn api_tasks(State(state): State<AppState>) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
     let kernel = state.kernel.clone();
     let work = async move {
         let summary = crate::tasks::tasks(&kernel).await.map_err(|e| e.to_string())?;
@@ -969,7 +972,7 @@ async fn api_tasks(State(state): State<AppState>) -> axum::response::Response {
         Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", error = %e, "task join read failed");
-            err_response(&e).into_response()
+            not_answered(StatusCode::BAD_GATEWAY, &e)
         }
     }
 }
@@ -1088,6 +1091,14 @@ fn err_response(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({ "output": msg, "is_error": true })),
     )
+}
+
+/// An answer the server could not give, and why (#576, the 2026-10-21
+/// review's E1): a 502 when the substrate behind it failed, a 503 while it
+/// is not ready, never a 400, which says the request was wrong.
+fn not_answered(status: StatusCode, msg: &str) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (status, Json(serde_json::json!({ "output": msg, "is_error": true }))).into_response()
 }
 
 /// Tiny ok/err JSON envelope for endpoints that can fail resolution.
@@ -1298,6 +1309,46 @@ mod tests {
         assert_eq!(failing, Err("the substrate did not answer".to_string()), "the failure stands while the next is computed");
         tokio::time::sleep(STEP).await;
         assert_eq!(answers.computed("f", 60, heals()).await.as_deref(), Ok("healed"), "a success clears the failure");
+    }
+
+    /// Until the tally has read all of history, and while its newest read
+    /// fails, the sessions list says so, and why, instead of figures that are
+    /// partial or have stopped moving (#576 review); once read, it lists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sessions_list_says_why_while_the_tally_is_not_read() {
+        let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+        db.use_ns("superx").use_db("kernel").await.expect("nsdb");
+        let ddl = superx_kernel::SCHEMA_DDL.replace("$SUPERX_KERNEL_PASSWORD", "test-kernel-password-for-mem-engine");
+        db.query(ddl).await.expect("ddl").check().expect("ddl ok");
+        let kernel = Kernel::from_db(db);
+        for t in superx_kernel::REQUIRED_METAMODEL_TYPES {
+            kernel.ensure_type_definition(t.uid, t.category, t.memory_tier).await.expect("seed");
+        }
+        let state = AppState {
+            kernel: kernel.clone(),
+            live: kernel.clone(),
+            tally: std::sync::Arc::default(),
+            tally_read: std::sync::Arc::default(),
+            events: broadcast::channel(1).0,
+            answers: Answers::default(),
+            capture_watch: std::sync::Arc::default(),
+        };
+        let list = || async {
+            let r = api_sessions(State(state.clone()), Query(SessionsQuery { agent: None })).await;
+            let status = r.status();
+            let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.expect("body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+        let (status, body) = list().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("being read for the first time"), "{body}");
+        *state.tally_read.lock().expect("state") = TallyRead::Failed("the substrate did not answer".to_string());
+        let (status, body) = list().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("could not be read: the substrate did not answer"), "{body}");
+        state.tally.lock().await.refresh(&kernel).await.expect("read");
+        *state.tally_read.lock().expect("state") = TallyRead::Read;
+        assert_eq!(list().await, (StatusCode::OK, "[]".to_string()));
     }
 
     async fn get(path: &str) -> axum::response::Response {

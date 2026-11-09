@@ -81,9 +81,9 @@ export default function StatusPage() {
     // A failed range keeps the last good reading on the instruments
     // and says so, instead of blanking every panel to a dash.
     placeholderData: keepPreviousData,
-    // A 400 from the substrate is deterministic, and TanStack pauses
-    // retries while the tab is hidden — a retried failure never reached
-    // the error state in a background tab. The interval is the retry.
+    // A failure is not retried at once: TanStack pauses retries while the
+    // tab is hidden, so a retried failure never reached the error state in
+    // a background tab. The interval is the retry.
     retry: false,
   })
   const insights = useQuery({ queryKey: ['insights'], queryFn: fetchInsights, refetchInterval: 60000 })
