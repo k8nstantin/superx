@@ -30,7 +30,13 @@ import type { WorkCell } from "./WorkCell";
  * actually DID. Window-scoped figures carry `window_messages` so the
  * UI can label them honestly.
  */
-export type StatsSummary = { agents: bigint, sessions_total: bigint, sessions_active: bigint, modules_total: bigint, modules_active: bigint, events_total: bigint, messages_total: bigint, output_tokens_total: bigint, 
+export type StatsSummary = { 
+/**
+ * When this answer was computed (#576): the page is served the newest
+ * computation at once while the next one is made, and says how old it
+ * is when that matters.
+ */
+computed_at: string, agents: bigint, sessions_total: bigint, sessions_active: bigint, modules_total: bigint, modules_active: bigint, events_total: bigint, messages_total: bigint, output_tokens_total: bigint, 
 /**
  * Lines of code written by Write/Edit tools across the window.
  */

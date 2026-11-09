@@ -104,6 +104,13 @@ function SessionList({ onOpen }: { onOpen: (s: SessionView) => void }) {
       <Title order={5} mb="xs">
         Sessions — click one to open its feed
       </Title>
+      {sessions.isError && (
+        <Alert color="orange" variant="light" mb="sm" title="The sessions could not be listed">
+          {String(sessions.error)}
+          {sessions.data ? ' — the list below is the last good one.' : ''}
+        </Alert>
+      )}
+      {sessions.isPending && <Text size="sm" c="dimmed" mb="sm">Reading the sessions…</Text>}
       <ScrollArea h={600}>
         <Table striped highlightOnHover>
           <Table.Thead>

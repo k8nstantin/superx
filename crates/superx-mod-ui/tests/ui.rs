@@ -5766,3 +5766,86 @@ async fn the_sessions_tally_gives_each_session_what_its_own_reads_give() {
         }
     }
 }
+
+/// A row's id is minted before it is written (#576 review): one minted
+/// before a newer row and committed after the tally read that newer one is
+/// still counted, and only once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sessions_tally_counts_a_row_committed_after_a_newer_one_once() {
+    use superx_kernel::types::{RecordId, Uuid, Value};
+    use superx_mod_ui::tally::Tally;
+
+    let kernel = fresh_kernel().await;
+    let (agent, a) = seed_agent_and_session(&kernel, "claude_code", "src-late").await;
+    let now = chrono::Utc::now();
+    said_at(&kernel, &a, &agent, "user", None, now).await;
+    // Minted now, written only after a newer row was written and read.
+    let early = Uuid::new_v7();
+    said_at(&kernel, &a, &agent, "user", None, now).await;
+    let mut tally = Tally::default();
+    tally.refresh(&kernel).await.expect("read");
+    let ua = superx_ops::record_uuid(&a);
+    assert_eq!(tally.lines(&ua), 2);
+    let raw = superx_kernel::message::json_to_object(&serde_json::json!({"message": {"id": "msg_late", "model": "claude-opus-5-5",
+        "usage": {"input_tokens": 3, "cache_read_input_tokens": 400, "output_tokens": 9}}}));
+    kernel
+        .db()
+        .query("CREATE $id CONTENT { session: $sess, agent: $agent, role: 'assistant', content: '', raw: $raw, valid_from: time::now() }")
+        .bind(("id", RecordId::new("message", early)))
+        .bind(("sess", a.clone()))
+        .bind(("agent", agent.clone()))
+        .bind(("raw", Value::Object(raw)))
+        .await
+        .expect("late row")
+        .check()
+        .expect("late row written");
+    tally.refresh(&kernel).await.expect("again");
+    assert_eq!(tally.lines(&ua), 3, "the late row counted");
+    assert_eq!(tally.tokens(&ua), (Some(403), Some(9)));
+    tally.refresh(&kernel).await.expect("and again");
+    assert_eq!(tally.lines(&ua), 3, "and counted once");
+    assert_eq!(tally.lines(&ua), kernel.session_message_count(a.clone()).await.expect("count"));
+}
+
+/// A late row stamped inside the late-commit window, but before every row
+/// the tally read inside it, is counted when it commits (#576 review): the
+/// next read starts at the newest row from before the window, not at the
+/// oldest read inside it, which is past the late row's id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sessions_tally_looks_back_from_before_the_late_commit_window() {
+    use superx_kernel::types::{RecordId, Uuid};
+    use superx_mod_ui::tally::Tally;
+
+    async fn said(kernel: &Kernel, id: Uuid, session: &RecordId, agent: &RecordId, at: chrono::DateTime<chrono::Utc>) {
+        kernel
+            .db()
+            .query("CREATE $id CONTENT { session: $sess, agent: $agent, role: 'user', content: '', valid_from: $at }")
+            .bind(("id", RecordId::new("message", id)))
+            .bind(("sess", session.clone()))
+            .bind(("agent", agent.clone()))
+            .bind(("at", at))
+            .await
+            .expect("row")
+            .check()
+            .expect("row written");
+    }
+
+    let kernel = fresh_kernel().await;
+    let (agent, a) = seed_agent_and_session(&kernel, "claude_code", "src-window").await;
+    // In mint order: a row from a minute ago, the late row, a newer row.
+    let mut ids = [Uuid::new_v7(), Uuid::new_v7(), Uuid::new_v7()];
+    ids.sort();
+    let [old, late, newer] = ids;
+    let now = chrono::Utc::now();
+    said(&kernel, old, &a, &agent, now - chrono::TimeDelta::seconds(60)).await;
+    said(&kernel, newer, &a, &agent, now - chrono::TimeDelta::seconds(3)).await;
+    let mut tally = Tally::default();
+    tally.refresh(&kernel).await.expect("read");
+    let ua = superx_ops::record_uuid(&a);
+    assert_eq!(tally.lines(&ua), 2);
+    // Stamped before the newer row, inside the window; committed only now.
+    said(&kernel, late, &a, &agent, now - chrono::TimeDelta::seconds(5)).await;
+    tally.refresh(&kernel).await.expect("again");
+    assert_eq!(tally.lines(&ua), 3, "the late row counted");
+    assert_eq!(tally.lines(&ua), kernel.session_message_count(a.clone()).await.expect("count"));
+}

@@ -14,6 +14,10 @@ import type { TokenTotals } from "./TokenTotals";
  */
 export type InsightsSummary = { 
 /**
+ * When this answer was computed (#576), as [`StatsSummary::computed_at`].
+ */
+computed_at: string, 
+/**
  * Events per calendar day, oldest first (`t` = `YYYY-MM-DD`).
  */
 events_per_day: Array<TimeCount>, 

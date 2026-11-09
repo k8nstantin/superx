@@ -320,6 +320,17 @@ pub async fn resolved_context_window(kernel: &Kernel) -> i64 {
     }
 }
 
+/// A socket of its own for one part of the module, else `fallback`'s.
+async fn own_socket(kernel: &Kernel, fallback: &Kernel, part: &str) -> Kernel {
+    match kernel.fork().await {
+        Ok(own) => own,
+        Err(e) => {
+            tracing::warn!(target: "ui", error = %e, part, "a part reads over another's socket: it could not open its own");
+            fallback.clone()
+        }
+    }
+}
+
 #[async_trait]
 impl KernelModule for UiModule {
     fn descriptor(&self) -> KernelModuleDescriptor {
@@ -334,25 +345,19 @@ impl KernelModule for UiModule {
 
     async fn startup(&self, kernel: &Kernel) -> Result<()> {
         let port = resolved_port(kernel).await;
-        // The page reads over a socket of its own (#568, #570): an answer
-        // that drops it fails the page's requests, never capture's.
-        let page = match kernel.fork().await {
-            Ok(own) => own,
-            Err(e) => {
-                tracing::warn!(target: "ui", error = %e, "the page reads over capture's socket: it could not open its own");
-                kernel.clone()
-            }
+        // Each part reads over a socket of its own (#568, #570, #576): an
+        // answer that waits or drops one holds none of the others, and never
+        // capture's. The page's recomputes; the lamp, the status and the
+        // parameters (a one-kilobyte answer waited 9.6 s behind a recompute);
+        // the live events; and the sessions tally's keeper.
+        let page = own_socket(kernel, kernel, "the page").await;
+        let sockets = server::Sockets {
+            live: own_socket(kernel, &page, "the lamp and the status").await,
+            events: own_socket(kernel, &page, "the live events").await,
+            tally: own_socket(kernel, &page, "the sessions tally").await,
+            page,
         };
-        // The capture lamp and the status read over another (#576): a
-        // one-kilobyte answer waited 9.6 s behind the Status page's recompute.
-        let live = match kernel.fork().await {
-            Ok(own) => own,
-            Err(e) => {
-                tracing::warn!(target: "ui", error = %e, "the lamp reads over the page's socket: it could not open its own");
-                page.clone()
-            }
-        };
-        server::spawn(page, live, port).await?;
+        server::spawn(sockets, port).await?;
         let url = format!("http://127.0.0.1:{port}");
         tracing::info!(target: "ui", %url, "ui module serving");
         let mut payload = superx_kernel::types::Object::new();

@@ -400,6 +400,7 @@ pub async fn insights_summary_on(kernel: &Kernel, clock: chrono::FixedOffset) ->
     let db_bytes_est = tables.iter().map(|t| t.bytes_est).sum();
 
     Ok(InsightsSummary {
+        computed_at: chrono::Utc::now().to_rfc3339(),
         events_per_day,
         hour_weekday,
         tokens,
