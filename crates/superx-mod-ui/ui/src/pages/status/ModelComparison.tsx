@@ -648,7 +648,16 @@ function verdict(rows: Row[]) {
   return { best, worst, tokX, hrX }
 }
 
-export function ModelComparison({ c }: { c: CompareSummary | undefined }) {
+export function ModelComparison({ c, error }: { c: CompareSummary | undefined; error: string | null }) {
+  // A failed read is said as one (#576): it read as "no commit could be
+  // credited" when the comparison never came.
+  if (error) {
+    return (
+      <Panel title="Model comparison" scope="all" range={null}>
+        <Text size="xs" c="red">the comparison could not be read: {error}</Text>
+      </Panel>
+    )
+  }
   if (!c) {
     return (
       <Panel title="Model comparison" scope="all" range={null}>

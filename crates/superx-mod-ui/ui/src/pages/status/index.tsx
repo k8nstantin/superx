@@ -81,15 +81,29 @@ export default function StatusPage() {
     // A failed range keeps the last good reading on the instruments
     // and says so, instead of blanking every panel to a dash.
     placeholderData: keepPreviousData,
-    // A 400 from the substrate is deterministic, and TanStack pauses
-    // retries while the tab is hidden — a retried failure never reached
-    // the error state in a background tab. The interval is the retry.
+    // A failure is not retried at once: TanStack pauses retries while the
+    // tab is hidden, so a retried failure never reached the error state in
+    // a background tab. The interval is the retry.
     retry: false,
   })
   const insights = useQuery({ queryKey: ['insights'], queryFn: fetchInsights, refetchInterval: 60000 })
   // Read from git, cached server-side for minutes: it moves when
-  // commits land, not when the page polls.
-  const compare = useQuery({ queryKey: ['compare'], queryFn: fetchCompare, refetchInterval: 300000 })
+  // commits land, not when the page polls. It walks every repository's git
+  // (97 s on a miss, #576), so it is asked for only once its section comes
+  // near the screen.
+  const [wantCompare, setWantCompare] = useState(false)
+  useEffect(() => {
+    const el = document.getElementById('models')
+    if (!el || wantCompare) return
+    const obs = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) setWantCompare(true)
+    }, { rootMargin: '800px 0px' })
+    obs.observe(el)
+    return () => obs.disconnect()
+  }, [wantCompare])
+  // A failed walk is not tried again at once: each try walks every
+  // repository. The interval is the retry, as it is for the range.
+  const compare = useQuery({ queryKey: ['compare'], queryFn: fetchCompare, refetchInterval: 300000, enabled: wantCompare, retry: false })
 
   const s = stats.data
   const i = insights.data
@@ -117,8 +131,13 @@ export default function StatusPage() {
   const note = useMemo(() => {
     if (!s) return ''
     const base = rangeLabel(s.range, s.window_messages)
-    return s.truncated ? `${base} · sampled, row cap reached` : base
-  }, [s])
+    const read = s.truncated ? `${base} · sampled, row cap reached` : base
+    // An older answer is served at once while the next is computed (#576),
+    // so the bar always says when the figures are from: the older of the
+    // range's and the all-history ones.
+    const at = Math.min(Date.parse(s.computed_at), i ? Date.parse(i.computed_at) : Infinity)
+    return `${read} · as of ${new Date(at).toLocaleTimeString()}`
+  }, [s, i])
 
   return (
     <>
@@ -215,7 +234,7 @@ export default function StatusPage() {
         title="Model comparison"
         blurb="which model to reach for — what its work is worth, how hard it churns, and what happens when the model is switched"
       >
-        <ModelComparison c={compare.data} />
+        <ModelComparison c={compare.data} error={compare.isError ? String(compare.error) : null} />
       </Section>
       <Section id="cost" title="Cost" blurb="what the tokens bought, and what left this machine">
         <CostSection s={s} i={i} range={s?.range ?? range} />

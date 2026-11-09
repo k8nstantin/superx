@@ -164,7 +164,7 @@ pub async fn session_named(kernel: &Kernel, id: &str) -> std::result::Result<Rec
 /// its time before it is written, so one stamped before a poll and
 /// committed after it lands behind the cursor, where a read of newer rows
 /// never looks. Rows already sent are skipped by id.
-const LATE_COMMIT_SECS: i64 = 10; // skill-allow: §9-const — read-path bound, not a policy tunable
+pub(crate) const LATE_COMMIT_SECS: i64 = 10; // skill-allow: §9-const — read-path bound, not a policy tunable
 
 /// Batches one live poll reads, at most; the rest follow on the next.
 const LIVE_PAGES: usize = 5; // skill-allow: §9-const — read-path bound, not a policy tunable
@@ -722,25 +722,6 @@ fn int_of(o: &superx_kernel::types::Object, key: &str) -> i64 {
     }
 }
 
-
-/// Rows read when looking for a session's newest real model or
-/// effort — enough to see past a run of runtime-written lines.
-const NEWEST_SCAN: u32 = 12; // skill-allow: §9-const — read-path bound, not a policy tunable
-
-/// A session's token telemetry, mined from the raw events adapters
-/// already preserve (issue #200): `(context, output_total)`.
-///
-/// - `context` — the NEWEST usage-bearing message's prompt footprint:
-///   Claude Code `raw.message.usage` (input + cache_read +
-///   cache_creation) or Gemini `raw.tokens` (total; else input+cached).
-/// - `output_total` — Σ output tokens across the session.
-///
-/// Both `None` when the session carries no usage data (e.g. telemetry-
-/// only agents). Pure SELECT over the `(session, valid_from)` index.
-///
-/// # Errors
-///
-/// [`superx_kernel::KernelError::Db`] for engine errors.
 /// The model CURRENTLY doing this session's work: the newest message
 /// that names one. A session outlives the model choice — the operator
 /// switches mid-conversation — so this is a moving fact, read fresh
@@ -764,16 +745,17 @@ pub async fn session_model_effort(
     kernel: &Kernel,
     session: RecordId,
 ) -> Result<(Option<String>, Option<String>)> {
-    // A few rows, not one: the newest line may name `<synthetic>`, the
-    // runtime's marker for a line it wrote itself. It is not a model
-    // (#367) — the Status page has filtered it since, the Sessions
-    // page showed it (#388). Skip the sentinels and take the newest
-    // real answer behind them.
+    // Every row that names one, newest first: the newest line may name
+    // `<synthetic>`, the runtime's marker for a line it wrote itself. It is
+    // not a model (#367) — the Status page has filtered it since, the
+    // Sessions page showed it (#388). Skip the sentinels and take the
+    // newest real answer behind them, however many there are, as the
+    // sessions list's tally does (#576).
     let newest = |field: &str, guard: &str| {
         format!(
             "SELECT {field} AS v, valid_from FROM message \
              WHERE session = $sess AND {guard} \
-             ORDER BY valid_from DESC LIMIT {NEWEST_SCAN}"
+             ORDER BY valid_from DESC"
         )
     };
     let pick = |rows: Vec<Value>| {
@@ -817,6 +799,9 @@ pub async fn session_model_effort(
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
+///
+/// The sessions list takes this from [`crate::tally::Tally`] (#576); this
+/// read is what the tests hold the tally to.
 pub async fn session_last_emitted(
     kernel: &Kernel,
     session: RecordId,
@@ -846,6 +831,23 @@ pub async fn session_last_emitted(
 /// past a run of `<synthetic>` or zero-usage replies.
 const CONTEXT_PROBE: u32 = 20; // skill-allow: §9-const — read-path bound, not a policy tunable
 
+/// A session's token telemetry, mined from the raw events adapters
+/// already preserve (issue #200): `(context, output_total)`.
+///
+/// - `context` — the NEWEST usage-bearing message's prompt footprint:
+///   Claude Code `raw.message.usage` (input + cache_read +
+///   cache_creation) or Gemini `raw.tokens` (total; else input+cached).
+/// - `output_total` — Σ output tokens across the session.
+///
+/// Both `None` when the session carries no usage data (e.g. telemetry-
+/// only agents). Pure SELECT over the `(session, valid_from)` index.
+///
+/// # Errors
+///
+/// [`superx_kernel::KernelError::Db`] for engine errors.
+///
+/// The sessions list takes this from [`crate::tally::Tally`] (#576); this
+/// read is what the tests hold the tally to.
 pub async fn session_token_stats(
     kernel: &Kernel,
     session: RecordId,
@@ -928,6 +930,9 @@ pub async fn session_token_stats(
 /// # Errors
 ///
 /// [`superx_kernel::KernelError::Db`] for engine errors.
+///
+/// The sessions list takes this from [`crate::tally::Tally`] (#576); this
+/// read is what the tests hold the tally to.
 pub async fn action_counts(
     kernel: &Kernel,
     sessions: &[(RecordId, Option<(RecordId, String)>)],

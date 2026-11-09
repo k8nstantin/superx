@@ -5652,3 +5652,200 @@ async fn the_core_uis_status_answer_links_only_active_modules() {
         assert!(named(name)["ui_url"].is_null(), "{name} is listed without a link: {}", named(name));
     }
 }
+
+/// One line of a session, its raw shape and its own time given.
+async fn said_at(
+    kernel: &superx_kernel::Kernel,
+    session: &superx_kernel::types::RecordId,
+    agent: &superx_kernel::types::RecordId,
+    role: &str,
+    raw: Option<serde_json::Value>,
+    emitted: chrono::DateTime<chrono::Utc>,
+) {
+    kernel
+        .log_message(superx_kernel::NewMessage {
+            session: session.clone(),
+            agent: agent.clone(),
+            role: role.to_string(),
+            content: String::new(),
+            raw: raw.as_ref().map(superx_kernel::message::json_to_object),
+            seq: None,
+            emitted_at: Some(emitted),
+        })
+        .await
+        .expect("message");
+}
+
+/// The sessions list's running tally (#576) gives each session what its own
+/// reads give: its lines and its action events, when it last did anything,
+/// its context and output tokens, its model and its effort. After more rows
+/// arrive, only those are read, and the figures follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sessions_tally_gives_each_session_what_its_own_reads_give() {
+    use superx_kernel::types::{Object, Value};
+    use superx_mod_ui::activity::{action_counts, session_last_emitted, session_model_effort, session_token_stats};
+    use superx_mod_ui::tally::Tally;
+
+    let kernel = fresh_kernel().await;
+    let (agent, a) = seed_agent_and_session(&kernel, "claude_code", "src-a").await;
+    let (gagent, g) = seed_agent_and_session(&kernel, "gemini_cli", "src-g").await;
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+    let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+    let claude = |id: &str, model: &str, input: i64, write: i64, read: i64, out: i64| {
+        serde_json::json!({"message": {"id": id, "model": model, "usage": {
+            "input_tokens": input, "cache_creation_input_tokens": write, "cache_read_input_tokens": read, "output_tokens": out}}})
+    };
+    said_at(&kernel, &a, &agent, "user", None, at(0)).await;
+    // One reply on two lines, its usage said on both, the newer larger.
+    said_at(&kernel, &a, &agent, "assistant", Some(claude("msg_1", "claude-opus-5-5", 100, 0, 1_000, 10)), at(1)).await;
+    said_at(&kernel, &a, &agent, "assistant", Some(claude("msg_1", "claude-opus-5-5", 100, 0, 1_000, 12)), at(1)).await;
+    let mut second = claude("msg_2", "claude-sonnet-5-5", 5, 30, 2_000, 20);
+    second["effort"] = serde_json::json!("max");
+    said_at(&kernel, &a, &agent, "assistant", Some(second), at(3)).await;
+    // The runtime's own stand-in for an API error, all zeros: the newest
+    // reply, but neither a model nor a context.
+    said_at(&kernel, &a, &agent, "assistant", Some(claude("msg_3", "<synthetic>", 0, 0, 0, 0)), at(4)).await;
+    said_at(&kernel, &a, &agent, "user", None, at(5)).await;
+    // A Gemini record re-emitted as it streamed, then another.
+    let gemini = |id: &str, model: &str, input: i64, out: i64, thoughts: i64| {
+        serde_json::json!({"id": id, "type": "gemini", "model": model,
+            "tokens": {"input": input, "output": out, "cached": 10, "thoughts": thoughts, "tool": 2}})
+    };
+    said_at(&kernel, &g, &gagent, "assistant", Some(gemini("g-1", "gemini-3.1-pro", 50, 7, 3)), at(2)).await;
+    said_at(&kernel, &g, &gagent, "assistant", Some(gemini("g-1", "gemini-3.1-pro", 50, 9, 3)), at(2)).await;
+    said_at(&kernel, &g, &gagent, "assistant", Some(gemini("g-2", "gemini-3.1-flash", 80, 1, 0)), at(6)).await;
+    // Action events: by subject, by source key, both at once, another
+    // source key's, and one no agent emitted.
+    let for_src = |src: &str| {
+        let mut o = Object::new();
+        o.insert("session".to_string(), Value::String(src.to_string()));
+        Value::Object(o)
+    };
+    kernel.log_telemetry_for_agent("message_captured", for_src("src-a"), Some(a.clone()), Some(agent.clone())).await.expect("a1");
+    kernel.log_telemetry_for_agent("tool_call", for_src("src-a"), Some(agent.clone()), Some(agent.clone())).await.expect("a2");
+    kernel.log_telemetry_for_agent("tool_call", for_src("src-g"), Some(gagent.clone()), Some(gagent.clone())).await.expect("g1");
+    kernel.log_telemetry_for_agent("tool_call", for_src("src-z"), Some(agent.clone()), Some(agent.clone())).await.expect("z");
+    kernel.log_telemetry("session_note", Value::String("g".to_string()), Some(g.clone())).await.expect("g2");
+    let scoped = vec![
+        (a.clone(), Some((agent.clone(), "src-a".to_string()))),
+        (g.clone(), Some((gagent.clone(), "src-g".to_string()))),
+    ];
+
+    let mut tally = Tally::default();
+    tally.refresh(&kernel).await.expect("all history");
+    let (ua, ug) = (superx_ops::record_uuid(&a), superx_ops::record_uuid(&g));
+    // The figures, worked by hand, so both ways cannot agree on a wrong one.
+    assert_eq!(tally.lines(&ua), 6);
+    assert_eq!(tally.last_active(&ua), Some(at(5)));
+    assert_eq!(tally.tokens(&ua), (Some(5 + 30 + 2_000), Some(12 + 20)), "each reply once; the synthetic sets nothing");
+    assert_eq!(tally.model_effort(&ua), (Some("claude-sonnet-5-5".to_string()), Some("max".to_string())));
+    assert_eq!(tally.tokens(&ug), (Some(80 + 2), Some((9 + 3) + 1)), "Gemini output and thoughts, its prompt and tools");
+    assert_eq!(tally.model_effort(&ug), (Some("gemini-3.1-flash".to_string()), None));
+    let actions = tally.actions(&scoped);
+    assert_eq!((actions.get(&ua), actions.get(&ug)), (Some(&2), Some(&2)), "{actions:?}");
+
+    // And each as the session's own reads give it, before and after more
+    // rows arrive.
+    for round in 0..2 {
+        for session in [&a, &g] {
+            let uuid = superx_ops::record_uuid(session);
+            assert_eq!(tally.lines(&uuid), kernel.session_message_count(session.clone()).await.expect("count"), "round {round}");
+            assert_eq!(tally.last_active(&uuid), session_last_emitted(&kernel, session.clone()).await.expect("last"), "round {round}");
+            assert_eq!(tally.tokens(&uuid), session_token_stats(&kernel, session.clone()).await.expect("tokens"), "round {round}");
+            assert_eq!(tally.model_effort(&uuid), session_model_effort(&kernel, session.clone()).await.expect("model"), "round {round}");
+        }
+        assert_eq!(tally.actions(&scoped), action_counts(&kernel, &scoped).await.expect("actions"), "round {round}");
+        if round == 0 {
+            let mut third = claude("msg_4", "claude-fable-5-1", 7, 0, 3_000, 40);
+            third["effort"] = serde_json::json!("high");
+            said_at(&kernel, &a, &agent, "assistant", Some(third), at(7)).await;
+            kernel.log_telemetry_for_agent("tool_call", for_src("src-a"), Some(agent.clone()), Some(agent.clone())).await.expect("a3");
+            tally.refresh(&kernel).await.expect("only the new rows");
+            assert_eq!(tally.model_effort(&ua), (Some("claude-fable-5-1".to_string()), Some("high".to_string())));
+            assert_eq!(tally.tokens(&ua), (Some(7 + 3_000), Some(12 + 20 + 40)));
+        }
+    }
+}
+
+/// A row's id is minted before it is written (#576 review): one minted
+/// before a newer row and committed after the tally read that newer one is
+/// still counted, and only once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sessions_tally_counts_a_row_committed_after_a_newer_one_once() {
+    use superx_kernel::types::{RecordId, Uuid, Value};
+    use superx_mod_ui::tally::Tally;
+
+    let kernel = fresh_kernel().await;
+    let (agent, a) = seed_agent_and_session(&kernel, "claude_code", "src-late").await;
+    let now = chrono::Utc::now();
+    said_at(&kernel, &a, &agent, "user", None, now).await;
+    // Minted now, written only after a newer row was written and read.
+    let early = Uuid::new_v7();
+    said_at(&kernel, &a, &agent, "user", None, now).await;
+    let mut tally = Tally::default();
+    tally.refresh(&kernel).await.expect("read");
+    let ua = superx_ops::record_uuid(&a);
+    assert_eq!(tally.lines(&ua), 2);
+    let raw = superx_kernel::message::json_to_object(&serde_json::json!({"message": {"id": "msg_late", "model": "claude-opus-5-5",
+        "usage": {"input_tokens": 3, "cache_read_input_tokens": 400, "output_tokens": 9}}}));
+    kernel
+        .db()
+        .query("CREATE $id CONTENT { session: $sess, agent: $agent, role: 'assistant', content: '', raw: $raw, valid_from: time::now() }")
+        .bind(("id", RecordId::new("message", early)))
+        .bind(("sess", a.clone()))
+        .bind(("agent", agent.clone()))
+        .bind(("raw", Value::Object(raw)))
+        .await
+        .expect("late row")
+        .check()
+        .expect("late row written");
+    tally.refresh(&kernel).await.expect("again");
+    assert_eq!(tally.lines(&ua), 3, "the late row counted");
+    assert_eq!(tally.tokens(&ua), (Some(403), Some(9)));
+    tally.refresh(&kernel).await.expect("and again");
+    assert_eq!(tally.lines(&ua), 3, "and counted once");
+    assert_eq!(tally.lines(&ua), kernel.session_message_count(a.clone()).await.expect("count"));
+}
+
+/// A late row stamped inside the late-commit window, but before every row
+/// the tally read inside it, is counted when it commits (#576 review): the
+/// next read starts at the newest row from before the window, not at the
+/// oldest read inside it, which is past the late row's id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sessions_tally_looks_back_from_before_the_late_commit_window() {
+    use superx_kernel::types::{RecordId, Uuid};
+    use superx_mod_ui::tally::Tally;
+
+    async fn said(kernel: &Kernel, id: Uuid, session: &RecordId, agent: &RecordId, at: chrono::DateTime<chrono::Utc>) {
+        kernel
+            .db()
+            .query("CREATE $id CONTENT { session: $sess, agent: $agent, role: 'user', content: '', valid_from: $at }")
+            .bind(("id", RecordId::new("message", id)))
+            .bind(("sess", session.clone()))
+            .bind(("agent", agent.clone()))
+            .bind(("at", at))
+            .await
+            .expect("row")
+            .check()
+            .expect("row written");
+    }
+
+    let kernel = fresh_kernel().await;
+    let (agent, a) = seed_agent_and_session(&kernel, "claude_code", "src-window").await;
+    // In mint order: a row from a minute ago, the late row, a newer row.
+    let mut ids = [Uuid::new_v7(), Uuid::new_v7(), Uuid::new_v7()];
+    ids.sort();
+    let [old, late, newer] = ids;
+    let now = chrono::Utc::now();
+    said(&kernel, old, &a, &agent, now - chrono::TimeDelta::seconds(60)).await;
+    said(&kernel, newer, &a, &agent, now - chrono::TimeDelta::seconds(3)).await;
+    let mut tally = Tally::default();
+    tally.refresh(&kernel).await.expect("read");
+    let ua = superx_ops::record_uuid(&a);
+    assert_eq!(tally.lines(&ua), 2);
+    // Stamped before the newer row, inside the window; committed only now.
+    said(&kernel, late, &a, &agent, now - chrono::TimeDelta::seconds(5)).await;
+    tally.refresh(&kernel).await.expect("again");
+    assert_eq!(tally.lines(&ua), 3, "the late row counted");
+    assert_eq!(tally.lines(&ua), kernel.session_message_count(a.clone()).await.expect("count"));
+}

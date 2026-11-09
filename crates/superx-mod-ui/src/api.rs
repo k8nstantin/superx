@@ -136,6 +136,10 @@ pub struct NameCount {
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct StatsSummary {
+    /// When this answer was computed (#576): the page is served the newest
+    /// computation at once while the next one is made, and says how old it
+    /// is when that matters.
+    pub computed_at: String,
     pub agents: i64,
     pub sessions_total: i64,
     pub sessions_active: i64,
@@ -932,6 +936,8 @@ pub struct ToolOutcome {
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct InsightsSummary {
+    /// When this answer was computed (#576), as [`StatsSummary::computed_at`].
+    pub computed_at: String,
     /// Events per calendar day, oldest first (`t` = `YYYY-MM-DD`).
     pub events_per_day: Vec<TimeCount>,
     /// Events by hour of day × day of week.

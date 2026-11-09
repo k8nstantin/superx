@@ -37,7 +37,18 @@ const SSE_BATCH: u32 = 200; // skill-allow: §9-const — poll page bound
 
 #[derive(Clone)]
 struct AppState {
+    /// The page's socket: the heavy reads, each answer's recompute.
     kernel: Kernel,
+    /// The small reads' own socket (#576): the capture lamp, the status,
+    /// the parameters and the entity lists, never behind a recompute.
+    live: Kernel,
+    /// The sessions list, kept as a running tally by its own task over its
+    /// own socket (#576).
+    tally: std::sync::Arc<tokio::sync::Mutex<crate::tally::Tally>>,
+    /// How the tally's newest read went: until one has read every row, and
+    /// while the newest failed, the list says so, and why, rather than show
+    /// figures that stopped moving.
+    tally_read: std::sync::Arc<std::sync::Mutex<TallyRead>>,
     events: broadcast::Sender<String>,
     answers: Answers,
     /// What the completeness check has counted of each watched transcript,
@@ -54,6 +65,31 @@ impl AppState {
     fn remember(&self, key: &str, body: &str) {
         self.answers.remember(key, body);
     }
+}
+
+/// How the sessions tally's newest read went (#576).
+#[derive(Clone, Debug, Default)]
+enum TallyRead {
+    /// None has finished: the first, of all history, is under way.
+    #[default]
+    Reading,
+    /// It failed, and why; the keeper reads again at its next poll.
+    Failed(String),
+    /// It read every row up to the newest: the list is answered from it.
+    Read,
+}
+
+/// The sockets the module's parts read over (#568, #570, #576): one that
+/// waits or drops holds none of the others, and never capture's.
+pub struct Sockets {
+    /// The page's heavy reads and recomputes.
+    pub page: Kernel,
+    /// The capture lamp, the status, the parameters, the entity lists.
+    pub live: Kernel,
+    /// The live events' poller.
+    pub events: Kernel,
+    /// The sessions tally's keeper.
+    pub tally: Kernel,
 }
 
 /// An answer still being computed: every request for it watches the one
@@ -74,17 +110,25 @@ struct Answers {
     /// key is computed once, whoever asks joins it, and it runs to its end
     /// and is kept even when the request that started it has given up.
     inflight: std::sync::Arc<std::sync::Mutex<HashMap<String, Pending>>>,
+    /// Each key's newest computation that failed, until one succeeds
+    /// (#576): an older answer is not served over a failure.
+    failed: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl Answers {
-    /// A body computed less than `ttl` ago, if there is one.
-    fn cached(&self, key: &str, ttl: u64) -> Option<String> {
+    /// The newest answer for `key` and its age, while caching is on.
+    fn held(&self, key: &str, ttl: u64) -> Option<(Duration, String)> {
         if ttl == 0 {
             return None;
         }
         let map = self.cache.lock().ok()?;
         let (at, body) = map.get(key)?;
-        (at.elapsed().as_secs() < ttl).then(|| body.clone())
+        Some((at.elapsed(), body.clone()))
+    }
+
+    /// A body computed less than `ttl` ago, if there is one.
+    fn cached(&self, key: &str, ttl: u64) -> Option<String> {
+        self.held(key, ttl).filter(|(age, _)| age.as_secs() < ttl).map(|(_, body)| body)
     }
 
     fn remember(&self, key: &str, body: &str) {
@@ -98,15 +142,25 @@ impl Answers {
         }
     }
 
-    /// The answer for `key`: from the cache, else from the computation
-    /// already under way, else from `work`, started on its own task so it
-    /// finishes, and is kept, whether or not this request waits for it.
+    /// The answer for `key`:
+    /// - computed less than `ttl` ago: from the cache;
+    /// - computed before that: that answer at once, while its successor is
+    ///   computed behind it (#576: the Status page waited 27 s for every
+    ///   recompute), unless the newest computation failed, whose error is
+    ///   then the answer, as it was before (#415 QA: a page left on old
+    ///   figures with nothing saying why);
+    /// - else from the computation under way, else from `work`, started on
+    ///   its own task so it finishes, and is kept, whether or not this
+    ///   request waits for it.
     async fn computed<F>(&self, key: &str, ttl: u64, work: F) -> std::result::Result<String, String>
     where
         F: std::future::Future<Output = std::result::Result<String, String>> + Send + 'static,
     {
-        if let Some(body) = self.cached(key, ttl) {
-            return Ok(body);
+        let held = self.held(key, ttl);
+        if let Some((age, body)) = &held {
+            if age.as_secs() < ttl {
+                return Ok(body.clone());
+            }
         }
         let mut pending = {
             let Ok(mut map) = self.inflight.lock() else { return work.await };
@@ -119,20 +173,36 @@ impl Answers {
                 let key = key.to_string();
                 tokio::spawn(async move {
                     let answer = work.await;
-                    if let Ok(body) = &answer {
-                        answers.remember(&key, body);
+                    match &answer {
+                        Ok(body) => {
+                            answers.remember(&key, body);
+                            if let Ok(mut failed) = answers.failed.lock() {
+                                failed.remove(&key);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "ui", key = %key, error = %e, "an answer could not be computed");
+                            if let Ok(mut failed) = answers.failed.lock() {
+                                failed.insert(key.clone(), e.clone());
+                            }
+                        }
                     }
                     if let Ok(mut map) = answers.inflight.lock() {
                         map.remove(&key);
                     }
-                    // Nobody watching is fine: the answer is cached.
                     if tx.send(Some(answer)).is_err() {
-                        tracing::debug!(target: "ui", key = %key, "answer finished with nobody waiting; cached");
+                        tracing::debug!(target: "ui", key = %key, "answer finished with nobody waiting");
                     }
                 });
                 pending
             }
         };
+        if let Some((_, body)) = held {
+            if let Some(e) = self.failed.lock().ok().and_then(|failed| failed.get(key).cloned()) {
+                return Err(e);
+            }
+            return Ok(body);
+        }
         loop {
             if let Some(answer) = pending.borrow_and_update().clone() {
                 return answer;
@@ -195,21 +265,27 @@ async fn bounded(
     }
 }
 
-/// Bind and spawn the server + the single SSE poller task.
-pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
+/// Bind and spawn the server, the live events' poller and the sessions
+/// tally's keeper, each reading over its own socket.
+pub async fn spawn(sockets: Sockets, port: u16) -> Result<()> {
+    let Sockets { page, live, events: poller, tally: keeper } = sockets;
     let (events, _) = broadcast::channel(1024);
     let state = AppState {
-        kernel: kernel.clone(),
+        kernel: page.clone(),
+        live: live.clone(),
+        tally: std::sync::Arc::default(),
+        tally_read: std::sync::Arc::default(),
         events: events.clone(),
         answers: Answers::default(),
         capture_watch: std::sync::Arc::default(),
     };
     // Read once, here: resolving it per request would itself await the
     // substrate that might not answer.
-    let secs = crate::resolved_read_timeout_secs(&kernel).await;
+    let secs = crate::resolved_read_timeout_secs(&live).await;
     let budget = (secs > 0).then(|| Duration::from_secs(secs));
     // Each substrate query gets a quarter of it, and one retry (#415 QA).
     crate::set_query_timeout(budget);
+    let (tally, tally_read) = (state.tally.clone(), state.tally_read.clone());
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/capture", get(api_capture))
@@ -238,8 +314,8 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
     // Stop means stop (M0): the kernel cancels this token on
     // `modules disable`/`restart`, axum closes the listener and the
     // port is free for the next start.
-    let stop = kernel.module_token(MODULE_NAME);
-    let poller_stop = stop.clone();
+    let stop = page.module_token(MODULE_NAME);
+    let (poller_stop, keeper_stop) = (stop.clone(), stop.clone());
     tokio::spawn(async move {
         let served = axum::serve(listener, app)
             .with_graceful_shutdown(stop.cancelled())
@@ -250,8 +326,39 @@ pub async fn spawn(kernel: Kernel, port: u16) -> Result<()> {
             tracing::info!(target: "ui", "ui server closed");
         }
     });
-    tokio::spawn(sse_poller(kernel, events, poller_stop));
+    tokio::spawn(sse_poller(poller, events, poller_stop));
+    // Started with every query bounded: its first read is all of history.
+    tokio::spawn(tally_keeper(keeper, tally, tally_read, keeper_stop));
     Ok(())
+}
+
+/// The sessions tally, kept (#576): all of history read once, then the
+/// newest rows at every live poll, until the module stops (M0). The list is
+/// answered from it, never by a read of its own.
+async fn tally_keeper(
+    kernel: Kernel,
+    tally: std::sync::Arc<tokio::sync::Mutex<crate::tally::Tally>>,
+    tally_read: std::sync::Arc<std::sync::Mutex<TallyRead>>,
+    stop: superx_kernel::supervise::CancelToken,
+) {
+    loop {
+        if stop.is_cancelled() {
+            tracing::info!(target: "ui", "sessions tally stopped");
+            return;
+        }
+        let read = tally.lock().await.refresh(&kernel).await;
+        if let Ok(mut went) = tally_read.lock() {
+            *went = match &read {
+                Ok(()) => TallyRead::Read,
+                Err(e) => TallyRead::Failed(e.to_string()),
+            };
+        }
+        if let Err(e) = read {
+            tracing::warn!(target: "ui", error = %e, "the sessions tally could not read the newest rows; it reads them at the next poll");
+        }
+        let poll = superx_ops::live_poll_secs(&kernel).await;
+        tokio::time::sleep(Duration::from_secs(poll)).await;
+    }
 }
 
 /// ONE poller for all SSE clients: bridges the kernel's live
@@ -359,7 +466,7 @@ fn names_a_file(path: &str) -> bool {
 /// Is every transcript line captured (#489)? Cached like the session list:
 /// the answer moves slowly.
 async fn api_capture(State(state): State<AppState>) -> axum::response::Response {
-    let kernel = &state.kernel;
+    let kernel = &state.live;
     let ttl = crate::resolved_cache_secs(kernel).await;
     if let Some(body) = state.cached("capture", ttl) {
         return json_body(body);
@@ -380,7 +487,7 @@ async fn api_capture(State(state): State<AppState>) -> axum::response::Response 
 }
 
 async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
-    let kernel = &state.kernel;
+    let kernel = &state.live;
     let mut modules = Vec::new();
     for kind in [NodeKind::KernelModule, NodeKind::Adapter] {
         if let Ok(list) = crate::answered("module list", || kernel.list_with_status(kind)).await {
@@ -480,21 +587,39 @@ async fn api_sessions(
     State(state): State<AppState>,
     Query(q): Query<SessionsQuery>,
 ) -> axum::response::Response {
-    let kernel = &state.kernel;
-    // Three substrate round-trips per session (#380), the action counts
-    // one read per agent (#530); until it is one query, at least two
-    // pollers share the cost (#390).
+    // The small reads, the entity lists and the parameters, go over the
+    // lamp's socket; every session's figures come from the running tally
+    // (#576), kept by its own task: four reads for each session, one after
+    // another, took 31 s. Two pollers within the cache bound share one
+    // answer (#390).
+    let kernel = &state.live;
     let ttl = crate::resolved_cache_secs(kernel).await;
     let key = format!("sessions:{}", q.agent.clone().unwrap_or_default());
     if let Some(body) = state.cached(&key, ttl) {
         return json_body(body);
     }
-    let mut out = Vec::new();
-    let Ok(sessions) =
-        crate::answered("sessions", || kernel.list_named_entities("node_session", "attr_session_descriptor")).await
-    else {
-        return json_body(serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string()));
+    let unread = match state.tally_read.lock().map(|went| went.clone()).unwrap_or_default() {
+        TallyRead::Read => None,
+        TallyRead::Reading => Some(
+            "the sessions are being read for the first time since the UI started; the list shows them once that read is done"
+                .to_string(),
+        ),
+        TallyRead::Failed(e) => Some(format!(
+            "the sessions' newest rows could not be read: {e}; they are read again at every poll"
+        )),
     };
+    if let Some(output) = unread {
+        return not_answered(StatusCode::SERVICE_UNAVAILABLE, &output);
+    }
+    let mut out = Vec::new();
+    let sessions =
+        match crate::answered("sessions", || kernel.list_named_entities("node_session", "attr_session_descriptor")).await {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::warn!(target: "ui", error = %e, "sessions read failed");
+                return not_answered(StatusCode::BAD_GATEWAY, &format!("the sessions could not be listed: {e}"));
+            }
+        };
     // The context bar's denominator — resolved once per request.
     let window = crate::resolved_context_window(kernel).await;
     // Each label is told apart from EVERY session, whatever the filter, so
@@ -506,18 +631,25 @@ async fn api_sessions(
     // re-resolving agents per row (review finding, issue #187).
     let mut agent_ids: std::collections::HashMap<String, superx_kernel::types::RecordId> =
         std::collections::HashMap::new();
-    if let Ok(agents) =
-        crate::answered("agents", || kernel.list_named_entities("node_agent", "attr_agent_descriptor")).await
-    {
-        for a in &agents {
-            if let superx_kernel::types::Value::Object(o) = &a.payload {
-                if let Some(superx_kernel::types::Value::String(n)) = o.get("name") {
-                    agent_ids.insert(n.clone(), a.entity_id.clone());
-                }
+    // Without them no session's events are matched by its source key: every
+    // count would fall short, unsaid.
+    let agents =
+        match crate::answered("agents", || kernel.list_named_entities("node_agent", "attr_agent_descriptor")).await {
+            Ok(agents) => agents,
+            Err(e) => {
+                tracing::warn!(target: "ui", error = %e, "agents read failed");
+                return not_answered(StatusCode::BAD_GATEWAY, &format!("the agents could not be listed: {e}"));
+            }
+        };
+    for a in &agents {
+        if let superx_kernel::types::Value::Object(o) = &a.payload {
+            if let Some(superx_kernel::types::Value::String(n)) = o.get("name") {
+                agent_ids.insert(n.clone(), a.entity_id.clone());
             }
         }
     }
-    // Every session's action count, in one read per agent (#530).
+    // Every session's (agent, source key): what its action events are
+    // matched by (#530).
     let scopes: Vec<_> = sessions
         .iter()
         .map(|s| {
@@ -535,7 +667,8 @@ async fn api_sessions(
             (s.entity_id.clone(), scope)
         })
         .collect();
-    let actions = crate::activity::action_counts(kernel, &scopes).await.unwrap_or_default();
+    let tally = state.tally.lock().await;
+    let actions = tally.actions(&scopes);
     for s in sessions {
         let name = match &s.payload {
             superx_kernel::types::Value::Object(o) => match o.get("name") {
@@ -554,25 +687,13 @@ async fn api_sessions(
         // TOTAL activity — messages + the session's action events
         // (issue #187: the list counts everything the feed shows).
         let uuid = superx_ops::record_uuid(&s.entity_id);
-        let count = crate::answered("session messages", || kernel.session_message_count(s.entity_id.clone()))
-            .await
-            .unwrap_or(0)
-            + actions.get(&uuid).copied().unwrap_or(0);
-        let last_active = crate::activity::session_last_emitted(kernel, s.entity_id.clone())
-            .await
-            .ok()
-            .flatten()
-            .map(|t| t.to_rfc3339());
-        // Token telemetry from the captured raw events (issue #200);
-        // best-effort — a session with no usage data shows nothing.
-        let (context_tokens, output_tokens) =
-            crate::activity::session_token_stats(kernel, s.entity_id.clone())
-                .await
-                .unwrap_or((None, None));
+        let count = tally.lines(&uuid) + actions.get(&uuid).copied().unwrap_or(0);
+        let last_active = tally.last_active(&uuid).map(|t| t.to_rfc3339());
+        // Token telemetry from the captured raw events (issue #200): a
+        // session with no usage data shows nothing.
+        let (context_tokens, output_tokens) = tally.tokens(&uuid);
         let context_pct = context_tokens.map(|c| ((c * 100) / window).clamp(0, 100));
-        let (model, effort) = crate::activity::session_model_effort(kernel, s.entity_id.clone())
-            .await
-            .unwrap_or((None, None));
+        let (model, effort) = tally.model_effort(&uuid);
         out.push(SessionView {
             identity: format!("{agent}/{uuid}"),
             short_id: short.get(&uuid).cloned().unwrap_or_else(|| uuid.clone()),
@@ -593,7 +714,7 @@ async fn api_sessions(
             state.remember(&key, &body);
             json_body(body)
         }
-        Err(_) => json_body("[]".to_string()),
+        Err(e) => not_answered(StatusCode::INTERNAL_SERVER_ERROR, &format!("the sessions could not be written out: {e}")),
     }
 }
 
@@ -753,8 +874,9 @@ async fn api_stats(
     State(state): State<AppState>,
     Query(q): Query<RangeQuery>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
-    let kernel = &state.kernel;
+    // The parameters over the lamp's socket: the page's may be busy with
+    // the very recompute an older answer stands in for (#576).
+    let kernel = &state.live;
     let window = crate::resolved_stats_window(kernel).await;
     // Scroll-back (#326): a named range replaces the fixed newest-N
     // read. Unknown values fall back to the window rather than
@@ -768,7 +890,7 @@ async fn api_stats(
     let clock = viewer_clock(q.tz);
     let ttl = crate::resolved_cache_secs(kernel).await;
     let key = format!("stats:{range}:{window}:{}", clock.local_minus_utc());
-    let (kernel, walk) = (kernel.clone(), range.clone());
+    let (kernel, walk) = (state.kernel.clone(), range.clone());
     let work = async move {
         let s = crate::stats::stats_for_range_on(&kernel, window, &walk, clock)
             .await
@@ -779,7 +901,7 @@ async fn api_stats(
         Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", range = %range, error = %e, "stats read failed");
-            err_response(&e).into_response()
+            not_answered(StatusCode::BAD_GATEWAY, &e)
         }
     }
 }
@@ -788,12 +910,11 @@ async fn api_stats(
 /// the engine. Separate from `/api/stats` so the live tiles keep their
 /// fast refresh while these poll lazily.
 async fn api_insights(State(state): State<AppState>, Query(q): Query<ClockQuery>) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
     // Whole-history, and seconds to compute (#415 review): held for the
     // same while as the Status page's own figures, so two pilots — or two
     // tabs — pay for it once.
     let clock = viewer_clock(q.tz);
-    let ttl = crate::resolved_cache_secs(&state.kernel).await;
+    let ttl = crate::resolved_cache_secs(&state.live).await;
     let key = format!("insights:{}", clock.local_minus_utc());
     let kernel = state.kernel.clone();
     let work = async move {
@@ -804,71 +925,66 @@ async fn api_insights(State(state): State<AppState>, Query(q): Query<ClockQuery>
         Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", error = %e, "insights read failed");
-            err_response(&e).into_response()
+            not_answered(StatusCode::BAD_GATEWAY, &e)
         }
     }
 }
 
 /// Model comparison (#406): the switches, and whether each model
 /// stayed on the objective. Same cache lifetime and same reason as
-/// [`THROWN_CACHE_SECS`] — it walks git, not the message stream.
+/// [`THROWN_CACHE_SECS`] — it walks git, not the message stream. Computed
+/// once however many ask, and an older answer served while the next is
+/// computed (#576: a miss took 97 s).
 async fn api_compare(State(state): State<AppState>) -> axum::response::Response {
-    const KEY: &str = "compare";
-    if let Some(body) = state.cached(KEY, THROWN_CACHE_SECS) {
-        return json_body(body);
-    }
-    let runs = match crate::thrown::model_runs(&state.kernel).await {
-        Ok(r) => r,
+    let kernel = state.kernel.clone();
+    let work = async move {
+        let runs = crate::thrown::model_runs(&kernel).await.map_err(|e| e.to_string())?;
+        let mainlines = crate::resolved_mainline_refs(&kernel).await;
+        let c = crate::compare::compare(&runs, &mainlines).await;
+        let summary = crate::api::CompareSummary {
+            handoffs: c.handoffs,
+            deviations: c.deviations,
+            repos: c.repos,
+            unjudged: c.unjudged,
+            computed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        serde_json::to_string(&summary).map_err(|e| e.to_string())
+    };
+    match state.answers.computed("compare", held_secs(&state).await, work).await {
+        Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", error = %e, "model comparison read failed");
-            return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string())));
+            not_answered(StatusCode::BAD_GATEWAY, &e)
         }
-    };
-    let mainlines = crate::resolved_mainline_refs(&state.kernel).await;
-    let c = crate::compare::compare(&runs, &mainlines).await;
-    let summary = crate::api::CompareSummary {
-        handoffs: c.handoffs,
-        deviations: c.deviations,
-        repos: c.repos,
-        unjudged: c.unjudged,
-        computed_at: chrono::Utc::now().to_rfc3339(),
-    };
-    match serde_json::to_string(&summary) {
-        Ok(body) => {
-            state.remember(KEY, &body);
-            json_body(body)
-        }
-        Err(e) => json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
     }
 }
 
 /// The join (#434): every task, every commit matched to it, and the
 /// operator's sittings. Cached for [`THROWN_CACHE_SECS`], as the comparison
-/// is: it walks git and every session.
+/// is, and computed the same way: it walks git and every session.
 async fn api_tasks(State(state): State<AppState>) -> axum::response::Response {
-    const KEY: &str = "tasks";
-    if let Some(body) = state.cached(KEY, THROWN_CACHE_SECS) {
-        return json_body(body);
-    }
-    let summary = match crate::tasks::tasks(&state.kernel).await {
-        Ok(s) => s,
+    let kernel = state.kernel.clone();
+    let work = async move {
+        let summary = crate::tasks::tasks(&kernel).await.map_err(|e| e.to_string())?;
+        serde_json::to_string(&summary).map_err(|e| e.to_string())
+    };
+    match state.answers.computed("tasks", held_secs(&state).await, work).await {
+        Ok(body) => json_body(body),
         Err(e) => {
             tracing::warn!(target: "ui", error = %e, "task join read failed");
-            return json_body(format!("{{\"error\":{}}}", json_str(&e.to_string())));
+            not_answered(StatusCode::BAD_GATEWAY, &e)
         }
-    };
-    match serde_json::to_string(&summary) {
-        Ok(body) => {
-            state.remember(KEY, &body);
-            json_body(body)
-        }
-        Err(e) => json_body(format!("{{\"error\":{}}}", json_str(&e.to_string()))),
     }
 }
 
-/// A JSON string literal, quotes and escapes included.
-fn json_str(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+/// How long the comparison and the task join are held: [`THROWN_CACHE_SECS`],
+/// or not at all when `attr_ui_cache_secs` turns the cache off.
+async fn held_secs(state: &AppState) -> u64 {
+    if crate::resolved_cache_secs(&state.live).await == 0 {
+        0
+    } else {
+        THROWN_CACHE_SECS
+    }
 }
 
 /// The GLOBAL feed backlog — everything the OS captured, merged
@@ -975,6 +1091,14 @@ fn err_response(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({ "output": msg, "is_error": true })),
     )
+}
+
+/// An answer the server could not give, and why (#576, the 2026-10-21
+/// review's E1): a 502 when the substrate behind it failed, a 503 while it
+/// is not ready, never a 400, which says the request was wrong.
+fn not_answered(status: StatusCode, msg: &str) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (status, Json(serde_json::json!({ "output": msg, "is_error": true }))).into_response()
 }
 
 /// Tiny ok/err JSON envelope for endpoints that can fail resolution.
@@ -1138,6 +1262,93 @@ mod tests {
         let cached = answers.computed("k", 60, slow(runs.clone())).await;
         assert_eq!(cached.as_deref(), Ok("body"));
         assert_eq!(runs.load(Ordering::SeqCst), 1, "and then from the cache");
+    }
+
+    /// An older answer is served at once while the next is computed behind
+    /// it (#576): the Status page waited 27 s on every recompute. Computed
+    /// once however many ask meanwhile; with the cache off, nothing older is
+    /// served.
+    #[tokio::test]
+    async fn an_older_answer_is_served_at_once_while_the_next_is_computed() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const STEP: Duration = Duration::from_millis(60); // skill-allow: §9-duration — test fixture, not a policy
+        const AGE: Duration = Duration::from_secs(120); // skill-allow: §9-duration — test fixture, not a policy
+        let answers = Answers::default();
+        let long_ago = std::time::Instant::now().checked_sub(AGE).expect("a clock past two minutes");
+        answers.cache.lock().expect("cache").insert("k".to_string(), (long_ago, "old".to_string()));
+        let runs = std::sync::Arc::new(AtomicU32::new(0));
+        let slow = |runs: std::sync::Arc<AtomicU32>| async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(STEP).await;
+            Ok::<_, String>("new".to_string())
+        };
+        let at_once = tokio::time::timeout(STEP / 4, answers.computed("k", 60, slow(runs.clone()))).await;
+        assert_eq!(at_once.expect("served without waiting").as_deref(), Ok("old"));
+        let meanwhile = answers.computed("k", 60, slow(runs.clone())).await;
+        assert_eq!(meanwhile.as_deref(), Ok("old"), "still the older while the next is computed");
+        tokio::time::sleep(STEP * 3).await;
+        let fresh = answers.computed("k", 60, slow(runs.clone())).await;
+        assert_eq!(fresh.as_deref(), Ok("new"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "computed once");
+        let off = answers.computed("k", 0, slow(runs.clone())).await;
+        assert_eq!((off.as_deref(), runs.load(Ordering::SeqCst)), (Ok("new"), 2), "with the cache off, computed and awaited");
+
+        // A recompute that fails is the answer, not the older body (#415 QA:
+        // the page shows the failure and keeps its last good reading).
+        answers.cache.lock().expect("cache").insert("f".to_string(), (long_ago, "old".to_string()));
+        let fails = || async {
+            tokio::time::sleep(STEP).await;
+            Err::<String, _>("the substrate did not answer".to_string())
+        };
+        assert_eq!(answers.computed("f", 60, fails()).await.as_deref(), Ok("old"), "not known to fail yet");
+        tokio::time::sleep(STEP * 3).await;
+        assert_eq!(answers.computed("f", 60, fails()).await, Err("the substrate did not answer".to_string()));
+        tokio::time::sleep(STEP * 3).await;
+        let heals = || async { Ok::<_, String>("healed".to_string()) };
+        let failing = answers.computed("f", 60, heals()).await;
+        assert_eq!(failing, Err("the substrate did not answer".to_string()), "the failure stands while the next is computed");
+        tokio::time::sleep(STEP).await;
+        assert_eq!(answers.computed("f", 60, heals()).await.as_deref(), Ok("healed"), "a success clears the failure");
+    }
+
+    /// Until the tally has read all of history, and while its newest read
+    /// fails, the sessions list says so, and why, instead of figures that are
+    /// partial or have stopped moving (#576 review); once read, it lists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sessions_list_says_why_while_the_tally_is_not_read() {
+        let db = surrealdb::engine::any::connect("mem://").await.expect("mem");
+        db.use_ns("superx").use_db("kernel").await.expect("nsdb");
+        let ddl = superx_kernel::SCHEMA_DDL.replace("$SUPERX_KERNEL_PASSWORD", "test-kernel-password-for-mem-engine");
+        db.query(ddl).await.expect("ddl").check().expect("ddl ok");
+        let kernel = Kernel::from_db(db);
+        for t in superx_kernel::REQUIRED_METAMODEL_TYPES {
+            kernel.ensure_type_definition(t.uid, t.category, t.memory_tier).await.expect("seed");
+        }
+        let state = AppState {
+            kernel: kernel.clone(),
+            live: kernel.clone(),
+            tally: std::sync::Arc::default(),
+            tally_read: std::sync::Arc::default(),
+            events: broadcast::channel(1).0,
+            answers: Answers::default(),
+            capture_watch: std::sync::Arc::default(),
+        };
+        let list = || async {
+            let r = api_sessions(State(state.clone()), Query(SessionsQuery { agent: None })).await;
+            let status = r.status();
+            let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.expect("body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+        let (status, body) = list().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("being read for the first time"), "{body}");
+        *state.tally_read.lock().expect("state") = TallyRead::Failed("the substrate did not answer".to_string());
+        let (status, body) = list().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("could not be read: the substrate did not answer"), "{body}");
+        state.tally.lock().await.refresh(&kernel).await.expect("read");
+        *state.tally_read.lock().expect("state") = TallyRead::Read;
+        assert_eq!(list().await, (StatusCode::OK, "[]".to_string()));
     }
 
     async fn get(path: &str) -> axum::response::Response {

@@ -4940,6 +4940,7 @@ pub async fn stats_for_range_capped(
     }
 
     Ok(StatsSummary {
+        computed_at: chrono::Utc::now().to_rfc3339(),
         landed,
         agents,
         sessions_total,
